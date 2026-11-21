@@ -487,6 +487,136 @@ void TestXgAllFormatsAndPlanarDepthStencil() {
     std::printf("  Verified all 19 format suites (BC1-BC7, RGB9E5, D16/D24S8/D32F/D32FS8X24 Plane 0+1) BIT-EXACT!\n");
 }
 
+void TestXgNpotMipChainsAnd3dLut() {
+    std::printf("[Test 4b] xg_xs.dll NPOT Mip Chains (300x180, 1920x1080) & 32x32x32 3D LUTs...\n");
+
+    struct NpotCase {
+        uint32_t format;
+        uint32_t expected_planes;
+        XG_TILE_MODE mode;
+    };
+    const std::array<NpotCase, 5> npot_cases = {{
+        {DXGI_FORMAT_BC6H_UF16, 1u, XG_TILE_MODE_2D_THIN_64KB_S},
+        {DXGI_FORMAT_BC6H_SF16, 1u, XG_TILE_MODE_2D_THIN_64KB_D_X},
+        {DXGI_FORMAT_R9G9B9E5_SHAREDEXP, 1u, XG_TILE_MODE_2D_THIN_64KB_S_X},
+        {DXGI_FORMAT_D32_FLOAT, 1u, XG_TILE_MODE_2D_THIN_64KB_Z},
+        {DXGI_FORMAT_D24_UNORM_S8_UINT, 2u, XG_TILE_MODE_2D_THIN_4KB_Z},
+    }};
+    const std::array<std::array<uint32_t, 3>, 2> npot_sizes = {{
+        {{300u, 180u, 9u}},
+        {{1920u, 1080u, 11u}},
+    }};
+
+    uint32_t npot_roundtrips = 0u;
+    for (const auto& sz : npot_sizes) {
+        for (const auto& c : npot_cases) {
+            XG_TEXTURE2D_DESC desc{};
+            desc.Width = sz[0];
+            desc.Height = sz[1];
+            desc.MipLevels = sz[2];
+            desc.ArraySize = 1u;
+            desc.Format = c.format;
+            desc.SampleCount = 1u;
+            desc.TileMode = c.mode;
+
+            XG_RESOURCE_LAYOUT layout{};
+            OS_REQUIRE(XGComputeMipLayout(&desc, &layout) == 0);
+            OS_REQUIRE(layout.SizeBytes > 0ull);
+
+            IXGTextureAddressComputer* comp = nullptr;
+            OS_REQUIRE(XGCreateTexture2DComputer(&desc, &comp) == 0 && comp != nullptr);
+            std::vector<uint8_t> tiled(static_cast<size_t>(layout.SizeBytes), 0x77u);
+            std::vector<std::vector<uint8_t>> plane_srcs[2];
+
+            for (uint32_t p = 0u; p < c.expected_planes; ++p) {
+                XG_FORMAT_BLOCK_INFO pfi{};
+                OS_REQUIRE(XGGetFormatPlaneBlockInfo(c.format, p, &pfi) == 0);
+                plane_srcs[p].resize(desc.MipLevels);
+                for (uint32_t m = 0u; m < desc.MipLevels; ++m) {
+                    const uint32_t mw = std::max(1u, desc.Width >> m);
+                    const uint32_t mh = std::max(1u, desc.Height >> m);
+                    const uint32_t ex = (mw + pfi.block_width - 1u) / pfi.block_width;
+                    const uint32_t ey = (mh + pfi.block_height - 1u) / pfi.block_height;
+                    const uint32_t rp = ex * pfi.bytes_per_block;
+                    plane_srcs[p][m].resize(static_cast<size_t>(rp) * ey);
+                    FillPattern(plane_srcs[p][m], 0xA500u + sz[0] + c.format * 37u + p * 13u + m);
+                    OS_REQUIRE(comp->CopyIntoSubresource(tiled.data(), p, m, plane_srcs[p][m].data(), rp, 0u) == 0);
+                }
+            }
+
+            for (uint32_t p = 0u; p < c.expected_planes; ++p) {
+                XG_FORMAT_BLOCK_INFO pfi{};
+                OS_REQUIRE(XGGetFormatPlaneBlockInfo(c.format, p, &pfi) == 0);
+                for (uint32_t m = 0u; m < desc.MipLevels; ++m) {
+                    const uint32_t mw = std::max(1u, desc.Width >> m);
+                    const uint32_t ex = (mw + pfi.block_width - 1u) / pfi.block_width;
+                    const uint32_t rp = ex * pfi.bytes_per_block;
+                    std::vector<uint8_t> dst(plane_srcs[p][m].size(), 0u);
+                    OS_REQUIRE(comp->CopyFromSubresource(dst.data(), p, m, tiled.data(), rp, 0u) == 0);
+                    OS_REQUIRE(std::memcmp(plane_srcs[p][m].data(), dst.data(), dst.size()) == 0);
+                    ++npot_roundtrips;
+                }
+            }
+            comp->Release();
+        }
+    }
+
+    const std::array<uint32_t, 2> lut_formats = {
+        DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+        DXGI_FORMAT_R16G16B16A16_FLOAT,
+    };
+    const std::array<XG_TILE_MODE, 2> lut_modes = {
+        XG_TILE_MODE_3D_THICK_64KB_S,
+        XG_TILE_MODE_3D_THICK_64KB_S_X,
+    };
+    uint32_t lut_roundtrips = 0u;
+    for (uint32_t fmt : lut_formats) {
+        XG_FORMAT_BLOCK_INFO fi{};
+        OS_REQUIRE(XGGetFormatBlockInfo(fmt, &fi) == 0);
+        for (XG_TILE_MODE mode : lut_modes) {
+            XG_TEXTURE3D_DESC desc{};
+            desc.Width = 32u;
+            desc.Height = 32u;
+            desc.Depth = 32u;
+            desc.MipLevels = 6u;
+            desc.Format = fmt;
+            desc.TileMode = mode;
+
+            XG_RESOURCE_LAYOUT layout{};
+            OS_REQUIRE(XGComputeMipLayout3D(&desc, &layout) == 0);
+            IXGTextureAddressComputer* comp = nullptr;
+            OS_REQUIRE(XGCreateTexture3DComputer(&desc, &comp) == 0 && comp != nullptr);
+
+            std::vector<uint8_t> tiled(static_cast<size_t>(layout.SizeBytes), 0xA5u);
+            std::vector<std::vector<uint8_t>> mip_srcs(desc.MipLevels);
+            for (uint32_t m = 0u; m < desc.MipLevels; ++m) {
+                const uint32_t mw = std::max(1u, desc.Width >> m);
+                const uint32_t mh = std::max(1u, desc.Height >> m);
+                const uint32_t md = std::max(1u, desc.Depth >> m);
+                const uint32_t rp = mw * fi.bytes_per_block;
+                const uint32_t sp = rp * mh;
+                mip_srcs[m].resize(static_cast<size_t>(sp) * md);
+                FillPattern(mip_srcs[m], 0x3D00u + fmt * 19u + static_cast<uint32_t>(mode) * 7u + m);
+                OS_REQUIRE(comp->CopyIntoSubresource(tiled.data(), 0u, m, mip_srcs[m].data(), rp, sp) == 0);
+            }
+            for (uint32_t m = 0u; m < desc.MipLevels; ++m) {
+                const uint32_t mw = std::max(1u, desc.Width >> m);
+                const uint32_t mh = std::max(1u, desc.Height >> m);
+                const uint32_t rp = mw * fi.bytes_per_block;
+                const uint32_t sp = rp * mh;
+                std::vector<uint8_t> dst(mip_srcs[m].size(), 0u);
+                OS_REQUIRE(comp->CopyFromSubresource(dst.data(), 0u, m, tiled.data(), rp, sp) == 0);
+                OS_REQUIRE(std::memcmp(mip_srcs[m].data(), dst.data(), dst.size()) == 0);
+                ++lut_roundtrips;
+            }
+            comp->Release();
+        }
+    }
+
+    std::printf("  Verified %u NPOT mip-chain roundtrips + %u 32x32x32 3D LUT roundtrips BIT-EXACT!\n",
+                npot_roundtrips, lut_roundtrips);
+}
+
 // ===========================================================================
 // 5. DirectStorage Queue Hardening Tests
 // ===========================================================================
@@ -803,6 +933,7 @@ int main() {
     TestXgAll3dModesAndVolumes();
     TestXgMipTailsArraysAndCubes();
     TestXgAllFormatsAndPlanarDepthStencil();
+    TestXgNpotMipChainsAnd3dLut();
     TestDirectStorageHardening();
     std::printf("ALL XG_XS GFX10 (2D/3D/MIP-TAIL/FORMATS) & DIRECTSTORAGE HARDENING TESTS PASSED!\n");
     return 0;
