@@ -736,7 +736,32 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSystemGetAppSpecificDevi
     char* appSpecificDeviceId,
     size_t* appSpecificDeviceIdUsed);
 OPENSCARLETT_GDK_API XSystemRuntimeInfo OPENSCARLETT_GDK_CALL XSystemGetRuntimeInfo(void);
+
+/// What kind of GDK object a tracked handle points at (informational).
+enum XSystemHandleType : uint32_t {
+    XSystemHandleType_Unknown = 0,
+    XSystemHandleType_TaskQueue = 1,
+    XSystemHandleType_User = 2,
+    XSystemHandleType_StoreContext = 3,
+    XSystemHandleType_Generic = 4,
+};
+
+/// Called when a tracked handle is closed (invalidated). May be null.
+typedef void(OPENSCARLETT_GDK_CALL* XSystemHandleInvalidatedCallback)(void* context, void* handle);
+
 OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XSystemIsHandleValid(void* handle);
+/// Registers `handle` in the runtime handle registry. `token` receives a
+/// non-zero tracking token on success. Re-tracking a live handle attaches the
+/// new callback/type and issues a fresh token; tracking a closed handle fails
+/// with XGR_E_HANDLE.
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSystemHandleTrack(
+    void* handle,
+    XSystemHandleType type,
+    XSystemHandleInvalidatedCallback callback,
+    void* context,
+    uint64_t* token);
+/// Removes a tracking token again. The handle itself stays usable.
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSystemHandleUntrack(uint64_t token);
 
 // ---------------------------------------------------------------------------
 // XGameStreaming (clean-room local-PC compatibility surface)
@@ -2632,6 +2657,13 @@ struct IXgrSystemApiVtable {
     XSystemAnalyticsInfo(OPENSCARLETT_GDK_CALL* XSystemGetAnalyticsInfo)(void);
     XSystemRuntimeInfo(OPENSCARLETT_GDK_CALL* XSystemGetRuntimeInfo)(void);
     bool(OPENSCARLETT_GDK_CALL* XSystemIsHandleValid)(void* handle);
+    XGameResult(OPENSCARLETT_GDK_CALL* XSystemHandleTrack)(
+        void* handle,
+        XSystemHandleType type,
+        XSystemHandleInvalidatedCallback callback,
+        void* context,
+        uint64_t* token);
+    XGameResult(OPENSCARLETT_GDK_CALL* XSystemHandleUntrack)(uint64_t token);
     // Extended System entries
     bool(OPENSCARLETT_GDK_CALL* XGameRuntimeIsFeatureAvailable)(XGameRuntimeFeature feature);
     XGameResult(OPENSCARLETT_GDK_CALL* XSystemGetAppSpecificDeviceId)(

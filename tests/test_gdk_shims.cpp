@@ -182,6 +182,71 @@ void TestXGameRuntime() {
     OS_REQUIRE(!XSystemIsHandleValid(nullptr));
     OS_REQUIRE(XSystemIsHandleValid(cid));
 
+    // XSystem handle registry (XSystemHandleTrack / XSystemIsHandleValid)
+    {
+        static std::atomic<int> invalidated_calls{0};
+        static void* invalidated_handle = nullptr;
+        auto on_invalidated = [](void* /*ctx*/, void* h) {
+            invalidated_handle = h;
+            invalidated_calls.fetch_add(1);
+        };
+        int dummy = 0;
+        void* h = &dummy;
+        uint64_t token = 0;
+        OS_REQUIRE(XSystemHandleTrack(h, XSystemHandleType_Generic, on_invalidated, nullptr, &token) == XGR_S_OK);
+        OS_REQUIRE(token != 0);
+        OS_REQUIRE(XSystemIsHandleValid(h));
+        // Re-tracking a live handle attaches the callback and issues a fresh
+        // token; bad arguments fail.
+        uint64_t token2 = 0;
+        OS_REQUIRE(XSystemHandleTrack(h, XSystemHandleType_Generic, on_invalidated, nullptr, &token2) == XGR_S_OK);
+        OS_REQUIRE(token2 != 0 && token2 != token);
+        OS_REQUIRE(XSystemHandleUntrack(token2) == XGR_S_OK);
+        OS_REQUIRE(XSystemHandleTrack(nullptr, XSystemHandleType_Generic, nullptr, nullptr, &token2) == XGR_E_INVALIDARG);
+        OS_REQUIRE(XSystemHandleTrack(h, XSystemHandleType_Generic, nullptr, nullptr, nullptr) == XGR_E_INVALIDARG);
+        OS_REQUIRE(!XSystemIsHandleValid(nullptr));
+        OS_REQUIRE(!XSystemIsHandleValid(reinterpret_cast<void*>(static_cast<intptr_t>(-1))));
+        // Untracking makes the handle fall back to legacy "valid" again.
+        OS_REQUIRE(XSystemHandleUntrack(token) == XGR_S_OK);
+        OS_REQUIRE(XSystemIsHandleValid(h));
+        OS_REQUIRE(XSystemHandleUntrack(token) == XGR_E_HANDLE);
+        // Re-track, then close through a real GDK handle path (task queue).
+        OS_REQUIRE(XSystemHandleTrack(h, XSystemHandleType_User, on_invalidated, nullptr, &token) == XGR_S_OK);
+        XTaskQueueHandle q = nullptr;
+        OS_REQUIRE(XTaskQueueCreate(XTaskQueueDispatchMode_Manual, XTaskQueueDispatchMode_Manual, &q) == XGR_S_OK);
+        OS_REQUIRE(q != nullptr);
+        OS_REQUIRE(XSystemIsHandleValid(q));  // auto-registered on create
+        uint64_t qtoken = 0;
+        OS_REQUIRE(XSystemHandleTrack(q, XSystemHandleType_TaskQueue, on_invalidated, nullptr, &qtoken) == XGR_S_OK);
+        OS_REQUIRE(qtoken != 0);
+        XTaskQueueCloseHandle(q);
+        OS_REQUIRE(!XSystemIsHandleValid(q));  // closed handles are invalid
+        OS_REQUIRE(invalidated_calls.load() == 1);
+        OS_REQUIRE(invalidated_handle == q);
+        // Untracked arbitrary pointers stay valid (legacy behaviour).
+        OS_REQUIRE(XSystemIsHandleValid(reinterpret_cast<void*>(0x1234u)));
+        OS_REQUIRE(XSystemHandleUntrack(token) == XGR_S_OK);
+        // Concurrent track/validate/untrack from several threads.
+        {
+            std::vector<std::thread> threads;
+            std::atomic<int> ok{0};
+            for (int t = 0; t < 8; ++t) {
+                threads.emplace_back([&ok, t] {
+                    void* local = reinterpret_cast<void*>(static_cast<intptr_t>(0x10000u + t));
+                    uint64_t tok = 0;
+                    if (XSystemHandleTrack(local, XSystemHandleType_Generic, nullptr, nullptr, &tok) == XGR_S_OK && tok != 0) {
+                        for (int i = 0; i < 1000; ++i) {
+                            if (XSystemIsHandleValid(local)) ok.fetch_add(1);
+                        }
+                        if (XSystemHandleUntrack(tok) == XGR_S_OK) ok.fetch_add(1);
+                    }
+                });
+            }
+            for (auto& th : threads) th.join();
+            OS_REQUIRE(ok.load() == 8 * 1001);
+        }
+    }
+
     // XMem + custom hooks
     OS_REQUIRE(XMemSetAllocationHooks(&CustomXMemAlloc, &CustomXMemFree) == XGR_S_OK);
     void* mem = XMemAlloc(256, 0);
