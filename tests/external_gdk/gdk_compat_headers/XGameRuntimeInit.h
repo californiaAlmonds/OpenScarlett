@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Microsoft GDK <XGameRuntimeInit.h> public C/C++ ABI header.
+// MIT Microsoft GDK <XGameRuntimeInit.h> public C/C++ ABI header.
 
 #include "XDisplay.h"
 #include "XGameRuntimeTypes.h"

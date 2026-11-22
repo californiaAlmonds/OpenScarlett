@@ -405,7 +405,7 @@ int CompareNumericStrings(const std::string& a, const std::string& b) {
     return 0;
 }
 
-// Clean-room minimal JSON parser tailored for GitHub /releases/latest response.
+// Minimal JSON parser tailored for GitHub /releases/latest response.
 class MinimalJsonParser {
 public:
     explicit MinimalJsonParser(const std::string& text) : src_(text) {}
@@ -1440,7 +1440,7 @@ bool DirectoryHasAnyEntries(const std::filesystem::path& dir) noexcept {
     return !ec && (it != std::filesystem::directory_iterator());
 }
 
-// Clean-room pure C++ PKZIP STORE (compression method 0) fallback extractor.
+// Pure C++ PKZIP STORE (compression method 0) fallback extractor.
 // Provides zero-subprocess extraction with strict Zip-Slip path validation and CRC-32 checks.
 Status ExtractStoredZipNative(const std::filesystem::path& zip_path,
                               const std::filesystem::path& extract_dir) {
@@ -1774,7 +1774,7 @@ Status ExtractZipArchive(const std::filesystem::path& zip_path,
         diag << "; powershell-zipfile(not found)";
     }
 
-    // Fallback 3: Built-in clean-room pure C++ PKZIP STORE (method 0) extractor
+    // Fallback 3: Built-in pure C++ PKZIP STORE (method 0) extractor
     // (guarantees zero-subprocess extraction even on locked-down environments).
     {
         Status prep_st = prepare_clean_dest();

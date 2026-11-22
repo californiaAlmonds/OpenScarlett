@@ -1,4 +1,4 @@
-// Clean-room MIT Microsoft Media Foundation Platform (mfplat_xs.dll) shim for OpenScarlett.
+// MIT Microsoft Media Foundation Platform (mfplat_xs.dll) shim for OpenScarlett.
 // Implements:
 //  - IMFDXGIDeviceManager wrapper supporting both host D3D11/DXGI and Xbox D3D12 devices
 //    (ResetDevice, OpenDeviceHandle, CloseDeviceHandle, LockDevice, UnlockDevice, TestDevice, GetVideoService)
@@ -446,7 +446,7 @@ HostMfPlat& GetHostMf() {
 }
 
 // ===========================================================================
-// Clean-Room IMFDXGIDeviceManager Wrapper (Supports D3D12 + D3D11 + DXGI)
+// IMFDXGIDeviceManager Wrapper (Supports D3D12 + D3D11 + DXGI)
 // ===========================================================================
 class OpenScarlettDxgiDeviceManager final : public IMFDXGIDeviceManager {
 public:
@@ -702,7 +702,7 @@ private:
 };
 
 // ===========================================================================
-// Clean-Room IMFMediaError & IMFMediaTimeRange
+// IMFMediaError & IMFMediaTimeRange
 // ===========================================================================
 class MediaErrorImpl final : public OsIMFMediaError {
 public:
@@ -1069,7 +1069,7 @@ bool TransferFrameToD3D12Resource(
 }
 
 // ===========================================================================
-// Clean-Room IMFMediaEngine / IMFMediaEngineEx Implementation
+// IMFMediaEngine / IMFMediaEngineEx Implementation
 // ===========================================================================
 class OpenScarlettMediaEngine final : public OsIMFMediaEngineEx {
 public:
@@ -2080,7 +2080,7 @@ public:
         return rem;
     }
 
-    // IMFAttributes (minimal clean-room implementation for MFT metadata queries)
+    // IMFAttributes (minimal implementation for MFT metadata queries)
     HRESULT STDMETHODCALLTYPE GetItem(REFGUID, PROPVARIANT*) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE GetItemType(REFGUID, MF_ATTRIBUTE_TYPE*) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE CompareItem(REFGUID, REFPROPVARIANT, BOOL* pbResult) override {
@@ -2174,7 +2174,7 @@ private:
     GUID clsid_{};
 };
 
-// Clean-room fallback IMFAttributes when host mfplat.dll is absent
+// Fallback IMFAttributes when host mfplat.dll is absent
 class FallbackMfAttributes final : public IMFAttributes {
 public:
     ~FallbackMfAttributes() {
@@ -2292,7 +2292,7 @@ private:
     std::vector<std::pair<GUID, IUnknown*>> unknowns_;
 };
 
-// Clean-room fallback IMFMediaBuffer when host mfplat.dll is absent
+// Fallback IMFMediaBuffer when host mfplat.dll is absent
 class FallbackMfMemoryBuffer final : public IMFMediaBuffer {
 public:
     explicit FallbackMfMemoryBuffer(DWORD max_len) : data_(max_len, 0u) {}
@@ -2709,7 +2709,7 @@ OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFTEnumEx(
         }
     }
 
-    // Clean-room H.264 / HEVC video decoder fallback activates for headless/CI hosts
+    // H.264 / HEVC video decoder fallback activates for headless/CI hosts
     // or Windows 10 machines without Microsoft HEVC Video Extensions installed.
     if (GuidEq(guidCategory, kMftCategoryVideoDecoder)) {
         const bool want_h264 = (!in_type) || GuidEq(in_type->guidSubtype, kMfVideoFormatH264);

@@ -640,7 +640,7 @@ void TestXAudio2Concurrent64VoicesAndEffects() {
     {
         std::vector<std::vector<uint8_t>> pkts;
         for (uint32_t i = 0u; i < 2u; ++i) {
-            pkts.push_back(openscarlett::BuildCleanRoomOpusTestPacket(2u, i + 1u, 64u));
+            pkts.push_back(openscarlett::BuildOpusTestPacket(2u, i + 1u, 64u));
         }
         opus_stream = openscarlett::PackOpusLengthPrefixedStream(pkts, false);
     }

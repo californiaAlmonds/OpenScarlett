@@ -93,7 +93,7 @@ using OsGameInputDeviceCallback = void(OPENSCARLETT_GAMEINPUT_CALL*)(
     uint32_t currentStatus,
     uint32_t previousStatus);
 
-// Spatial Audio clean-room COM mirrors matching xaudio2_shim.cpp
+// Spatial Audio COM mirrors matching xaudio2_shim.cpp
 constexpr XAudio2Guid kIidSpatialAudioClient = {
     0xBBF8E066u, 0xAAAAu, 0x49BEu, {0x9Au, 0x4Du, 0xFDu, 0x2Au, 0x85u, 0x8Eu, 0xAEu, 0x29u}};
 constexpr XAudio2Guid kIidSpatialAudioRenderStream = {
@@ -536,7 +536,7 @@ void TestOpenscarlettProbeCli(const fs::path& bin_dir, const fs::path& scratch) 
     OS_REQUIRE(exit_code == 0);
     OS_REQUIRE(out_txt.find("Preflight Compatibility Probe (XVD/XVC)") != std::string::npos);
     OS_REQUIRE(out_txt.find("ENCRYPTED") != std::string::npos);
-    OS_REQUIRE(out_txt.find("out of scope") != std::string::npos);
+    OS_REQUIRE(out_txt.find("unpacked package directory") != std::string::npos);
 
     std::string out_json;
     OS_REQUIRE(RunProcessCaptureStdout(cli.wstring(), L"probe \"" + xvd_path.wstring() + L"\" --json",

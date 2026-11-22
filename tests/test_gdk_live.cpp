@@ -34,7 +34,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// Clean-room MIT fallback HLSL used ONLY if E:\OpenScarlett\packages\Xbox-GDK-Samples is absent (e.g. CI).
+// Fallback HLSL used ONLY if E:\OpenScarlett\packages\Xbox-GDK-Samples is absent (e.g. CI).
 constexpr const char* kFallbackSimpleTriangleVs = R"HLSL(
 struct Vertex { float4 position : SV_Position; float4 color : COLOR0; };
 struct Interpolants { float4 position : SV_Position; float4 color : COLOR0; };

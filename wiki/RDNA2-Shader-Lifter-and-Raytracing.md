@@ -1,6 +1,6 @@
 # RDNA2 Shader Lifter & Ray Tracing
 
-Xbox Series X|S titles ship pre-compiled **AMD RDNA2 / GFX10.3** GPU machine code (compiled by Xbox `dxc_xs`) rather than portable PC DXIL bytecode. OpenScarlett contains a clean-room RDNA2 shader pipeline that parses Xbox shader containers, disassembles GFX10.3 machine code into SSA IR, lifts it to **SPIR-V 1.6** and **DXIL SM 6.5/6.6**, and caches compiled PC pipelines to disk.
+Xbox Series X|S titles ship pre-compiled **AMD RDNA2 / GFX10.3** GPU machine code (compiled by Xbox `dxc_xs`) rather than portable PC DXIL bytecode. OpenScarlett contains an RDNA2 shader pipeline that parses Xbox shader containers, disassembles GFX10.3 machine code into SSA IR, lifts it to **SPIR-V 1.6** and **DXIL SM 6.5/6.6**, and caches compiled PC pipelines to disk.
 
 ---
 

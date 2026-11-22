@@ -9,8 +9,7 @@
 
 namespace openscarlett {
 
-// Public 12 KiB (0x3000) Xbox Virtual Disk (XVD) header layout constants.
-// Strictly read-only inspection metadata — NO DRM circumvention, NO decryption, NO key extraction.
+// 12 KiB (0x3000) Xbox Virtual Disk (XVD) header layout constants.
 inline constexpr size_t kXvdSignatureOffset = 0x0000u;
 inline constexpr size_t kXvdSignatureSize = 0x0200u;
 inline constexpr size_t kXvdMagicOffset = 0x0200u;
@@ -124,7 +123,7 @@ inline constexpr uint32_t kRegionIdInXts = 0x00000040u;
 inline constexpr uint32_t kEraSpecific = 0x00000080u;
 }  // namespace XvdVolumeFlags
 
-// XvdExtEntry code tags (public metadata extensions).
+// XvdExtEntry code tags (metadata extensions).
 inline constexpr uint32_t kXvdExtCodeTitleId = 0x00000001u;
 
 struct XvdExtEntryInfo {
@@ -227,7 +226,7 @@ struct XvdInspectionReport {
     bool is_era_specific = false;
     bool has_embedded_xvd = false;
     bool has_user_data = false;
-    bool has_key_material_present = false;  // Read-only presence indicator; raw bytes never exported
+    bool has_key_material_present = false;  // Header presence indicator for the key material field
     bool is_payload_truncated = false;
     bool can_inspect_filesystem_directly = false;
 

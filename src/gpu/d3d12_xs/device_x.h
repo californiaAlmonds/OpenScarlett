@@ -15,6 +15,8 @@
 #include "openscarlett/gpu/descriptor_sgpr_bridge.h"
 #include "openscarlett/gpu/frame_capture.h"
 #include "openscarlett/gpu/query_accumulator_x.h"
+#include "openscarlett/gpu/rdna2_rayquery_bridge.h"
+#include "openscarlett/gpu/rdna2_xbox_container.h"
 #include "openscarlett/gpu/sampler_feedback_x.h"
 #include "openscarlett/gpu/shader_cache.h"
 #include "openscarlett/gpu/vulkan_backend.h"
@@ -71,6 +73,10 @@ struct UnifiedTextureMapping {
     uint64_t uploaded_generation = 0ull;
     bool dirty = false;
     bool cpu_readable = false;
+    bool write_watch_enabled = false;
+    bool has_uploaded_once = false;
+    bool mirrored_by_title_va = false;
+    uint64_t last_uploaded_hash = 0ull;
 };
 
 struct XMemAllocationRecord {
@@ -98,7 +104,10 @@ public:
 
     ID3D12Device* HostDevice() const noexcept { return host_dev_; }
     const D3D12AdapterInfo& AdapterInfo() const noexcept { return adapter_info_; }
-    HWND DefaultWindow() const noexcept { return default_hwnd_; }
+    HWND DefaultWindow() const noexcept;
+    void SetDefaultWindow(HWND hwnd) noexcept;
+    bool AdoptTitleWindow(HWND hwnd) noexcept;
+    HWND ResolveEffectiveOutputWindow(HWND explicit_hwnd = nullptr) const noexcept;
     bool SupportsDepthBoundsTest() const noexcept { return supports_depth_bounds_test_; }
     bool SupportsViewInstancing() const noexcept { return supports_view_instancing_; }
     bool SupportsProgrammableSamplePositions() const noexcept {
@@ -242,6 +251,10 @@ public:
     bool HasDirtyUnifiedTextures() const noexcept {
         return dirty_unified_count_.load(std::memory_order_acquire) > 0u;
     }
+    bool RefreshDirtyUnifiedResources() noexcept;
+    HRESULT SyncAllUnifiedResourcesBeforeSubmit(
+        ID3D12CommandQueue* host_queue,
+        D3D12_COMMAND_LIST_TYPE queue_type);
     void NotifyResourceStateTransition(
         ID3D12Resource* resource, D3D12_RESOURCE_STATES new_state) noexcept;
 
@@ -646,12 +659,32 @@ private:
     bool IsTrackedFallbackResource(ID3D12Resource* resource) const noexcept;
     HRESULT EnsureUnifiedUploadObjectsLocked();
     HRESULT EnsureUnifiedUploadBufferLocked(uint64_t required_bytes);
+    HRESULT EnsureInternalDirectSyncQueueLocked();
     void ReleaseUnifiedMemoryObjects();
     void AutoRegisterUnifiedResource(
         ID3D12Resource* resource,
         uint64_t guest_va,
         const D3D12_RESOURCE_DESC& desc,
-        D3D12_RESOURCE_STATES initial_state);
+        D3D12_RESOURCE_STATES initial_state,
+        bool mirrored_by_title_va = false);
+    ID3D12RootSignature* SynthesizeHostRootSignatureFromXboxDesc(
+        const openscarlett::XboxRootSignatureDesc& desc);
+    void SyncXboxContainerSgprMapToBridge(const openscarlett::XboxParsedShaderContainer& parsed);
+    bool LiftXboxStageToHostBytecode(
+        const void* data,
+        size_t size,
+        bool mesh_has_payload,
+        bool prefer_dxil_standin,
+        const openscarlett::XboxParsedShaderContainer* paired_other_stage,
+        std::vector<uint8_t>& out_bytecode,
+        openscarlett::XboxParsedShaderContainer* out_parsed = nullptr);
+    bool LiftXboxStageToSpirv(
+        const void* data,
+        size_t size,
+        bool mesh_has_payload,
+        const openscarlett::XboxParsedShaderContainer* paired_other_stage,
+        std::vector<uint32_t>& out_spirv,
+        openscarlett::XboxParsedShaderContainer* out_parsed = nullptr);
 
     friend class DeviceExtendedProxy;
     friend class DxgiDeviceProxy;
@@ -692,6 +725,13 @@ private:
     std::atomic<bool> suspended_{false};
     std::mutex shader_lift_mutex_;
     openscarlett::ShaderCache shader_cache_;
+    std::unordered_map<uint64_t, std::vector<uint8_t>> xbox_container_dxil_cache_;
+    std::mutex synth_rs_mutex_;
+    std::vector<ID3D12RootSignature*> synthesized_root_sigs_;
+    std::atomic<uint64_t> xbox_container_lifts_{0ull};
+    std::atomic<uint64_t> rayquery_bridge_lifts_{0ull};
+    std::atomic<uint64_t> mesh_inferred_root_lifts_{0ull};
+    mutable std::mutex window_mutex_;
 
     std::atomic<GuestGpuVaTranslatorFn> va_translator_hook_{nullptr};
     std::atomic<void*> va_translator_ctx_{nullptr};
@@ -770,6 +810,7 @@ private:
     uint64_t unified_fence_val_ = 0ull;
     ID3D12Resource* unified_upload_buf_ = nullptr;
     uint64_t unified_upload_capacity_ = 0ull;
+    ID3D12CommandQueue* unified_sync_direct_queue_ = nullptr;
 
     // Direct d3d12_xs -> Vulkan 1.4 routing state (active when OPENSCARLETT_BACKEND=vulkan)
     bool vulkan_routing_active_ = false;

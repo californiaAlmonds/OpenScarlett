@@ -73,3 +73,18 @@ EXPORTS
     GetProcessAffinityMask = KernelXGetProcessAffinityMask
     GetSystemInfo = KernelXGetSystemInfo
     GetCurrentProcessorNumber = KernelXGetCurrentProcessorNumber
+    CreateUmsCompletionList
+    DeleteUmsCompletionList
+    GetUmsCompletionListEvent
+    DequeueUmsCompletionListItems
+    GetNextUmsListItem
+    CreateUmsThreadContext
+    DeleteUmsThreadContext
+    QueryUmsThreadInformation
+    SetUmsThreadInformation
+    GetCurrentUmsThread
+    EnterUmsSchedulingMode
+    ExecuteUmsThread
+    UmsThreadYield
+    OpenScarlettUmsBindWorkerProc
+    OpenScarlettUmsEnqueueCompletionItem

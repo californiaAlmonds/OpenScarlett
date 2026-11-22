@@ -37,7 +37,7 @@ namespace {
 
 #if defined(_WIN32)
 
-// Matching clean-room COM inspection interfaces exposed by d3d12_xs proxies (no extra DLL exports needed).
+// Matching COM inspection interfaces exposed by d3d12_xs proxies (no extra DLL exports needed).
 enum class D3D12XProxyKind : uint32_t {
     Unknown = 0u,
     Resource = 1u,
@@ -679,7 +679,7 @@ void RunAllTenProxiesTest(bool use_warp, IDXGIAdapter1* hw_adapter, const char* 
 
     // (10) StateObjectX (+ ID3D12StateObjectProperties QI)
     // Verified on BOTH HW DXR adapters (real host ID3D12StateObject) AND non-DXR adapters
-    // (GTX 1650 Ti / Win10 WARP via clean-room software StateObjectXProxy fallback)!
+    // (GTX 1650 Ti / Win10 WARP via software StateObjectXProxy fallback)!
     D3D12_FEATURE_DATA_D3D12_OPTIONS5 opts5{};
     const bool has_hw_dxr =
         SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &opts5, sizeof(opts5))) &&

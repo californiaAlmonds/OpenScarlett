@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Standalone Playable Xbox Series X|S (Scarlett) Game:
+// OpenScarlett MIT Standalone Playable Xbox Series X|S (Scarlett) Game:
 // "Scarlett Arena" — a crisp 640x400 Wolf-style textured 3D raycaster running on the
 // exact same Scarlett full-stack platform host (d3d12_xs.dll + PresentX + kernelx.dll +
 // xgameruntime.dll + GameInput.dll + XAudio2_9.dll + G:\ VFS + S:\ XGameSave).

@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Standalone Xbox-ABI Guest Sample 3:
+// OpenScarlett MIT Standalone Xbox-ABI Guest Sample 3:
 // Mirrors Microsoft Xbox-GDK-Samples/Samples/IntroGraphics/SimpleCompute (fractal.hlsl Mandelbrot).
 //
 // Deliberately does NOT link openscarlett_core. Runs on BOTH NVIDIA GTX 1650 Ti (HW)

@@ -1,5 +1,5 @@
 /*
- * OpenScarlett Clean-Room MIT DOOM (doomgeneric) -> Xbox Series X|S (Scarlett) Platform Bridge.
+ * OpenScarlett MIT DOOM (doomgeneric) -> Xbox Series X|S (Scarlett) Platform Bridge.
  *
  * Implements the 6 doomgeneric platform callbacks (DG_Init, DG_DrawFrame, DG_SleepMs,
  * DG_GetTicksMs, DG_GetKey, DG_SetWindowTitle) on top of scarlett_platform.h

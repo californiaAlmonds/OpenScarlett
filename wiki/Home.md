@@ -4,11 +4,9 @@
 
 # Welcome to the OpenScarlett Wiki
 
-**OpenScarlett** is an MIT-licensed, 100% clean-room C++20 compatibility and translation layer for running **Xbox Series X|S (Scarlett / Gen9 Game Core)** x86-64 Windows PE software natively on **Windows 10 & Windows 11 PCs**.
+**OpenScarlett** is an MIT-licensed C++20 compatibility and translation layer for running **Xbox Series X|S (Scarlett / Gen9 Game Core)** x86-64 Windows PE software natively on **Windows 10 & Windows 11 PCs**.
 
 Because the Xbox Series X|S runs an **AMD Zen 2 x86-64 CPU** with a Windows-derived Game Core kernel, OpenScarlett executes guest CPU code **natively** rather than emulating an instruction set — translating only the console-specific graphics (`d3d12_xs`, `xg_xs`), AMD RDNA2/GFX10.3 shaders, unified memory, DirectStorage/BCPack streaming, audio, input, and GDK/OS runtime calls to native PC **DirectX 12**, **Vulkan 1.4**, and Win32 APIs.
-
-> **Legal & Clean-Room Policy:** OpenScarlett is strictly for legally obtained, unencrypted apps, homebrew, and SDK samples. OpenScarlett **never** extracts Microsoft keys, decrypts retail `.xvc`/`.xvd` packages, or bypasses DRM. All code is 100% original MIT clean-room C++20 written from public specifications.
 
 ---
 
@@ -34,7 +32,7 @@ Because the Xbox Series X|S runs an **AMD Zen 2 x86-64 CPU** with a Windows-deri
 
 ### Architecture & Subsystem Deep Dives
 - **[Architecture Overview](Architecture-Overview.md)** — How native x86-64 execution, APC injection, 30-DLL routing, dual D3D12/Vulkan 1.4 rendering, and RDNA2 lifting fit together.
-- **[Loader & Virtual Filesystem (VFS)](Loader-and-VFS.md)** — PE32+ inspection, suspended-process APC hook loader, `CreateProcess` child-hook propagation, `PeForwarderResolver`, `MicrosoftGame.Config`, `ConsoleLsaPolicy`, clean-room 12 KiB XVD inspection, and `NtCreateFile` / CoW `G:\`, `T:\`, `S:\` mounts.
+- **[Loader & Virtual Filesystem (VFS)](Loader-and-VFS.md)** — PE32+ inspection, suspended-process APC hook loader, `CreateProcess` child-hook propagation, `PeForwarderResolver`, `MicrosoftGame.Config`, `ConsoleLsaPolicy`, 12 KiB XVD inspection, and `NtCreateFile` / CoW `G:\`, `T:\`, `S:\` mounts.
 - **[Graphics: DirectX 12 (`d3d12_xs`) & Vulkan 1.4](Graphics-D3D12-and-Vulkan.md)** — All 13 Xbox COM proxies, 6-thread multi-queue sync, GXDK extensions, Sampler Feedback, `QueryAccumulatorX`, HDR10 `PresentX`, direct `d3d12_xs` → Vulkan 1.4 routing, `xg_xs` GPU compute untiling, and GPU FSR 1.0.
 - **[RDNA2 Shader Lifter & Ray Tracing](RDNA2-Shader-Lifter-and-Raytracing.md)** — GFX10.3 ISA decoders (`774/779`), Xbox DXBC/PM4/SGPR container parser, SSA IR + EXEC-mask CFG hardening, SPIR-V 1.6 (`TaskEXT`/`MeshEXT`) & DXIL SM 6.5/6.6 lifting, Wave64-on-Wave32, bindless `V#`/`T#`/`S#`, async PSO cache, and DXR 1.1 / `image_bvh64_intersect_ray` RayQuery bridge.
 - **[Memory, Streaming & Storage](Memory-Streaming-and-Storage.md)** — `kernelx`/`xmem` `VirtualAlloc2` 64 KiB & 4 MiB page aliasing, `GpuTilePool`, 64-bit `TitleVAMirror` (`MEM_WRITE_WATCH`), LRU `VramResidencyManager`, and `dstorage_xs` (priority queues, GDeflate v1, BCPack BC1–BC7 texture arrays, GPU untile upload).
@@ -44,7 +42,7 @@ Because the Xbox Series X|S runs an **AMD Zen 2 x86-64 CPU** with a Windows-deri
 - **[System DLL Shims Reference (All 30 DLLs)](System-DLL-Shims-Reference.md)** — Export counts, coverage tiers, and capabilities for all 30 shimmed DLLs (`993` exports).
 - **[CLI, Environment Variables & Diagnostics](CLI-Environment-and-Diagnostics.md)** — `openscarlett.exe` subcommands, `OpenScarlettLauncher.exe`, First-Boot Probe mode, VEH 50-call crash ring buffer, `CallTelemetry`, frame/shader capture, and all `OPENSCARLETT_*` env vars.
 - **[Testing, Compatibility & Hardware](Testing-Compatibility-and-Hardware.md)** — Honest workload compatibility matrix, all 62 CTest suites, live GPU measurements, and community hardware tiers.
-- **[Contributing & Roadmap](Contributing-and-Roadmap.md)** — Clean-room rules, sprint history (`v0.1` → Sprint 12), parallel worktree workflow, and how to contribute code or hardware reports.
+- **[Contributing & Roadmap](Contributing-and-Roadmap.md)** — Sprint history (`v0.1` → Sprint 12), parallel worktree workflow, and how to contribute code or hardware reports.
 
 ---
 

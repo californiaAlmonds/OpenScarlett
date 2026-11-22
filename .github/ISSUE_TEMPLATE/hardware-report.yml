@@ -10,8 +10,6 @@ body:
 
         **Fastest way to fill this out:** Download the latest `OpenScarlett-win64.zip` from [Releases](https://github.com/californiaAlmonds/OpenScarlett/releases/latest), unzip it, and run **`run_hardware_test.ps1`** *(right-click → Run with PowerShell)* — it runs all tests automatically and opens this page pre-filled!
 
-        > **Clean-Room Policy:** Please submit **only** OpenScarlett self-test reports or results from open-source GDK samples. Do not upload retail game binaries, keys, or encrypted `.xvc`/`.xvd` dumps.
-
   - type: input
     id: os_version
     attributes:
@@ -54,11 +52,3 @@ body:
       placeholder: "e.g. GeForce 566.36 / Adrenalin 25.1.1 / tested on ROG Ally / etc."
     validations:
       required: false
-
-  - type: checkboxes
-    id: clean_room
-    attributes:
-      label: Clean-Room Confirmation
-      options:
-        - label: This report contains only OpenScarlett test output (no retail game files, keys, or personal data).
-          required: true

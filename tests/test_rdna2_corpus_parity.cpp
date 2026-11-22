@@ -915,7 +915,7 @@ void TestMeshPixelContractAndDxilResign() {
         OS_REQUIRE(VerifyDxbcContainerHash(dxil_ps.data(), dxil_ps.size()));
     }
 
-    // 3. Clean-room DXIL container MD5 hash re-signing (verified bit-for-bit against dxc.exe + live D3D12 PSO)
+    // 3. DXIL container MD5 hash re-signing (verified bit-for-bit against dxc.exe + live D3D12 PSO)
     {
         Rdna2Assembler cs;
         cs.EmitVop1(Rdna2Opcode::V_MOV_B32, 1, Rdna2Operand::InlineInt(0x2Au));
@@ -941,7 +941,7 @@ void TestMeshPixelContractAndDxilResign() {
         std::memset(lifted.pc_dxil.data() + 4u, 0xAA, 16u);
         OS_REQUIRE(!VerifyDxbcContainerHash(lifted.pc_dxil.data(), lifted.pc_dxil.size()));
 
-        // Re-sign using our clean-room DXIL MD5 signer and confirm bit-for-bit match with dxc.exe!
+        // Re-sign using our DXIL MD5 signer and confirm bit-for-bit match with dxc.exe!
         OS_REQUIRE(ResignDxilContainer(lifted.pc_dxil).ok());
         OS_REQUIRE(VerifyDxbcContainerHash(lifted.pc_dxil.data(), lifted.pc_dxil.size()));
         OS_REQUIRE(std::memcmp(lifted.pc_dxil.data() + 4u, orig_digest.data(), 16u) == 0);

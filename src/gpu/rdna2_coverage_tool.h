@@ -1,7 +1,7 @@
 #pragma once
 
 // OpenScarlett - MIT License
-// Clean-room GFX10.3 (RDNA2) 779-opcode ISA coverage auditor & 3,000+ shader corpus bench.
+// GFX10.3 (RDNA2) 779-opcode ISA coverage auditor & 3,000+ shader corpus bench.
 
 #include <cstdint>
 #include <string>

@@ -1,6 +1,6 @@
 # Building From Source
 
-OpenScarlett is written in clean-room **C++20** with a modular CMake + Ninja build system. Primary development targets **Visual Studio 2022 MSVC**, with continuous portability checks on **Clang-CL** and **MinGW-w64**.
+OpenScarlett is written in **C++20** with a modular CMake + Ninja build system. Primary development targets **Visual Studio 2022 MSVC**, with continuous portability checks on **Clang-CL** and **MinGW-w64**.
 
 ---
 

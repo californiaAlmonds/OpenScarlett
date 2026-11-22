@@ -61,7 +61,7 @@ struct GpuTilePoolStats {
     size_t physical_bytes = 0;
 };
 
-// Clean-room Scarlett 64 KiB (and optional 4 MiB super-tile) GPU tile pool backed by
+// Scarlett 64 KiB (and optional 4 MiB super-tile) GPU tile pool backed by
 // UnifiedMemoryManager physical sections and OS virtual memory placeholders.
 class GpuTilePool {
 public:

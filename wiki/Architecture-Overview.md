@@ -83,7 +83,7 @@ flowchart TB
 | `src/middleware/` | `bink2_decoder.cpp` (KB2i DCT multi-frame decode) |
 | `src/shims/` | All 30 exported Windows PE shim DLLs (`d3d12_xs`, `xg_xs`, `kernelx`, `xmem`, `xgameruntime`, `winrt_xs`, `XAudio2_9`, `GameInput`, `dstorage_xs`, `mfplat_xs`, `XCurl`, `XSAPI`, etc.) |
 | `src/launcher/` | Native Win32/Direct2D `OpenScarlettLauncher.exe` GUI, 60s hardware test runner, PE inspector bridge, and BCrypt SHA-256 updater |
-| `include/openscarlett/` | Clean-room public headers and ABI structs for every subsystem |
+| `include/openscarlett/` | Public headers and ABI structs for every subsystem |
 | `tests/` | 62 automated CTest suites, GDK samples, untouched Microsoft `Xbox-GDK-Samples`, *Freedoom*/*ScarlettArena*, and dual-API `gdk_3d_scene` |
 | `tools/` | `generate_status.py`, `rdna2_corpus_bench.py`, `run_hardware_test.ps1` / `.bat`, `publish_wiki.ps1` |
 

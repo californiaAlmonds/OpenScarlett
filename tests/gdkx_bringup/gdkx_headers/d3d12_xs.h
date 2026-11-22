@@ -4,7 +4,7 @@
 #include <dcommon.h>
 #include <cstdint>
 
-// Clean-room MIT GDKX public D3D12.XS declarations for compiling untouched
+// MIT GDKX public D3D12.XS declarations for compiling untouched
 // _GAMING_XBOX_SCARLETT workloads against OpenScarlett's d3d12_xs.dll.
 // Struct layouts and COM vtable slots match GXDK 221000+ / OpenScarlett d3d12_xs_abi.h.
 
@@ -27,6 +27,7 @@ static constexpr UINT D3D12XBOX_FRAME_INTERVAL_60_HZ = 16667u;
 static constexpr UINT D3D12XBOX_FRAME_INTERVAL_FLAG_NONE = 0u;
 static constexpr UINT D3D12XBOX_SCHEDULE_FRAME_EVENT_FLAG_NONE = 0u;
 static constexpr UINT D3D12XBOX_WAIT_FRAME_EVENT_FLAG_NONE = 0u;
+static constexpr UINT D3D12XBOX_TEXTURE_DATA_PITCH_ALIGNMENT = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
 
 // Xbox-exclusive resource flags (upper bits stripped cleanly by OpenScarlett DeviceX)
 static const D3D12_RESOURCE_FLAGS D3D12XBOX_RESOURCE_FLAG_ALLOW_DCC =

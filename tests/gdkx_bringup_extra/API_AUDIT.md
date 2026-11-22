@@ -114,7 +114,7 @@ Both `SimpleTexture` and `SimpleInstancing` share the exact same Scarlett GDKX c
 | `pixevt` (`PIXBeginEvent`/`PIXScopedEvent`) | Required | Required | Implemented (`pixevt.dll`) |
 | `MicrosoftGameConfig.mgc` -> PFN/LSA policy | Verified in `test_xvd_loader_lsa` | Verified in `test_xvd_loader_lsa` | Implemented (`game_config` + `console_lsa_policy`) |
 | `d3dx12_xs.h` (`GetRequiredIntermediateSize`, `UpdateSubresources`) | **Needed for bring-up** | Basic `CD3DX12_*` only | Add inline helpers to GDKX compat header |
-| `<appnotify.h>` PLM callbacks | **Needed for bring-up** | **Needed for bring-up** | Add clean-room compat header + no-op/event shim |
+| `<appnotify.h>` PLM callbacks | **Needed for bring-up** | **Needed for bring-up** | Add compat header + no-op/event shim |
 | `<gxdk.h>` + `<XGame.h>` | **Needed for bring-up** | **Needed for bring-up** | Add thin compat header forwarding to existing `XGameRuntime*` headers |
 | Host WIC (`windowscodecs.dll`) | **Needed (`sunset.jpg`)** | Not used | Native Windows DLL (ensure `d3d12_xs.h` compat with `pch.h` DXGI guard macros) |
-| DirectXTK12 (`DescriptorHeap`, `ResourceUploadBatch`, `SpriteBatch`, `SpriteFont`, `ControllerFont`) | Not used | **Needed for bring-up** | Link MIT DirectXTK12 or provide clean-room compat headers in integration harness |
+| DirectXTK12 (`DescriptorHeap`, `ResourceUploadBatch`, `SpriteBatch`, `SpriteFont`, `ControllerFont`) | Not used | **Needed for bring-up** | Link MIT DirectXTK12 or provide compat headers in integration harness |

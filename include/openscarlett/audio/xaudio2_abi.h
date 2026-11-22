@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Microsoft XAudio2 2.9 (XAudio2_9.dll) COM ABI definitions for OpenScarlett.
+// Microsoft XAudio2 2.9 (XAudio2_9.dll) COM ABI definitions for OpenScarlett.
 // Supports PCM16, IEEE Float32, and Xbox XMA2 (wFormatTag == 0x0166) streams.
 // Self-contained (does not include <windows.h> or <xaudio2.h>).
 
@@ -286,7 +286,7 @@ struct IXAudio2 {
 };
 
 // ---------------------------------------------------------------------------
-// X3DAudio (Clean-Room 3D Spatial Audio ABI matching XAudio2_9.dll)
+// X3DAudio (3D Spatial Audio ABI matching XAudio2_9.dll)
 // ---------------------------------------------------------------------------
 constexpr float OS_X3DAUDIO_SPEED_OF_SOUND = 343.5f;
 constexpr float OS_X3DAUDIO_PI = 3.141592654f;
@@ -488,7 +488,7 @@ OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL XAudio2CreateVolumeMe
     OS_IXAudio2Unknown** ppApo,
     uint32_t Flags);
 
-// Clean-room deterministic mixer readback helper for headless / automated verification.
+// Deterministic mixer readback helper for headless / automated verification.
 // Renders `frame_count` interleaved float32 frames (frame_count * master_channels floats).
 OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL OpenScarlettXAudio2RenderMixForTest(
     IXAudio2* pXAudio2,

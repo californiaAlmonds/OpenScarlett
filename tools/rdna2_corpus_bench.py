@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """OpenScarlett GFX10.3 (RDNA2) 779-Opcode Coverage Auditor & Shader Corpus Benchmark CLI.
 
-MIT License - 100% clean-room OpenScarlett tooling.
+MIT License - OpenScarlett tooling.
 
 Runs `openscarlett.exe rdna2-bench` to generate & validate the reproducible GFX10.3
 shader corpus, verifies `docs/rdna2_coverage.json` schema integrity, prints human-readable

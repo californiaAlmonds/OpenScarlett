@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Wave 4 Standalone Xbox-ABI Guest Sample:
+// OpenScarlett MIT Wave 4 Standalone Xbox-ABI Guest Sample:
 // VulkanMeshShowcase — Real RDNA2 XS2\0 Amplification (AS) + Mesh (MS) + Pixel (PS)
 // + 32x32x32 3D Color-Grading LUT Volume Texture Showcase.
 //

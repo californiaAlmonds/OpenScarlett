@@ -4,7 +4,7 @@
 #include "SpriteBatch.h"
 #include "SpriteFont.h"
 
-// Clean-room MIT ATG ControllerFont helper subset for untouched Xbox-GDK-Samples.
+// MIT ATG ControllerFont helper subset for untouched Xbox-GDK-Samples.
 
 namespace DX {
 

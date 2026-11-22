@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Standalone Xbox-ABI Guest Sample 1:
+// OpenScarlett MIT Standalone Xbox-ABI Guest Sample 1:
 // Mirrors Microsoft Xbox-GDK-Samples/Samples/IntroGraphics/SimpleTriangle.
 //
 // Deliberately does NOT link openscarlett_core. Runs inside an isolated package

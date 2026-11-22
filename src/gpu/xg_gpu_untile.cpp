@@ -1782,7 +1782,7 @@ Status BuildXgGpuUntileParams3D(
 
 std::string GenerateXgGpuUntileHlsl() {
     return R"HLSL(
-// Clean-room OpenScarlett GFX10 / RDNA2 GPU Compute Untiler & Retiler (cs_6_2 / cs_6_5)
+// OpenScarlett GFX10 / RDNA2 GPU Compute Untiler & Retiler (cs_6_2 / cs_6_5)
 cbuffer UntileParams : register(b0) {
     uint g_direction;
     uint g_tile_mode;
@@ -3113,6 +3113,166 @@ Status ExpandAndSyncFastClearMetadata2D(
         *out_stats = std::move(local_stats);
     }
     return Status::Ok();
+}
+
+// ---------------------------------------------------------------------------
+// Placed Tiled Texture 64KB Tile-Pool Helpers (Leonida #1674)
+// Shared by CommandListX (d3d12_xs) and unit/live tests via openscarlett_core.
+// ---------------------------------------------------------------------------
+struct XgPlacedTiledSubresourceDesc {
+    uint32_t subresource_index = 0u;
+    uint32_t mip_level = 0u;
+    uint32_t array_slice = 0u;
+    uint32_t width_elements = 0u;
+    uint32_t height_elements = 0u;
+    uint32_t depth_elements = 1u;
+    uint32_t tiles_x = 0u;
+    uint32_t tiles_y = 0u;
+    uint32_t tiles_z = 1u;
+    uint32_t tile_size_bytes = 65536u;
+    uint32_t bytes_per_element = 4u;
+    uint32_t linear_row_pitch_bytes = 256u;
+    uint64_t subresource_offset_bytes = 0ull;
+    uint64_t heap_subresource_offset_bytes = 0ull;
+    uint64_t subresource_size_bytes = 0ull;
+    uint32_t tile_pool_start_index_64kb = 0u;
+    uint32_t tile_pool_count_64kb = 0u;
+};
+
+struct XgPlacedTilePoolEntry {
+    uint32_t logical_tile_index = 0u;
+    uint32_t heap_tile_index_64kb = 0u;
+    uint64_t pool_byte_offset = 0ull;
+    bool mapped = true;
+};
+
+bool ComputePlacedTiledSubresourceLayout2D(
+    const XG_TEXTURE2D_DESC& desc,
+    uint64_t placed_heap_offset_bytes,
+    uint32_t subresource_index,
+    XgPlacedTiledSubresourceDesc& out_sub) noexcept {
+    out_sub = XgPlacedTiledSubresourceDesc{};
+    XG_RESOURCE_LAYOUT layout{};
+    if (!xg::ComputeTexture2DLayout(desc, layout) || layout.MipLevels == 0u || layout.ArraySize == 0u) {
+        return false;
+    }
+    const uint32_t total_subs = layout.MipLevels * layout.ArraySize;
+    if (subresource_index >= total_subs) {
+        return false;
+    }
+    const uint32_t mip = subresource_index % layout.MipLevels;
+    const uint32_t slice = subresource_index / layout.MipLevels;
+    const XG_MIPLEVEL_LAYOUT& ml = layout.Mips[mip];
+    const uint32_t bpe = layout.FormatInfo.bytes_per_block;
+
+    const uint64_t sub_off = (ml.InMipTail != 0u)
+        ? (layout.MipTailOffsetBytes +
+           static_cast<uint64_t>(slice) * layout.MipTailSlicePitchBytes +
+           ml.MipTailSubTileOffsetBytes)
+        : (ml.OffsetBytes + static_cast<uint64_t>(slice) * ml.SlicePitchBytes);
+    const uint64_t sub_size = (ml.InMipTail != 0u)
+        ? static_cast<uint64_t>(ml.MipTailSubBlockBytes)
+        : ml.SlicePitchBytes;
+
+    constexpr uint64_t kPoolTile64KB = 65536ull;
+    const uint64_t heap_sub_off = placed_heap_offset_bytes + sub_off;
+
+    out_sub.subresource_index = subresource_index;
+    out_sub.mip_level = mip;
+    out_sub.array_slice = slice;
+    out_sub.width_elements = ml.WidthElements;
+    out_sub.height_elements = ml.HeightElements;
+    out_sub.depth_elements = 1u;
+    out_sub.tiles_x = std::max<uint32_t>(1u, ml.TilesX);
+    out_sub.tiles_y = std::max<uint32_t>(1u, ml.TilesY);
+    out_sub.tiles_z = 1u;
+    out_sub.tile_size_bytes = ml.TileSizeBytes;
+    out_sub.bytes_per_element = bpe;
+    // D3D12 placed texture subresource row pitch is 256-byte aligned.
+    out_sub.linear_row_pitch_bytes = AlignUpU32(ml.WidthElements * bpe, 256u);
+    out_sub.subresource_offset_bytes = sub_off;
+    out_sub.heap_subresource_offset_bytes = heap_sub_off;
+    out_sub.subresource_size_bytes = sub_size;
+    out_sub.tile_pool_start_index_64kb = static_cast<uint32_t>(heap_sub_off / kPoolTile64KB);
+    out_sub.tile_pool_count_64kb = static_cast<uint32_t>(
+        std::max<uint64_t>(1ull, (sub_size + kPoolTile64KB - 1ull) / kPoolTile64KB));
+    return true;
+}
+
+bool GatherPlacedTiledPool64KB(
+    const void* src_pool_base,
+    uint64_t src_pool_size_bytes,
+    uint64_t pool_base_offset_bytes,
+    const std::vector<XgPlacedTilePoolEntry>& mappings,
+    uint32_t tile_size_bytes,
+    std::vector<uint8_t>& out_contiguous_tiled) {
+    if (!src_pool_base || mappings.empty() || tile_size_bytes == 0u) {
+        return false;
+    }
+    const auto* src = static_cast<const uint8_t*>(src_pool_base);
+    uint32_t max_logical = 0u;
+    for (const auto& m : mappings) {
+        max_logical = std::max(max_logical, m.logical_tile_index);
+    }
+    const size_t total_out = static_cast<size_t>(max_logical + 1u) * static_cast<size_t>(tile_size_bytes);
+    out_contiguous_tiled.assign(total_out, 0u);
+
+    constexpr uint64_t kPoolTile64KB = 65536ull;
+    const uint64_t tile_stride = (tile_size_bytes >= kPoolTile64KB) ? kPoolTile64KB : static_cast<uint64_t>(tile_size_bytes);
+
+    for (const auto& m : mappings) {
+        const size_t dst_off = static_cast<size_t>(m.logical_tile_index) * static_cast<size_t>(tile_size_bytes);
+        if (dst_off + tile_size_bytes > out_contiguous_tiled.size()) {
+            return false;
+        }
+        if (!m.mapped) {
+            std::memset(out_contiguous_tiled.data() + dst_off, 0, tile_size_bytes);
+            continue;
+        }
+        const uint64_t src_off = (m.pool_byte_offset != 0ull)
+            ? m.pool_byte_offset
+            : (pool_base_offset_bytes + static_cast<uint64_t>(m.heap_tile_index_64kb) * tile_stride);
+        if (src_off + tile_size_bytes > src_pool_size_bytes) {
+            return false;
+        }
+        std::memcpy(out_contiguous_tiled.data() + dst_off, src + src_off, tile_size_bytes);
+    }
+    return true;
+}
+
+bool ScatterPlacedTiledPool64KB(
+    const void* src_contiguous_tiled,
+    uint64_t src_size_bytes,
+    uint64_t pool_base_offset_bytes,
+    const std::vector<XgPlacedTilePoolEntry>& mappings,
+    uint32_t tile_size_bytes,
+    void* dst_pool_base,
+    uint64_t dst_pool_size_bytes) {
+    if (!src_contiguous_tiled || !dst_pool_base || mappings.empty() || tile_size_bytes == 0u) {
+        return false;
+    }
+    const auto* src = static_cast<const uint8_t*>(src_contiguous_tiled);
+    auto* dst = static_cast<uint8_t*>(dst_pool_base);
+    constexpr uint64_t kPoolTile64KB = 65536ull;
+    const uint64_t tile_stride = (tile_size_bytes >= kPoolTile64KB) ? kPoolTile64KB : static_cast<uint64_t>(tile_size_bytes);
+
+    for (const auto& m : mappings) {
+        if (!m.mapped) {
+            continue;
+        }
+        const uint64_t src_off = static_cast<uint64_t>(m.logical_tile_index) * static_cast<uint64_t>(tile_size_bytes);
+        if (src_off + tile_size_bytes > src_size_bytes) {
+            return false;
+        }
+        const uint64_t dst_off = (m.pool_byte_offset != 0ull)
+            ? m.pool_byte_offset
+            : (pool_base_offset_bytes + static_cast<uint64_t>(m.heap_tile_index_64kb) * tile_stride);
+        if (dst_off + tile_size_bytes > dst_pool_size_bytes) {
+            return false;
+        }
+        std::memcpy(dst + dst_off, src + src_off, tile_size_bytes);
+    }
+    return true;
 }
 
 }  // namespace openscarlett

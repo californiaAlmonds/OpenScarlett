@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <Windows.h>
-// Clean-room MIT XSystem.h importing from OpenScarlett xgameruntime.dll.
+// MIT XSystem.h importing from OpenScarlett xgameruntime.dll.
 enum class XSystemDeviceType : uint32_t {
     Unknown = 0,
     Pc = 1,

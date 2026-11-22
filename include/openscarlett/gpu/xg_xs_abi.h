@@ -15,7 +15,7 @@
 #define OPENSCARLETT_XG_API
 #endif
 
-// Clean-room Xbox Scarlett texture swizzle / tiling ABI (xg_xs.dll).
+// Xbox Scarlett texture swizzle / tiling ABI (xg_xs.dll).
 // Implements AMD GFX10 / RDNA2 2D thin (all 15 tiled modes + linear),
 // 3D thick (all 6 modes), mip chains with GFX10 mip tails, texture arrays,
 // cube maps, 3D volumes, BC1-BC7, RGB9E5, and planar depth/stencil formats.
@@ -126,7 +126,7 @@ struct XG_TEXTURE2D_DESC {
     XG_TILE_MODE TileMode;
 };
 
-// Clean-room AMD GFX10 / RDNA2 DCC metadata block states & encoding parameters.
+// AMD GFX10 / RDNA2 DCC metadata block states & encoding parameters.
 enum XG_DCC_BLOCK_STATE : uint32_t {
     XG_DCC_STATE_UNCOMPRESSED = 0u,
     XG_DCC_STATE_CLEAR_0000 = 1u,

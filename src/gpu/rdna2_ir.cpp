@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -15,6 +16,141 @@
 namespace openscarlett {
 
 namespace {
+
+// Flag set in IrOp::LoadUav imm_u32 to target a non-colliding constant-buffer heap
+// binding (register(b<n>, space1) in HLSL; DescriptorSet 1, Binding <n> in SPIR-V)
+// instead of V# slot 0 (register(u0, space0) / DescriptorSet 0, Binding 0).
+constexpr uint32_t kIrLoadCbHeapFlag = 0x80000000u;
+
+bool IsValidVertexMtbufFormat(Rdna2MtbufFormat fmt) noexcept {
+    switch (fmt) {
+        case Rdna2MtbufFormat::R8_UNORM:
+        case Rdna2MtbufFormat::R8_SNORM:
+        case Rdna2MtbufFormat::R8_UINT:
+        case Rdna2MtbufFormat::R8_SINT:
+        case Rdna2MtbufFormat::R16_UNORM:
+        case Rdna2MtbufFormat::R16_SNORM:
+        case Rdna2MtbufFormat::R16_UINT:
+        case Rdna2MtbufFormat::R16_SINT:
+        case Rdna2MtbufFormat::R16_FLOAT:
+        case Rdna2MtbufFormat::R8G8_UNORM:
+        case Rdna2MtbufFormat::R8G8_SNORM:
+        case Rdna2MtbufFormat::R8G8_UINT:
+        case Rdna2MtbufFormat::R8G8_SINT:
+        case Rdna2MtbufFormat::R32_UINT:
+        case Rdna2MtbufFormat::R32_SINT:
+        case Rdna2MtbufFormat::R32_FLOAT:
+        case Rdna2MtbufFormat::R16G16_UNORM:
+        case Rdna2MtbufFormat::R16G16_SNORM:
+        case Rdna2MtbufFormat::R16G16_UINT:
+        case Rdna2MtbufFormat::R16G16_SINT:
+        case Rdna2MtbufFormat::R16G16_FLOAT:
+        case Rdna2MtbufFormat::R8G8B8A8_UNORM:
+        case Rdna2MtbufFormat::R8G8B8A8_SNORM:
+        case Rdna2MtbufFormat::R8G8B8A8_UINT:
+        case Rdna2MtbufFormat::R8G8B8A8_SINT:
+        case Rdna2MtbufFormat::R32G32_FLOAT:
+        case Rdna2MtbufFormat::R16G16B16A16_UNORM:
+        case Rdna2MtbufFormat::R16G16B16A16_SNORM:
+        case Rdna2MtbufFormat::R16G16B16A16_UINT:
+        case Rdna2MtbufFormat::R16G16B16A16_SINT:
+        case Rdna2MtbufFormat::R16G16B16A16_FLOAT:
+        case Rdna2MtbufFormat::R32G32B32_FLOAT:
+        case Rdna2MtbufFormat::R32G32B32A32_FLOAT:
+            return true;
+        case Rdna2MtbufFormat::Invalid:
+        default:
+            return false;
+    }
+}
+
+Status ValidateVertexInputTable(const std::vector<VertexFetchEntry>& fetches) {
+    constexpr uint32_t kMaxVertexBufferSlots = 16u;
+    constexpr uint32_t kMaxVertexFetchByteOffset = 65536u;
+    std::array<bool, 256> dst_vgpr_claimed{};
+
+    for (size_t idx = 0u; idx < fetches.size(); ++idx) {
+        const auto& vf = fetches[idx];
+        if (!IsValidVertexMtbufFormat(vf.format)) {
+            return Status::Error(
+                StatusCode::InvalidArgument,
+                "Malformed vertex input table entry #" + std::to_string(idx) +
+                    ": invalid or unsupported MTBUF format code " +
+                    std::to_string(static_cast<uint32_t>(vf.format)));
+        }
+        if (vf.num_components == 0u || vf.num_components > 4u) {
+            return Status::Error(
+                StatusCode::InvalidArgument,
+                "Malformed vertex input table entry #" + std::to_string(idx) +
+                    ": num_components=" + std::to_string(static_cast<uint32_t>(vf.num_components)) +
+                    " out of valid range [1, 4]");
+        }
+        if (vf.vb_slot >= kMaxVertexBufferSlots) {
+            return Status::Error(
+                StatusCode::InvalidArgument,
+                "Malformed vertex input table entry #" + std::to_string(idx) +
+                    ": vb_slot=" + std::to_string(vf.vb_slot) +
+                    " exceeds maximum vertex buffer slot limit (" +
+                    std::to_string(kMaxVertexBufferSlots) + ")");
+        }
+        if (vf.byte_offset > kMaxVertexFetchByteOffset) {
+            return Status::Error(
+                StatusCode::InvalidArgument,
+                "Malformed vertex input table entry #" + std::to_string(idx) +
+                    ": corrupt byte_offset=" + std::to_string(vf.byte_offset) +
+                    " exceeds maximum fetch offset (" +
+                    std::to_string(kMaxVertexFetchByteOffset) + ")");
+        }
+        if (static_cast<uint32_t>(vf.dst_vgpr) + static_cast<uint32_t>(vf.num_components) > 256u) {
+            return Status::Error(
+                StatusCode::InvalidArgument,
+                "Malformed vertex input table entry #" + std::to_string(idx) +
+                    ": dst_vgpr range v[" + std::to_string(static_cast<uint32_t>(vf.dst_vgpr)) +
+                    ":" + std::to_string(static_cast<uint32_t>(vf.dst_vgpr) + vf.num_components - 1u) +
+                    "] exceeds 256-VGPR register file");
+        }
+        for (uint8_t c = 0u; c < vf.num_components; ++c) {
+            const uint32_t reg = static_cast<uint32_t>(vf.dst_vgpr) + c;
+            if (dst_vgpr_claimed[reg]) {
+                return Status::Error(
+                    StatusCode::InvalidArgument,
+                    "Malformed vertex input table entry #" + std::to_string(idx) +
+                        ": overlapping destination VGPR v" + std::to_string(reg));
+            }
+            dst_vgpr_claimed[reg] = true;
+        }
+    }
+    return Status::Ok();
+}
+
+Status ValidateMimgUnsupportedModifiersIr(const std::vector<Rdna2Instruction>& instructions) {
+    for (const auto& inst : instructions) {
+        if (inst.encoding != Rdna2Encoding::MIMG || inst.word_count == 0u) continue;
+        const uint32_t w0 = inst.raw_words[0];
+        const bool has_r128 = ((w0 >> 15) & 1u) != 0u;
+        const bool has_tfe = ((w0 >> 6) & 1u) != 0u;
+        const bool has_lwe = ((w0 >> 17) & 1u) != 0u;
+        if (!has_r128 && !has_tfe && !has_lwe) continue;
+
+        std::string mods;
+        auto add_mod = [&](const char* name) {
+            if (!mods.empty()) mods += ", ";
+            mods += name;
+        };
+        if (has_r128) add_mod("R128");
+        if (has_tfe) add_mod("TFE");
+        if (has_lwe) add_mod("LWE");
+        const std::string op_name = !inst.mnemonic.empty()
+                                        ? inst.mnemonic
+                                        : std::string(Rdna2OpcodeName(inst.opcode));
+        return Status::Error(
+            StatusCode::UnsupportedFormat,
+            "Unsupported MIMG modifier(s) [" + mods + "] on opcode " + op_name +
+                " at word_offset=" + std::to_string(inst.word_offset) +
+                " (R128 4-dword T#, TFE residency return, and LWE LOD warning are refused)");
+    }
+    return Status::Ok();
+}
 
 uint32_t FloatToBits(float f) {
     uint32_t bits = 0;
@@ -28,7 +164,7 @@ float BitsToFloat(uint32_t bits) {
     return f;
 }
 
-// Clean-room IEEE-754 binary16 <-> float32 conversion helpers (round-to-nearest-even)
+// IEEE-754 binary16 <-> float32 conversion helpers (round-to-nearest-even)
 float HalfBitsToFloat(uint16_t h) noexcept {
     const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
     const uint32_t exp = (h >> 10) & 0x1Fu;
@@ -512,6 +648,391 @@ void AnalyzeRdna2Cfg(const Rdna2IrModule& ir, Rdna2CfgAnalysis& out_analysis) {
     }
 }
 
+void CanonicalizeRdna2Cfg(Rdna2IrModule& module) {
+    if (module.blocks.empty()) return;
+
+    auto rebuild_edges = [&]() {
+        const size_t n = module.blocks.size();
+        for (size_t b = 0u; b < n; ++b) {
+            module.blocks[b].id = static_cast<uint32_t>(b);
+            module.blocks[b].predecessors.clear();
+            module.blocks[b].successors.clear();
+        }
+        for (size_t b = 0u; b < n; ++b) {
+            const auto& ins = module.blocks[b].instructions;
+            if (ins.empty()) continue;
+            const auto& term = ins.back();
+            if (term.op == IrOp::Branch && term.true_block < n) {
+                module.blocks[b].successors.push_back(term.true_block);
+            } else if (term.op == IrOp::CondBranch) {
+                if (term.true_block < n) module.blocks[b].successors.push_back(term.true_block);
+                if (term.false_block < n && term.false_block != term.true_block) {
+                    module.blocks[b].successors.push_back(term.false_block);
+                }
+            }
+        }
+        for (size_t b = 0u; b < n; ++b) {
+            for (uint32_t s : module.blocks[b].successors) {
+                auto& preds = module.blocks[s].predecessors;
+                if (std::find(preds.begin(), preds.end(), static_cast<uint32_t>(b)) == preds.end()) {
+                    preds.push_back(static_cast<uint32_t>(b));
+                }
+            }
+        }
+    };
+
+    auto redirect_edge = [&](uint32_t src_bb, uint32_t old_dst, uint32_t new_dst) {
+        auto& ins = module.blocks[src_bb].instructions;
+        if (ins.empty()) return;
+        auto& term = ins.back();
+        if (term.op == IrOp::Branch) {
+            if (term.true_block == old_dst) term.true_block = new_dst;
+        } else if (term.op == IrOp::CondBranch) {
+            if (term.true_block == old_dst) term.true_block = new_dst;
+            if (term.false_block == old_dst) term.false_block = new_dst;
+        }
+    };
+
+    // Pass A: Canonicalize exit-less loops (infinite / self-looping cyclic SCCs with no exit edge
+    // and no Return) by synthesizing a bounded loop-guard exit edge + clean Return exit block so
+    // structured HLSL / SPIR-V emission never hangs or produces invalid control flow.
+    for (uint32_t pass = 0u; pass < 16u; ++pass) {
+        rebuild_edges();
+        const size_t n = module.blocks.size();
+
+        std::vector<uint8_t> reachable(n, 0u);
+        std::vector<uint32_t> dfs_stk = {0u};
+        reachable[0] = 1u;
+        while (!dfs_stk.empty()) {
+            const uint32_t u = dfs_stk.back();
+            dfs_stk.pop_back();
+            for (uint32_t v : module.blocks[u].successors) {
+                if (!reachable[v]) {
+                    reachable[v] = 1u;
+                    dfs_stk.push_back(v);
+                }
+            }
+        }
+
+        std::vector<int32_t> dfn(n, -1);
+        std::vector<int32_t> low(n, -1);
+        std::vector<uint8_t> on_stack(n, 0u);
+        std::vector<uint32_t> tarjan_stk;
+        int32_t cur_time = 0;
+        std::vector<std::vector<uint32_t>> sccs;
+
+        auto strongconnect = [&](auto&& self, uint32_t u) -> void {
+            dfn[u] = low[u] = cur_time++;
+            tarjan_stk.push_back(u);
+            on_stack[u] = 1u;
+            for (uint32_t v : module.blocks[u].successors) {
+                if (!reachable[v]) continue;
+                if (dfn[v] == -1) {
+                    self(self, v);
+                    low[u] = std::min(low[u], low[v]);
+                } else if (on_stack[v]) {
+                    low[u] = std::min(low[u], dfn[v]);
+                }
+            }
+            if (low[u] == dfn[u]) {
+                std::vector<uint32_t> comp;
+                for (;;) {
+                    const uint32_t w = tarjan_stk.back();
+                    tarjan_stk.pop_back();
+                    on_stack[w] = 0u;
+                    comp.push_back(w);
+                    if (w == u) break;
+                }
+                std::sort(comp.begin(), comp.end());
+                sccs.push_back(std::move(comp));
+            }
+        };
+        strongconnect(strongconnect, 0u);
+
+        bool fixed_one = false;
+        for (const auto& comp : sccs) {
+            bool is_cyclic = (comp.size() > 1u);
+            if (!is_cyclic && comp.size() == 1u) {
+                const uint32_t u = comp[0];
+                for (uint32_t v : module.blocks[u].successors) {
+                    if (v == u) {
+                        is_cyclic = true;
+                        break;
+                    }
+                }
+            }
+            if (!is_cyclic) continue;
+
+            std::unordered_set<uint32_t> in_comp(comp.begin(), comp.end());
+            bool has_exit = false;
+            for (uint32_t u : comp) {
+                const auto& ins = module.blocks[u].instructions;
+                if (!ins.empty() && ins.back().op == IrOp::Return) {
+                    has_exit = true;
+                    break;
+                }
+                for (uint32_t v : module.blocks[u].successors) {
+                    if (in_comp.count(v) == 0u) {
+                        has_exit = true;
+                        break;
+                    }
+                }
+                if (has_exit) break;
+            }
+            if (has_exit) continue;
+
+            // Found an exit-less cyclic SCC: choose header H, collect external & back-edge preds.
+            uint32_t H = comp[0];
+            if (in_comp.count(0u) > 0u) {
+                H = 0u;
+            } else {
+                for (uint32_t u : comp) {
+                    bool ext = false;
+                    for (uint32_t p : module.blocks[u].predecessors) {
+                        if (reachable[p] && in_comp.count(p) == 0u) {
+                            ext = true;
+                            break;
+                        }
+                    }
+                    if (ext) {
+                        H = u;
+                        break;
+                    }
+                }
+            }
+
+            std::vector<uint32_t> ext_preds;
+            std::vector<uint32_t> back_preds;
+            for (uint32_t p : module.blocks[H].predecessors) {
+                if (!reachable[p]) continue;
+                if (in_comp.count(p) > 0u) back_preds.push_back(p);
+                else ext_preds.push_back(p);
+            }
+            if (back_preds.empty()) {
+                // Fallback: find any block in comp with an edge into comp
+                for (uint32_t u : comp) {
+                    if (!module.blocks[u].successors.empty()) {
+                        H = module.blocks[u].successors[0];
+                        for (uint32_t p : module.blocks[H].predecessors) {
+                            if (in_comp.count(p) > 0u) back_preds.push_back(p);
+                            else if (reachable[p]) ext_preds.push_back(p);
+                        }
+                        break;
+                    }
+                }
+            }
+            if (back_preds.empty()) continue;
+
+            std::unordered_set<uint32_t> back_set(back_preds.begin(), back_preds.end());
+            const uint32_t exit_bb_id = static_cast<uint32_t>(module.blocks.size());
+            const uint32_t guard_bb_id = exit_bb_id + 1u;
+
+            IrBasicBlock exit_bb{};
+            exit_bb.id = exit_bb_id;
+            IrInstruction ret_ins{};
+            ret_ins.op = IrOp::Return;
+            ret_ins.type = IrType::Void;
+            exit_bb.instructions.push_back(std::move(ret_ins));
+
+            IrBasicBlock guard_bb{};
+            guard_bb.id = guard_bb_id;
+
+            // Redirect every back-edge (L -> H) to (L -> guard_bb) and update H's Phis.
+            for (uint32_t L : back_preds) {
+                redirect_edge(L, H, guard_bb_id);
+            }
+            for (auto& phi : module.blocks[H].instructions) {
+                if (phi.op != IrOp::Phi) break;
+                std::vector<std::pair<uint32_t, IrValueId>> kept;
+                std::vector<std::pair<uint32_t, IrValueId>> from_back;
+                for (const auto& inc : phi.phi_incoming) {
+                    if (back_set.count(inc.first) > 0u) from_back.push_back(inc);
+                    else kept.push_back(inc);
+                }
+                if (!from_back.empty()) {
+                    if (from_back.size() == 1u) {
+                        kept.emplace_back(guard_bb_id, from_back[0].second);
+                    } else {
+                        IrInstruction merge_phi{};
+                        merge_phi.id = module.AllocateValueId();
+                        merge_phi.op = IrOp::Phi;
+                        merge_phi.type = phi.type;
+                        merge_phi.phi_incoming = std::move(from_back);
+                        const IrValueId merged_id = merge_phi.id;
+                        guard_bb.instructions.push_back(std::move(merge_phi));
+                        kept.emplace_back(guard_bb_id, merged_id);
+                    }
+                    phi.phi_incoming = std::move(kept);
+                }
+            }
+
+            // Synthesize a bounded loop trip-counter Phi in H and guard branch in guard_bb.
+            IrValueId c_zero_id = kInvalidIrValue;
+            if (!ext_preds.empty()) {
+                IrInstruction c_zero{};
+                c_zero.id = module.AllocateValueId();
+                c_zero.op = IrOp::ConstU32;
+                c_zero.type = IrType::U32;
+                c_zero.imm_u32 = 0u;
+                c_zero_id = c_zero.id;
+                auto& b0_ins = module.blocks[0].instructions;
+                size_t insert_pos = 0u;
+                while (insert_pos < b0_ins.size() && b0_ins[insert_pos].op == IrOp::Phi) {
+                    ++insert_pos;
+                }
+                b0_ins.insert(b0_ins.begin() + static_cast<std::ptrdiff_t>(insert_pos), std::move(c_zero));
+            }
+
+            const IrValueId cnt_phi_id = module.AllocateValueId();
+            const IrValueId c_one_id = module.AllocateValueId();
+            const IrValueId c_lim_id = module.AllocateValueId();
+            const IrValueId cnt_next_id = module.AllocateValueId();
+            const IrValueId keep_id = module.AllocateValueId();
+
+            IrInstruction cnt_phi{};
+            cnt_phi.id = cnt_phi_id;
+            cnt_phi.op = IrOp::Phi;
+            cnt_phi.type = IrType::U32;
+            for (uint32_t ep : ext_preds) {
+                cnt_phi.phi_incoming.emplace_back(ep, c_zero_id);
+            }
+            cnt_phi.phi_incoming.emplace_back(guard_bb_id, cnt_next_id);
+            module.blocks[H].instructions.insert(module.blocks[H].instructions.begin(), std::move(cnt_phi));
+
+            {
+                IrInstruction c_one{};
+                c_one.id = c_one_id;
+                c_one.op = IrOp::ConstU32;
+                c_one.type = IrType::U32;
+                c_one.imm_u32 = 1u;
+                guard_bb.instructions.push_back(std::move(c_one));
+
+                IrInstruction c_lim{};
+                c_lim.id = c_lim_id;
+                c_lim.op = IrOp::ConstU32;
+                c_lim.type = IrType::U32;
+                c_lim.imm_u32 = 65536u;
+                guard_bb.instructions.push_back(std::move(c_lim));
+
+                IrInstruction cnt_next{};
+                cnt_next.id = cnt_next_id;
+                cnt_next.op = IrOp::IAdd;
+                cnt_next.type = IrType::U32;
+                cnt_next.operands = {cnt_phi_id, c_one_id};
+                guard_bb.instructions.push_back(std::move(cnt_next));
+
+                IrInstruction keep{};
+                keep.id = keep_id;
+                keep.op = IrOp::CmpLtU;
+                keep.type = IrType::Bool;
+                keep.operands = {cnt_next_id, c_lim_id};
+                guard_bb.instructions.push_back(std::move(keep));
+
+                IrInstruction cbr{};
+                cbr.op = IrOp::CondBranch;
+                cbr.type = IrType::Void;
+                cbr.operands = {keep_id};
+                cbr.true_block = H;
+                cbr.false_block = exit_bb_id;
+                guard_bb.instructions.push_back(std::move(cbr));
+            }
+
+            module.blocks.push_back(std::move(exit_bb));
+            module.blocks.push_back(std::move(guard_bb));
+            fixed_one = true;
+            break;
+        }
+        if (!fixed_one) break;
+    }
+
+    // Pass B: Canonicalize non-merge loop latches on natural loops (multi-latch, self-loop, or
+    // conditional back-edge latches) into a single dedicated unconditional latch block -> header.
+    // Irreducible multi-entry SCCs are intentionally left intact so their SCC topology is preserved.
+    rebuild_edges();
+    Rdna2CfgAnalysis cfg{};
+    AnalyzeRdna2Cfg(module, cfg);
+    std::unordered_set<uint32_t> irred_blocks;
+    for (const auto& comp : cfg.irreducible_sccs) {
+        for (uint32_t b : comp) irred_blocks.insert(b);
+    }
+
+    std::map<uint32_t, std::vector<uint32_t>> header_latches;
+    for (const auto& edge : cfg.back_edges) {
+        const uint32_t L = edge.first;
+        const uint32_t H = edge.second;
+        if (irred_blocks.count(H) > 0u || irred_blocks.count(L) > 0u) continue;
+        auto& vec = header_latches[H];
+        if (std::find(vec.begin(), vec.end(), L) == vec.end()) {
+            vec.push_back(L);
+        }
+    }
+
+    bool modified_latches = false;
+    for (const auto& kv : header_latches) {
+        const uint32_t H = kv.first;
+        const auto& latches = kv.second;
+        if (latches.empty()) continue;
+
+        const bool already_canonical =
+            (latches.size() == 1u) &&
+            (latches[0] != H) &&
+            !module.blocks[latches[0]].instructions.empty() &&
+            (module.blocks[latches[0]].instructions.back().op == IrOp::Branch) &&
+            (module.blocks[latches[0]].instructions.back().true_block == H) &&
+            (module.blocks[latches[0]].successors.size() == 1u);
+        if (already_canonical) continue;
+
+        const uint32_t latch_bb_id = static_cast<uint32_t>(module.blocks.size());
+        IrBasicBlock latch_bb{};
+        latch_bb.id = latch_bb_id;
+
+        std::unordered_set<uint32_t> latch_set(latches.begin(), latches.end());
+        for (uint32_t L : latches) {
+            redirect_edge(L, H, latch_bb_id);
+        }
+
+        for (auto& phi : module.blocks[H].instructions) {
+            if (phi.op != IrOp::Phi) break;
+            std::vector<std::pair<uint32_t, IrValueId>> kept;
+            std::vector<std::pair<uint32_t, IrValueId>> from_latches;
+            for (const auto& inc : phi.phi_incoming) {
+                if (latch_set.count(inc.first) > 0u) from_latches.push_back(inc);
+                else kept.push_back(inc);
+            }
+            if (!from_latches.empty()) {
+                if (from_latches.size() == 1u) {
+                    kept.emplace_back(latch_bb_id, from_latches[0].second);
+                } else {
+                    IrInstruction merge_phi{};
+                    merge_phi.id = module.AllocateValueId();
+                    merge_phi.op = IrOp::Phi;
+                    merge_phi.type = phi.type;
+                    merge_phi.phi_incoming = std::move(from_latches);
+                    const IrValueId merged_id = merge_phi.id;
+                    latch_bb.instructions.push_back(std::move(merge_phi));
+                    kept.emplace_back(latch_bb_id, merged_id);
+                }
+                phi.phi_incoming = std::move(kept);
+            }
+        }
+
+        IrInstruction br{};
+        br.op = IrOp::Branch;
+        br.type = IrType::Void;
+        br.true_block = H;
+        latch_bb.instructions.push_back(std::move(br));
+
+        module.blocks.push_back(std::move(latch_bb));
+        modified_latches = true;
+    }
+
+    if (modified_latches) {
+        rebuild_edges();
+    } else {
+        rebuild_edges();
+    }
+}
+
 const IrInstruction* Rdna2IrModule::FindDef(IrValueId id) const noexcept {
     if (id == kInvalidIrValue) return nullptr;
     for (const auto& bb : blocks) {
@@ -694,6 +1215,9 @@ Status BuildRdna2Ir(
     out_module.mesh_num_threads = std::max(
         1u, out_module.threadgroup_x * out_module.threadgroup_y * out_module.threadgroup_z);
     if (stage_contract != nullptr) {
+        if (auto st = ValidateVertexInputTable(stage_contract->vertex_fetches); !st.ok()) {
+            return st;
+        }
         out_module.stage_contract = *stage_contract;
         out_module.texture_srv_format = stage_contract->texture_srv_format;
         for (const auto& entry : stage_contract->pixel_inputs) {
@@ -706,6 +1230,9 @@ Status BuildRdna2Ir(
 
     if (instructions.empty()) {
         return Status::Error(StatusCode::ParseError, "Cannot build IR from empty instruction stream");
+    }
+    if (auto st = ValidateMimgUnsupportedModifiersIr(instructions); !st.ok()) {
+        return st;
     }
 
     // 1. Map word offsets -> instruction indices & identify basic block leaders.
@@ -2526,8 +3053,25 @@ Status BuildRdna2Ir(
                 case Rdna2Opcode::S_BUFFER_LOAD_DWORD: {
                     const uint32_t byte_off = inst.mem_offset >= 0 ? static_cast<uint32_t>(inst.mem_offset) : 0u;
                     const uint32_t slot = byte_off / 4u;
-                    if (slot < 16u && (inst.soffset == 0x7Du || inst.soffset == 0x7Cu || inst.soffset == 128u)) {
+                    const bool static_zero_soff =
+                        (inst.soffset == 0x7Du || inst.soffset == 0x7Cu || inst.soffset == 128u);
+                    if (inst.sbase == 0u && slot < 16u && static_zero_soff) {
                         write_dst(inst.dst, get_root_const(slot));
+                    } else if (inst.sbase != 0u || inst.opcode == Rdna2Opcode::S_BUFFER_LOAD_DWORD) {
+                        // Mixed-heap safety: CB loads with non-zero base SGPR offset (or S_BUFFER_LOAD_DWORD
+                        // beyond root constants) route to dedicated CB space1 / DescriptorSet 1 so they
+                        // never alias or overwrite V# slot 0 (register(u0, space0) / set=0, binding=0).
+                        const uint32_t cb_slot = static_cast<uint32_t>(inst.sbase & 0xFFu);
+                        IrValueId off = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, byte_off, 0.0f);
+                        if (inst.soffset < 106u) {
+                            off = emit_in_bb(IrOp::IAdd, IrType::U32, {off, read_sgpr(inst.soffset)});
+                        } else if (inst.soffset >= 129u && inst.soffset <= 192u) {
+                            IrValueId imm_s = emit_in_bb(IrOp::ConstU32, IrType::U32, {},
+                                                         static_cast<uint32_t>(inst.soffset - 128u), 0.0f);
+                            off = emit_in_bb(IrOp::IAdd, IrType::U32, {off, imm_s});
+                        }
+                        write_dst(inst.dst, emit_in_bb(IrOp::LoadUav, IrType::U32, {off},
+                                                       kIrLoadCbHeapFlag | cb_slot));
                     } else {
                         out_module.uses_uav = true;
                         out_module.uses_uav0 = true;
@@ -2814,6 +3358,7 @@ Status BuildRdna2Ir(
                     }
                     IrValueId data = eval_operand(inst.src[1], false);
                     emit_in_bb(IrOp::LdsStore, IrType::Void, {addr, data});
+                    attach_exec_pred();
                     break;
                 }
                 case Rdna2Opcode::DS_READ_B32: {
@@ -2836,6 +3381,7 @@ Status BuildRdna2Ir(
                     }
                     IrValueId data = eval_operand(inst.src[1], false);
                     IrValueId prev = emit_in_bb(IrOp::LdsAtomicAdd, IrType::U32, {addr, data});
+                    attach_exec_pred();
                     if (inst.opcode == Rdna2Opcode::DS_ADD_RTN_U32) {
                         write_dst(inst.dst, prev);
                     }
@@ -3118,12 +3664,20 @@ Status BuildRdna2Ir(
         out_module.scratch_size_dwords = RoundUpPow2U32(needed_dwords, 64u, 2048u);
     }
 
-    // Prepend hoisted entry preamble into block 0.
+    // Prepend hoisted entry preamble into block 0 (strictly after any Phi nodes).
     if (!entry_preamble.empty()) {
         auto& bb0 = out_module.blocks[0].instructions;
-        bb0.insert(bb0.begin(), std::make_move_iterator(entry_preamble.begin()),
+        size_t insert_pos = 0u;
+        while (insert_pos < bb0.size() && bb0[insert_pos].op == IrOp::Phi) {
+            ++insert_pos;
+        }
+        bb0.insert(bb0.begin() + static_cast<std::ptrdiff_t>(insert_pos),
+                   std::make_move_iterator(entry_preamble.begin()),
                    std::make_move_iterator(entry_preamble.end()));
     }
+
+    // Canonicalize exit-less loops and non-merge natural loop latches for structured lowering.
+    CanonicalizeRdna2Cfg(out_module);
 
     uint32_t total_ops = 0;
     for (const auto& bb : out_module.blocks) {
@@ -3139,6 +3693,7 @@ Status BuildRdna2Ir(
 // Constant Folding + Dead-Code Elimination Passes
 // ---------------------------------------------------------------------------
 Status OptimizeRdna2Ir(Rdna2IrModule& module, Rdna2IrOptStats* out_stats) {
+    CanonicalizeRdna2Cfg(module);
     Rdna2IrOptStats stats{};
     for (const auto& bb : module.blocks) {
         stats.initial_ops += static_cast<uint32_t>(bb.instructions.size());

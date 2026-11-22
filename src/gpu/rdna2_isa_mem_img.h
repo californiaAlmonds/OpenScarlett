@@ -311,7 +311,7 @@ void PackMtbufFormatComponent(
 // Seeds standard compute-thread VGPRs (v0=lane, v1=lane*4, v2=lane*16, v3=lane*8) matching LiftMemImgShader.
 void SeedDefaultComputeVgprs(MemImgExecState& state) noexcept;
 
-// Clean-room CPU reference execution for MUBUF/MTBUF/MIMG/DS/FLAT/GLOBAL/SCRATCH/EXP.
+// CPU reference execution for MUBUF/MTBUF/MIMG/DS/FLAT/GLOBAL/SCRATCH/EXP.
 Status ExecuteMemImgCpu(
     const std::vector<MemImgDecodedInst>& insts,
     MemImgExecState& state);

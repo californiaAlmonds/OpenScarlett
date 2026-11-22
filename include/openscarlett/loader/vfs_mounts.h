@@ -44,7 +44,7 @@ struct VfsMountConfig {
     bool forbid_system_drive_writes = false;  // When true, mutating operations targeting C:\ or %SystemDrive% are rejected
 };
 
-// Clean-room UTF-8 / UTF-16 conversion helpers (safe on Windows x64).
+// UTF-8 / UTF-16 conversion helpers (safe on Windows x64).
 std::wstring Utf8ToWide(std::string_view utf8);
 std::string WideToUtf8(std::wstring_view wide);
 
@@ -70,7 +70,7 @@ std::string ResolveDefaultWorkDirUtf8(std::string_view anchor_dir = {});
 std::wstring ResolveDefaultVfsRootW(std::wstring_view anchor_dir = {});
 std::wstring ResolveDefaultTelemetryDirW(std::wstring_view anchor_dir = {});
 
-// Clean-room virtual drive translator for Xbox Series X|S G:\, GAME:\, T:\, and S:\ mounts,
+// Virtual drive translator for Xbox Series X|S G:\, GAME:\, T:\, and S:\ mounts,
 // with Read-Only Copy-on-Write (CoW) overlay & whiteout tracking for G:\ / GAME:\.
 class VfsMounts {
 public:

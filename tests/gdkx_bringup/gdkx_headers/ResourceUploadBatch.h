@@ -3,7 +3,7 @@
 
 #include <future>
 
-// Clean-room MIT DirectXTK12 ResourceUploadBatch subset for untouched Xbox-GDK-Samples.
+// MIT DirectXTK12 ResourceUploadBatch subset for untouched Xbox-GDK-Samples.
 
 namespace DirectX {
 

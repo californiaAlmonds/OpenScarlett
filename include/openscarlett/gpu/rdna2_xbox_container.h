@@ -94,20 +94,36 @@ inline constexpr uint16_t kSop2RawOrB64 = 0x11u;
 inline constexpr uint16_t kSop2RawXorB64 = 0x13u;
 inline constexpr uint16_t kSop2RawAndN2B64 = 0x15u;
 
+// RDNA2 / GFX10.3 MIMG BVH ray intersection raw opcodes
+inline constexpr uint16_t kMimgRawImageBvhIntersectRay = 0xE6u;
+inline constexpr uint16_t kMimgRawImageBvh64IntersectRay = 0xE7u;
+
 // Emits raw GFX10.3 SOP1/SOP2 EXEC-mask instructions (s_and_saveexec_b64, s_mov_b64,
 // s_or_b64, s_xor_b64, s_andn2_b64, etc.) directly into a word stream.
 void EmitRawExecSop1(std::vector<uint32_t>& words, uint16_t raw_op, uint8_t sdst, const Rdna2Operand& ssrc0);
 void EmitRawExecSop2(std::vector<uint32_t>& words, uint16_t raw_op, uint8_t sdst,
                      const Rdna2Operand& ssrc0, const Rdna2Operand& ssrc1);
 
+// Emits a raw GFX10.3 MIMG image_bvh64_intersect_ray (opcode 0xE7) instruction directly into a word stream.
+void EmitRawBvh64IntersectRay(
+    std::vector<uint32_t>& words,
+    uint8_t vdata,
+    uint8_t vaddr,
+    uint8_t srsrc,
+    uint8_t dmask = 0xFu);
+
+// Fast zero-allocation detector recognizing raw XS2\0 blobs AND Xbox DXBC containers
+// carrying XBOX, XS2M, RDNA, PM4R, or RREG chunks (returns false for standard host DXBC/DXIL).
+bool IsXboxShaderContainerBlob(const void* data, size_t size) noexcept;
+
 // Extended disassembler: decodes all standard Rdna2Opcode instructions PLUS GFX10.3 64-bit/32-bit
-// EXEC-mask manipulation instructions (s_and_saveexec_b64, s_or_b64, s_xor_b64, s_andn2_b64, s_mov_b64).
+// EXEC-mask manipulation instructions and image_bvh64_intersect_ray (MIMG 0xE7).
 Status DisassembleRdna2Extended(
     const std::vector<uint32_t>& words,
     std::vector<Rdna2Instruction>& out_instructions);
 
 // ---------------------------------------------------------------------------
-// Clean-room DXBC Header, Signature (ISGN/OSGN/PSGN), & RTS0 Root Signature
+// DXBC Header, Signature (ISGN/OSGN/PSGN), & RTS0 Root Signature
 // ---------------------------------------------------------------------------
 struct XboxDxbcHeaderInfo {
     uint8_t md5_digest[16] = {};
@@ -231,7 +247,7 @@ struct Rdna2PgmRegisterSetup {
 
 // Parses PM4 Type-3 SET_SH_REG / SET_CONTEXT_REG packet streams OR structured (reg, val) pair blocks.
 Status ParsePm4RegisterBlock(const uint8_t* data, size_t size, Rdna2PgmRegisterSetup& out_setup);
-// Builds a clean-room PM4 Type-3 packet stream encoding the register setup.
+// Builds a PM4 Type-3 packet stream encoding the register setup.
 std::vector<uint8_t> BuildPm4RegisterBlock(const Rdna2PgmRegisterSetup& setup, ShaderStage stage);
 
 // ---------------------------------------------------------------------------
@@ -298,6 +314,25 @@ Status ApplyRootSgprMapToDescriptorBridge(
     const std::vector<uint64_t>& root_descriptor_vas,
     DescriptorSgprBridge& bridge);
 
+struct XboxVsPrologueInfo {
+    bool uses_vertex_id_v0 = false;
+    bool uses_instance_id_v3 = false;
+    bool declared_vertex_id_in_sig = false;
+    bool declared_instance_id_in_sig = false;
+    uint8_t injected_iid_sentinel_sgpr = 0xFFu;
+};
+
+struct XboxBvhIntersectInfo {
+    bool detected = false;
+    bool is_64bit = false;
+    bool a16 = false;
+    uint8_t srsrc_sgpr = 0u;
+    uint32_t instruction_count = 0u;
+    uint32_t threadgroup_x = 64u;
+    uint32_t ray_flags = 0u;
+    uint32_t instance_mask = 0xFFu;
+};
+
 // ---------------------------------------------------------------------------
 // Full Xbox dxc_xs DXBC/RDNA2 Container Model, Parser, & Synthetic Builder
 // ---------------------------------------------------------------------------
@@ -312,7 +347,7 @@ struct XboxParsedShaderContainer {
     std::vector<uint8_t> shdr_or_shex_payload;
 
     std::vector<XboxSignatureParamDesc> input_signature;          // ISGN / ISG1
-    std::vector<XboxSignatureParamDesc> output_signature;         // OSGN / OSG1
+    std::vector<XboxSignatureParamDesc> output_signature;         // OSGN / OSG5 / OSG1
     std::vector<XboxSignatureParamDesc> patch_constant_signature; // PSGN / PSG1
 
     XboxRootSignatureDesc root_signature{};  // RTS0 (v1.0 or v1.1)
@@ -321,6 +356,15 @@ struct XboxParsedShaderContainer {
     XboxRootSgprMap sgpr_map{};              // Derived s0..s31 user-data binding map
 
     std::vector<XboxDxbcChunk> chunks;
+
+    // Signature element stride (24=ISGN/OSGN, 28=OSG5, 32=ISG1/OSG1), inferred root bindings,
+    // VS v0/v3 prologue metadata, and RDNA2 BVH ray-intersection detection.
+    uint32_t input_sig_element_stride = 0u;
+    uint32_t output_sig_element_stride = 0u;
+    bool root_signature_inferred = false;
+    XboxRootSignatureDesc inferred_root_signature{};
+    XboxVsPrologueInfo vs_prologue{};
+    XboxBvhIntersectInfo bvh_info{};
 };
 
 struct XboxFullDxbcBuildDesc {
@@ -347,6 +391,38 @@ std::vector<uint8_t> BuildFullXboxDxbcContainer(const XboxFullDxbcBuildDesc& des
 // Populates Rdna2LiftOptions (FSSM pixel inputs, interpolation modes, vertex fetch mappings, etc.)
 // directly from a parsed Xbox shader container.
 void ApplyXboxContainerToLiftOptions(const XboxParsedShaderContainer& container, Rdna2LiftOptions& opts);
+
+// Infers descriptor-table and root-constant bindings from PM4/SGPR setup and RDNA2 ISA
+// when RTS0 is absent (especially Mesh/Amplification pipelines).
+bool InferShaderRootBindingsWhenRts0Absent(XboxParsedShaderContainer& container);
+
+struct XboxContainerLiftOptions {
+    Rdna2LiftOptions lift_options{};
+    bool enable_vs_system_id_prologue = true;
+    bool infer_missing_root_signature = true;
+    bool use_in_process_dxc = true;
+    const XboxParsedShaderContainer* paired_other_stage = nullptr;
+};
+
+struct XboxContainerLiftResult {
+    XboxParsedShaderContainer parsed{};
+    Rdna2LiftResult lift{};
+    bool vs_v0_auto_loaded = false;
+    bool vs_v3_instance_id_auto_loaded = false;
+    bool root_signature_inferred = false;
+    bool uses_ray_query_bridge = false;
+};
+
+// Container-aware Xbox DXBC / PM4 / RDNA2 shader lifter:
+//  - Handles 24/28/32-byte ISGN/OSGN/OSG5/ISG1/OSG1 signatures, PM4 registers, and inferred root tables
+//  - Auto-loads VS v0 (SV_VertexID) and v3 (SV_InstanceID) prologues into HLSL & SPIR-V
+//  - Applies paired-stage interpolation linkage reconciliation when paired_other_stage is supplied
+//  - Compiles HLSL via in-process dxcompiler.dll (with dxc.exe fallback) and validates SPIR-V
+Status LiftXboxShaderContainer(
+    const void* data,
+    size_t size,
+    XboxContainerLiftResult& out_result,
+    const XboxContainerLiftOptions& options = {});
 
 // ---------------------------------------------------------------------------
 // VS -> PS Interpolation Modifier PSO Linkage Validator & Matcher

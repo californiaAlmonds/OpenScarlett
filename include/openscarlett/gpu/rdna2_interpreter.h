@@ -9,7 +9,7 @@
 
 namespace openscarlett {
 
-// Clean-room CPU texture mip representation (supports 2D, 3D, and 6-face Cube textures).
+// CPU texture mip representation (supports 2D, 3D, and 6-face Cube textures).
 struct Rdna2CpuTextureMip {
     uint32_t width = 0;
     uint32_t height = 0;
@@ -90,7 +90,7 @@ struct Rdna2CpuExecState {
     uint32_t waves_executed = 0;
 };
 
-// Clean-room CPU reference interpreter for decoded AMD RDNA2 / GFX10.3 wave32 & wave64 shaders.
+// CPU reference interpreter for decoded AMD RDNA2 / GFX10.3 wave32 & wave64 shaders.
 Status ExecuteRdna2Cpu(
     const Xs2ShaderContainer& container,
     const std::vector<Rdna2Instruction>& instructions,

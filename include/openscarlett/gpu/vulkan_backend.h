@@ -60,6 +60,113 @@ struct VulkanDeviceInfo {
     // OPENSCARLETT_VK_DEVICE adapter substring selection diagnostics
     std::string selected_device_filter;
     bool matched_device_filter = false;
+
+    // Extended D3D12 parity capabilities probed live via vkGetPhysicalDeviceFeatures2/Properties2
+    bool supports_depth_bounds_test = false;
+    bool supports_sample_locations_ext = false;
+    bool supports_custom_border_color = false;
+    bool supports_custom_border_color_without_format = false;
+    uint32_t max_custom_border_color_samplers = 0;
+};
+
+// Clean-room portable D3D12 OPTIONS2 / OPTIONS7 tier enums matching Windows D3D12 ABI values.
+// Portable across MSVC, Clang-CL, and MinGW-w64 without requiring Windows SDK d3d12.h headers.
+enum class VulkanD3D12ProgrammableSamplePositionsTier : uint32_t {
+    NotSupported = 0u,
+    Tier1 = 1u,
+    Tier2 = 2u,
+};
+
+enum class VulkanD3D12MeshShaderTier : uint32_t {
+    NotSupported = 0u,
+    Tier1 = 10u,  // Matches D3D12_MESH_SHADER_TIER_1
+};
+
+enum class VulkanD3D12SamplerFeedbackTier : uint32_t {
+    NotSupported = 0u,
+    Tier0_9 = 90u,   // Matches D3D12_SAMPLER_FEEDBACK_TIER_0_9
+    Tier1_0 = 100u,  // Matches D3D12_SAMPLER_FEEDBACK_TIER_1_0
+};
+
+struct VulkanD3D12Options2 {
+    bool depth_bounds_test_supported = false;
+    VulkanD3D12ProgrammableSamplePositionsTier programmable_sample_positions_tier =
+        VulkanD3D12ProgrammableSamplePositionsTier::NotSupported;
+};
+
+struct VulkanD3D12Options7 {
+    VulkanD3D12MeshShaderTier mesh_shader_tier = VulkanD3D12MeshShaderTier::NotSupported;
+    VulkanD3D12SamplerFeedbackTier sampler_feedback_tier = VulkanD3D12SamplerFeedbackTier::NotSupported;
+};
+
+// Portable template mappers onto native Windows D3D12_FEATURE_DATA_D3D12_OPTIONS2 / OPTIONS7
+// (or any ABI-compatible clean-room struct on MinGW-w64).
+template <typename NativeOptions2>
+inline void FillNativeD3D12Options2(const VulkanD3D12Options2& src, NativeOptions2& dst) noexcept {
+    dst.DepthBoundsTestSupported = src.depth_bounds_test_supported ? 1 : 0;
+    dst.ProgrammableSamplePositionsTier =
+        static_cast<decltype(dst.ProgrammableSamplePositionsTier)>(src.programmable_sample_positions_tier);
+}
+
+template <typename NativeOptions7>
+inline void FillNativeD3D12Options7(const VulkanD3D12Options7& src, NativeOptions7& dst) noexcept {
+    dst.MeshShaderTier = static_cast<decltype(dst.MeshShaderTier)>(src.mesh_shader_tier);
+    dst.SamplerFeedbackTier = static_cast<decltype(dst.SamplerFeedbackTier)>(src.sampler_feedback_tier);
+}
+
+// Live physical-device capability snapshot probed via vkGetPhysicalDeviceFeatures2/Properties2.
+struct VulkanFeatureProbe {
+    uint32_t api_version = 0;
+    uint32_t api_major = 0;
+    uint32_t api_minor = 0;
+    uint32_t api_patch = 0;
+    bool probed_from_icd = false;
+
+    // Core VkPhysicalDeviceFeatures
+    bool depth_bounds = false;
+    bool texture_compression_bc = false;
+    bool fragment_stores_and_atomics = false;
+    bool shader_resource_residency = false;
+    bool shader_resource_min_lod = false;
+    bool sparse_binding = false;
+    bool sparse_residency_image_2d = false;
+    bool sparse_residency_image_3d = false;
+
+    // Vulkan 1.2 / 1.3 core feature chains
+    bool vulkan12_probed = false;
+    bool sampler_filter_minmax = false;
+    bool timeline_semaphore = false;
+    bool buffer_device_address = false;
+    bool descriptor_indexing = false;
+    bool vulkan13_probed = false;
+    bool synchronization2 = false;
+    bool dynamic_rendering = false;
+    bool maintenance4 = false;
+
+    // VK_EXT_sample_locations (Programmable Sample Positions)
+    bool has_sample_locations_ext = false;
+    uint32_t sample_location_sample_counts = 0;
+    uint32_t max_sample_location_grid_size_x = 0;
+    uint32_t max_sample_location_grid_size_y = 0;
+    uint32_t sample_location_subpixel_bits = 0;
+    bool variable_sample_locations = false;
+
+    // VK_EXT_mesh_shader (Mesh / Task Shaders)
+    bool has_mesh_shader_ext = false;
+    bool task_shader = false;
+    bool mesh_shader = false;
+    bool mesh_shader_queries = false;
+
+    // Sampler feedback extension probe (VK_EXT_sampler_feedback / VK_KHR_sampler_feedback)
+    bool has_sampler_feedback_ext = false;
+    bool sampler_feedback_min_mip = false;
+    bool sampler_feedback_mip_region_used = false;
+
+    // VK_EXT_custom_border_color
+    bool has_custom_border_color_ext = false;
+    bool custom_border_colors = false;
+    bool custom_border_color_without_format = false;
+    uint32_t max_custom_border_color_samplers = 0;
 };
 
 struct SpirvValidationInfo {
@@ -121,6 +228,50 @@ enum class VulkanImageFormat : uint32_t {
     Bc5Unorm = 141,     // VK_FORMAT_BC5_UNORM_BLOCK
     Bc6hUfloat = 143,   // VK_FORMAT_BC6H_UFLOAT_BLOCK
     Bc7Unorm = 145,     // VK_FORMAT_BC7_UNORM_BLOCK
+};
+
+// Sampler addressing modes (values match Khronos VkSamplerAddressMode).
+enum class VulkanSamplerAddressMode : uint32_t {
+    Repeat = 0u,
+    MirroredRepeat = 1u,
+    ClampToEdge = 2u,
+    ClampToBorder = 3u,
+    MirrorClampToEdge = 4u,
+};
+
+// Sampler border color modes (values match Khronos VkBorderColor + VK_EXT_custom_border_color).
+enum class VulkanBorderColorMode : uint32_t {
+    FloatTransparentBlack = 0u,
+    IntTransparentBlack = 1u,
+    FloatOpaqueBlack = 2u,
+    IntOpaqueBlack = 3u,
+    FloatOpaqueWhite = 4u,
+    IntOpaqueWhite = 5u,
+    FloatCustom = 1000287003u,  // VK_BORDER_COLOR_FLOAT_CUSTOM_EXT
+    IntCustom = 1000287004u,    // VK_BORDER_COLOR_INT_CUSTOM_EXT
+};
+
+struct VulkanCustomBorderSamplerDesc {
+    VulkanSamplerAddressMode address_mode_u = VulkanSamplerAddressMode::ClampToBorder;
+    VulkanSamplerAddressMode address_mode_v = VulkanSamplerAddressMode::ClampToBorder;
+    VulkanSamplerAddressMode address_mode_w = VulkanSamplerAddressMode::ClampToBorder;
+    bool linear_filter = false;
+    VulkanBorderColorMode border_color_mode = VulkanBorderColorMode::FloatCustom;
+    float custom_border_color_float[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    int32_t custom_border_color_int[4] = {0, 0, 0, 1};
+    VulkanImageFormat border_format = VulkanImageFormat::Rgba8Unorm;
+    bool specify_border_format = false;
+    bool force_standard_fallback = false;
+};
+
+struct VulkanCustomBorderSamplerResult {
+    bool created = false;
+    bool executed_on_vulkan_icd = false;
+    bool used_custom_border_color_ext = false;
+    bool used_standard_border_fallback = false;
+    VulkanBorderColorMode effective_border_color_mode = VulkanBorderColorMode::FloatTransparentBlack;
+    float effective_border_color_float[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int32_t effective_border_color_int[4] = {0, 0, 0, 0};
 };
 
 // Supported vertex attribute formats (values match Khronos VkFormat constants).
@@ -235,6 +386,16 @@ struct VulkanDescriptorBinding {
     float sampler_min_lod = 0.0f;
     float sampler_max_lod = 16.0f;
     float sampler_mip_lod_bias = 0.0f;
+
+    // Optional sampler addressing & custom border color (VK_EXT_custom_border_color)
+    VulkanSamplerAddressMode address_mode_u = VulkanSamplerAddressMode::ClampToEdge;
+    VulkanSamplerAddressMode address_mode_v = VulkanSamplerAddressMode::ClampToEdge;
+    VulkanSamplerAddressMode address_mode_w = VulkanSamplerAddressMode::ClampToEdge;
+    VulkanBorderColorMode border_color_mode = VulkanBorderColorMode::FloatTransparentBlack;
+    float custom_border_color_float[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    int32_t custom_border_color_int[4] = {0, 0, 0, 1};
+    bool custom_border_specify_format = false;
+    bool force_standard_border_fallback = false;
 };
 
 // Full VS+PS graphics draw configuration (VB, IB, UBO/SSBO/2D/3D textures, push constants, depth, MSAA 4x).
@@ -283,6 +444,8 @@ struct VulkanGraphicsDrawResult {
     uint32_t device_push_constant_limit = 128;
     uint32_t descriptor_collisions_resolved = 0;
     std::vector<VulkanDescriptorSlotRemap> descriptor_slot_remaps;
+    uint32_t custom_border_samplers_used = 0;
+    uint32_t custom_border_fallback_samplers_used = 0;
 };
 
 // VK_EXT_mesh_shader draw configuration (optional Task/AS + Mesh/MS + Fragment/PS).
@@ -309,7 +472,7 @@ struct VulkanMeshDrawDesc {
     uint32_t push_constant_budget_override = 0;
     std::vector<VulkanDescriptorBinding> descriptors;
 
-    // If true, transparently falls back to deterministic clean-room SPIR-V mesh emulation
+    // If true, transparently falls back to deterministic SPIR-V mesh emulation
     // when the host GPU / CI runner does not expose VK_EXT_mesh_shader.
     bool allow_fallback_emulation = true;
 };
@@ -326,6 +489,8 @@ struct VulkanMeshDrawResult {
     uint32_t device_push_constant_limit = 128;
     uint32_t descriptor_collisions_resolved = 0;
     std::vector<VulkanDescriptorSlotRemap> descriptor_slot_remaps;
+    uint32_t custom_border_samplers_used = 0;
+    uint32_t custom_border_fallback_samplers_used = 0;
 };
 
 // Win32 surface / swapchain / headless offscreen presentation descriptor.
@@ -419,11 +584,11 @@ struct VulkanReservedResourceHandle {
     bool executed_on_vulkan_icd = false;
 };
 
-// Clean-room Dynamic Vulkan 1.2/1.3/1.4 backend with zero Vulkan SDK header dependencies.
+// Dynamic Vulkan 1.2/1.3/1.4 backend with zero Vulkan SDK header dependencies.
 // Dynamically loads vulkan-1.dll at runtime via LoadLibraryA + vkGetInstanceProcAddr,
 // executes real hardware/ICD compute, graphics rasterization, VK_EXT_mesh_shader,
 // 2D/3D mipmapped texture copies, and Win32 swapchain presentation when available,
-// and provides deterministic clean-room SPIR-V software fallbacks when no ICD is present.
+// and provides deterministic SPIR-V software fallbacks when no ICD is present.
 class VulkanBackend {
 public:
     VulkanBackend();
@@ -446,6 +611,18 @@ public:
     bool is_fallback_mode() const noexcept;
 
     const VulkanDeviceInfo& GetDeviceInfo() const noexcept { return device_info_; }
+
+    // Live Vulkan physical-device capability probe & D3D12 OPTIONS2 / OPTIONS7 mapping helpers.
+    const VulkanFeatureProbe& GetFeatureProbe() const noexcept { return feature_probe_; }
+    static VulkanD3D12Options2 MapVulkanToD3D12Options2(const VulkanFeatureProbe& probe) noexcept;
+    static VulkanD3D12Options7 MapVulkanToD3D12Options7(const VulkanFeatureProbe& probe) noexcept;
+    Status QueryD3D12Options2(VulkanD3D12Options2& out_options) const noexcept;
+    Status QueryD3D12Options7(VulkanD3D12Options7& out_options) const noexcept;
+
+    // Creates and validates a Vulkan sampler using VK_EXT_custom_border_color when supported,
+    // or falls back cleanly to standard Vulkan border colors when unsupported or forced.
+    Status ProbeCustomBorderColorSampler(const VulkanCustomBorderSamplerDesc& desc,
+                                         VulkanCustomBorderSamplerResult& out_result);
 
     // Validates SPIR-V binary magic (0x07230203), version, header bounds, instruction
     // word lengths, OpMemoryModel presence, and balanced OpFunction/OpFunctionEnd blocks.
@@ -541,6 +718,9 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     VulkanDeviceInfo device_info_{};
+    VulkanFeatureProbe feature_probe_{};
+    VulkanD3D12Options2 d3d12_options2_{};
+    VulkanD3D12Options7 d3d12_options7_{};
 };
 
 }  // namespace openscarlett

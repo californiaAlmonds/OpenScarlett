@@ -1,6 +1,6 @@
 # Audio, Video & Input
 
-OpenScarlett implements clean-room translations for Xbox Series X|S's audio engine (`XAudio2_9`, `AcpHal`, XMA2/Opus/ADPCM), hardware video playback (`mfplat_xs`, `Bink2Scarlett`), and unified controller/keyboard/mouse API (`GameInput`).
+OpenScarlett implements native translations for Xbox Series X|S's audio engine (`XAudio2_9`, `AcpHal`, XMA2/Opus/ADPCM), hardware video playback (`mfplat_xs`, `Bink2Scarlett`), and unified controller/keyboard/mouse API (`GameInput`).
 
 ---
 
@@ -18,7 +18,7 @@ Source: `src/shims/xaudio2_shim.cpp`, `src/shims/acphal_shim.cpp`, `src/audio/xm
 | Component | Capabilities | Verified In |
 | :--- | :--- | :--- |
 | **`AcpHal.dll`** | Console Audio Co-Processor (SHAPE) DSP context/queue shim forwarding XMA2 packets directly to OpenScarlett's software decoder | `test_codecs`, `test_audio_opus_wasapi` |
-| **XMA2 Decoder (`xma2_decoder.cpp`)** | Clean-room IMDCT-based XMA2 packet/frame decoder | `test_codecs` |
+| **XMA2 Decoder (`xma2_decoder.cpp`)** | IMDCT-based XMA2 packet/frame decoder | `test_codecs` |
 | **Opus & ADPCM (`opus_adpcm_decoder.cpp`)** | Integrates Windows `MSOpusDecoder` Media Foundation Transform (MFT) for low-latency Opus playback + IMA/MS-ADPCM decoding | `test_audio_opus_wasapi`, `test_dstorage_audio_diag_parity` |
 
 ---
@@ -33,7 +33,7 @@ Source: `src/shims/mfplat_shim.cpp`, `src/middleware/bink2_decoder.cpp`, `src/sh
 - Companion registration shims (`mfhevcdec.dll`, `mflnmhelp.dll`) ensure Media Foundation decoder discovery never fails on boot.
 
 ### `Bink2Scarlett.dll`
-- Clean-room **KB2i** DCT multi-frame video streaming decoder and Xbox Bink2 C ABI exports (`test_codecs`, `test_media_video_gameinput`).
+- **KB2i** DCT multi-frame video streaming decoder and Xbox Bink2 C ABI exports (`test_codecs`, `test_media_video_gameinput`).
 - *(Note: Full commercial retail Bink2 bitstream variants are still in progress.)*
 
 ---

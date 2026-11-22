@@ -106,7 +106,7 @@ struct BvhNodeView {
     uint32_t tri_count = 0;
 };
 
-// Clean-room binned Surface Area Heuristic (SAH) software BVH for DXR acceleration
+// Binned Surface Area Heuristic (SAH) software BVH for DXR acceleration
 // structure traversal and deterministic fallback on non-DXR GPUs and WARP.
 class BvhAccelerationStructure {
 public:

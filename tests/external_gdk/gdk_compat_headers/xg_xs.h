@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Xbox Scarlett Texture Address Computer (<xg_xs.h>) public ABI header.
+// MIT Xbox Scarlett Texture Address Computer (<xg_xs.h>) public ABI header.
 
 #include <cstddef>
 #include <cstdint>

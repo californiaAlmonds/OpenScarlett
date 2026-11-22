@@ -436,7 +436,7 @@ jobs:
             fi
           done
 
-          # Run clean-room MinGW unit tests that built cleanly
+          # Run MinGW unit tests that built cleanly
           TEST_RESULTS_FILE="build-mingw/mingw_test_results.txt"
           : > "$TEST_RESULTS_FILE"
           export OPENSCARLETT_AUDIO_NULL=1
@@ -538,7 +538,7 @@ jobs:
           - **Commercial-Engine OS, WinRT, Offline Auth & Media Stack**: `kernelx` 7-core/14-thread CPU affinity remapping, WinRT `CoreApplication`/`CoreWindow`/`ApplicationView`/`DisplayInformation` lifecycle + `IReferenceTracker` `E_NOINTERFACE` refusal, non-blocking offline XSTS/JWT & XStore auth, `mfplat_xs` H.264/HEVC D3D12 video decode, 64+ concurrent `XAudio2_9` voices with submix/reverb/meter APOs, multi-frame `Bink2` streaming, and `GameInput` hot-plug & impulse-trigger rings.
           - **First-Boot Probe Mode, VEH Crash Diagnostics & Frame Capture**: `--probe-unknown-imports` x64 `E_NOTIMPL` trampoline pool, portable Win32 VEH crash/50-call API ring buffer with PII sanitization, `OPENSCARLETT_CAPTURE_DIR` frame/shader dumper, and Launcher First-Boot Probe + Copy Sanitized Telemetry controls (`51/51` CTest).
 
-          > **Open-Source Policy:** 100% MIT open-source code. Contains bundled open-source Microsoft ``dxc.exe``/``dxcompiler.dll``/``dxil.dll`` so no Windows SDK is required. Never decrypts retail ``.xvc``/``.xvd`` packages.
+          > **Bundled Toolchain:** 100% MIT open-source code. Contains bundled open-source Microsoft ``dxc.exe``/``dxcompiler.dll``/``dxil.dll`` so no Windows SDK is required.
           "@
           $notesFile = Join-Path $env:RUNNER_TEMP 'release_notes.md'
           [System.IO.File]::WriteAllText($notesFile, $notes, (New-Object System.Text.UTF8Encoding($false)))

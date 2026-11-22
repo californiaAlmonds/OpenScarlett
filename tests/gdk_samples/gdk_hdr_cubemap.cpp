@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Standalone Xbox-ABI Guest Sample (Wave 4):
+// OpenScarlett MIT Standalone Xbox-ABI Guest Sample (Wave 4):
 // HDRCubeMap — High-Dynamic-Range FP16 6-face TextureCube + Default (nullptr desc)
 // Texture2DArray SRV slice preservation (ScarlettX #46) + Reflective 3D Sphere +
 // HDR10 ST.2084 PQ Encode Pass (R10G10B10A2_UNORM + G2084_NONE_P2020 + HDR10 Metadata) +

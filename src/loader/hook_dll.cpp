@@ -3310,7 +3310,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         case DLL_PROCESS_ATTACH: {
             ::DisableThreadLibraryCalls(hinstDLL);
             // Reserve & preserve TLS slot 0 BEFORE any runtime initialization touches TLS,
-            // preventing UE5 / real retail title TLS slot 0 collisions during APC hook attach.
+            // preventing UE5 / real title TLS slot 0 collisions during APC hook attach.
             const DWORD prev_last_err = ::GetLastError();
             LPVOID saved_slot0 = ::TlsGetValue(0u);
             const DWORD slot0_get_err = ::GetLastError();

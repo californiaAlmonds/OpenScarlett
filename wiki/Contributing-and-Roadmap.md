@@ -1,19 +1,10 @@
 # Contributing & Roadmap
 
-OpenScarlett welcomes both **community hardware testers** (no coding required!) and **clean-room C++20 developers**.
+OpenScarlett welcomes both **community hardware testers** (no coding required!) and **C++20 developers**.
 
 ---
 
-## 1. Strict Legal & Clean-Room Policy
-
-Every contribution must strictly uphold OpenScarlett's legal boundaries:
-1. **100% Original MIT Code:** Never copy source code from unlicensed (`NONE`) or proprietary repositories. Write original clean-room implementations solely from public specifications (Microsoft GDK docs, DirectX 12 / DXIL specs, AMD RDNA2 / GFX10.3 ISA Manual, Khronos Vulkan / SPIR-V specs, RFC standards).
-2. **Zero DRM Bypass:** Never extract encryption keys, decrypt retail `.xvc`/`.xvd` containers, or commit copyrighted game binaries, shaders, or assets.
-3. **Privacy-First Telemetry:** All diagnostic reports and launcher captures must strip Windows usernames and local directory paths before sharing.
-
----
-
-## 2. How to Contribute
+## 1. How to Contribute
 
 ### Option A: 60-Second GPU Hardware Report (No Coding!)
 1. Download the latest portable `OpenScarlett-*-win64.zip` from [GitHub Releases](https://github.com/californiaAlmonds/OpenScarlett/releases/latest).
@@ -21,12 +12,12 @@ Every contribution must strictly uphold OpenScarlett's legal boundaries:
 3. Click **Open Pre-Filled GitHub Hardware Report** or share your sanitized summary in [Discord](https://discord.gg/sShMY2fjR).
    *(Failing tests on new GPUs like RTX 40, RX 6000, Intel Arc, or handheld APUs are just as valuable as passing ones!)*
 
-### Option B: Test Legal Unpacked GDK Builds with First-Boot Probe
-Run your legally obtained, unencrypted GDK samples or homebrew through:
+### Option B: Test Unpacked GDK Builds with First-Boot Probe
+Run unencrypted GDK samples or homebrew packages through:
 ```powershell
 openscarlett.exe run --probe-unknown-imports path\to\package --telemetry probe.json
 ```
-Share only the sanitized telemetry (`missing exports`, `not_impl COM slots`, `shader opcodes`) on Discord or GitHub Issues — never upload game files.
+Share only the sanitized telemetry (`missing exports`, `not_impl COM slots`, `shader opcodes`) on Discord or GitHub Issues — diagnostic reports and launcher captures automatically strip Windows usernames and local directory paths.
 
 ### Option C: Code Pull Requests
 1. Fork & clone the repository and build locally ([Building From Source](Building-From-Source.md)).
@@ -39,7 +30,7 @@ Share only the sanitized telemetry (`missing exports`, `not_impl COM slots`, `sh
 
 ---
 
-## 3. Milestone History (`v0.1` → Sprint 12)
+## 2. Milestone History (`v0.1` → Sprint 12)
 
 - [x] **Bootstrap (`v0.1`):** MIT C++20 foundation, PE32+ inspector, `CallTelemetry`, GDeflate v1, BCPack, XMA2 IMDCT, Bink2, WinRT `HSTRING`, RDNA2 decoder + SSA IR, live Vulkan 1.4 compute.
 - [x] **Sprint 1 — Live Loader & Core Shims:** Suspended-process APC hook loader (`openscarlett_hook.dll`), `G:\`/`T:\`/`S:\` mounts, `kernelx` `VirtualAlloc2` 64 KiB/4 MiB aliasing + `GpuTilePool`, `d3d12_xs` COM proxies + `xg_xs` + GPU FSR 1.0.
@@ -56,7 +47,7 @@ Share only the sanitized telemetry (`missing exports`, `not_impl COM slots`, `sh
 
 ---
 
-## 4. What's Next (Active Roadmap)
+## 3. What's Next (Active Roadmap)
 
 - [ ] **First Commercial Xbox-ABI / GDK Title Bring-Up:** Boot → main menu → playable in-game driven by community First-Boot Probe, `CallTelemetry`, and VEH crash reports.
 - [ ] **Final 5 GFX10.3 Edge Opcodes (`774 → 779`):** Close the remaining 4 `SMEM` and 1 `VOP2` edge opcodes and expand live-GPU verification from `615/779` toward `779/779`.

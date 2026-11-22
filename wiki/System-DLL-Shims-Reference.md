@@ -1,6 +1,6 @@
 # System DLL Shims Reference (All 30 DLLs)
 
-OpenScarlett ships **30 clean-room Xbox / GDK Windows PE DLLs** totaling **993 live PE exports** (measured directly from `build/*.dll` PE export directories via `tools/generate_status.py`).
+OpenScarlett ships **30 Xbox / GDK Windows PE shim DLLs** totaling **993 live PE exports** (measured directly from `build/*.dll` PE export directories via `tools/generate_status.py`).
 
 Each DLL is honestly classified into one of three implementation tiers:
 - **High (12 DLLs):** Substantial functional implementation verified on real binaries and/or live GPUs.
@@ -56,7 +56,7 @@ Commercial GDK games typically link against Microsoft's static **`XGamingRuntime
 - **Exact `XTaskQueue` Port Delivery:** Supports manual, thread-pool, serialized thread-pool, and immediate work/completion port dispatch modes (`test_xgr_conformance_parity`, `test_s7_pe_gdk_runtime`).
 
 ### `winrt_xs.dll` (Console WinRT Lifecycle)
-- Provides clean-room `RoInitialize`, `HSTRING` allocation/refcounting, and `RoGetActivationFactory` for `CoreApplication`, `CoreWindow`, `ApplicationView`, and `DisplayInformation`.
+- Provides `RoInitialize`, `HSTRING` allocation/refcounting, and `RoGetActivationFactory` for `CoreApplication`, `CoreWindow`, `ApplicationView`, and `DisplayInformation`.
 - Intentionally returns `E_NOINTERFACE` for `IReferenceTracker` on host WinRT objects to match console GC/interop expectations (`test_os_winrt_offline_auth`).
 
 ---

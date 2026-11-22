@@ -182,7 +182,7 @@ struct RtDispatchDesc {
     const DxrShaderBindingTable* sbt = nullptr;
 };
 
-// Clean-room Hardware DXR Tier 1.0 / 1.1 engine wrapping ID3D12Device5 and
+// Hardware DXR Tier 1.0 / 1.1 engine wrapping ID3D12Device5 and
 // ID3D12GraphicsCommandList4, with transparent 256B-aligned SAH software BVH
 // fallback on non-DXR adapters (such as GTX 1650 Ti) and D3D12 WARP.
 class DxrHardwareEngine {

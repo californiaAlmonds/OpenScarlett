@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Standalone Xbox-ABI Guest Sample 4:
+// OpenScarlett MIT Standalone Xbox-ABI Guest Sample 4:
 // Unified GDK System Combo — exercises ALL 10 shimmed Xbox DLLs in ONE live APC-injected process!
 //   1. kernelx.dll                        (TitleMemoryStatus, AllocateTitlePhysicalPages + MapTitleVirtualMemory aliasing)
 //   2. xgameruntime.dll                   (XSystem, XTaskQueue, XAsync, XUser, XGameSave disk persistence on E:)

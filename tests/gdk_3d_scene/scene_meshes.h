@@ -1,6 +1,6 @@
 #pragma once
 
-// OpenScarlett Clean-Room MIT 3D Multi-Mesh & Skinned Armature Geometry Builder.
+// OpenScarlett MIT 3D Multi-Mesh & Skinned Armature Geometry Builder.
 // Builds rigid meshes (floor plane, beveled pedestal/monument, orbiting cubes/spheres, pillars)
 // and a 3-bone linear-blend-skinned articulated banner/armature sharing one unified vertex layout.
 

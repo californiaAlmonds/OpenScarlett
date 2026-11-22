@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT minimal pch.h for compiling untouched MIT Microsoft Xbox-GDK-Samples
+// MIT minimal pch.h for compiling untouched MIT Microsoft Xbox-GDK-Samples
 // SimpleDirectStorageCombo/SampleImplementations/*.cpp headlessly against OpenScarlett dstorage_xs.dll.
 
 #ifndef WIN32_LEAN_AND_MEAN

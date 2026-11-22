@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Standalone Xbox-ABI Guest Sample (Wave 2):
+// OpenScarlett MIT Standalone Xbox-ABI Guest Sample (Wave 2):
 // SimplePBR — Multi-frame 3D Cook-Torrance PBR workload with 4x MSAA render target
 // (ALLOW_DCC), 4x MSAA D32_FLOAT depth buffer, procedural 256x256 albedo/normal/roughness-metallic
 // textures (CopyTextureRegion + SRV descriptor table + static sampler), per-frame dynamic

@@ -1,4 +1,4 @@
-# OpenScarlett Clean-Room MIT xgameruntime 100% Thunks Export Parity,
+# OpenScarlett MIT xgameruntime 100% Thunks Export Parity,
 # 3-arg QueryApiImpl COM ABI, Headless XStore/PLS, and XTaskQueue/XAsync Conformance Suite.
 # Owned by wt-xgr-100pct-queryapi worktree.
 

@@ -3,7 +3,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <vector>
-// Clean-room MIT DX::ReadData helper for untouched Xbox-GDK-Samples.
+// MIT DX::ReadData helper for untouched Xbox-GDK-Samples.
 namespace DX {
 inline std::vector<uint8_t> ReadData(const wchar_t* name) {
     std::ifstream f(name, std::ios::binary | std::ios::ate);

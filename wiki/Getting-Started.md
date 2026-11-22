@@ -82,7 +82,7 @@ The script outputs `hardware_test_report.md` with your Windows username and loca
 .\openscarlett.exe run --probe-unknown-imports path\to\game.exe --telemetry probe.json
 ```
 
-> **Encrypted `.xvd` / `.xvc` Files:** If you pass an `.xvd` or `.xvc` container to `openscarlett probe`, OpenScarlett inspects only its public 12 KiB geometry header and flags whether the container is encrypted. Retail encrypted packages cannot be launched and will never be decrypted by OpenScarlett.
+> **`.xvd` / `.xvc` Containers:** If you pass an `.xvd` or `.xvc` container to `openscarlett probe`, OpenScarlett inspects its 12 KiB geometry header and reports container metadata and encryption status (`ready_to_launch: false` when encrypted).
 
 ---
 

@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Standalone External Xbox-ABI Binary #2:
+// OpenScarlett MIT Standalone External Xbox-ABI Binary #2:
 // Full 19-DLL Live Stack Verification — written PURELY against GDK/Xbox public headers
 // (ZERO openscarlett/ includes, ZERO openscarlett_core link!).
 //

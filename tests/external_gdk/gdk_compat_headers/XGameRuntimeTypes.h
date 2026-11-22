@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Microsoft GDK common runtime types & HRESULT definitions.
+// MIT Microsoft GDK common runtime types & HRESULT definitions.
 
 #include <cstddef>
 #include <cstdint>

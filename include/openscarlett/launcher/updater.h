@@ -75,7 +75,7 @@ bool IsNewerVersion(const std::string& current_version, const std::string& candi
 // Returns true when OPENSCARLETT_NO_UPDATE_CHECK is set to "1" / "true" / "yes".
 bool IsUpdateCheckDisabledByEnv();
 
-// Clean-room minimal JSON parser for GitHub /releases/latest response.
+// Minimal JSON parser for GitHub /releases/latest response.
 Status ParseGitHubReleaseJson(const std::string& json_text, UpdateReleaseInfo& out_info);
 
 // Parses a "<64-hex-sha256>  <filename>" checksum file. Rejects malformed/non-64-hex text.

@@ -1063,8 +1063,39 @@ void TestOfflineAuthStoreAndNetworkBoot() {
     OS_REQUIRE(XUserGetGamerPictureResult(&pic_ab, pic_buf.size(), pic_buf.data(), &pic_used) == XGR_S_OK);
     OS_REQUIRE(pic_used >= 8u && pic_buf[0] == 0x89u && pic_buf[1] == 'P' && pic_buf[2] == 'N' && pic_buf[3] == 'G');
 
-    // 3C. XUserGetTokenAndSignatureAsync -> XBL3.0 + 3-segment Base64URL JWT
+    // 3C. XUserGetTokenAndSignatureAsync -> XBL3.0 + 3-segment Base64URL JWT (opt-in mock XSTS)
     {
+        struct ScopedMockXstsEnv {
+            bool had_prev = false;
+            std::string prev;
+            ScopedMockXstsEnv() {
+#if defined(_WIN32)
+                char buf[256]{};
+                const DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_MOCK_XSTS", buf, sizeof(buf));
+                if (n > 0 && n < sizeof(buf)) {
+                    had_prev = true;
+                    prev.assign(buf, n);
+                }
+                ::SetEnvironmentVariableA("OPENSCARLETT_MOCK_XSTS", "1");
+#else
+                const char* v = std::getenv("OPENSCARLETT_MOCK_XSTS");
+                if (v) {
+                    had_prev = true;
+                    prev = v;
+                }
+                setenv("OPENSCARLETT_MOCK_XSTS", "1", 1);
+#endif
+            }
+            ~ScopedMockXstsEnv() {
+#if defined(_WIN32)
+                ::SetEnvironmentVariableA("OPENSCARLETT_MOCK_XSTS", had_prev ? prev.c_str() : nullptr);
+#else
+                if (had_prev) setenv("OPENSCARLETT_MOCK_XSTS", prev.c_str(), 1);
+                else unsetenv("OPENSCARLETT_MOCK_XSTS");
+#endif
+            }
+        } mock_xsts_guard;
+
         std::atomic<bool> tok_done{false};
         XAsyncBlock tok_ab{};
         tok_ab.queue = boot_q;

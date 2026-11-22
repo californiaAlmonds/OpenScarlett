@@ -7,12 +7,135 @@
 
 #include "device_x.h"
 #include "openscarlett/core/telemetry.h"
+#include "openscarlett/gpu/xg_gpu_untile.h"
+
+namespace openscarlett {
+
+// Placed tiled texture 64KB tile-pool helpers defined in src/gpu/xg_gpu_untile.cpp.
+struct XgPlacedTiledSubresourceDesc {
+    uint32_t subresource_index = 0u;
+    uint32_t mip_level = 0u;
+    uint32_t array_slice = 0u;
+    uint32_t width_elements = 0u;
+    uint32_t height_elements = 0u;
+    uint32_t depth_elements = 1u;
+    uint32_t tiles_x = 0u;
+    uint32_t tiles_y = 0u;
+    uint32_t tiles_z = 1u;
+    uint32_t tile_size_bytes = 65536u;
+    uint32_t bytes_per_element = 4u;
+    uint32_t linear_row_pitch_bytes = 256u;
+    uint64_t subresource_offset_bytes = 0ull;
+    uint64_t heap_subresource_offset_bytes = 0ull;
+    uint64_t subresource_size_bytes = 0ull;
+    uint32_t tile_pool_start_index_64kb = 0u;
+    uint32_t tile_pool_count_64kb = 0u;
+};
+
+struct XgPlacedTilePoolEntry {
+    uint32_t logical_tile_index = 0u;
+    uint32_t heap_tile_index_64kb = 0u;
+    uint64_t pool_byte_offset = 0ull;
+    bool mapped = true;
+};
+
+bool ComputePlacedTiledSubresourceLayout2D(
+    const XG_TEXTURE2D_DESC& desc,
+    uint64_t placed_heap_offset_bytes,
+    uint32_t subresource_index,
+    XgPlacedTiledSubresourceDesc& out_sub) noexcept;
+
+bool GatherPlacedTiledPool64KB(
+    const void* src_pool_base,
+    uint64_t src_pool_size_bytes,
+    uint64_t pool_base_offset_bytes,
+    const std::vector<XgPlacedTilePoolEntry>& mappings,
+    uint32_t tile_size_bytes,
+    std::vector<uint8_t>& out_contiguous_tiled);
+
+bool ScatterPlacedTiledPool64KB(
+    const void* src_contiguous_tiled,
+    uint64_t src_size_bytes,
+    uint64_t pool_base_offset_bytes,
+    const std::vector<XgPlacedTilePoolEntry>& mappings,
+    uint32_t tile_size_bytes,
+    void* dst_pool_base,
+    uint64_t dst_pool_size_bytes);
+
+}  // namespace openscarlett
 
 namespace openscarlett::d3d12_xs {
 
 namespace {
 
 constexpr const char* kModule = "d3d12_xs.dll";
+
+constexpr uint64_t AlignUpPlaced64(uint64_t v, uint64_t a) noexcept {
+    return (a <= 1ull) ? v : ((v + a - 1ull) & ~(a - 1ull));
+}
+
+constexpr uint32_t AlignUpPlaced32(uint32_t v, uint32_t a) noexcept {
+    return (a <= 1u) ? v : ((v + a - 1u) & ~(a - 1u));
+}
+
+struct PlacedTiledTileKey {
+    uint32_t subresource = 0u;
+    uint32_t tx = 0u;
+    uint32_t ty = 0u;
+    uint32_t tz = 0u;
+
+    bool operator==(const PlacedTiledTileKey& o) const noexcept {
+        return subresource == o.subresource && tx == o.tx && ty == o.ty && tz == o.tz;
+    }
+};
+
+struct PlacedTiledTileKeyHash {
+    size_t operator()(const PlacedTiledTileKey& k) const noexcept {
+        uint64_t h = static_cast<uint64_t>(k.subresource) * 1469598103934665603ull;
+        h ^= static_cast<uint64_t>(k.tx) * 1099511628211ull;
+        h ^= (static_cast<uint64_t>(k.ty) << 17u) ^ (static_cast<uint64_t>(k.tz) << 33u);
+        return static_cast<size_t>(h);
+    }
+};
+
+struct PlacedTiledSubresourceRecord {
+    D3D12XBOX_TILED_PLACED_SUBRESOURCE_PITCH pitch{};
+    bool dirty_for_flush = false;
+};
+
+struct PlacedTiledResourceRecord {
+    ID3D12Resource* host_resource = nullptr;
+    ID3D12Heap* host_heap = nullptr;
+    D3D12_RESOURCE_DESC res_desc{};
+    XG_TEXTURE2D_DESC xg2d_desc{};
+    XG_RESOURCE_LAYOUT xg_layout{};
+    uint64_t heap_offset_bytes = 0ull;
+    uint64_t tile_pool_base_offset_bytes = 0ull;
+    XG_TILE_MODE tile_mode = XG_TILE_MODE_LINEAR;
+    D3D12_RESOURCE_STATES all_sub_state = D3D12_RESOURCE_STATE_COMMON;
+    uint32_t total_64kb_tiles = 0u;
+    std::vector<PlacedTiledSubresourceRecord> subresources;
+    std::unordered_map<PlacedTiledTileKey, D3D12XBOX_TILED_PLACED_TILE_MAPPING, PlacedTiledTileKeyHash> tile_mappings;
+    bool has_custom_tile_mapping = false;
+    uint64_t untile_copy_count = 0ull;
+    uint64_t retile_copy_count = 0ull;
+    uint64_t copy_resource_bridge_count = 0ull;
+    uint64_t copy_tiles_bridge_count = 0ull;
+    uint64_t barrier_transition_count = 0ull;
+    uint64_t aliasing_barrier_count = 0ull;
+    uint64_t coherency_flush_count = 0ull;
+    bool used_gpu_untile_bridge = false;
+};
+
+struct PlacedTiledRegistry {
+    std::mutex mutex;
+    std::unordered_map<ID3D12Resource*, PlacedTiledResourceRecord> map;
+};
+
+PlacedTiledRegistry& GetPlacedTiledRegistry() {
+    static PlacedTiledRegistry reg;
+    return reg;
+}
 
 inline void RecordList(const char* method, int32_t slot, HRESULT hr = S_OK) {
     openscarlett::CallOutcome outcome = openscarlett::CallOutcome::Ok;
@@ -227,6 +350,7 @@ CommandListX::CommandListX(DeviceX* parent_device, ID3D12GraphicsCommandList* ho
 }
 
 CommandListX::~CommandListX() {
+    ReleaseTiledTransientResources();
     {
         auto& reg = GetCommandListRegistry();
         std::unique_lock<std::shared_mutex> lock(reg.mutex);
@@ -328,6 +452,12 @@ HRESULT STDMETHODCALLTYPE CommandListX::QueryInterface(REFIID riid, void** ppvOb
     }
     if (IsEqualIID(riid, IID_IOpenScarlettCommandListExtState)) {
         *ppvObject = static_cast<IOpenScarlettCommandListExtState*>(this);
+        AddRef();
+        RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
+        return S_OK;
+    }
+    if (IsEqualIID(riid, IID_IOpenScarlettTiledPlacedManager)) {
+        *ppvObject = static_cast<IOpenScarlettTiledPlacedManager*>(this);
         AddRef();
         RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
         return S_OK;
@@ -435,6 +565,7 @@ HRESULT STDMETHODCALLTYPE CommandListX::Close() {
 
 HRESULT STDMETHODCALLTYPE CommandListX::Reset(
     ID3D12CommandAllocator* pAllocator, ID3D12PipelineState* pInitialState) {
+    ReleaseTiledTransientResources();
     depth_bias_.store(0.0f, std::memory_order_relaxed);
     depth_bias_clamp_.store(0.0f, std::memory_order_relaxed);
     slope_scaled_depth_bias_.store(0.0f, std::memory_order_relaxed);
@@ -683,6 +814,14 @@ void STDMETHODCALLTYPE CommandListX::CopyTextureRegion(
         vk_batch_.has_host_commands = true;
     }
 
+    // Sprint 13 placed tiled texture bridge (64KB tile-pool mapping, subresource pitch, untile/retile).
+    if (dst_ptr && src_ptr &&
+        TryBridgePlacedTiledCopyTextureRegion(*dst_ptr, DstX, DstY, DstZ, *src_ptr, pSrcBox)) {
+        RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion[PlacedTiled]", 16, S_OK);
+        RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion", 16, S_OK);
+        return;
+    }
+
     // Live XgGpuUntiler intercept when source or destination uses a GFX10 swizzle layout.
     if (device_x_ && dst_ptr && src_ptr &&
         dst_ptr->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
@@ -720,6 +859,11 @@ void STDMETHODCALLTYPE CommandListX::CopyResource(
         vk_batch_.ops.push_back(std::move(op));
         vk_batch_.has_host_commands = true;
     }
+    if (TryBridgePlacedTiledCopyResource(host_dst, host_src)) {
+        RecordList("ID3D12GraphicsCommandListX::CopyResource[PlacedTiled]", 17, S_OK);
+        RecordList("ID3D12GraphicsCommandListX::CopyResource", 17, S_OK);
+        return;
+    }
     host_list_->CopyResource(host_dst, host_src);
     RecordList("ID3D12GraphicsCommandListX::CopyResource", 17, S_OK);
 }
@@ -730,9 +874,18 @@ void STDMETHODCALLTYPE CommandListX::CopyTiles(
     const D3D12_TILE_REGION_SIZE* pTileRegionSize,
     ID3D12Resource* pBuffer, UINT64 BufferStartOffsetInBytes,
     D3D12_TILE_COPY_FLAGS Flags) {
+    ID3D12Resource* host_tiled = UnwrapResource(pTiledResource);
+    ID3D12Resource* host_buf = UnwrapResource(pBuffer);
+    if (TryBridgePlacedTiledCopyTiles(
+            host_tiled, pTileRegionStartCoordinate, pTileRegionSize,
+            host_buf, BufferStartOffsetInBytes, Flags)) {
+        RecordList("ID3D12GraphicsCommandListX::CopyTiles[PlacedTiled]", 18, S_OK);
+        RecordList("ID3D12GraphicsCommandListX::CopyTiles", 18, S_OK);
+        return;
+    }
     host_list_->CopyTiles(
-        UnwrapResource(pTiledResource), pTileRegionStartCoordinate, pTileRegionSize,
-        UnwrapResource(pBuffer), BufferStartOffsetInBytes, Flags);
+        host_tiled, pTileRegionStartCoordinate, pTileRegionSize,
+        host_buf, BufferStartOffsetInBytes, Flags);
     RecordList("ID3D12GraphicsCommandListX::CopyTiles", 18, S_OK);
 }
 
@@ -883,13 +1036,22 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
         }
     }
 
+    std::vector<D3D12_RESOURCE_BARRIER> extra_tiled_barriers;
+    if (out_count > 0u) {
+        TrackPlacedTiledResourceBarriers(out_count, unwrapped, extra_tiled_barriers);
+    }
+
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
         VulkanRecordedOp op{};
         op.kind = VulkanRecordedOpKind::Barrier;
-        op.barrier_count = out_count;
+        op.barrier_count = out_count + static_cast<uint32_t>(extra_tiled_barriers.size());
         vk_batch_.ops.push_back(std::move(op));
         vk_batch_.has_host_commands = true;
+    }
+    if (!extra_tiled_barriers.empty()) {
+        host_list_->ResourceBarrier(
+            static_cast<UINT>(extra_tiled_barriers.size()), extra_tiled_barriers.data());
     }
     if (out_count > 0u) {
         host_list_->ResourceBarrier(out_count, unwrapped);
@@ -2066,6 +2228,975 @@ void CommandListX::ExtractDeferredCpuOps(
     std::lock_guard<std::mutex> lock(aaa_rec_mutex_);
     out_writes.insert(out_writes.end(), deferred_cpu_writes_.begin(), deferred_cpu_writes_.end());
     out_waits.insert(out_waits.end(), deferred_cpu_waits_.begin(), deferred_cpu_waits_.end());
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 13 Placed Tiled Texture Management, Copy Bridging & Barrier Coherency
+// (Leonida #1674)
+// ---------------------------------------------------------------------------
+void CommandListX::TrackTiledTransientResource(ID3D12Resource* res) {
+    if (!res) return;
+    std::lock_guard<std::mutex> lock(tiled_transient_mutex_);
+    tiled_transient_resources_.push_back(res);
+}
+
+void CommandListX::ReleaseTiledTransientResources() {
+    std::lock_guard<std::mutex> lock(tiled_transient_mutex_);
+    for (ID3D12Resource* r : tiled_transient_resources_) {
+        if (r) r->Release();
+    }
+    tiled_transient_resources_.clear();
+}
+
+HRESULT STDMETHODCALLTYPE CommandListX::RegisterPlacedTiledTexture(
+    ID3D12Resource* resource,
+    const D3D12XBOX_TILED_PLACED_DESC* desc) {
+    if (!resource || !desc) return E_INVALIDARG;
+    ID3D12Resource* host_res = UnwrapResource(resource);
+    if (!host_res) return E_INVALIDARG;
+
+    const D3D12_RESOURCE_DESC rdesc = host_res->GetDesc();
+    if (rdesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        return E_INVALIDARG;
+    }
+
+    const XG_TILE_MODE tile_mode = static_cast<XG_TILE_MODE>(desc->xg_tile_mode);
+    XG_TEXTURE2D_DESC xg2d{};
+    xg2d.Width = static_cast<uint32_t>(rdesc.Width);
+    xg2d.Height = rdesc.Height;
+    xg2d.MipLevels = std::max<uint32_t>(1u, rdesc.MipLevels);
+    xg2d.ArraySize = std::max<uint32_t>(1u, rdesc.DepthOrArraySize);
+    xg2d.Format = static_cast<uint32_t>(rdesc.Format);
+    xg2d.SampleCount = std::max<uint32_t>(1u, rdesc.SampleDesc.Count);
+    xg2d.TileMode = tile_mode;
+    xg2d.BindFlags = XG_BIND_SHADER_RESOURCE;
+    if ((rdesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0) {
+        xg2d.BindFlags |= XG_BIND_RENDER_TARGET;
+    }
+    if ((rdesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0) {
+        xg2d.BindFlags |= XG_BIND_DEPTH_STENCIL;
+    }
+    if ((rdesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0) {
+        xg2d.BindFlags |= XG_BIND_UNORDERED_ACCESS;
+    }
+
+    XG_RESOURCE_LAYOUT layout{};
+    if (!openscarlett::xg::ComputeTexture2DLayout(xg2d, layout)) {
+        return E_INVALIDARG;
+    }
+
+    PlacedTiledResourceRecord rec{};
+    rec.host_resource = host_res;
+    rec.host_heap = desc->placed_heap ? UnwrapHeap(desc->placed_heap) : nullptr;
+    rec.res_desc = rdesc;
+    rec.xg2d_desc = xg2d;
+    rec.xg_layout = layout;
+    rec.heap_offset_bytes = desc->heap_offset_bytes;
+    rec.tile_pool_base_offset_bytes =
+        (desc->tile_pool_base_offset_bytes != 0ull)
+            ? desc->tile_pool_base_offset_bytes
+            : desc->heap_offset_bytes;
+    rec.tile_mode = tile_mode;
+    rec.all_sub_state = static_cast<D3D12_RESOURCE_STATES>(desc->initial_state);
+
+    const uint32_t sub_count = layout.MipLevels * layout.ArraySize;
+    rec.subresources.resize(sub_count);
+    uint32_t running_64kb_tiles = 0u;
+    for (uint32_t s = 0u; s < sub_count; ++s) {
+        openscarlett::XgPlacedTiledSubresourceDesc sd{};
+        if (!openscarlett::ComputePlacedTiledSubresourceLayout2D(
+                xg2d, rec.heap_offset_bytes, s, sd)) {
+            return E_FAIL;
+        }
+        PlacedTiledSubresourceRecord& sr = rec.subresources[s];
+        sr.pitch.subresource_index = sd.subresource_index;
+        sr.pitch.mip_level = sd.mip_level;
+        sr.pitch.array_slice = sd.array_slice;
+        sr.pitch.width_elements = sd.width_elements;
+        sr.pitch.height_elements = sd.height_elements;
+        sr.pitch.depth_elements = sd.depth_elements;
+        sr.pitch.tiles_x = sd.tiles_x;
+        sr.pitch.tiles_y = sd.tiles_y;
+        sr.pitch.tiles_z = sd.tiles_z;
+        sr.pitch.tile_size_bytes = sd.tile_size_bytes;
+        sr.pitch.bytes_per_element = sd.bytes_per_element;
+        sr.pitch.linear_row_pitch_bytes = sd.linear_row_pitch_bytes;
+        sr.pitch.subresource_offset_bytes = sd.subresource_offset_bytes;
+        sr.pitch.heap_subresource_offset_bytes = sd.heap_subresource_offset_bytes;
+        sr.pitch.subresource_size_bytes = sd.subresource_size_bytes;
+        sr.pitch.tile_pool_start_index_64kb = sd.tile_pool_start_index_64kb;
+        sr.pitch.tile_pool_count_64kb = sd.tile_pool_count_64kb;
+        sr.pitch.current_state = desc->initial_state;
+        sr.pitch.dirty_for_flush = 0u;
+        sr.dirty_for_flush = false;
+
+        running_64kb_tiles += sd.tile_pool_count_64kb;
+
+        // Seed identity tile-pool mappings for every tile in this subresource.
+        for (uint32_t ty = 0u; ty < sd.tiles_y; ++ty) {
+            for (uint32_t tx = 0u; tx < sd.tiles_x; ++tx) {
+                const uint32_t logical_idx = ty * sd.tiles_x + tx;
+                D3D12XBOX_TILED_PLACED_TILE_MAPPING tm{};
+                tm.subresource_index = s;
+                tm.logical_tile_x = tx;
+                tm.logical_tile_y = ty;
+                tm.logical_tile_z = 0u;
+                tm.heap_tile_index_64kb = logical_idx;
+                tm.pool_byte_offset =
+                    rec.tile_pool_base_offset_bytes +
+                    sd.subresource_offset_bytes +
+                    static_cast<uint64_t>(logical_idx) * static_cast<uint64_t>(sd.tile_size_bytes);
+                tm.mapped = 1u;
+                rec.tile_mappings[{s, tx, ty, 0u}] = tm;
+            }
+        }
+    }
+    rec.total_64kb_tiles = std::max<uint32_t>(
+        running_64kb_tiles,
+        static_cast<uint32_t>((layout.SizeBytes + 65535ull) / 65536ull));
+
+    {
+        auto& reg = GetPlacedTiledRegistry();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        reg.map[host_res] = std::move(rec);
+    }
+    if (device_x_) {
+        device_x_->SetTrackedResourceTileMode(host_res, tile_mode);
+    }
+    RecordList("IOpenScarlettTiledPlacedManager::RegisterPlacedTiledTexture", 90, S_OK);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE CommandListX::UnregisterPlacedTiledTexture(
+    ID3D12Resource* resource) {
+    if (!resource) return E_INVALIDARG;
+    ID3D12Resource* host_res = UnwrapResource(resource);
+    auto& reg = GetPlacedTiledRegistry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    const size_t erased = reg.map.erase(host_res);
+    return (erased > 0u) ? S_OK : S_FALSE;
+}
+
+HRESULT STDMETHODCALLTYPE CommandListX::UpdatePlacedTileMappings(
+    ID3D12Resource* resource,
+    uint32_t mapping_count,
+    const D3D12XBOX_TILED_PLACED_TILE_MAPPING* mappings) {
+    if (!resource || (mapping_count > 0u && !mappings)) return E_INVALIDARG;
+    ID3D12Resource* host_res = UnwrapResource(resource);
+    auto& reg = GetPlacedTiledRegistry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    auto it = reg.map.find(host_res);
+    if (it == reg.map.end()) return E_INVALIDARG;
+
+    PlacedTiledResourceRecord& rec = it->second;
+    for (uint32_t i = 0u; i < mapping_count; ++i) {
+        D3D12XBOX_TILED_PLACED_TILE_MAPPING m = mappings[i];
+        if (m.subresource_index >= rec.subresources.size()) return E_INVALIDARG;
+        const auto& sp = rec.subresources[m.subresource_index].pitch;
+        if (m.logical_tile_x >= sp.tiles_x || m.logical_tile_y >= sp.tiles_y) {
+            return E_INVALIDARG;
+        }
+        const uint64_t tile_stride =
+            (sp.tile_size_bytes >= 65536u) ? 65536ull : static_cast<uint64_t>(sp.tile_size_bytes);
+        if (m.pool_byte_offset == 0ull && m.mapped != 0u) {
+            m.pool_byte_offset =
+                rec.tile_pool_base_offset_bytes +
+                static_cast<uint64_t>(m.heap_tile_index_64kb) * tile_stride;
+        }
+        rec.tile_mappings[{m.subresource_index, m.logical_tile_x, m.logical_tile_y, m.logical_tile_z}] = m;
+    }
+    rec.has_custom_tile_mapping = true;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE CommandListX::QueryPlacedTiledSubresourcePitch(
+    ID3D12Resource* resource,
+    uint32_t subresource_index,
+    D3D12XBOX_TILED_PLACED_SUBRESOURCE_PITCH* out_pitch) {
+    if (!resource || !out_pitch) return E_INVALIDARG;
+    ID3D12Resource* host_res = UnwrapResource(resource);
+    auto& reg = GetPlacedTiledRegistry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    auto it = reg.map.find(host_res);
+    if (it == reg.map.end() || subresource_index >= it->second.subresources.size()) {
+        return E_INVALIDARG;
+    }
+    *out_pitch = it->second.subresources[subresource_index].pitch;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE CommandListX::QueryPlacedTiledTextureInfo(
+    ID3D12Resource* resource,
+    D3D12XBOX_TILED_PLACED_INFO* out_info) {
+    if (!resource || !out_info) return E_INVALIDARG;
+    ID3D12Resource* host_res = UnwrapResource(resource);
+    auto& reg = GetPlacedTiledRegistry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    auto it = reg.map.find(host_res);
+    if (it == reg.map.end()) return E_INVALIDARG;
+
+    const PlacedTiledResourceRecord& rec = it->second;
+    std::memset(out_info, 0, sizeof(*out_info));
+    out_info->heap_offset_bytes = rec.heap_offset_bytes;
+    out_info->tile_pool_base_offset_bytes = rec.tile_pool_base_offset_bytes;
+    out_info->total_surface_bytes = rec.xg_layout.SizeBytes;
+    out_info->xg_tile_mode = static_cast<uint32_t>(rec.tile_mode);
+    out_info->subresource_count = static_cast<uint32_t>(rec.subresources.size());
+    out_info->total_64kb_tiles = rec.total_64kb_tiles;
+    uint32_t mapped_cnt = 0u;
+    for (const auto& kv : rec.tile_mappings) {
+        if (kv.second.mapped != 0u) ++mapped_cnt;
+    }
+    out_info->mapped_tile_count = mapped_cnt;
+    out_info->current_state = static_cast<uint32_t>(rec.all_sub_state);
+    out_info->untile_copy_count = rec.untile_copy_count;
+    out_info->retile_copy_count = rec.retile_copy_count;
+    out_info->copy_resource_bridge_count = rec.copy_resource_bridge_count;
+    out_info->copy_tiles_bridge_count = rec.copy_tiles_bridge_count;
+    out_info->barrier_transition_count = rec.barrier_transition_count;
+    out_info->aliasing_barrier_count = rec.aliasing_barrier_count;
+    out_info->coherency_flush_count = rec.coherency_flush_count;
+    out_info->used_gpu_untile_bridge = rec.used_gpu_untile_bridge ? 1u : 0u;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE CommandListX::QueryPlacedTileMapping(
+    ID3D12Resource* resource,
+    uint32_t subresource_index,
+    uint32_t tile_x,
+    uint32_t tile_y,
+    uint32_t tile_z,
+    D3D12XBOX_TILED_PLACED_TILE_MAPPING* out_mapping) {
+    if (!resource || !out_mapping) return E_INVALIDARG;
+    ID3D12Resource* host_res = UnwrapResource(resource);
+    auto& reg = GetPlacedTiledRegistry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    auto it = reg.map.find(host_res);
+    if (it == reg.map.end()) return E_INVALIDARG;
+    auto mit = it->second.tile_mappings.find({subresource_index, tile_x, tile_y, tile_z});
+    if (mit == it->second.tile_mappings.end()) return E_INVALIDARG;
+    *out_mapping = mit->second;
+    return S_OK;
+}
+
+bool CommandListX::TryBridgePlacedTiledCopyTextureRegion(
+    const D3D12_TEXTURE_COPY_LOCATION& dst_loc,
+    UINT dst_x,
+    UINT dst_y,
+    UINT dst_z,
+    const D3D12_TEXTURE_COPY_LOCATION& src_loc,
+    const D3D12_BOX* src_box) {
+    if (!device_x_ || !device_x_->HostDevice() || !host_list_) return false;
+    ID3D12Device* host_dev = device_x_->HostDevice();
+
+    PlacedTiledResourceRecord dst_snap{};
+    PlacedTiledResourceRecord src_snap{};
+    bool dst_is_placed = false;
+    bool src_is_placed = false;
+    {
+        auto& reg = GetPlacedTiledRegistry();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        if (dst_loc.pResource) {
+            auto dit = reg.map.find(dst_loc.pResource);
+            if (dit != reg.map.end()) {
+                dst_is_placed = true;
+                dst_snap = dit->second;
+            }
+        }
+        if (src_loc.pResource) {
+            auto sit = reg.map.find(src_loc.pResource);
+            if (sit != reg.map.end()) {
+                src_is_placed = true;
+                src_snap = sit->second;
+            }
+        }
+    }
+    if (!dst_is_placed && !src_is_placed) return false;
+
+    auto create_buffer = [&](D3D12_HEAP_TYPE htype, uint64_t width_bytes,
+                             D3D12_RESOURCE_FLAGS flags,
+                             D3D12_RESOURCE_STATES init_state) -> ID3D12Resource* {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = htype;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = AlignUpPlaced64(std::max<uint64_t>(width_bytes, 256ull), 256ull);
+        bd.Height = 1u;
+        bd.DepthOrArraySize = 1u;
+        bd.MipLevels = 1u;
+        bd.SampleDesc.Count = 1u;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags = flags;
+        ID3D12Resource* buf = nullptr;
+        if (FAILED(host_dev->CreateCommittedResource(
+                &hp, D3D12_HEAP_FLAG_NONE, &bd, init_state, nullptr,
+                OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&buf)))) {
+            return nullptr;
+        }
+        return buf;
+    };
+
+    // Case 1: Tiled buffer -> Placed tiled texture (Untile + 64KB tile-pool gather)
+    if (dst_is_placed &&
+        dst_loc.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+        src_loc.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT &&
+        dst_snap.tile_mode != XG_TILE_MODE_LINEAR) {
+        const uint32_t sub = dst_loc.SubresourceIndex;
+        if (sub >= dst_snap.subresources.size()) return false;
+        const auto& sp = dst_snap.subresources[sub].pitch;
+
+        const uint32_t row_pitch =
+            (src_loc.PlacedFootprint.Footprint.RowPitch >= sp.width_elements * sp.bytes_per_element)
+                ? src_loc.PlacedFootprint.Footprint.RowPitch
+                : sp.linear_row_pitch_bytes;
+
+        openscarlett::XgGpuSurface2DRequest req{};
+        req.desc = dst_snap.xg2d_desc;
+        req.mip_level = sp.mip_level;
+        req.slice_index = sp.array_slice;
+        req.direction = openscarlett::XgGpuDirection::Untile;
+        req.linear_row_pitch_bytes = row_pitch;
+
+        openscarlett::XgGpuUntileParams params{};
+        uint64_t linear_bytes = 0ull;
+        uint64_t tiled_bytes = 0ull;
+        if (!openscarlett::BuildXgGpuUntileParams2D(req, params, &linear_bytes, &tiled_bytes).ok() ||
+            linear_bytes == 0ull || tiled_bytes == 0ull) {
+            return false;
+        }
+
+        const bool can_gpu =
+            (list_type_ == D3D12_COMMAND_LIST_TYPE_DIRECT ||
+             list_type_ == D3D12_COMMAND_LIST_TYPE_COMPUTE) &&
+            device_x_->EnsureXgGpuUntilerReady() &&
+            device_x_->GetXgGpuUntiler() != nullptr;
+
+        if (can_gpu) {
+            ID3D12Resource* effective_src_buf = src_loc.pResource;
+            uint64_t effective_src_off = src_loc.PlacedFootprint.Offset;
+
+            // Gather non-contiguous / permuted 64KB tile-pool entries into a contiguous
+            // tiled staging buffer on GPU so XgGpuUntiler sees logical tile order.
+            if (dst_snap.has_custom_tile_mapping) {
+                const uint64_t src_buf_width = src_loc.pResource->GetDesc().Width;
+                ID3D12Resource* gathered_buf = create_buffer(
+                    D3D12_HEAP_TYPE_DEFAULT, tiled_bytes,
+                    D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+                if (!gathered_buf) return false;
+
+                ID3D12Resource* zero_tile = create_buffer(
+                    D3D12_HEAP_TYPE_UPLOAD, sp.tile_size_bytes,
+                    D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+                if (zero_tile) {
+                    void* zp = nullptr;
+                    D3D12_RANGE rn{0u, 0u};
+                    if (SUCCEEDED(zero_tile->Map(0u, &rn, &zp)) && zp) {
+                        std::memset(zp, 0, sp.tile_size_bytes);
+                        D3D12_RANGE wf{0u, sp.tile_size_bytes};
+                        zero_tile->Unmap(0u, &wf);
+                    }
+                }
+
+                const uint64_t tile_stride =
+                    (sp.tile_size_bytes >= 65536u) ? 65536ull : static_cast<uint64_t>(sp.tile_size_bytes);
+                for (uint32_t ty = 0u; ty < sp.tiles_y; ++ty) {
+                    for (uint32_t tx = 0u; tx < sp.tiles_x; ++tx) {
+                        const uint32_t logical_idx = ty * sp.tiles_x + tx;
+                        const uint64_t dst_tile_off =
+                            sp.subresource_offset_bytes +
+                            static_cast<uint64_t>(logical_idx) * static_cast<uint64_t>(sp.tile_size_bytes);
+                        if (dst_tile_off + sp.tile_size_bytes > tiled_bytes) continue;
+
+                        auto mit = dst_snap.tile_mappings.find({sub, tx, ty, 0u});
+                        const bool is_mapped = (mit == dst_snap.tile_mappings.end()) || (mit->second.mapped != 0u);
+                        if (!is_mapped) {
+                            if (zero_tile) {
+                                host_list_->CopyBufferRegion(
+                                    gathered_buf, dst_tile_off, zero_tile, 0ull, sp.tile_size_bytes);
+                            }
+                            continue;
+                        }
+                        const uint32_t pool_tile_idx =
+                            (mit != dst_snap.tile_mappings.end()) ? mit->second.heap_tile_index_64kb : logical_idx;
+                        const uint64_t src_tile_off =
+                            src_loc.PlacedFootprint.Offset +
+                            static_cast<uint64_t>(pool_tile_idx) * tile_stride;
+                        if (src_tile_off + sp.tile_size_bytes <= src_buf_width) {
+                            host_list_->CopyBufferRegion(
+                                gathered_buf, dst_tile_off, src_loc.pResource, src_tile_off, sp.tile_size_bytes);
+                        } else if (zero_tile) {
+                            host_list_->CopyBufferRegion(
+                                gathered_buf, dst_tile_off, zero_tile, 0ull, sp.tile_size_bytes);
+                        }
+                    }
+                }
+
+                D3D12_RESOURCE_BARRIER to_srv{};
+                to_srv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                to_srv.Transition.pResource = gathered_buf;
+                to_srv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                to_srv.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                to_srv.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                host_list_->ResourceBarrier(1u, &to_srv);
+
+                TrackTiledTransientResource(gathered_buf);
+                if (zero_tile) TrackTiledTransientResource(zero_tile);
+                effective_src_buf = gathered_buf;
+                effective_src_off = 0ull;
+            }
+
+            ID3D12Resource* cbv_buf = create_buffer(
+                D3D12_HEAP_TYPE_UPLOAD, 256ull,
+                D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            ID3D12Resource* linear_uav = create_buffer(
+                D3D12_HEAP_TYPE_DEFAULT, linear_bytes,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            if (!cbv_buf || !linear_uav) {
+                if (cbv_buf) cbv_buf->Release();
+                if (linear_uav) linear_uav->Release();
+                return false;
+            }
+
+            void* cbv_ptr = nullptr;
+            D3D12_RANGE rn{0u, 0u};
+            if (SUCCEEDED(cbv_buf->Map(0u, &rn, &cbv_ptr)) && cbv_ptr) {
+                std::memset(cbv_ptr, 0, 256u);
+                std::memcpy(cbv_ptr, &params, sizeof(params));
+                D3D12_RANGE wf{0u, sizeof(params)};
+                cbv_buf->Unmap(0u, &wf);
+            }
+
+            const openscarlett::Status st = device_x_->GetXgGpuUntiler()->RecordDispatchD3D12(
+                host_list_, params,
+                cbv_buf->GetGPUVirtualAddress(),
+                effective_src_buf->GetGPUVirtualAddress() + effective_src_off,
+                0ull,
+                linear_uav->GetGPUVirtualAddress());
+            if (!st.ok()) {
+                cbv_buf->Release();
+                linear_uav->Release();
+                return false;
+            }
+
+            D3D12_RESOURCE_BARRIER barriers[2]{};
+            barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            barriers[0].UAV.pResource = linear_uav;
+            barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[1].Transition.pResource = linear_uav;
+            barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            host_list_->ResourceBarrier(2u, barriers);
+
+            D3D12_TEXTURE_COPY_LOCATION linear_src = src_loc;
+            linear_src.pResource = linear_uav;
+            linear_src.PlacedFootprint.Offset = 0ull;
+            linear_src.PlacedFootprint.Footprint.RowPitch = row_pitch;
+            host_list_->CopyTextureRegion(&dst_loc, dst_x, dst_y, dst_z, &linear_src, src_box);
+
+            if (last_host_compute_rs_) host_list_->SetComputeRootSignature(last_host_compute_rs_);
+            if (last_host_pso_) host_list_->SetPipelineState(last_host_pso_);
+
+            TrackTiledTransientResource(cbv_buf);
+            TrackTiledTransientResource(linear_uav);
+
+            auto& reg = GetPlacedTiledRegistry();
+            std::lock_guard<std::mutex> lock(reg.mutex);
+            auto it = reg.map.find(dst_loc.pResource);
+            if (it != reg.map.end()) {
+                ++it->second.untile_copy_count;
+                it->second.used_gpu_untile_bridge = true;
+                if (sub < it->second.subresources.size()) {
+                    it->second.subresources[sub].dirty_for_flush = true;
+                    it->second.subresources[sub].pitch.dirty_for_flush = 1u;
+                }
+            }
+            return true;
+        }
+
+        // Safe CPU fallback (e.g. COPY command list or minimal host without DXC).
+        D3D12_HEAP_PROPERTIES src_hp{};
+        D3D12_HEAP_FLAGS src_hf = D3D12_HEAP_FLAG_NONE;
+        if (FAILED(src_loc.pResource->GetHeapProperties(&src_hp, &src_hf)) ||
+            src_hp.Type != D3D12_HEAP_TYPE_UPLOAD) {
+            return false;
+        }
+        const uint64_t src_buf_width = src_loc.pResource->GetDesc().Width;
+        void* src_mapped = nullptr;
+        D3D12_RANGE srange{0u, static_cast<SIZE_T>(src_buf_width)};
+        if (FAILED(src_loc.pResource->Map(0u, &srange, &src_mapped)) || !src_mapped) {
+            return false;
+        }
+
+        std::vector<uint8_t> gathered_cpu;
+        const uint8_t* tiled_ptr = static_cast<const uint8_t*>(src_mapped) + src_loc.PlacedFootprint.Offset;
+        uint64_t tiled_avail = (src_buf_width > src_loc.PlacedFootprint.Offset)
+                                   ? (src_buf_width - src_loc.PlacedFootprint.Offset)
+                                   : 0ull;
+        if (dst_snap.has_custom_tile_mapping) {
+            std::vector<openscarlett::XgPlacedTilePoolEntry> entries;
+            entries.reserve(static_cast<size_t>(sp.tiles_x) * sp.tiles_y);
+            for (uint32_t ty = 0u; ty < sp.tiles_y; ++ty) {
+                for (uint32_t tx = 0u; tx < sp.tiles_x; ++tx) {
+                    openscarlett::XgPlacedTilePoolEntry e{};
+                    e.logical_tile_index = ty * sp.tiles_x + tx;
+                    auto mit = dst_snap.tile_mappings.find({sub, tx, ty, 0u});
+                    e.heap_tile_index_64kb =
+                        (mit != dst_snap.tile_mappings.end()) ? mit->second.heap_tile_index_64kb : e.logical_tile_index;
+                    e.pool_byte_offset = 0ull;
+                    e.mapped = (mit == dst_snap.tile_mappings.end()) || (mit->second.mapped != 0u);
+                    entries.push_back(e);
+                }
+            }
+            std::vector<uint8_t> sub_tiles;
+            if (openscarlett::GatherPlacedTiledPool64KB(
+                    tiled_ptr, tiled_avail, 0ull, entries, sp.tile_size_bytes, sub_tiles)) {
+                gathered_cpu.assign(static_cast<size_t>(tiled_bytes), 0u);
+                const size_t copy_n = std::min<size_t>(
+                    sub_tiles.size(),
+                    (tiled_bytes > sp.subresource_offset_bytes)
+                        ? static_cast<size_t>(tiled_bytes - sp.subresource_offset_bytes)
+                        : 0u);
+                if (copy_n > 0u) {
+                    std::memcpy(gathered_cpu.data() + sp.subresource_offset_bytes, sub_tiles.data(), copy_n);
+                }
+                tiled_ptr = gathered_cpu.data();
+                tiled_avail = gathered_cpu.size();
+            }
+        }
+
+        ID3D12Resource* lin_up = create_buffer(
+            D3D12_HEAP_TYPE_UPLOAD, linear_bytes,
+            D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+        bool ok = false;
+        if (lin_up) {
+            void* dst_mapped = nullptr;
+            D3D12_RANGE rn{0u, 0u};
+            if (SUCCEEDED(lin_up->Map(0u, &rn, &dst_mapped)) && dst_mapped) {
+                ok = openscarlett::xg::UntileSurface2D(
+                    dst_snap.xg2d_desc, sp.mip_level, sp.array_slice,
+                    tiled_ptr, tiled_avail, dst_mapped, row_pitch);
+                D3D12_RANGE wf{0u, static_cast<SIZE_T>(linear_bytes)};
+                lin_up->Unmap(0u, &wf);
+            }
+        }
+        D3D12_RANGE wn{0u, 0u};
+        src_loc.pResource->Unmap(0u, &wn);
+
+        if (!ok || !lin_up) {
+            if (lin_up) lin_up->Release();
+            return false;
+        }
+
+        D3D12_TEXTURE_COPY_LOCATION linear_src = src_loc;
+        linear_src.pResource = lin_up;
+        linear_src.PlacedFootprint.Offset = 0ull;
+        linear_src.PlacedFootprint.Footprint.RowPitch = row_pitch;
+        host_list_->CopyTextureRegion(&dst_loc, dst_x, dst_y, dst_z, &linear_src, src_box);
+        TrackTiledTransientResource(lin_up);
+
+        auto& reg = GetPlacedTiledRegistry();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        auto it = reg.map.find(dst_loc.pResource);
+        if (it != reg.map.end()) {
+            ++it->second.untile_copy_count;
+            if (sub < it->second.subresources.size()) {
+                it->second.subresources[sub].dirty_for_flush = true;
+                it->second.subresources[sub].pitch.dirty_for_flush = 1u;
+            }
+        }
+        return true;
+    }
+
+    // Case 2: Placed tiled texture -> Buffer (Retile if dst buffer is tiled; else linear readback)
+    if (src_is_placed &&
+        src_loc.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+        dst_loc.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+        const uint32_t sub = src_loc.SubresourceIndex;
+        if (sub >= src_snap.subresources.size()) return false;
+        const auto& sp = src_snap.subresources[sub].pitch;
+
+        const XG_TILE_MODE dst_buf_mode = device_x_->GetTrackedResourceTileMode(dst_loc.pResource);
+        if (dst_buf_mode != XG_TILE_MODE_LINEAR && src_snap.tile_mode != XG_TILE_MODE_LINEAR) {
+            const uint32_t row_pitch =
+                (dst_loc.PlacedFootprint.Footprint.RowPitch >= sp.width_elements * sp.bytes_per_element)
+                    ? dst_loc.PlacedFootprint.Footprint.RowPitch
+                    : sp.linear_row_pitch_bytes;
+
+            openscarlett::XgGpuSurface2DRequest req{};
+            req.desc = src_snap.xg2d_desc;
+            req.desc.TileMode = dst_buf_mode;
+            req.mip_level = sp.mip_level;
+            req.slice_index = sp.array_slice;
+            req.direction = openscarlett::XgGpuDirection::Retile;
+            req.linear_row_pitch_bytes = row_pitch;
+
+            openscarlett::XgGpuUntileParams params{};
+            uint64_t linear_bytes = 0ull;
+            uint64_t tiled_bytes = 0ull;
+            if (openscarlett::BuildXgGpuUntileParams2D(req, params, &linear_bytes, &tiled_bytes).ok() &&
+                linear_bytes > 0ull && tiled_bytes > 0ull &&
+                (list_type_ == D3D12_COMMAND_LIST_TYPE_DIRECT ||
+                 list_type_ == D3D12_COMMAND_LIST_TYPE_COMPUTE) &&
+                device_x_->EnsureXgGpuUntilerReady() &&
+                device_x_->GetXgGpuUntiler() != nullptr) {
+                ID3D12Resource* linear_stage = create_buffer(
+                    D3D12_HEAP_TYPE_DEFAULT, linear_bytes,
+                    D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+                ID3D12Resource* cbv_buf = create_buffer(
+                    D3D12_HEAP_TYPE_UPLOAD, 256ull,
+                    D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+                ID3D12Resource* tiled_uav = create_buffer(
+                    D3D12_HEAP_TYPE_DEFAULT, tiled_bytes,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                if (linear_stage && cbv_buf && tiled_uav) {
+                    D3D12_TEXTURE_COPY_LOCATION stage_dst = dst_loc;
+                    stage_dst.pResource = linear_stage;
+                    stage_dst.PlacedFootprint.Offset = 0ull;
+                    stage_dst.PlacedFootprint.Footprint.RowPitch = row_pitch;
+                    host_list_->CopyTextureRegion(&stage_dst, 0u, 0u, 0u, &src_loc, src_box);
+
+                    D3D12_RESOURCE_BARRIER to_srv{};
+                    to_srv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    to_srv.Transition.pResource = linear_stage;
+                    to_srv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    to_srv.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                    to_srv.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    host_list_->ResourceBarrier(1u, &to_srv);
+
+                    void* cbv_ptr = nullptr;
+                    D3D12_RANGE rn{0u, 0u};
+                    if (SUCCEEDED(cbv_buf->Map(0u, &rn, &cbv_ptr)) && cbv_ptr) {
+                        std::memset(cbv_ptr, 0, 256u);
+                        std::memcpy(cbv_ptr, &params, sizeof(params));
+                        D3D12_RANGE wf{0u, sizeof(params)};
+                        cbv_buf->Unmap(0u, &wf);
+                    }
+
+                    if (device_x_->GetXgGpuUntiler()->RecordDispatchD3D12(
+                            host_list_, params,
+                            cbv_buf->GetGPUVirtualAddress(),
+                            linear_stage->GetGPUVirtualAddress(),
+                            0ull,
+                            tiled_uav->GetGPUVirtualAddress()).ok()) {
+                        D3D12_RESOURCE_BARRIER post[2]{};
+                        post[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                        post[0].UAV.pResource = tiled_uav;
+                        post[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                        post[1].Transition.pResource = tiled_uav;
+                        post[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                        post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                        post[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                        host_list_->ResourceBarrier(2u, post);
+
+                        const uint64_t dst_buf_width = dst_loc.pResource->GetDesc().Width;
+                        if (src_snap.has_custom_tile_mapping) {
+                            const uint64_t tile_stride =
+                                (sp.tile_size_bytes >= 65536u) ? 65536ull : static_cast<uint64_t>(sp.tile_size_bytes);
+                            for (uint32_t ty = 0u; ty < sp.tiles_y; ++ty) {
+                                for (uint32_t tx = 0u; tx < sp.tiles_x; ++tx) {
+                                    const uint32_t logical_idx = ty * sp.tiles_x + tx;
+                                    auto mit = src_snap.tile_mappings.find({sub, tx, ty, 0u});
+                                    if (mit != src_snap.tile_mappings.end() && mit->second.mapped == 0u) continue;
+                                    const uint32_t pool_tile_idx =
+                                        (mit != src_snap.tile_mappings.end()) ? mit->second.heap_tile_index_64kb : logical_idx;
+                                    const uint64_t src_tile_off =
+                                        sp.subresource_offset_bytes +
+                                        static_cast<uint64_t>(logical_idx) * static_cast<uint64_t>(sp.tile_size_bytes);
+                                    const uint64_t dst_tile_off =
+                                        dst_loc.PlacedFootprint.Offset +
+                                        static_cast<uint64_t>(pool_tile_idx) * tile_stride;
+                                    if (src_tile_off + sp.tile_size_bytes <= tiled_bytes &&
+                                        dst_tile_off + sp.tile_size_bytes <= dst_buf_width) {
+                                        host_list_->CopyBufferRegion(
+                                            dst_loc.pResource, dst_tile_off, tiled_uav, src_tile_off, sp.tile_size_bytes);
+                                    }
+                                }
+                            }
+                        } else {
+                            const uint64_t copy_bytes = std::min<uint64_t>(
+                                tiled_bytes,
+                                (dst_buf_width > dst_loc.PlacedFootprint.Offset)
+                                    ? (dst_buf_width - dst_loc.PlacedFootprint.Offset)
+                                    : 0ull);
+                            if (copy_bytes > 0ull) {
+                                host_list_->CopyBufferRegion(
+                                    dst_loc.pResource, dst_loc.PlacedFootprint.Offset, tiled_uav, 0ull, copy_bytes);
+                            }
+                        }
+
+                        if (last_host_compute_rs_) host_list_->SetComputeRootSignature(last_host_compute_rs_);
+                        if (last_host_pso_) host_list_->SetPipelineState(last_host_pso_);
+                        TrackTiledTransientResource(linear_stage);
+                        TrackTiledTransientResource(cbv_buf);
+                        TrackTiledTransientResource(tiled_uav);
+
+                        auto& reg = GetPlacedTiledRegistry();
+                        std::lock_guard<std::mutex> lock(reg.mutex);
+                        auto it = reg.map.find(src_loc.pResource);
+                        if (it != reg.map.end()) {
+                            ++it->second.retile_copy_count;
+                            it->second.used_gpu_untile_bridge = true;
+                        }
+                        return true;
+                    }
+                }
+                if (linear_stage) linear_stage->Release();
+                if (cbv_buf) cbv_buf->Release();
+                if (tiled_uav) tiled_uav->Release();
+            }
+        }
+
+        // Standard linear readback from placed tiled texture (already untiled on host GPU).
+        host_list_->CopyTextureRegion(&dst_loc, dst_x, dst_y, dst_z, &src_loc, src_box);
+        return true;
+    }
+
+    // Case 3: Texture-to-texture copy involving placed tiled texture(s).
+    host_list_->CopyTextureRegion(&dst_loc, dst_x, dst_y, dst_z, &src_loc, src_box);
+    if (dst_is_placed && dst_loc.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+        auto& reg = GetPlacedTiledRegistry();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        auto it = reg.map.find(dst_loc.pResource);
+        if (it != reg.map.end() && dst_loc.SubresourceIndex < it->second.subresources.size()) {
+            it->second.subresources[dst_loc.SubresourceIndex].dirty_for_flush = true;
+            it->second.subresources[dst_loc.SubresourceIndex].pitch.dirty_for_flush = 1u;
+        }
+    }
+    return true;
+}
+
+bool CommandListX::TryBridgePlacedTiledCopyResource(
+    ID3D12Resource* host_dst,
+    ID3D12Resource* host_src) {
+    if (!host_dst || !host_src || !host_list_) return false;
+
+    PlacedTiledResourceRecord dst_snap{};
+    PlacedTiledResourceRecord src_snap{};
+    bool dst_is_placed = false;
+    bool src_is_placed = false;
+    {
+        auto& reg = GetPlacedTiledRegistry();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        auto dit = reg.map.find(host_dst);
+        if (dit != reg.map.end()) {
+            dst_is_placed = true;
+            dst_snap = dit->second;
+        }
+        auto sit = reg.map.find(host_src);
+        if (sit != reg.map.end()) {
+            src_is_placed = true;
+            src_snap = sit->second;
+        }
+    }
+    if (!dst_is_placed && !src_is_placed) return false;
+
+    const D3D12_RESOURCE_DESC ddesc = host_dst->GetDesc();
+    const D3D12_RESOURCE_DESC sdesc = host_src->GetDesc();
+
+    // Buffer -> Placed tiled texture: untile every subresource.
+    if (dst_is_placed && sdesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        for (size_t s = 0u; s < dst_snap.subresources.size(); ++s) {
+            const auto& sp = dst_snap.subresources[s].pitch;
+            D3D12_TEXTURE_COPY_LOCATION dloc{};
+            dloc.pResource = host_dst;
+            dloc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dloc.SubresourceIndex = static_cast<UINT>(s);
+
+            D3D12_TEXTURE_COPY_LOCATION sloc{};
+            sloc.pResource = host_src;
+            sloc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            sloc.PlacedFootprint.Offset = 0ull;
+            sloc.PlacedFootprint.Footprint.Format = ddesc.Format;
+            sloc.PlacedFootprint.Footprint.Width = std::max<UINT>(1u, static_cast<UINT>(ddesc.Width) >> sp.mip_level);
+            sloc.PlacedFootprint.Footprint.Height = std::max<UINT>(1u, ddesc.Height >> sp.mip_level);
+            sloc.PlacedFootprint.Footprint.Depth = 1u;
+            sloc.PlacedFootprint.Footprint.RowPitch = sp.linear_row_pitch_bytes;
+            if (!TryBridgePlacedTiledCopyTextureRegion(dloc, 0u, 0u, 0u, sloc, nullptr)) {
+                return false;
+            }
+        }
+        auto& reg = GetPlacedTiledRegistry();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        auto it = reg.map.find(host_dst);
+        if (it != reg.map.end()) ++it->second.copy_resource_bridge_count;
+        return true;
+    }
+
+    // Placed tiled texture -> Buffer: bridge each subresource.
+    if (src_is_placed && ddesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        for (size_t s = 0u; s < src_snap.subresources.size(); ++s) {
+            const auto& sp = src_snap.subresources[s].pitch;
+            D3D12_TEXTURE_COPY_LOCATION dloc{};
+            dloc.pResource = host_dst;
+            dloc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dloc.PlacedFootprint.Offset = 0ull;
+            dloc.PlacedFootprint.Footprint.Format = sdesc.Format;
+            dloc.PlacedFootprint.Footprint.Width = std::max<UINT>(1u, static_cast<UINT>(sdesc.Width) >> sp.mip_level);
+            dloc.PlacedFootprint.Footprint.Height = std::max<UINT>(1u, sdesc.Height >> sp.mip_level);
+            dloc.PlacedFootprint.Footprint.Depth = 1u;
+            dloc.PlacedFootprint.Footprint.RowPitch = sp.linear_row_pitch_bytes;
+
+            D3D12_TEXTURE_COPY_LOCATION sloc{};
+            sloc.pResource = host_src;
+            sloc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            sloc.SubresourceIndex = static_cast<UINT>(s);
+            if (!TryBridgePlacedTiledCopyTextureRegion(dloc, 0u, 0u, 0u, sloc, nullptr)) {
+                return false;
+            }
+        }
+        auto& reg = GetPlacedTiledRegistry();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        auto it = reg.map.find(host_src);
+        if (it != reg.map.end()) ++it->second.copy_resource_bridge_count;
+        return true;
+    }
+
+    // Texture <-> Texture where at least one is a placed tiled texture.
+    host_list_->CopyResource(host_dst, host_src);
+    {
+        auto& reg = GetPlacedTiledRegistry();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        if (dst_is_placed) {
+            auto it = reg.map.find(host_dst);
+            if (it != reg.map.end()) {
+                ++it->second.copy_resource_bridge_count;
+                for (auto& sr : it->second.subresources) {
+                    sr.dirty_for_flush = true;
+                    sr.pitch.dirty_for_flush = 1u;
+                }
+            }
+        }
+        if (src_is_placed) {
+            auto it = reg.map.find(host_src);
+            if (it != reg.map.end()) {
+                ++it->second.copy_resource_bridge_count;
+            }
+        }
+    }
+    return true;
+}
+
+bool CommandListX::TryBridgePlacedTiledCopyTiles(
+    ID3D12Resource* host_tiled_res,
+    const D3D12_TILED_RESOURCE_COORDINATE* start_coord,
+    const D3D12_TILE_REGION_SIZE* /*region_size*/,
+    ID3D12Resource* host_buffer,
+    UINT64 buffer_offset_bytes,
+    D3D12_TILE_COPY_FLAGS flags) {
+    if (!host_tiled_res || !host_buffer || !start_coord) return false;
+    PlacedTiledResourceRecord snap{};
+    {
+        auto& reg = GetPlacedTiledRegistry();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        auto it = reg.map.find(host_tiled_res);
+        if (it == reg.map.end()) return false;
+        snap = it->second;
+    }
+    const uint32_t sub = start_coord->Subresource;
+    if (sub >= snap.subresources.size()) return false;
+    const auto& sp = snap.subresources[sub].pitch;
+
+    D3D12_TEXTURE_COPY_LOCATION tex_loc{};
+    tex_loc.pResource = host_tiled_res;
+    tex_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    tex_loc.SubresourceIndex = sub;
+
+    D3D12_TEXTURE_COPY_LOCATION buf_loc{};
+    buf_loc.pResource = host_buffer;
+    buf_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    buf_loc.PlacedFootprint.Offset = buffer_offset_bytes;
+    buf_loc.PlacedFootprint.Footprint.Format = snap.res_desc.Format;
+    buf_loc.PlacedFootprint.Footprint.Width =
+        std::max<UINT>(1u, static_cast<UINT>(snap.res_desc.Width) >> sp.mip_level);
+    buf_loc.PlacedFootprint.Footprint.Height =
+        std::max<UINT>(1u, snap.res_desc.Height >> sp.mip_level);
+    buf_loc.PlacedFootprint.Footprint.Depth = 1u;
+    buf_loc.PlacedFootprint.Footprint.RowPitch = sp.linear_row_pitch_bytes;
+
+    const bool to_buffer =
+        (flags & D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER) != 0;
+    const bool ok = to_buffer
+        ? TryBridgePlacedTiledCopyTextureRegion(buf_loc, 0u, 0u, 0u, tex_loc, nullptr)
+        : TryBridgePlacedTiledCopyTextureRegion(tex_loc, 0u, 0u, 0u, buf_loc, nullptr);
+    if (!ok) return false;
+
+    auto& reg = GetPlacedTiledRegistry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    auto it = reg.map.find(host_tiled_res);
+    if (it != reg.map.end()) {
+        ++it->second.copy_tiles_bridge_count;
+    }
+    return true;
+}
+
+void CommandListX::TrackPlacedTiledResourceBarriers(
+    UINT num_barriers,
+    const D3D12_RESOURCE_BARRIER* unwrapped_barriers,
+    std::vector<D3D12_RESOURCE_BARRIER>& extra_coherency_barriers) {
+    if (!unwrapped_barriers || num_barriers == 0u) return;
+    auto& reg = GetPlacedTiledRegistry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    if (reg.map.empty()) return;
+
+    auto flush_subresource = [&](PlacedTiledResourceRecord& rec, uint32_t sub_idx,
+                                 D3D12_RESOURCE_STATES new_state) {
+        if (sub_idx >= rec.subresources.size()) return;
+        auto& sr = rec.subresources[sub_idx];
+        sr.pitch.current_state = static_cast<uint32_t>(new_state);
+        if (sr.dirty_for_flush) {
+            sr.dirty_for_flush = false;
+            sr.pitch.dirty_for_flush = 0u;
+            ++rec.coherency_flush_count;
+        }
+    };
+
+    for (UINT i = 0u; i < num_barriers; ++i) {
+        const D3D12_RESOURCE_BARRIER& b = unwrapped_barriers[i];
+        if (b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && b.Transition.pResource) {
+            auto it = reg.map.find(b.Transition.pResource);
+            if (it == reg.map.end()) continue;
+            PlacedTiledResourceRecord& rec = it->second;
+            ++rec.barrier_transition_count;
+            if (b.Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
+                rec.all_sub_state = b.Transition.StateAfter;
+                for (uint32_t s = 0u; s < static_cast<uint32_t>(rec.subresources.size()); ++s) {
+                    flush_subresource(rec, s, b.Transition.StateAfter);
+                }
+            } else if (b.Transition.Subresource < rec.subresources.size()) {
+                flush_subresource(rec, b.Transition.Subresource, b.Transition.StateAfter);
+            }
+        } else if (b.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) {
+            auto touch_alias = [&](ID3D12Resource* res) {
+                if (!res) return;
+                auto it = reg.map.find(res);
+                if (it == reg.map.end()) return;
+                PlacedTiledResourceRecord& rec = it->second;
+                ++rec.aliasing_barrier_count;
+                for (auto& sr : rec.subresources) {
+                    if (sr.dirty_for_flush) {
+                        sr.dirty_for_flush = false;
+                        sr.pitch.dirty_for_flush = 0u;
+                        ++rec.coherency_flush_count;
+                    }
+                }
+            };
+            touch_alias(b.Aliasing.pResourceBefore);
+            touch_alias(b.Aliasing.pResourceAfter);
+        } else if (b.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV && b.UAV.pResource) {
+            auto it = reg.map.find(b.UAV.pResource);
+            if (it == reg.map.end()) continue;
+            PlacedTiledResourceRecord& rec = it->second;
+            for (auto& sr : rec.subresources) {
+                if (sr.dirty_for_flush) {
+                    sr.dirty_for_flush = false;
+                    sr.pitch.dirty_for_flush = 0u;
+                    ++rec.coherency_flush_count;
+                }
+            }
+        }
+    }
+    (void)extra_coherency_barriers;
 }
 
 }  // namespace openscarlett::d3d12_xs

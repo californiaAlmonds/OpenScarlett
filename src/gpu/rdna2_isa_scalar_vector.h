@@ -14,7 +14,7 @@
 namespace openscarlett::rdna2_sv {
 
 // ---------------------------------------------------------------------------
-// Clean-room AMD RDNA2 / GFX10.3 Scalar & Vector ISA Modifier Definitions
+// AMD RDNA2 / GFX10.3 Scalar & Vector ISA Modifier Definitions
 // (SDWA src0==249, DPP16 src0==250, DPP8 src0==233, DPP8FI src0==234)
 // ---------------------------------------------------------------------------
 enum class SvModifierKind : uint8_t {
@@ -231,7 +231,7 @@ bool EncodeScalarVectorInst(
     const DecodedSvModifier* mod = nullptr);
 
 // ---------------------------------------------------------------------------
-// Wave-Level Clean-Room CPU Reference State & Executor (Wave32 & Wave64)
+// Wave-Level CPU Reference State & Executor (Wave32 & Wave64)
 // ---------------------------------------------------------------------------
 struct SvWaveState {
     std::array<uint32_t, 106> sgpr{};

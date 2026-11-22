@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Xbox Series X|S D3D12X (<d3d12_xs.h>) public COM ABI header.
+// MIT Xbox Series X|S D3D12X (<d3d12_xs.h>) public COM ABI header.
 
 #include <cstdint>
 #include <d3d12.h>

@@ -1,7 +1,7 @@
 #pragma once
 #include <Windows.h>
 
-// Clean-room MIT appnotify.h importing real PLM exports from OpenScarlett's kernelx.dll / xgameruntime.dll.
+// MIT appnotify.h importing real PLM exports from OpenScarlett's kernelx.dll / xgameruntime.dll.
 
 struct _APPSTATE_REGISTRATION;
 struct _APPCONSTRAIN_REGISTRATION;

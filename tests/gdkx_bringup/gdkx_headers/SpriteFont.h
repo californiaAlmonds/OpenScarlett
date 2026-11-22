@@ -7,7 +7,7 @@
 #include "ResourceUploadBatch.h"
 #include "SpriteBatch.h"
 
-// Clean-room MIT DirectXTK12 SpriteFont subset for untouched Xbox-GDK-Samples.
+// MIT DirectXTK12 SpriteFont subset for untouched Xbox-GDK-Samples.
 // Gracefully handles optional .spritefont HUD overlays without requiring binary font packs.
 
 namespace DirectX {

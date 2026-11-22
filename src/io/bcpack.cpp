@@ -864,7 +864,7 @@ Status HuffmanDecompress(const uint8_t* src, size_t src_size, size_t expected_si
 }
 
 // ---------------------------------------------------------------------------
-// Clean-Room Endpoint Ring-Buffer Sliding-Window Codec (BC1..BC7 Endpoints)
+// Endpoint Ring-Buffer Sliding-Window Codec (BC1..BC7 Endpoints)
 // ---------------------------------------------------------------------------
 // Fixed 64-entry history ring buffer of element_bytes (1..8):
 //   0x00..0x3F : Single history back-ref at age_idx = tag (0 = most recent, < populated)
@@ -1151,7 +1151,7 @@ Status EndpointRingWindowDecompress(
 }
 
 // ---------------------------------------------------------------------------
-// Clean-Room Selector Index-Table & Sliding-Window Codec (BC1..BC7 Selectors)
+// Selector Index-Table & Sliding-Window Codec (BC1..BC7 Selectors)
 // ---------------------------------------------------------------------------
 // Header:
 //   uint16 LE table_size (0..256)
@@ -2530,7 +2530,7 @@ Status BcPackDecompressTextureArraySubresource(
 }
 
 // ---------------------------------------------------------------------------
-// Clean-Room Synthetic BC1..BC7 Surface Generator (for Round-Trip Verification)
+// Synthetic BC1..BC7 Surface Generator (for Round-Trip Verification)
 // ---------------------------------------------------------------------------
 Status BcGenerateSyntheticSurface(
     BcFormat format,

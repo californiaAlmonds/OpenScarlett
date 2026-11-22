@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT AMD FidelityFX SDK 2.0 Loader & Upscaler (<ffx_api/ffx_api.h>) public C ABI header
+// MIT AMD FidelityFX SDK 2.0 Loader & Upscaler (<ffx_api/ffx_api.h>) public C ABI header
 // backed by amd_fidelityfx_loader_xbox.dll and amd_fidelityfx_upscaler_xbox.dll.
 
 #include <cstddef>

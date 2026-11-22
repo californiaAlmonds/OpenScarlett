@@ -1387,8 +1387,7 @@ StoreBootstrapDiagnostic DiagnoseStoreBootstrapper(const LaunchResult& result,
         "               gamelaunchhelper.exe or AppModel launchers under WindowsApps / XboxGames)\n"
         "               delegate launch to Windows GamingServices and exit immediately with code 0\n"
         "               after spawning a detached AppModel child process.\n"
-        "               OpenScarlett strictly respects Windows Store / AppModel boundaries and\n"
-        "               does not bypass Windows Store ACLs or DRM.";
+        "               Supply an unpacked package directory with loose files to run directly.";
     return diag;
 }
 

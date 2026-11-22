@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Xbox BVH Acceleration Builder (<XboxBvhBuilder.h>) public C ABI header
+// MIT Xbox BVH Acceleration Builder (<XboxBvhBuilder.h>) public C ABI header
 // backed by XboxBvhBuilder.dll.
 
 #include <cstddef>
