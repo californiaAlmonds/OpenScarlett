@@ -2762,7 +2762,10 @@ void EmitHlslAtomicOp(
             else os << "        " << buf_name << ".InterlockedAdd(_addr, v[" << d0 << "], _prev);\n";
             break;
         case 0x33:
-            if (is_lds) os << "        InterlockedAdd(" << target_lhs() << ", (0u - v[" << d0 << "]), _prev);\n";
+            // LDS: a CAS loop, not InterlockedAdd of the negated value. NVIDIA's D3D12 driver (621.24, RTX 5070)
+            // fails CreateComputePipelineState with E_OUTOFMEMORY on a groupshared atomic add whose operand is a
+            // runtime negation (DXC folds every spelling of -x to `sub 0, x`); UAV atomics are not affected.
+            if (is_lds) emit_cas_loop("_cur - v[" + std::to_string(d0) + "]");
             else os << "        " << buf_name << ".InterlockedAdd(_addr, (0u - v[" << d0 << "]), _prev);\n";
             break;
         case 0x34:
