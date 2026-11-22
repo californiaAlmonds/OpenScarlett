@@ -43,7 +43,7 @@ constexpr DWORD kMemPreservePlaceholder = 0x00000002u;
 constexpr DWORD kMemReplacePlaceholder = 0x00004000u;
 constexpr DWORD kMemReservePlaceholder = 0x00040000u;
 
-// Clean-room ABI-identical structures for VirtualAlloc2 extended parameters
+// ABI-identical structures for VirtualAlloc2 extended parameters
 // (avoids depending on host _WIN32_WINNT macro configuration).
 struct OsMemAddressRequirements {
     void* lowest_starting_address;

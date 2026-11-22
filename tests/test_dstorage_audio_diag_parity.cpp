@@ -1101,7 +1101,7 @@ void TestWasapiEndpointFormatsAndCodecs() {
     {
         std::vector<std::vector<uint8_t>> pkts;
         for (uint32_t i = 0u; i < 4u; ++i) {
-            pkts.push_back(openscarlett::BuildCleanRoomOpusTestPacket(2u, i, 64u));
+            pkts.push_back(openscarlett::BuildOpusTestPacket(2u, i, 64u));
         }
         const auto stream = openscarlett::PackOpusLengthPrefixedStream(pkts, false);
         OS_OPUSWAVEFORMAT ofmt{};

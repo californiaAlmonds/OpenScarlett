@@ -1,4 +1,5 @@
 #include "openscarlett/gpu/rdna2_lifter.h"
+#include "openscarlett/gpu/rdna2_xbox_container.h"
 
 #include <algorithm>
 #include <atomic>
@@ -43,11 +44,12 @@ uint64_t HashBytesFnv1a(const uint8_t* data, size_t size) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// SPIR-V 1.3 / 1.4 Constants (Khronos SPIR-V Specification)
+// SPIR-V 1.3 / 1.4 / 1.6 Constants (Khronos SPIR-V Specification)
 // ---------------------------------------------------------------------------
 constexpr uint32_t kSpirvMagic = 0x07230203u;
 constexpr uint32_t kSpirvVersion13 = 0x00010300u;
 constexpr uint32_t kSpirvVersion14 = 0x00010400u;
+constexpr uint32_t kSpirvVersion16 = 0x00010600u;
 constexpr uint32_t kSpirvGeneratorOpenScarlett = 0x4F533200u;  // "OS2\0"
 
 enum SpirvOp : uint16_t {
@@ -151,7 +153,10 @@ enum SpirvOp : uint16_t {
     SpvOpLabel = 248,
     SpvOpBranch = 249,
     SpvOpBranchConditional = 250,
+    SpvOpSwitch = 251,
+    SpvOpKill = 252,
     SpvOpReturn = 253,
+    SpvOpEmitMeshTasksEXT = 5294,
     SpvOpSetMeshOutputsEXT = 5295,
 };
 
@@ -181,8 +186,10 @@ constexpr uint32_t kSpvStorageUniform = 2u;
 constexpr uint32_t kSpvStorageOutput = 3u;
 constexpr uint32_t kSpvStorageWorkgroup = 4u;
 constexpr uint32_t kSpvStoragePrivate = 6u;
+constexpr uint32_t kSpvStorageFunction = 7u;
 constexpr uint32_t kSpvStorageImage = 11u;
 constexpr uint32_t kSpvStorageStorageBuffer = 12u;
+constexpr uint32_t kSpvStorageTaskPayloadWorkgroupEXT = 5402u;
 
 // SPIR-V Image Formats
 constexpr uint32_t kSpvImgFmtUnknown = 0u;
@@ -209,6 +216,7 @@ constexpr uint32_t kSpvDecPerPrimitiveEXT = 5271u;
 
 // SPIR-V BuiltIns
 constexpr uint32_t kSpvBuiltInPosition = 0u;
+constexpr uint32_t kSpvBuiltInCullDistance = 4u;
 constexpr uint32_t kSpvBuiltInWorkgroupId = 26u;
 constexpr uint32_t kSpvBuiltInGlobalInvocationId = 28u;
 constexpr uint32_t kSpvBuiltInLocalInvocationIndex = 29u;
@@ -216,8 +224,10 @@ constexpr uint32_t kSpvBuiltInVertexIndex = 42u;
 constexpr uint32_t kSpvBuiltInPrimitiveTriangleIndicesEXT = 5294u;
 constexpr uint32_t kSpvBuiltInCullPrimitiveEXT = 5299u;
 
-// SPIR-V Mesh Shader EXT constants
+// SPIR-V Capabilities & Mesh/Task Shader EXT constants
+constexpr uint32_t kSpvCapCullDistance = 45u;
 constexpr uint32_t kSpvCapMeshShadingEXT = 5283u;
+constexpr uint32_t kSpvExecModelTaskEXT = 5364u;
 constexpr uint32_t kSpvExecModelMeshEXT = 5365u;
 constexpr uint32_t kSpvExecModeOutputVertices = 26u;
 constexpr uint32_t kSpvExecModeOutputPrimitivesEXT = 5270u;
@@ -276,6 +286,45 @@ bool ModuleUsesStageInput(const Rdna2IrModule& ir) {
     return false;
 }
 
+uint32_t ModuleParamOutputCount(const Rdna2IrModule& ir) noexcept {
+    uint32_t count = ir.exports_param0 ? 1u : 0u;
+    for (const auto& bb : ir.blocks) {
+        for (const auto& inst : bb.instructions) {
+            if (inst.op == IrOp::Export &&
+                inst.export_target >= static_cast<uint8_t>(Rdna2ExportTarget::Param0) &&
+                inst.export_target <= static_cast<uint8_t>(Rdna2ExportTarget::Param3)) {
+                const uint32_t slot = static_cast<uint32_t>(
+                    inst.export_target - static_cast<uint8_t>(Rdna2ExportTarget::Param0));
+                if (slot + 1u > count) count = slot + 1u;
+            }
+        }
+    }
+    if (count > 0u && ir.output_interp_modes.size() > count) {
+        count = std::min<uint32_t>(4u, static_cast<uint32_t>(ir.output_interp_modes.size()));
+    }
+    return std::min<uint32_t>(4u, count);
+}
+
+uint32_t ModuleParamInputCount(const Rdna2IrModule& ir) noexcept {
+    uint32_t count = 0u;
+    for (const auto& bb : ir.blocks) {
+        for (const auto& inst : bb.instructions) {
+            if (inst.op == IrOp::StageInput) {
+                const uint32_t slot = (inst.imm_u32 >> 2) & 3u;
+                if (slot + 1u > count) count = slot + 1u;
+            }
+        }
+    }
+    return std::min<uint32_t>(4u, count);
+}
+
+Rdna2InterpMode SafeInterpMode(const std::vector<Rdna2InterpMode>& modes, uint32_t slot) noexcept {
+    return (slot < modes.size()) ? modes[slot] : Rdna2InterpMode::Perspective;
+}
+
+constexpr uint32_t kIrKillExportMagicLifter = 0xDEAD0001u;
+constexpr uint32_t kIrLoadCbHeapFlagLifter = 0x80000000u;
+
 bool ModuleUsesThreadId(const Rdna2IrModule& ir) {
     for (const auto& bb : ir.blocks) {
         for (const auto& inst : bb.instructions) {
@@ -301,6 +350,22 @@ bool ModuleUsesOp(const Rdna2IrModule& ir, IrOp target_op) {
         }
     }
     return false;
+}
+
+uint32_t ModuleCullDistanceCount(const Rdna2IrModule& ir) noexcept {
+    uint32_t count = 0u;
+    for (const auto& bb : ir.blocks) {
+        for (const auto& inst : bb.instructions) {
+            if (inst.op != IrOp::Export) continue;
+            if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos3)) {
+                return 8u;
+            }
+            if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos2)) {
+                count = 4u;
+            }
+        }
+    }
+    return count;
 }
 
 enum class SpvValKind : uint8_t {
@@ -493,7 +558,10 @@ Status RunExternalProcess(const std::string& cmdline, uint32_t& out_exit_code, s
     // Guard CreatePipe + CreateProcessA and restrict handle inheritance strictly to h_write
     // via PROC_THREAD_ATTRIBUTE_HANDLE_LIST so concurrent worker threads (e.g. AsyncPsoCompilePool)
     // never inherit another thread's open temp .hlsl/.dxil or pipe handles.
+    // Poison-aware RAII tracking ensures any exception/unwind releases the mutex and closes
+    // pipe handles cleanly while allowing subsequent calls to recover automatically.
     static std::mutex g_spawn_mutex;
+    static std::atomic<bool> g_spawn_mutex_poisoned{false};
     HANDLE h_read = nullptr;
     HANDLE h_write = nullptr;
     PROCESS_INFORMATION pi{};
@@ -501,12 +569,36 @@ Status RunExternalProcess(const std::string& cmdline, uint32_t& out_exit_code, s
     DWORD spawn_err = 0;
 
     {
-        std::lock_guard<std::mutex> spawn_lock(g_spawn_mutex);
+        std::unique_lock<std::mutex> spawn_lock(g_spawn_mutex);
+        if (g_spawn_mutex_poisoned.exchange(false, std::memory_order_acq_rel)) {
+            CallTelemetry::Global().Record("rdna2_lifter", "SpawnMutexRecoveredFromPoison", CallOutcome::Ok, 1);
+        }
+        bool spawn_committed = false;
+        struct SpawnCleanupGuard {
+            bool& committed;
+            HANDLE& hw;
+            HANDLE& hr;
+            ~SpawnCleanupGuard() {
+                if (hw != nullptr) {
+                    CloseHandle(hw);
+                    hw = nullptr;
+                }
+                if (!committed) {
+                    if (hr != nullptr) {
+                        CloseHandle(hr);
+                        hr = nullptr;
+                    }
+                    g_spawn_mutex_poisoned.store(true, std::memory_order_release);
+                    CallTelemetry::Global().Record("rdna2_lifter", "SpawnMutexPoisoned", CallOutcome::Error, -1);
+                }
+            }
+        } cleanup{spawn_committed, h_write, h_read};
 
         SECURITY_ATTRIBUTES sa{};
         sa.nLength = sizeof(sa);
         sa.bInheritHandle = TRUE;
         if (!CreatePipe(&h_read, &h_write, &sa, 0)) {
+            spawn_committed = true;
             return Status::Error(StatusCode::IoError, "CreatePipe failed for external shader tool");
         }
         SetHandleInformation(h_read, HANDLE_FLAG_INHERIT, 0);
@@ -576,6 +668,8 @@ Status RunExternalProcess(const std::string& cmdline, uint32_t& out_exit_code, s
         }
 
         CloseHandle(h_write);
+        h_write = nullptr;
+        spawn_committed = true;
     }
 
     if (!ok) {
@@ -657,7 +751,7 @@ public:
         const uint32_t hw_tg_total = std::max(1u, hw_tg_x * hw_tg_y * hw_tg_z);
 
         std::ostringstream hdr;
-        hdr << "// Generated by OpenScarlett Clean-Room RDNA2 (XS2) -> HLSL Lifter\n";
+        hdr << "// Generated by OpenScarlett RDNA2 (XS2) -> HLSL Lifter\n";
 
         if (ir_.uses_root_constants) {
             hdr << "cbuffer OpenScarlettRootConstants : register(b0) {\n";
@@ -665,6 +759,27 @@ public:
                 hdr << "    uint _rc" << i << ";\n";
             }
             hdr << "};\n";
+        }
+        // Distinct CB heap register space (space1) for CB loads with non-zero base SGPR offset
+        // so they never collide with mixed-heap V# slot 0 (u0, space0) or root constants (b0, space0).
+        {
+            std::vector<uint32_t> cb_heap_regs;
+            for (const auto& bb : ir_.blocks) {
+                for (const auto& inst : bb.instructions) {
+                    if (inst.op == IrOp::LoadUav && (inst.imm_u32 & kIrLoadCbHeapFlagLifter) != 0u) {
+                        const uint32_t reg = inst.imm_u32 & 0xFFu;
+                        if (std::find(cb_heap_regs.begin(), cb_heap_regs.end(), reg) == cb_heap_regs.end()) {
+                            cb_heap_regs.push_back(reg);
+                        }
+                    }
+                }
+            }
+            std::sort(cb_heap_regs.begin(), cb_heap_regs.end());
+            for (uint32_t reg : cb_heap_regs) {
+                hdr << "cbuffer OpenScarlettCbHeap" << reg << " : register(b" << reg << ", space1) {\n"
+                    << "    uint4 _cb_heap_" << reg << "[4096];\n"
+                    << "};\n";
+            }
         }
         if (uses_uav0) {
             hdr << "RWByteAddressBuffer _in0 : register(u0);\n";
@@ -974,10 +1089,12 @@ public:
                    "}\n";
         }
 
-        const Rdna2InterpMode out_interp0 =
-            !ir_.output_interp_modes.empty() ? ir_.output_interp_modes[0] : Rdna2InterpMode::Perspective;
-        const Rdna2InterpMode in_interp0 =
-            !ir_.input_interp_modes.empty() ? ir_.input_interp_modes[0] : Rdna2InterpMode::Perspective;
+        const uint32_t param_out_count = ModuleParamOutputCount(ir_);
+        const uint32_t param_in_count = uses_stage_in ? std::max(1u, ModuleParamInputCount(ir_)) : 0u;
+        cull_dist_count_ =
+            (ir_.stage == ShaderStage::Vertex || ir_.stage == ShaderStage::Geometry || ir_.stage == ShaderStage::Mesh)
+                ? ModuleCullDistanceCount(ir_)
+                : 0u;
 
         switch (ir_.stage) {
             case ShaderStage::Compute:
@@ -997,23 +1114,37 @@ public:
                 out_target = use_sm65_ ? "vs_6_5" : "vs_5_0";
                 hdr << "struct VSOut {\n";
                 hdr << "    float4 pos : SV_POSITION;\n";
-                if (ir_.exports_param0) {
-                    hdr << "    " << HlslInterpModifier(out_interp0) << "float4 param0 : TEXCOORD0;\n";
+                for (uint32_t p = 0u; p < param_out_count; ++p) {
+                    hdr << "    " << HlslInterpModifier(SafeInterpMode(ir_.output_interp_modes, p))
+                        << "float4 param" << p << " : TEXCOORD" << p << ";\n";
+                }
+                if (cull_dist_count_ > 0u) {
+                    hdr << "    float4 cull_dist0 : SV_CullDistance0;\n";
+                }
+                if (cull_dist_count_ > 4u) {
+                    hdr << "    float4 cull_dist1 : SV_CullDistance1;\n";
                 }
                 hdr << "};\n";
                 hdr << "VSOut main(uint _vid : SV_VertexID) {\n";
                 hdr << "    VSOut _out;\n";
                 hdr << "    _out.pos = float4(0.0, 0.0, 0.0, 1.0);\n";
-                if (ir_.exports_param0) {
-                    hdr << "    _out.param0 = float4(0.0, 0.0, 0.0, 1.0);\n";
+                for (uint32_t p = 0u; p < param_out_count; ++p) {
+                    hdr << "    _out.param" << p << " = float4(0.0, 0.0, 0.0, 1.0);\n";
+                }
+                if (cull_dist_count_ > 0u) {
+                    hdr << "    _out.cull_dist0 = float4(0.0, 0.0, 0.0, 0.0);\n";
+                }
+                if (cull_dist_count_ > 4u) {
+                    hdr << "    _out.cull_dist1 = float4(0.0, 0.0, 0.0, 0.0);\n";
                 }
                 break;
             case ShaderStage::Pixel:
                 out_target = use_sm65_ ? "ps_6_5" : "ps_5_0";
                 hdr << "struct PSIn {\n";
                 hdr << "    float4 pos : SV_POSITION;\n";
-                if (uses_stage_in) {
-                    hdr << "    " << HlslInterpModifier(in_interp0) << "float4 param0 : TEXCOORD0;\n";
+                for (uint32_t p = 0u; p < param_in_count; ++p) {
+                    hdr << "    " << HlslInterpModifier(SafeInterpMode(ir_.input_interp_modes, p))
+                        << "float4 param" << p << " : TEXCOORD" << p << ";\n";
                 }
                 hdr << "};\n";
                 hdr << "float4 main(PSIn _in) : SV_TARGET0 {\n";
@@ -1026,16 +1157,29 @@ public:
                 hdr << "};\n";
                 hdr << "struct GSOut {\n";
                 hdr << "    float4 pos : SV_POSITION;\n";
-                if (ir_.exports_param0) {
-                    hdr << "    " << HlslInterpModifier(out_interp0) << "float4 param0 : TEXCOORD0;\n";
+                for (uint32_t p = 0u; p < param_out_count; ++p) {
+                    hdr << "    " << HlslInterpModifier(SafeInterpMode(ir_.output_interp_modes, p))
+                        << "float4 param" << p << " : TEXCOORD" << p << ";\n";
+                }
+                if (cull_dist_count_ > 0u) {
+                    hdr << "    float4 cull_dist0 : SV_CullDistance0;\n";
+                }
+                if (cull_dist_count_ > 4u) {
+                    hdr << "    float4 cull_dist1 : SV_CullDistance1;\n";
                 }
                 hdr << "};\n";
                 hdr << "[maxvertexcount(6)]\n";
                 hdr << "void main(triangle GSIn _gs_in[3], inout TriangleStream<GSOut> _gs_stream) {\n";
                 hdr << "    GSOut _gs_out;\n";
                 hdr << "    _gs_out.pos = float4(0.0, 0.0, 0.0, 1.0);\n";
-                if (ir_.exports_param0) {
-                    hdr << "    _gs_out.param0 = float4(0.0, 0.0, 0.0, 1.0);\n";
+                for (uint32_t p = 0u; p < param_out_count; ++p) {
+                    hdr << "    _gs_out.param" << p << " = float4(0.0, 0.0, 0.0, 1.0);\n";
+                }
+                if (cull_dist_count_ > 0u) {
+                    hdr << "    _gs_out.cull_dist0 = float4(0.0, 0.0, 0.0, 0.0);\n";
+                }
+                if (cull_dist_count_ > 4u) {
+                    hdr << "    _gs_out.cull_dist1 = float4(0.0, 0.0, 0.0, 0.0);\n";
                 }
                 if (bounded_wave64_dispatcher_) {
                     hdr << "    uint _w64_ballot[2] = {0u, 0u};\n";
@@ -1055,8 +1199,15 @@ public:
                 }
                 hdr << "struct MeshVert {\n";
                 hdr << "    float4 pos : SV_POSITION;\n";
-                if (ir_.exports_param0) {
-                    hdr << "    " << HlslInterpModifier(out_interp0) << "float4 param0 : TEXCOORD0;\n";
+                for (uint32_t p = 0u; p < param_out_count; ++p) {
+                    hdr << "    " << HlslInterpModifier(SafeInterpMode(ir_.output_interp_modes, p))
+                        << "float4 param" << p << " : TEXCOORD" << p << ";\n";
+                }
+                if (cull_dist_count_ > 0u) {
+                    hdr << "    float4 cull_dist0 : SV_CullDistance0;\n";
+                }
+                if (cull_dist_count_ > 4u) {
+                    hdr << "    float4 cull_dist1 : SV_CullDistance1;\n";
                 }
                 hdr << "};\n";
                 if (ir_.uses_mesh_cull) {
@@ -1110,6 +1261,13 @@ public:
                 hdr << "    uint _dm_x = 1u;\n";
                 hdr << "    uint _dm_y = 1u;\n";
                 hdr << "    uint _dm_z = 1u;\n";
+                if (ir_.uses_wave64_emulation && !bounded_wave64_dispatcher_) {
+                    const uint32_t lane_mask = (ir_.wave_size == 64u) ? 63u : 31u;
+                    const uint32_t wave_shift = (ir_.wave_size == 64u) ? 6u : 5u;
+                    hdr << "    uint _gw_id = _gtid >> " << wave_shift << "u;\n";
+                    hdr << "    uint _w64_lane = _gtid & " << lane_mask << "u;\n";
+                    hdr << "    uint _gw_base = _gw_id << " << wave_shift << "u;\n";
+                }
                 break;
             default:
                 return Status::Error(StatusCode::UnsupportedFormat, "Unsupported shader stage for HLSL emission");
@@ -1188,28 +1346,47 @@ public:
             }
         }
 
-        const int base_depth = bounded_wave64_dispatcher_ ? 2 : 1;
+        const bool wrap_as_single_dispatch =
+            (!bounded_wave64_dispatcher_ && ir_.stage == ShaderStage::Amplification);
+        const int base_depth = (bounded_wave64_dispatcher_ || wrap_as_single_dispatch) ? 2 : 1;
+        Rdna2CfgAnalysis cfg_info{};
+        AnalyzeRdna2Cfg(ir_, cfg_info);
         std::ostringstream body;
         std::unordered_set<uint32_t> visited;
-        if (EmitStructured(body, 0u, UINT32_MAX, base_depth, visited)) {
-            hdr << body.str();
+        if (!cfg_info.has_cycles && !cfg_info.is_irreducible &&
+            EmitStructured(body, 0u, UINT32_MAX, base_depth, visited)) {
+            if (wrap_as_single_dispatch) {
+                hdr << "    do {\n";
+                hdr << body.str();
+                hdr << "    } while (false);\n";
+            } else {
+                hdr << body.str();
+            }
         } else {
-            EmitStateMachine(hdr, base_depth);
+            EmitStateMachine(hdr, bounded_wave64_dispatcher_ ? 2 : 1);
             if (!bounded_wave64_dispatcher_) {
                 if (ir_.stage == ShaderStage::Vertex) {
                     hdr << "    return _out;\n";
                 } else if (ir_.stage == ShaderStage::Pixel) {
                     hdr << "    return _mrt0;\n";
-                } else if (ir_.stage == ShaderStage::Amplification) {
-                    hdr << "    DispatchMesh(_dm_x, _dm_y, _dm_z, _payload);\n";
                 }
             }
         }
         if (bounded_wave64_dispatcher_) {
             hdr << "    }\n";
-            if (ir_.stage == ShaderStage::Amplification) {
-                hdr << "    DispatchMesh(_dm_x, _dm_y, _dm_z, _payload);\n";
+        }
+        if (ir_.stage == ShaderStage::Amplification) {
+            if (ir_.uses_lds) {
+                hdr << "    GroupMemoryBarrierWithGroupSync();\n";
+                hdr << "    if (_gtid == 0u) {\n";
+                hdr << "        _payload._data[0] = _lds[0];\n";
+                hdr << "        _payload._data[1] = _lds[1];\n";
+                hdr << "        _payload._data[2] = _lds[2];\n";
+                hdr << "        _payload._data[3] = _lds[3];\n";
+                hdr << "    }\n";
+                hdr << "    GroupMemoryBarrierWithGroupSync();\n";
             }
+            hdr << "    DispatchMesh(_dm_x, _dm_y, _dm_z, _payload);\n";
         }
         hdr << "}\n";
 
@@ -1254,30 +1431,53 @@ private:
         if (bounded_wave64_dispatcher_) return "continue;";
         if (ir_.stage == ShaderStage::Vertex) return "return _out;";
         if (ir_.stage == ShaderStage::Pixel) return "return _mrt0;";
-        if (ir_.stage == ShaderStage::Amplification) return "DispatchMesh(_dm_x, _dm_y, _dm_z, _payload);";
+        if (ir_.stage == ShaderStage::Amplification) return "break;";
         return "return;";
     }
 
     void EmitPhiCopies(std::ostringstream& os, uint32_t from_bb, uint32_t to_bb, int depth) const {
         if (to_bb >= ir_.blocks.size()) return;
         const auto& dst_bb = ir_.blocks[to_bb];
+        struct PhiCopy {
+            IrValueId dst_id;
+            IrType dst_type;
+            IrValueId src_id;
+        };
+        std::vector<PhiCopy> copies;
         for (const auto& inst : dst_bb.instructions) {
             if (inst.op != IrOp::Phi) continue;
             for (const auto& inc : inst.phi_incoming) {
                 if (inc.first == from_bb) {
-                    os << Indent(depth) << "_v" << inst.id << " = ";
-                    if (inst.type == IrType::F32) {
-                        os << AsF32(inc.second);
-                    } else if (inst.type == IrType::Bool) {
-                        os << AsBool(inc.second);
-                    } else {
-                        os << AsU32(inc.second);
-                    }
-                    os << ";\n";
+                    copies.push_back({inst.id, inst.type, inc.second});
                     break;
                 }
             }
         }
+        if (copies.empty()) return;
+        if (copies.size() == 1u) {
+            const auto& c = copies[0];
+            os << Indent(depth) << "_v" << c.dst_id << " = ";
+            if (c.dst_type == IrType::F32) os << AsF32(c.src_id);
+            else if (c.dst_type == IrType::Bool) os << AsBool(c.src_id);
+            else os << AsU32(c.src_id);
+            os << ";\n";
+            return;
+        }
+        // Parallel-safe copy for multiple loop-carried Phis
+        os << Indent(depth) << "{\n";
+        for (size_t k = 0u; k < copies.size(); ++k) {
+            const auto& c = copies[k];
+            const char* ty = (c.dst_type == IrType::F32) ? "float" : (c.dst_type == IrType::Bool ? "bool" : "uint");
+            os << Indent(depth + 1) << ty << " _pt" << k << " = ";
+            if (c.dst_type == IrType::F32) os << AsF32(c.src_id);
+            else if (c.dst_type == IrType::Bool) os << AsBool(c.src_id);
+            else os << AsU32(c.src_id);
+            os << ";\n";
+        }
+        for (size_t k = 0u; k < copies.size(); ++k) {
+            os << Indent(depth + 1) << "_v" << copies[k].dst_id << " = _pt" << k << ";\n";
+        }
+        os << Indent(depth) << "}\n";
     }
 
     bool HasPhiCopies(uint32_t from_bb, uint32_t to_bb) const {
@@ -1356,15 +1556,25 @@ private:
                     }
                     break;
                 }
-                case IrOp::StageInput:
-                    os << ind << "_v" << inst.id << " = _in.param0." << kSwiz[inst.imm_u32 & 3u] << ";\n";
+                case IrOp::StageInput: {
+                    const uint32_t pslot = (inst.imm_u32 >> 2) & 3u;
+                    os << ind << "_v" << inst.id << " = _in.param" << pslot << "." << kSwiz[inst.imm_u32 & 3u] << ";\n";
                     break;
+                }
                 case IrOp::LoadRootConst:
                     os << ind << "_v" << inst.id << " = _rc" << inst.imm_u32 << ";\n";
                     break;
                 case IrOp::LoadUav: {
-                    const char* buf = (inst.imm_u32 == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
-                    os << ind << "_v" << inst.id << " = " << buf << ".Load(" << AsU32(inst.operands[0]) << ");\n";
+                    if ((inst.imm_u32 & kIrLoadCbHeapFlagLifter) != 0u) {
+                        const uint32_t cb_reg = inst.imm_u32 & 0xFFu;
+                        os << ind << "{ uint _cb_dw = ((" << AsU32(inst.operands[0]) << ") >> 2u); "
+                           << "uint4 _cb_q = _cb_heap_" << cb_reg << "[(_cb_dw >> 2u) & 4095u]; "
+                           << "uint _cb_l = _cb_dw & 3u; "
+                           << "_v" << inst.id << " = (_cb_l == 0u) ? _cb_q.x : ((_cb_l == 1u) ? _cb_q.y : ((_cb_l == 2u) ? _cb_q.z : _cb_q.w)); }\n";
+                    } else {
+                        const char* buf = (inst.imm_u32 == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
+                        os << ind << "_v" << inst.id << " = " << buf << ".Load(" << AsU32(inst.operands[0]) << ");\n";
+                    }
                     break;
                 }
                 case IrOp::StoreUav: {
@@ -1494,12 +1704,24 @@ private:
                        << lds_mask << "u];\n";
                     break;
                 case IrOp::LdsStore:
-                    os << ind << "_lds[((" << AsU32(inst.operands[0]) << ") >> 2u) & " << lds_mask
-                       << "u] = " << AsU32(inst.operands[1]) << ";\n";
+                    if (inst.exec_pred != kInvalidIrValue) {
+                        os << ind << "if (" << AsBool(inst.exec_pred) << ") { _lds[(("
+                           << AsU32(inst.operands[0]) << ") >> 2u) & " << lds_mask
+                           << "u] = " << AsU32(inst.operands[1]) << "; }\n";
+                    } else {
+                        os << ind << "_lds[((" << AsU32(inst.operands[0]) << ") >> 2u) & " << lds_mask
+                           << "u] = " << AsU32(inst.operands[1]) << ";\n";
+                    }
                     break;
                 case IrOp::LdsAtomicAdd:
-                    os << ind << "InterlockedAdd(_lds[((" << AsU32(inst.operands[0]) << ") >> 2u) & "
-                       << lds_mask << "u], " << AsU32(inst.operands[1]) << ", _v" << inst.id << ");\n";
+                    if (inst.exec_pred != kInvalidIrValue) {
+                        os << ind << "_v" << inst.id << " = 0u; if (" << AsBool(inst.exec_pred)
+                           << ") { InterlockedAdd(_lds[((" << AsU32(inst.operands[0]) << ") >> 2u) & "
+                           << lds_mask << "u], " << AsU32(inst.operands[1]) << ", _v" << inst.id << "); }\n";
+                    } else {
+                        os << ind << "InterlockedAdd(_lds[((" << AsU32(inst.operands[0]) << ") >> 2u) & "
+                           << lds_mask << "u], " << AsU32(inst.operands[1]) << ", _v" << inst.id << ");\n";
+                    }
                     break;
                 case IrOp::ScratchLoad: {
                     const uint32_t scr_mask = (ir_.scratch_size_dwords ? ir_.scratch_size_dwords : 64u) - 1u;
@@ -1509,8 +1731,13 @@ private:
                 }
                 case IrOp::ScratchStore: {
                     const uint32_t scr_mask = (ir_.scratch_size_dwords ? ir_.scratch_size_dwords : 64u) - 1u;
-                    os << ind << "_scratch[((" << AsU32(inst.operands[0]) << ") >> 2u) & " << scr_mask
-                       << "u] = " << AsU32(inst.operands[1]) << ";\n";
+                    if (inst.exec_pred != kInvalidIrValue) {
+                        os << ind << "if (" << AsBool(inst.exec_pred) << ") { _scratch[((" << AsU32(inst.operands[0])
+                           << ") >> 2u) & " << scr_mask << "u] = " << AsU32(inst.operands[1]) << "; }\n";
+                    } else {
+                        os << ind << "_scratch[((" << AsU32(inst.operands[0]) << ") >> 2u) & " << scr_mask
+                           << "u] = " << AsU32(inst.operands[1]) << ";\n";
+                    }
                     break;
                 }
                 case IrOp::WaveLaneId:
@@ -1601,7 +1828,11 @@ private:
                     break;
                 }
                 case IrOp::SetMeshOutputCounts:
-                    if (!hoisted_mesh_counts_) {
+                    if (ir_.stage == ShaderStage::Amplification) {
+                        os << ind << "_dm_x = " << AsU32(inst.operands[0]) << ";\n";
+                        os << ind << "_dm_y = " << AsU32(inst.operands[1]) << ";\n";
+                        os << ind << "_dm_z = 1u;\n";
+                    } else if (!hoisted_mesh_counts_) {
                         os << ind << "_mesh_vcnt = " << AsU32(inst.operands[0]) << ";\n";
                         os << ind << "_mesh_pcnt = " << AsU32(inst.operands[1]) << ";\n";
                         os << ind << "SetMeshOutputCounts(_mesh_vcnt, _mesh_pcnt);\n";
@@ -1772,7 +2003,7 @@ private:
                     os << ind << "    uint _bfe_w = " << AsU32(inst.operands[2]) << " & "
                        << ((inst.imm_u32 != 0u) ? "0x7Fu" : "31u") << ";\n";
                     os << ind << "    bool _bfe_lt = (_bfe_o + _bfe_w) < 32u;\n";
-                    os << ind << "    uint _bfe_shl = _bfe_lt ? (32u - _bfe_o - _bfe_w) : 0u;\n";
+                    os << ind << "    uint _bfe_shl = (_bfe_lt && (_bfe_w > 0u)) ? (32u - _bfe_o - _bfe_w) : 0u;\n";
                     os << ind << "    uint _bfe_shr = (_bfe_lt && (_bfe_w > 0u)) ? (32u - _bfe_w) : 0u;\n";
                     os << ind << "    int _bfe_r = (_bfe_w == 0u) ? 0 : (_bfe_lt ? (asint(_bfe_s << _bfe_shl) >> _bfe_shr) : (asint(_bfe_s) >> _bfe_o));\n";
                     os << ind << "    _v" << inst.id << " = asuint(_bfe_r);\n";
@@ -1983,6 +2214,16 @@ private:
                     }
                     break;
                 case IrOp::Export: {
+                    if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Null) &&
+                        inst.imm_u32 == kIrKillExportMagicLifter &&
+                        ir_.stage == ShaderStage::Pixel) {
+                        if (inst.operands.empty()) {
+                            os << ind << "discard;\n";
+                        } else {
+                            os << ind << "if (" << AsBool(inst.operands[0]) << ") { discard; }\n";
+                        }
+                        break;
+                    }
                     const std::string vec = "float4(" + AsF32(inst.operands[0]) + ", " + AsF32(inst.operands[1]) +
                                             ", " + AsF32(inst.operands[2]) + ", " + AsF32(inst.operands[3]) + ")";
                     const char* mesh_idx = bounded_wave64_dispatcher_ ? "_w64_gtid" : "_gtid";
@@ -1996,14 +2237,32 @@ private:
                             os << ind << "_gs_out.pos = " << vec << ";\n";
                             os << ind << "_gs_stream.Append(_gs_out);\n";
                         }
-                    } else if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Param0)) {
+                    } else if (inst.export_target >= static_cast<uint8_t>(Rdna2ExportTarget::Param0) &&
+                               inst.export_target <= static_cast<uint8_t>(Rdna2ExportTarget::Param3)) {
+                        const uint32_t pslot = static_cast<uint32_t>(
+                            inst.export_target - static_cast<uint8_t>(Rdna2ExportTarget::Param0));
                         if (ir_.stage == ShaderStage::Vertex) {
-                            os << ind << "_out.param0 = " << vec << ";\n";
+                            os << ind << "_out.param" << pslot << " = " << vec << ";\n";
                         } else if (ir_.stage == ShaderStage::Mesh) {
                             os << ind << "if (" << mesh_idx << " < _mesh_vcnt) { _verts["
-                               << mesh_idx << "].param0 = " << vec << "; }\n";
+                               << mesh_idx << "].param" << pslot << " = " << vec << "; }\n";
                         } else if (ir_.stage == ShaderStage::Geometry) {
-                            os << ind << "_gs_out.param0 = " << vec << ";\n";
+                            os << ind << "_gs_out.param" << pslot << " = " << vec << ";\n";
+                        }
+                    } else if ((inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos2) ||
+                                inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos3)) &&
+                               cull_dist_count_ > 0u) {
+                        const char* field =
+                            (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos3))
+                                ? "cull_dist1"
+                                : "cull_dist0";
+                        if (ir_.stage == ShaderStage::Vertex) {
+                            os << ind << "_out." << field << " = " << vec << ";\n";
+                        } else if (ir_.stage == ShaderStage::Mesh) {
+                            os << ind << "if (" << mesh_idx << " < _mesh_vcnt) { _verts[" << mesh_idx
+                               << "]." << field << " = " << vec << "; }\n";
+                        } else if (ir_.stage == ShaderStage::Geometry) {
+                            os << ind << "_gs_out." << field << " = " << vec << ";\n";
                         }
                     } else if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Mrt0) &&
                                ir_.stage == ShaderStage::Pixel) {
@@ -2151,36 +2410,43 @@ private:
         const std::string i1 = Indent(base_depth + 1);
         const std::string i2 = Indent(base_depth + 2);
         const std::string i3 = Indent(base_depth + 3);
-        os << i0 << "uint _bb = 0u;\n";
-        os << i0 << "[loop] while (_bb != 0xFFFFFFFFu) {\n";
+        const std::string i4 = Indent(base_depth + 4);
+        os << i0 << "uint _cfg_state = 0u;\n";
+        os << i0 << "[loop] while (true) {\n";
+        os << i1 << "if (_cfg_state == 0xFFFFFFFFu) { break; }\n";
+        os << i1 << "switch (_cfg_state) {\n";
         for (size_t i = 0; i < ir_.blocks.size(); ++i) {
             const auto& bb = ir_.blocks[i];
-            os << i1 << (i == 0 ? "if" : "else if") << " (_bb == " << bb.id << "u) {\n";
-            EmitNonTerminators(os, bb, base_depth + 2);
+            os << i2 << "case " << bb.id << "u: {\n";
+            EmitNonTerminators(os, bb, base_depth + 3);
             if (!bb.instructions.empty()) {
                 const auto& term = bb.instructions.back();
                 if (term.op == IrOp::Return) {
-                    os << i2 << "_bb = 0xFFFFFFFFu;\n";
+                    os << i3 << "_cfg_state = 0xFFFFFFFFu;\n";
                 } else if (term.op == IrOp::Branch) {
-                    EmitPhiCopies(os, bb.id, term.true_block, base_depth + 2);
-                    os << i2 << "_bb = " << term.true_block << "u;\n";
-                } else if (term.op == IrOp::CondBranch) {
-                    os << i2 << "if (" << AsBool(term.operands[0]) << ") {\n";
                     EmitPhiCopies(os, bb.id, term.true_block, base_depth + 3);
-                    os << i3 << "_bb = " << term.true_block << "u;\n";
-                    os << i2 << "} else {\n";
-                    EmitPhiCopies(os, bb.id, term.false_block, base_depth + 3);
-                    os << i3 << "_bb = " << term.false_block << "u;\n";
-                    os << i2 << "}\n";
+                    os << i3 << "_cfg_state = " << term.true_block << "u;\n";
+                } else if (term.op == IrOp::CondBranch) {
+                    os << i3 << "if (" << AsBool(term.operands[0]) << ") {\n";
+                    EmitPhiCopies(os, bb.id, term.true_block, base_depth + 4);
+                    os << i4 << "_cfg_state = " << term.true_block << "u;\n";
+                    os << i3 << "} else {\n";
+                    EmitPhiCopies(os, bb.id, term.false_block, base_depth + 4);
+                    os << i4 << "_cfg_state = " << term.false_block << "u;\n";
+                    os << i3 << "}\n";
                 } else {
-                    os << i2 << "_bb = 0xFFFFFFFFu;\n";
+                    os << i3 << "_cfg_state = 0xFFFFFFFFu;\n";
                 }
             } else {
-                os << i2 << "_bb = 0xFFFFFFFFu;\n";
+                os << i3 << "_cfg_state = 0xFFFFFFFFu;\n";
             }
-            os << i1 << "}\n";
+            os << i3 << "break;\n";
+            os << i2 << "}\n";
         }
-        os << i1 << "else { _bb = 0xFFFFFFFFu; }\n";
+        os << i2 << "default:\n";
+        os << i3 << "_cfg_state = 0xFFFFFFFFu;\n";
+        os << i3 << "break;\n";
+        os << i1 << "}\n";
         os << i0 << "}\n";
     }
 
@@ -2188,13 +2454,14 @@ private:
     bool use_sm65_ = true;
     bool bounded_wave64_dispatcher_ = false;
     bool hoisted_mesh_counts_ = false;
+    uint32_t cull_dist_count_ = 0u;
     std::unordered_map<IrValueId, const IrInstruction*> defs_;
 };
 
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// SPIR-V 1.3 Binary Emitter (Strict Vulkan 1.1 / 1.2 spirv-val Compliance)
+// SPIR-V 1.3 / 1.4 / 1.6 Binary Emitter (Strict Vulkan 1.1 / 1.2 / 1.3 spirv-val Compliance)
 // ---------------------------------------------------------------------------
 Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     out_spirv.clear();
@@ -2203,14 +2470,19 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         return Status::Error(StatusCode::ShaderError, "Cannot emit SPIR-V from empty IR module");
     }
     if (ir.stage != ShaderStage::Compute && ir.stage != ShaderStage::Vertex &&
-        ir.stage != ShaderStage::Pixel && ir.stage != ShaderStage::Mesh) {
+        ir.stage != ShaderStage::Pixel && ir.stage != ShaderStage::Mesh &&
+        ir.stage != ShaderStage::Amplification) {
         CallTelemetry::Global().Record("rdna2_lifter", "EmitSpirv", CallOutcome::NotImplemented, -1);
         return Status::Error(StatusCode::UnsupportedFormat,
-                             "SPIR-V emitter supports Compute/Vertex/Pixel/Mesh (use DXC SM 6.5 for AS/GS)");
+                             "SPIR-V emitter supports Compute/Vertex/Pixel/Mesh/Amplification (use extended stage lifter for HS/DS/GS)");
     }
 
     const bool is_mesh_stage = (ir.stage == ShaderStage::Mesh);
-    const bool is_spirv14 = is_mesh_stage;
+    const bool is_task_stage = (ir.stage == ShaderStage::Amplification);
+    const bool is_mesh_or_task = is_mesh_stage || is_task_stage;
+    const bool is_spirv14 = is_mesh_or_task;  // SPIR-V 1.4+ (Mesh=1.4, Task=1.6) requires all globals in OpEntryPoint
+    const uint32_t cull_dist_count =
+        (ir.stage == ShaderStage::Vertex || is_mesh_stage) ? ModuleCullDistanceCount(ir) : 0u;
     uint32_t next_id = 1;
     auto alloc_id = [&]() -> uint32_t { return next_id++; };
 
@@ -2227,11 +2499,14 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
 
     // 1. Capabilities, Extensions, ExtInstImport, MemoryModel
     EmitSpvInst(sec_caps, SpvOpCapability, {1u});  // Shader
-    if (is_mesh_stage) {
+    if (is_mesh_or_task) {
         EmitSpvInst(sec_caps, SpvOpCapability, {kSpvCapMeshShadingEXT});
         std::vector<uint32_t> ext_ops;
         AppendSpvString(ext_ops, "SPV_EXT_mesh_shader");
         EmitSpvInst(sec_exts, SpvOpExtension, ext_ops);
+    }
+    if (cull_dist_count > 0u) {
+        EmitSpvInst(sec_caps, SpvOpCapability, {kSpvCapCullDistance});
     }
     const uint32_t glsl_ext_id = alloc_id();
     {
@@ -2349,6 +2624,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
             interface_vars.push_back(var_id);
         }
     };
+    bool emitted_sample_rate_cap = false;
     auto emit_interp_decor = [&](uint32_t var_id, Rdna2InterpMode mode) {
         if (var_id == 0u) return;
         if (mode == Rdna2InterpMode::Flat) {
@@ -2358,6 +2634,10 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         } else if (mode == Rdna2InterpMode::Centroid) {
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_id, kSpvDecCentroid});
         } else if (mode == Rdna2InterpMode::Sample) {
+            if (!emitted_sample_rate_cap) {
+                EmitSpvInst(sec_caps, SpvOpCapability, {35u});  // SampleRateShading
+                emitted_sample_rate_cap = true;
+            }
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_id, kSpvDecSample});
         }
     };
@@ -2367,23 +2647,47 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     uint32_t t_ptr_in_u32 = 0;
     uint32_t var_vid = 0;
     uint32_t var_pervertex = 0;
+    uint32_t t_ptr_out_f32 = 0;
     uint32_t t_ptr_out_v4f32 = 0;
     uint32_t t_ptr_out_v3u32 = 0;
     uint32_t t_ptr_out_bool = 0;
     uint32_t var_mesh_prims = 0;
     uint32_t var_mesh_cull = 0;
-    uint32_t var_param0_out = 0;
-    uint32_t var_param0_in = 0;
+    uint32_t var_task_payload = 0;
+    uint32_t t_ptr_tp_u32 = 0;
+    uint32_t t_ptr_fn_u32 = 0;
+    uint32_t var_dm_x = 0;
+    uint32_t var_dm_y = 0;
+    uint32_t var_dm_z = 0;
+    uint32_t var_param_out[4] = {0u, 0u, 0u, 0u};
+    uint32_t var_param_in[4] = {0u, 0u, 0u, 0u};
     uint32_t var_mrt0 = 0;
+    const uint32_t param_out_count = ModuleParamOutputCount(ir);
+    const uint32_t param_in_count = ModuleUsesStageInput(ir) ? std::max(1u, ModuleParamInputCount(ir)) : 0u;
 
     // Storage buffers (SPIR-V 1.3 core StorageBuffer + Block)
+    // Plus dedicated DescriptorSet 1 read-only CB heap bindings for non-zero CB offsets
+    // so they never collide with mixed-heap V# slot 0 (DescriptorSet 0, Binding 0).
     uint32_t var_uav0 = 0;
     uint32_t var_uav1 = 0;
     uint32_t t_ptr_sb_u32 = 0;
     const bool uses_uav0 = ir.uses_uav0 || (ir.uses_uav && !ir.uses_uav1);
     const bool uses_uav1 = ir.uses_uav1;
+    std::vector<uint32_t> spv_cb_heap_regs;
+    for (const auto& bb : ir.blocks) {
+        for (const auto& inst : bb.instructions) {
+            if (inst.op == IrOp::LoadUav && (inst.imm_u32 & kIrLoadCbHeapFlagLifter) != 0u) {
+                const uint32_t reg = inst.imm_u32 & 0xFFu;
+                if (std::find(spv_cb_heap_regs.begin(), spv_cb_heap_regs.end(), reg) == spv_cb_heap_regs.end()) {
+                    spv_cb_heap_regs.push_back(reg);
+                }
+            }
+        }
+    }
+    std::sort(spv_cb_heap_regs.begin(), spv_cb_heap_regs.end());
+    std::unordered_map<uint32_t, uint32_t> var_cb_heap;
 
-    if (uses_uav0 || uses_uav1) {
+    if (uses_uav0 || uses_uav1 || !spv_cb_heap_regs.empty()) {
         const uint32_t t_rta_u32 = alloc_id();
         const uint32_t t_uav_struct = alloc_id();
         const uint32_t t_ptr_sb_struct = alloc_id();
@@ -2411,6 +2715,15 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_uav1, kSpvDecDescriptorSet, 0u});
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_uav1, kSpvDecBinding, 1u});
             register_spv14_global(var_uav1);
+        }
+        for (uint32_t cb_reg : spv_cb_heap_regs) {
+            const uint32_t v_cb = alloc_id();
+            EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_sb_struct, v_cb, kSpvStorageStorageBuffer});
+            EmitSpvInst(sec_decor, SpvOpDecorate, {v_cb, kSpvDecDescriptorSet, 1u});
+            EmitSpvInst(sec_decor, SpvOpDecorate, {v_cb, kSpvDecBinding, cb_reg});
+            EmitSpvInst(sec_decor, SpvOpDecorate, {v_cb, kSpvDecNonWritable});
+            register_spv14_global(v_cb);
+            var_cb_heap[cb_reg] = v_cb;
         }
     }
 
@@ -2469,6 +2782,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_uc_img, var_tex0, kSpvStorageUniformConstant});
         EmitSpvInst(sec_decor, SpvOpDecorate, {var_tex0, kSpvDecDescriptorSet, 0u});
         EmitSpvInst(sec_decor, SpvOpDecorate, {var_tex0, kSpvDecBinding, 3u});
+        register_spv14_global(var_tex0);
 
         if (ir.uses_texture_sample) {
             t_sampler = alloc_id();
@@ -2481,6 +2795,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
             EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_uc_samp, var_samp0, kSpvStorageUniformConstant});
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_samp0, kSpvDecDescriptorSet, 0u});
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_samp0, kSpvDecBinding, 4u});
+            register_spv14_global(var_samp0);
         }
     }
 
@@ -2496,6 +2811,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_rwtex0, kSpvDecDescriptorSet, 0u});
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_rwtex0, kSpvDecBinding, 5u});
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_rwtex0, kSpvDecNonReadable});
+            register_spv14_global(var_rwtex0);
         }
         if (ir.uses_texture_load && !tex_srv_is_u32) {
             t_roimg2d = t_rwimg2d;
@@ -2504,6 +2820,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_img_ro, kSpvDecDescriptorSet, 0u});
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_img_ro, kSpvDecBinding, 6u});
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_img_ro, kSpvDecNonWritable});
+            register_spv14_global(var_img_ro);
         }
     }
     if (ir.uses_texture_load && tex_srv_is_u32) {
@@ -2516,6 +2833,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         EmitSpvInst(sec_decor, SpvOpDecorate, {var_img_ro, kSpvDecDescriptorSet, 0u});
         EmitSpvInst(sec_decor, SpvOpDecorate, {var_img_ro, kSpvDecBinding, 6u});
         EmitSpvInst(sec_decor, SpvOpDecorate, {var_img_ro, kSpvDecNonWritable});
+        register_spv14_global(var_img_ro);
     }
 
     if (ir.uses_texture3d_srv) {
@@ -2527,6 +2845,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_uc_img3d, var_tex3d, kSpvStorageUniformConstant});
         EmitSpvInst(sec_decor, SpvOpDecorate, {var_tex3d, kSpvDecDescriptorSet, 0u});
         EmitSpvInst(sec_decor, SpvOpDecorate, {var_tex3d, kSpvDecBinding, 7u});
+        register_spv14_global(var_tex3d);
     }
 
     if (ir.uses_texture_cube_srv) {
@@ -2539,6 +2858,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_uc_cube, var_texcube, kSpvStorageUniformConstant});
         EmitSpvInst(sec_decor, SpvOpDecorate, {var_texcube, kSpvDecDescriptorSet, 0u});
         EmitSpvInst(sec_decor, SpvOpDecorate, {var_texcube, kSpvDecBinding, 8u});
+        register_spv14_global(var_texcube);
     }
 
     if (ir.uses_texture_u32_uav) {
@@ -2555,6 +2875,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_uc_u32, var_rwimg_u32, kSpvStorageUniformConstant});
         EmitSpvInst(sec_decor, SpvOpDecorate, {var_rwimg_u32, kSpvDecDescriptorSet, 0u});
         EmitSpvInst(sec_decor, SpvOpDecorate, {var_rwimg_u32, kSpvDecBinding, 9u});
+        register_spv14_global(var_rwimg_u32);
     }
 
     // Thread-private scratch memory (Private storage class array, zero-initialized)
@@ -2585,7 +2906,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     const uint32_t lds_size_dwords = ir.lds_size_dwords ? ir.lds_size_dwords : 1024u;
     const uint32_t c_lds_len_val = ir.uses_lds ? get_const_u32(lds_size_dwords) : 0u;
     const uint32_t c_tg_stride_val =
-        (ir.uses_lds && ir.stage == ShaderStage::Compute)
+        (ir.uses_lds && (ir.stage == ShaderStage::Compute || is_task_stage || is_mesh_stage))
             ? get_const_u32(std::max(1u, ir.threadgroup_x * ir.threadgroup_y * ir.threadgroup_z))
             : 0u;
     const uint32_t c_lds_mask = get_const_u32(lds_size_dwords - 1u);
@@ -2649,11 +2970,6 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         }
     }
 
-    const Rdna2InterpMode out_interp0 =
-        !ir.output_interp_modes.empty() ? ir.output_interp_modes[0] : Rdna2InterpMode::Perspective;
-    const Rdna2InterpMode in_interp0 =
-        !ir.input_interp_modes.empty() ? ir.input_interp_modes[0] : Rdna2InterpMode::Perspective;
-
     if (ir.stage == ShaderStage::Vertex) {
         if (uses_tid) {
             const uint32_t t_ptr_in_i32 = alloc_id();
@@ -2664,10 +2980,21 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
             interface_vars.push_back(var_vid);
         }
         // Vulkan requires BuiltIn Position in a Block-decorated gl_PerVertex struct
+        // (optionally with member 1 BuiltIn CullDistance float[N] when Pos2/Pos3 is exported)
         const uint32_t t_pervertex = alloc_id();
         const uint32_t t_ptr_out_pv = alloc_id();
         t_ptr_out_v4f32 = alloc_id();
-        EmitSpvInst(sec_types, SpvOpTypeStruct, {t_pervertex, t_v4f32});
+        if (cull_dist_count > 0u) {
+            const uint32_t c_cull_len = get_const_u32(cull_dist_count);
+            const uint32_t t_arr_cull = alloc_id();
+            t_ptr_out_f32 = alloc_id();
+            EmitSpvInst(sec_types, SpvOpTypeArray, {t_arr_cull, t_f32, c_cull_len});
+            EmitSpvInst(sec_types, SpvOpTypeStruct, {t_pervertex, t_v4f32, t_arr_cull});
+            EmitSpvInst(sec_decor, SpvOpMemberDecorate, {t_pervertex, 1u, kSpvDecBuiltIn, kSpvBuiltInCullDistance});
+            EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_out_f32, kSpvStorageOutput, t_f32});
+        } else {
+            EmitSpvInst(sec_types, SpvOpTypeStruct, {t_pervertex, t_v4f32});
+        }
         EmitSpvInst(sec_decor, SpvOpDecorate, {t_pervertex, kSpvDecBlock});
         EmitSpvInst(sec_decor, SpvOpMemberDecorate, {t_pervertex, 0u, kSpvDecBuiltIn, kSpvBuiltInPosition});
         EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_out_pv, kSpvStorageOutput, t_pervertex});
@@ -2676,12 +3003,12 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_out_pv, var_pervertex, kSpvStorageOutput});
         interface_vars.push_back(var_pervertex);
 
-        if (ir.exports_param0) {
-            var_param0_out = alloc_id();
-            EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_out_v4f32, var_param0_out, kSpvStorageOutput});
-            EmitSpvInst(sec_decor, SpvOpDecorate, {var_param0_out, kSpvDecLocation, 0u});
-            emit_interp_decor(var_param0_out, out_interp0);
-            interface_vars.push_back(var_param0_out);
+        for (uint32_t p = 0u; p < param_out_count; ++p) {
+            var_param_out[p] = alloc_id();
+            EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_out_v4f32, var_param_out[p], kSpvStorageOutput});
+            EmitSpvInst(sec_decor, SpvOpDecorate, {var_param_out[p], kSpvDecLocation, p});
+            emit_interp_decor(var_param_out[p], SafeInterpMode(ir.output_interp_modes, p));
+            interface_vars.push_back(var_param_out[p]);
         }
     }
 
@@ -2707,12 +3034,22 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
             interface_vars.push_back(var_wg_id);
         }
 
-        // Per-vertex gl_MeshVerticesEXT[] (Block-decorated struct with BuiltIn Position)
+        // Per-vertex gl_MeshVerticesEXT[] (Block-decorated struct with BuiltIn Position + optional CullDistance)
         const uint32_t t_pervertex = alloc_id();
         const uint32_t t_arr_pv = alloc_id();
         const uint32_t t_ptr_out_pv_arr = alloc_id();
         t_ptr_out_v4f32 = alloc_id();
-        EmitSpvInst(sec_types, SpvOpTypeStruct, {t_pervertex, t_v4f32});
+        if (cull_dist_count > 0u) {
+            const uint32_t c_cull_len = get_const_u32(cull_dist_count);
+            const uint32_t t_arr_cull = alloc_id();
+            t_ptr_out_f32 = alloc_id();
+            EmitSpvInst(sec_types, SpvOpTypeArray, {t_arr_cull, t_f32, c_cull_len});
+            EmitSpvInst(sec_types, SpvOpTypeStruct, {t_pervertex, t_v4f32, t_arr_cull});
+            EmitSpvInst(sec_decor, SpvOpMemberDecorate, {t_pervertex, 1u, kSpvDecBuiltIn, kSpvBuiltInCullDistance});
+            EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_out_f32, kSpvStorageOutput, t_f32});
+        } else {
+            EmitSpvInst(sec_types, SpvOpTypeStruct, {t_pervertex, t_v4f32});
+        }
         EmitSpvInst(sec_decor, SpvOpDecorate, {t_pervertex, kSpvDecBlock});
         EmitSpvInst(sec_decor, SpvOpMemberDecorate, {t_pervertex, 0u, kSpvDecBuiltIn, kSpvBuiltInPosition});
         EmitSpvInst(sec_types, SpvOpTypeArray, {t_arr_pv, t_pervertex, c_max_v});
@@ -2722,16 +3059,18 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_out_pv_arr, var_pervertex, kSpvStorageOutput});
         interface_vars.push_back(var_pervertex);
 
-        if (ir.exports_param0) {
+        if (param_out_count > 0u) {
             const uint32_t t_arr_v4 = alloc_id();
             const uint32_t t_ptr_out_arr_v4 = alloc_id();
             EmitSpvInst(sec_types, SpvOpTypeArray, {t_arr_v4, t_v4f32, c_max_v});
             EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_out_arr_v4, kSpvStorageOutput, t_arr_v4});
-            var_param0_out = alloc_id();
-            EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_out_arr_v4, var_param0_out, kSpvStorageOutput});
-            EmitSpvInst(sec_decor, SpvOpDecorate, {var_param0_out, kSpvDecLocation, 0u});
-            emit_interp_decor(var_param0_out, out_interp0);
-            interface_vars.push_back(var_param0_out);
+            for (uint32_t p = 0u; p < param_out_count; ++p) {
+                var_param_out[p] = alloc_id();
+                EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_out_arr_v4, var_param_out[p], kSpvStorageOutput});
+                EmitSpvInst(sec_decor, SpvOpDecorate, {var_param_out[p], kSpvDecLocation, p});
+                emit_interp_decor(var_param_out[p], SafeInterpMode(ir.output_interp_modes, p));
+                interface_vars.push_back(var_param_out[p]);
+            }
         }
 
         // Primitive triangle indices output array
@@ -2765,15 +3104,54 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         }
     }
 
+    if (is_task_stage) {
+        t_ptr_in_u32 = alloc_id();
+        EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_in_u32, kSpvStorageInput, t_u32});
+        var_local_idx = alloc_id();
+        EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_in_u32, var_local_idx, kSpvStorageInput});
+        EmitSpvInst(sec_decor, SpvOpDecorate, {var_local_idx, kSpvDecBuiltIn, kSpvBuiltInLocalInvocationIndex});
+        interface_vars.push_back(var_local_idx);
+
+        if (ir.uses_mesh_global_tid) {
+            const uint32_t t_ptr_in_v3u32 = alloc_id();
+            EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_in_v3u32, kSpvStorageInput, t_v3u32});
+            var_wg_id = alloc_id();
+            EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_in_v3u32, var_wg_id, kSpvStorageInput});
+            EmitSpvInst(sec_decor, SpvOpDecorate, {var_wg_id, kSpvDecBuiltIn, kSpvBuiltInWorkgroupId});
+            interface_vars.push_back(var_wg_id);
+        }
+
+        // Workgroup task payload in TaskPayloadWorkgroupEXT storage class:
+        //   struct TaskPayload { uint data[4]; uint dispatch_x; uint dispatch_y; uint dispatch_z; };
+        const uint32_t c_u32_4 = get_const_u32(4u);
+        const uint32_t t_tp_arr = alloc_id();
+        const uint32_t t_tp_struct = alloc_id();
+        const uint32_t t_ptr_tp_struct = alloc_id();
+        t_ptr_tp_u32 = alloc_id();
+        EmitSpvInst(sec_types, SpvOpTypeArray, {t_tp_arr, t_u32, c_u32_4});
+        EmitSpvInst(sec_types, SpvOpTypeStruct, {t_tp_struct, t_tp_arr, t_u32, t_u32, t_u32});
+        EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_tp_struct, kSpvStorageTaskPayloadWorkgroupEXT, t_tp_struct});
+        EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_tp_u32, kSpvStorageTaskPayloadWorkgroupEXT, t_u32});
+        var_task_payload = alloc_id();
+        EmitSpvInst(sec_globals, SpvOpVariable,
+                    {t_ptr_tp_struct, var_task_payload, kSpvStorageTaskPayloadWorkgroupEXT});
+        interface_vars.push_back(var_task_payload);
+
+        t_ptr_fn_u32 = alloc_id();
+        EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_fn_u32, kSpvStorageFunction, t_u32});
+    }
+
     if (ir.stage == ShaderStage::Pixel) {
-        if (uses_stage_in) {
+        if (uses_stage_in && param_in_count > 0u) {
             const uint32_t t_ptr_in_v4f32 = alloc_id();
             EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_in_v4f32, kSpvStorageInput, t_v4f32});
-            var_param0_in = alloc_id();
-            EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_in_v4f32, var_param0_in, kSpvStorageInput});
-            EmitSpvInst(sec_decor, SpvOpDecorate, {var_param0_in, kSpvDecLocation, 0u});
-            emit_interp_decor(var_param0_in, in_interp0);
-            interface_vars.push_back(var_param0_in);
+            for (uint32_t p = 0u; p < param_in_count; ++p) {
+                var_param_in[p] = alloc_id();
+                EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_in_v4f32, var_param_in[p], kSpvStorageInput});
+                EmitSpvInst(sec_decor, SpvOpDecorate, {var_param_in[p], kSpvDecLocation, p});
+                emit_interp_decor(var_param_in[p], SafeInterpMode(ir.input_interp_modes, p));
+                interface_vars.push_back(var_param_in[p]);
+            }
         }
         t_ptr_out_v4f32 = alloc_id();
         EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_out_v4f32, kSpvStorageOutput, t_v4f32});
@@ -2790,6 +3168,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         if (ir.stage == ShaderStage::Vertex) exec_model = 0u;
         else if (ir.stage == ShaderStage::Pixel) exec_model = 4u;
         else if (ir.stage == ShaderStage::Mesh) exec_model = kSpvExecModelMeshEXT;
+        else if (ir.stage == ShaderStage::Amplification) exec_model = kSpvExecModelTaskEXT;
 
         std::vector<uint32_t> ops = {exec_model, main_fn_id};
         AppendSpvString(ops, "main");
@@ -2798,26 +3177,52 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
 
         if (ir.stage == ShaderStage::Compute) {
             EmitSpvInst(sec_exec, SpvOpExecutionMode,
-                        {main_fn_id, 17u, ir.threadgroup_x, ir.threadgroup_y, ir.threadgroup_z});
+                        {main_fn_id, 17u,
+                         std::max(1u, ir.threadgroup_x),
+                         std::max(1u, ir.threadgroup_y),
+                         std::max(1u, ir.threadgroup_z)});
         } else if (ir.stage == ShaderStage::Pixel) {
             EmitSpvInst(sec_exec, SpvOpExecutionMode, {main_fn_id, 7u});  // OriginUpperLeft
         } else if (ir.stage == ShaderStage::Mesh) {
             const uint32_t max_v = ir.mesh_max_vertices ? ir.mesh_max_vertices : 64u;
             const uint32_t max_p = ir.mesh_max_primitives ? ir.mesh_max_primitives : 64u;
             EmitSpvInst(sec_exec, SpvOpExecutionMode,
-                        {main_fn_id, 17u, ir.threadgroup_x, ir.threadgroup_y, ir.threadgroup_z});
+                        {main_fn_id, 17u,
+                         std::max(1u, ir.threadgroup_x),
+                         std::max(1u, ir.threadgroup_y),
+                         std::max(1u, ir.threadgroup_z)});
             EmitSpvInst(sec_exec, SpvOpExecutionMode, {main_fn_id, kSpvExecModeOutputVertices, max_v});
             EmitSpvInst(sec_exec, SpvOpExecutionMode, {main_fn_id, kSpvExecModeOutputPrimitivesEXT, max_p});
             EmitSpvInst(sec_exec, SpvOpExecutionMode, {main_fn_id, kSpvExecModeOutputTrianglesEXT});
+        } else if (ir.stage == ShaderStage::Amplification) {
+            EmitSpvInst(sec_exec, SpvOpExecutionMode,
+                        {main_fn_id, 17u,
+                         std::max(1u, ir.threadgroup_x),
+                         std::max(1u, ir.threadgroup_y),
+                         std::max(1u, ir.threadgroup_z)});
         }
     }
 
-    // 5. Block labels, immediate post-dominators (for OpSelectionMerge), and value IDs
+    // 5. Block labels, CFG cycle/irreducibility analysis, immediate post-dominators, and value IDs
+    Rdna2CfgAnalysis spv_cfg{};
+    AnalyzeRdna2Cfg(ir, spv_cfg);
+    bool has_backward_block_edge = false;
+    for (size_t b = 0; b < ir.blocks.size() && !has_backward_block_edge; ++b) {
+        for (uint32_t s : ir.blocks[b].successors) {
+            if (s <= b) {
+                has_backward_block_edge = true;
+                break;
+            }
+        }
+    }
+    const bool use_spv_state_machine =
+        (spv_cfg.has_cycles || spv_cfg.is_irreducible || has_backward_block_edge);
+
     const std::vector<uint32_t> ipdom = ComputeImmediatePostDominators(ir);
     const bool has_cond_branch = ModuleHasCondBranch(ir);
     const uint32_t exit_node = static_cast<uint32_t>(ir.blocks.size());
-    bool need_epilogue = false;
-    if (has_cond_branch) {
+    bool need_epilogue = is_task_stage;
+    if (!use_spv_state_machine && has_cond_branch) {
         for (size_t b = 0; b < ir.blocks.size(); ++b) {
             const auto& ins = ir.blocks[b].instructions;
             if (!ins.empty() && ins.back().op == IrOp::CondBranch && ipdom[b] == exit_node) {
@@ -2833,12 +3238,42 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     }
     const uint32_t epilogue_label = need_epilogue ? alloc_id() : 0u;
 
+    uint32_t t_ptr_fn_f32 = 0u;
+    uint32_t t_ptr_fn_bool = 0u;
+    uint32_t var_cfg_state = 0u;
+    uint32_t lbl_sm_hdr = 0u;
+    uint32_t lbl_sm_dispatch = 0u;
+    uint32_t lbl_sm_default = 0u;
+    uint32_t lbl_sm_sw_merge = 0u;
+    uint32_t lbl_sm_cont = 0u;
+    uint32_t lbl_sm_exit = 0u;
+    std::unordered_map<IrValueId, uint32_t> val_fn_var;
+
+    if (use_spv_state_machine) {
+        if (t_ptr_fn_u32 == 0u) {
+            t_ptr_fn_u32 = alloc_id();
+            EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_fn_u32, kSpvStorageFunction, t_u32});
+        }
+        t_ptr_fn_f32 = alloc_id();
+        t_ptr_fn_bool = alloc_id();
+        EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_fn_f32, kSpvStorageFunction, t_f32});
+        EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_fn_bool, kSpvStorageFunction, t_bool});
+        lbl_sm_hdr = alloc_id();
+        lbl_sm_dispatch = alloc_id();
+        lbl_sm_default = alloc_id();
+        lbl_sm_sw_merge = alloc_id();
+        lbl_sm_cont = alloc_id();
+        lbl_sm_exit = alloc_id();
+    }
+
     std::unordered_map<IrValueId, uint32_t> val_spv_id;
     std::unordered_map<IrValueId, SpvValKind> val_kind;
+    std::vector<std::pair<IrValueId, SpvValKind>> sm_fn_var_order;
     for (const auto& bb : ir.blocks) {
         for (const auto& inst : bb.instructions) {
             if (inst.id == kInvalidIrValue) continue;
-            val_kind[inst.id] = CanonicalSpvKind(inst.type);
+            const SpvValKind k = CanonicalSpvKind(inst.type);
+            val_kind[inst.id] = k;
             if (inst.op == IrOp::ConstU32) {
                 if (inst.type == IrType::Bool) {
                     val_spv_id[inst.id] = get_const_bool(inst.imm_u32 != 0u);
@@ -2847,6 +3282,11 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                 }
             } else if (inst.op == IrOp::ConstF32) {
                 val_spv_id[inst.id] = get_const_f32(inst.imm_f32);
+            } else if (use_spv_state_machine) {
+                const uint32_t v_id = alloc_id();
+                val_fn_var[inst.id] = v_id;
+                val_spv_id[inst.id] = v_id;
+                sm_fn_var_order.emplace_back(inst.id, k);
             } else {
                 val_spv_id[inst.id] = alloc_id();
             }
@@ -2859,8 +3299,20 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         return t_u32;
     };
 
+    auto get_raw_val = [&](IrValueId v) -> uint32_t {
+        if (use_spv_state_machine) {
+            auto it = val_fn_var.find(v);
+            if (it != val_fn_var.end()) {
+                const uint32_t loaded = alloc_id();
+                EmitSpvInst(sec_fn, SpvOpLoad, {spv_type_for_kind(val_kind[v]), loaded, it->second});
+                return loaded;
+            }
+        }
+        return val_spv_id[v];
+    };
+
     auto get_as_u32 = [&](IrValueId v) -> uint32_t {
-        const uint32_t id = val_spv_id[v];
+        const uint32_t id = get_raw_val(v);
         const SpvValKind k = val_kind[v];
         if (k == SpvValKind::U32) return id;
         if (k == SpvValKind::F32) {
@@ -2881,7 +3333,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     };
 
     auto get_as_f32 = [&](IrValueId v) -> uint32_t {
-        const uint32_t id = val_spv_id[v];
+        const uint32_t id = get_raw_val(v);
         const SpvValKind k = val_kind[v];
         if (k == SpvValKind::F32) return id;
         uint32_t u = get_as_u32(v);
@@ -2891,13 +3343,54 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     };
 
     auto get_as_bool = [&](IrValueId v) -> uint32_t {
-        const uint32_t id = val_spv_id[v];
+        const uint32_t id = get_raw_val(v);
         const SpvValKind k = val_kind[v];
         if (k == SpvValKind::Bool) return id;
         uint32_t u = get_as_u32(v);
         uint32_t cmp_id = alloc_id();
         EmitSpvInst(sec_fn, SpvOpINotEqual, {t_bool, cmp_id, u, c_u32_0});
         return cmp_id;
+    };
+
+    auto emit_sm_fn_vars = [&]() {
+        if (!use_spv_state_machine) return;
+        var_cfg_state = alloc_id();
+        EmitSpvInst(sec_fn, SpvOpVariable, {t_ptr_fn_u32, var_cfg_state, kSpvStorageFunction, c_u32_0});
+        for (const auto& entry : sm_fn_var_order) {
+            const uint32_t v_id = val_fn_var[entry.first];
+            if (entry.second == SpvValKind::F32) {
+                EmitSpvInst(sec_fn, SpvOpVariable, {t_ptr_fn_f32, v_id, kSpvStorageFunction, c_f32_0});
+            } else if (entry.second == SpvValKind::Bool) {
+                EmitSpvInst(sec_fn, SpvOpVariable,
+                            {t_ptr_fn_bool, v_id, kSpvStorageFunction, get_const_bool(false)});
+            } else {
+                EmitSpvInst(sec_fn, SpvOpVariable, {t_ptr_fn_u32, v_id, kSpvStorageFunction, c_u32_0});
+            }
+        }
+    };
+
+    auto emit_sm_phi_copies = [&](uint32_t from_bb, uint32_t to_bb) {
+        if (!use_spv_state_machine || to_bb >= ir.blocks.size()) return;
+        std::vector<std::pair<uint32_t, uint32_t>> staged;  // (dst_fn_var, loaded_val)
+        for (const auto& inst : ir.blocks[to_bb].instructions) {
+            if (inst.op != IrOp::Phi) continue;
+            auto it_dst = val_fn_var.find(inst.id);
+            if (it_dst == val_fn_var.end()) continue;
+            for (const auto& inc : inst.phi_incoming) {
+                if (inc.first == from_bb) {
+                    const SpvValKind k = CanonicalSpvKind(inst.type);
+                    uint32_t v_val = (k == SpvValKind::F32)
+                                         ? get_as_f32(inc.second)
+                                         : (k == SpvValKind::Bool ? get_as_bool(inc.second)
+                                                                  : get_as_u32(inc.second));
+                    staged.emplace_back(it_dst->second, v_val);
+                    break;
+                }
+            }
+        }
+        for (const auto& s : staged) {
+            EmitSpvInst(sec_fn, SpvOpStore, {s.first, s.second});
+        }
     };
 
     auto emit_wg_barrier = [&]() {
@@ -2935,17 +3428,19 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     std::unordered_map<uint64_t, uint32_t> phi_edge_override;
     std::vector<std::vector<PhiEdgeFixup>> block_exit_fixups(ir.blocks.size());
 
-    for (const auto& bb : ir.blocks) {
-        for (const auto& inst : bb.instructions) {
-            if (inst.op != IrOp::Phi) continue;
-            const SpvValKind expected = CanonicalSpvKind(inst.type);
-            for (const auto& inc : inst.phi_incoming) {
-                const uint32_t pred = inc.first;
-                const IrValueId v = inc.second;
-                if (val_kind[v] != expected && pred < ir.blocks.size()) {
-                    const uint32_t coerced = alloc_id();
-                    block_exit_fixups[pred].push_back({inst.id, expected, v, coerced});
-                    phi_edge_override[(static_cast<uint64_t>(inst.id) << 32) | pred] = coerced;
+    if (!use_spv_state_machine) {
+        for (const auto& bb : ir.blocks) {
+            for (const auto& inst : bb.instructions) {
+                if (inst.op != IrOp::Phi) continue;
+                const SpvValKind expected = CanonicalSpvKind(inst.type);
+                for (const auto& inc : inst.phi_incoming) {
+                    const uint32_t pred = inc.first;
+                    const IrValueId v = inc.second;
+                    if (val_kind[v] != expected && pred < ir.blocks.size()) {
+                        const uint32_t coerced = alloc_id();
+                        block_exit_fixups[pred].push_back({inst.id, expected, v, coerced});
+                        phi_edge_override[(static_cast<uint64_t>(inst.id) << 32) | pred] = coerced;
+                    }
                 }
             }
         }
@@ -2953,9 +3448,89 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
 
     // 6. Emit Function Body
     EmitSpvInst(sec_fn, SpvOpFunction, {t_void, main_fn_id, 0u, t_fn_void});
+    const uint32_t first_body_target = use_spv_state_machine ? lbl_sm_hdr : bb_labels[0];
+
+    // TaskEXT entry preamble: declare Function-scope variables first, then zero-init TaskPayload + LDS.
+    if (is_task_stage) {
+        const uint32_t lbl_task_entry = alloc_id();
+        const uint32_t lbl_tp_zero = alloc_id();
+        const uint32_t lbl_tp_done = alloc_id();
+
+        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_task_entry});
+        var_dm_x = alloc_id();
+        var_dm_y = alloc_id();
+        var_dm_z = alloc_id();
+        EmitSpvInst(sec_fn, SpvOpVariable, {t_ptr_fn_u32, var_dm_x, kSpvStorageFunction, c_u32_1});
+        EmitSpvInst(sec_fn, SpvOpVariable, {t_ptr_fn_u32, var_dm_y, kSpvStorageFunction, c_u32_1});
+        EmitSpvInst(sec_fn, SpvOpVariable, {t_ptr_fn_u32, var_dm_z, kSpvStorageFunction, c_u32_1});
+        emit_sm_fn_vars();
+
+        const uint32_t init_lidx = alloc_id();
+        const uint32_t is_l0 = alloc_id();
+        EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, init_lidx, var_local_idx});
+        EmitSpvInst(sec_fn, SpvOpIEqual, {t_bool, is_l0, init_lidx, c_u32_0});
+        EmitSpvInst(sec_fn, SpvOpSelectionMerge, {lbl_tp_done, 0u});
+        EmitSpvInst(sec_fn, SpvOpBranchConditional, {is_l0, lbl_tp_zero, lbl_tp_done});
+
+        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_tp_zero});
+        for (uint32_t k = 0u; k < 4u; ++k) {
+            const uint32_t p_d = alloc_id();
+            EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_tp_u32, p_d, var_task_payload, c_i32_0, get_const_u32(k)});
+            EmitSpvInst(sec_fn, SpvOpStore, {p_d, c_u32_0});
+        }
+        {
+            const uint32_t p_dx = alloc_id();
+            const uint32_t p_dy = alloc_id();
+            const uint32_t p_dz = alloc_id();
+            EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_tp_u32, p_dx, var_task_payload, get_const_i32(1)});
+            EmitSpvInst(sec_fn, SpvOpStore, {p_dx, c_u32_1});
+            EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_tp_u32, p_dy, var_task_payload, get_const_i32(2)});
+            EmitSpvInst(sec_fn, SpvOpStore, {p_dy, c_u32_1});
+            EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_tp_u32, p_dz, var_task_payload, get_const_i32(3)});
+            EmitSpvInst(sec_fn, SpvOpStore, {p_dz, c_u32_1});
+        }
+        EmitSpvInst(sec_fn, SpvOpBranch, {lbl_tp_done});
+
+        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_tp_done});
+        if (ir.uses_lds && var_lds != 0u) {
+            const uint32_t lbl_loop_hdr = alloc_id();
+            const uint32_t lbl_loop_body = alloc_id();
+            const uint32_t lbl_loop_cont = alloc_id();
+            const uint32_t lbl_loop_merge = alloc_id();
+
+            const uint32_t phi_idx = alloc_id();
+            const uint32_t next_idx = alloc_id();
+            const uint32_t cmp_lt = alloc_id();
+            const uint32_t lds_ptr = alloc_id();
+
+            EmitSpvInst(sec_fn, SpvOpBranch, {lbl_loop_hdr});
+
+            EmitSpvInst(sec_fn, SpvOpLabel, {lbl_loop_hdr});
+            EmitSpvInst(sec_fn, SpvOpPhi, {t_u32, phi_idx, init_lidx, lbl_tp_done, next_idx, lbl_loop_cont});
+            EmitSpvInst(sec_fn, SpvOpULessThan, {t_bool, cmp_lt, phi_idx, c_lds_len_val});
+            EmitSpvInst(sec_fn, SpvOpLoopMerge, {lbl_loop_merge, lbl_loop_cont, 0u});
+            EmitSpvInst(sec_fn, SpvOpBranchConditional, {cmp_lt, lbl_loop_body, lbl_loop_merge});
+
+            EmitSpvInst(sec_fn, SpvOpLabel, {lbl_loop_body});
+            EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_wg_u32, lds_ptr, var_lds, phi_idx});
+            EmitSpvInst(sec_fn, SpvOpStore, {lds_ptr, c_u32_0});
+            EmitSpvInst(sec_fn, SpvOpBranch, {lbl_loop_cont});
+
+            EmitSpvInst(sec_fn, SpvOpLabel, {lbl_loop_cont});
+            EmitSpvInst(sec_fn, SpvOpIAdd, {t_u32, next_idx, phi_idx, c_tg_stride_val});
+            EmitSpvInst(sec_fn, SpvOpBranch, {lbl_loop_hdr});
+
+            EmitSpvInst(sec_fn, SpvOpLabel, {lbl_loop_merge});
+        }
+        emit_wg_barrier();
+        EmitSpvInst(sec_fn, SpvOpBranch, {first_body_target});
+    }
 
     // Cooperative Workgroup LDS zero-initialization loop at shader entry followed by OpControlBarrier
-    if (ir.uses_lds && ir.stage == ShaderStage::Compute && var_lds != 0u && var_local_idx != 0u) {
+    const bool has_compute_lds_entry =
+        (ir.uses_lds && (ir.stage == ShaderStage::Compute || is_mesh_stage) &&
+         var_lds != 0u && var_local_idx != 0u);
+    if (has_compute_lds_entry) {
         const uint32_t lbl_init_entry = alloc_id();
         const uint32_t lbl_loop_hdr = alloc_id();
         const uint32_t lbl_loop_body = alloc_id();
@@ -2969,6 +3544,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         const uint32_t lds_ptr = alloc_id();
 
         EmitSpvInst(sec_fn, SpvOpLabel, {lbl_init_entry});
+        emit_sm_fn_vars();
         EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, init_gtid, var_local_idx});
         EmitSpvInst(sec_fn, SpvOpBranch, {lbl_loop_hdr});
 
@@ -2989,26 +3565,54 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
 
         EmitSpvInst(sec_fn, SpvOpLabel, {lbl_loop_merge});
         emit_wg_barrier();
-        EmitSpvInst(sec_fn, SpvOpBranch, {bb_labels[0]});
+        EmitSpvInst(sec_fn, SpvOpBranch, {first_body_target});
+    } else if (use_spv_state_machine && !is_task_stage) {
+        // Standalone entry block holding all Function-storage OpVariables for state-machine CFG
+        const uint32_t lbl_sm_entry = alloc_id();
+        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_sm_entry});
+        emit_sm_fn_vars();
+        EmitSpvInst(sec_fn, SpvOpBranch, {lbl_sm_hdr});
+    }
+
+    if (use_spv_state_machine) {
+        // Structured state-machine loop header + OpSwitch dispatch (handles reducible & irreducible CFGs)
+        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_sm_hdr});
+        const uint32_t cur_state = alloc_id();
+        const uint32_t is_done = alloc_id();
+        EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, cur_state, var_cfg_state});
+        EmitSpvInst(sec_fn, SpvOpIEqual, {t_bool, is_done, cur_state, c_u32_allones});
+        EmitSpvInst(sec_fn, SpvOpLoopMerge, {lbl_sm_exit, lbl_sm_cont, 0u});
+        EmitSpvInst(sec_fn, SpvOpBranchConditional, {is_done, lbl_sm_exit, lbl_sm_dispatch});
+
+        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_sm_dispatch});
+        EmitSpvInst(sec_fn, SpvOpSelectionMerge, {lbl_sm_sw_merge, 0u});
+        std::vector<uint32_t> sw_ops = {cur_state, lbl_sm_default};
+        for (size_t bi = 0u; bi < ir.blocks.size(); ++bi) {
+            sw_ops.push_back(static_cast<uint32_t>(bi));
+            sw_ops.push_back(bb_labels[bi]);
+        }
+        EmitSpvInst(sec_fn, SpvOpSwitch, sw_ops);
     }
 
     for (size_t bi = 0; bi < ir.blocks.size(); ++bi) {
         const auto& bb = ir.blocks[bi];
         EmitSpvInst(sec_fn, SpvOpLabel, {bb_labels[bi]});
 
-        // OpPhi strictly first after OpLabel
-        for (const auto& inst : bb.instructions) {
-            if (inst.op != IrOp::Phi) continue;
-            const uint32_t res_type = spv_type_for_kind(CanonicalSpvKind(inst.type));
-            std::vector<uint32_t> ops = {res_type, val_spv_id[inst.id]};
-            for (const auto& inc : inst.phi_incoming) {
-                const uint64_t key = (static_cast<uint64_t>(inst.id) << 32) | inc.first;
-                auto ov = phi_edge_override.find(key);
-                const uint32_t v_id = (ov != phi_edge_override.end()) ? ov->second : val_spv_id[inc.second];
-                ops.push_back(v_id);
-                ops.push_back(bb_labels[inc.first]);
+        // OpPhi strictly first after OpLabel (DAG mode only; SM mode writes Phi vars on incoming edges)
+        if (!use_spv_state_machine) {
+            for (const auto& inst : bb.instructions) {
+                if (inst.op != IrOp::Phi) continue;
+                const uint32_t res_type = spv_type_for_kind(CanonicalSpvKind(inst.type));
+                std::vector<uint32_t> ops = {res_type, val_spv_id[inst.id]};
+                for (const auto& inc : inst.phi_incoming) {
+                    const uint64_t key = (static_cast<uint64_t>(inst.id) << 32) | inc.first;
+                    auto ov = phi_edge_override.find(key);
+                    const uint32_t v_id = (ov != phi_edge_override.end()) ? ov->second : val_spv_id[inc.second];
+                    ops.push_back(v_id);
+                    ops.push_back(bb_labels[inc.first]);
+                }
+                EmitSpvInst(sec_fn, SpvOpPhi, ops);
             }
-            EmitSpvInst(sec_fn, SpvOpPhi, ops);
         }
 
         // Per-block cache for consecutive BvhIntersectRay component extracts
@@ -3021,7 +3625,9 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                 inst.op == IrOp::Branch || inst.op == IrOp::CondBranch || inst.op == IrOp::Return) {
                 continue;
             }
-            const uint32_t res = (inst.id != kInvalidIrValue) ? val_spv_id[inst.id] : 0u;
+            const uint32_t res = (inst.id != kInvalidIrValue)
+                                     ? (use_spv_state_machine ? alloc_id() : val_spv_id[inst.id])
+                                     : 0u;
 
             switch (inst.op) {
                 case IrOp::ThreadIdX:
@@ -3033,7 +3639,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                         uint32_t vid_i32 = alloc_id();
                         EmitSpvInst(sec_fn, SpvOpLoad, {t_i32, vid_i32, var_vid});
                         EmitSpvInst(sec_fn, SpvOpBitcast, {t_u32, res, vid_i32});
-                    } else if (ir.stage == ShaderStage::Mesh) {
+                    } else if (ir.stage == ShaderStage::Mesh || ir.stage == ShaderStage::Amplification) {
                         EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, res, var_local_idx});
                     }
                     break;
@@ -3062,8 +3668,10 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     break;
                 }
                 case IrOp::StageInput: {
+                    const uint32_t pslot = (inst.imm_u32 >> 2) & 3u;
+                    const uint32_t vin = (var_param_in[pslot] != 0u) ? var_param_in[pslot] : var_param_in[0];
                     uint32_t v4 = alloc_id();
-                    EmitSpvInst(sec_fn, SpvOpLoad, {t_v4f32, v4, var_param0_in});
+                    EmitSpvInst(sec_fn, SpvOpLoad, {t_v4f32, v4, vin});
                     EmitSpvInst(sec_fn, SpvOpCompositeExtract, {t_f32, res, v4, inst.imm_u32 & 3u});
                     break;
                 }
@@ -3075,7 +3683,13 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     break;
                 }
                 case IrOp::LoadUav: {
-                    const uint32_t var_buf = (inst.imm_u32 == 1u && var_uav1 != 0u) ? var_uav1 : var_uav0;
+                    uint32_t var_buf = (inst.imm_u32 == 1u && var_uav1 != 0u) ? var_uav1 : var_uav0;
+                    if ((inst.imm_u32 & kIrLoadCbHeapFlagLifter) != 0u) {
+                        auto cb_it = var_cb_heap.find(inst.imm_u32 & 0xFFu);
+                        if (cb_it != var_cb_heap.end()) {
+                            var_buf = cb_it->second;
+                        }
+                    }
                     uint32_t byte_off = get_as_u32(inst.operands[0]);
                     uint32_t dword_idx = alloc_id();
                     EmitSpvInst(sec_fn, SpvOpShiftRightLogical, {t_u32, dword_idx, byte_off, c_u32_2});
@@ -3439,7 +4053,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                 }
                 case IrOp::BvhIntersectRay: {
                     if (last_bvh_vec4_id == 0u || last_bvh_ops != inst.operands) {
-                        // Branchless clean-room Möller-Trumbore triangle + slab AABB intersection
+                        // Branchless Möller-Trumbore triangle + slab AABB intersection
                         const uint32_t node_ptr = get_as_u32(inst.operands[0]);
                         const uint32_t tmax = get_as_f32(inst.operands[1]);
                         const uint32_t ox = get_as_f32(inst.operands[2]);
@@ -3660,12 +4274,30 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     EmitSpvInst(sec_fn, SpvOpShiftRightLogical, {t_u32, dword_idx, byte_off, c_u32_2});
                     EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, masked_idx, dword_idx, c_lds_mask});
                     EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_wg_u32, ptr, var_lds, masked_idx});
-                    EmitSpvInst(sec_fn, SpvOpStore, {ptr, data_u32});
+                    if (inst.exec_pred != kInvalidIrValue) {
+                        uint32_t pred = get_as_bool(inst.exec_pred);
+                        uint32_t lbl_then = alloc_id();
+                        uint32_t lbl_merge = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpSelectionMerge, {lbl_merge, 0u});
+                        EmitSpvInst(sec_fn, SpvOpBranchConditional, {pred, lbl_then, lbl_merge});
+                        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_then});
+                        EmitSpvInst(sec_fn, SpvOpStore, {ptr, data_u32});
+                        EmitSpvInst(sec_fn, SpvOpBranch, {lbl_merge});
+                        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_merge});
+                    } else {
+                        EmitSpvInst(sec_fn, SpvOpStore, {ptr, data_u32});
+                    }
                     break;
                 }
                 case IrOp::LdsAtomicAdd: {
                     uint32_t byte_off = get_as_u32(inst.operands[0]);
                     uint32_t addend = get_as_u32(inst.operands[1]);
+                    if (inst.exec_pred != kInvalidIrValue) {
+                        uint32_t pred = get_as_bool(inst.exec_pred);
+                        uint32_t eff_add = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpSelect, {t_u32, eff_add, pred, addend, c_u32_0});
+                        addend = eff_add;
+                    }
                     uint32_t dword_idx = alloc_id();
                     uint32_t masked_idx = alloc_id();
                     uint32_t ptr = alloc_id();
@@ -3697,7 +4329,19 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     EmitSpvInst(sec_fn, SpvOpShiftRightLogical, {t_u32, dword_idx, byte_off, c_u32_2});
                     EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, masked_idx, dword_idx, c_scratch_mask});
                     EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_priv_u32, ptr, var_scratch, masked_idx});
-                    EmitSpvInst(sec_fn, SpvOpStore, {ptr, data_u32});
+                    if (inst.exec_pred != kInvalidIrValue) {
+                        uint32_t pred = get_as_bool(inst.exec_pred);
+                        uint32_t lbl_then = alloc_id();
+                        uint32_t lbl_merge = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpSelectionMerge, {lbl_merge, 0u});
+                        EmitSpvInst(sec_fn, SpvOpBranchConditional, {pred, lbl_then, lbl_merge});
+                        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_then});
+                        EmitSpvInst(sec_fn, SpvOpStore, {ptr, data_u32});
+                        EmitSpvInst(sec_fn, SpvOpBranch, {lbl_merge});
+                        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_merge});
+                    } else {
+                        EmitSpvInst(sec_fn, SpvOpStore, {ptr, data_u32});
+                    }
                     break;
                 }
                 case IrOp::WaveLaneId: {
@@ -3897,6 +4541,17 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     if (is_mesh_stage) {
                         EmitSpvInst(sec_fn, SpvOpSetMeshOutputsEXT,
                                     {get_as_u32(inst.operands[0]), get_as_u32(inst.operands[1])});
+                    } else if (is_task_stage && var_dm_x != 0u) {
+                        EmitSpvInst(sec_fn, SpvOpStore, {var_dm_x, get_as_u32(inst.operands[0])});
+                        EmitSpvInst(sec_fn, SpvOpStore, {var_dm_y, get_as_u32(inst.operands[1])});
+                        EmitSpvInst(sec_fn, SpvOpStore, {var_dm_z, c_u32_1});
+                    }
+                    break;
+                case IrOp::DispatchMeshGroups:
+                    if (is_task_stage && var_dm_x != 0u) {
+                        EmitSpvInst(sec_fn, SpvOpStore, {var_dm_x, get_as_u32(inst.operands[0])});
+                        EmitSpvInst(sec_fn, SpvOpStore, {var_dm_y, get_as_u32(inst.operands[1])});
+                        EmitSpvInst(sec_fn, SpvOpStore, {var_dm_z, get_as_u32(inst.operands[2])});
                     }
                     break;
                 case IrOp::ExportMeshPrim:
@@ -4321,7 +4976,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     EmitSpvInst(sec_fn, SpvOpULessThan, {t_bool, lt32, sum, c_u32_32});
                     EmitSpvInst(sec_fn, SpvOpLogicalAnd, {t_bool, lt32_nz, lt32, not_zero});
                     EmitSpvInst(sec_fn, SpvOpISub, {t_u32, shl_raw, c_u32_32, sum});
-                    EmitSpvInst(sec_fn, SpvOpSelect, {t_u32, shl_safe, lt32, shl_raw, c_u32_0});
+                    EmitSpvInst(sec_fn, SpvOpSelect, {t_u32, shl_safe, lt32_nz, shl_raw, c_u32_0});
                     EmitSpvInst(sec_fn, SpvOpISub, {t_u32, shr_raw, c_u32_32, wid});
                     EmitSpvInst(sec_fn, SpvOpSelect, {t_u32, shr_safe, lt32_nz, shr_raw, c_u32_0});
                     EmitSpvInst(sec_fn, SpvOpShiftLeftLogical, {t_u32, tmp_l, s0, shl_safe});
@@ -4652,11 +5307,54 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     break;
                 }
                 case IrOp::Barrier:
-                    if (ir.stage == ShaderStage::Compute || ir.stage == ShaderStage::Mesh) {
+                    if (ir.stage == ShaderStage::Compute || ir.stage == ShaderStage::Mesh ||
+                        ir.stage == ShaderStage::Amplification) {
                         emit_wg_barrier();
                     }
                     break;
                 case IrOp::Export: {
+                    if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Null) &&
+                        inst.imm_u32 == kIrKillExportMagicLifter &&
+                        ir.stage == ShaderStage::Pixel) {
+                        const uint32_t kill_cond = inst.operands.empty()
+                                                       ? get_const_bool(true)
+                                                       : get_as_bool(inst.operands[0]);
+                        const uint32_t lbl_kill = alloc_id();
+                        const uint32_t lbl_after = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpSelectionMerge, {lbl_after, 0u});
+                        EmitSpvInst(sec_fn, SpvOpBranchConditional, {kill_cond, lbl_kill, lbl_after});
+                        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_kill});
+                        EmitSpvInst(sec_fn, SpvOpKill, {});
+                        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_after});
+                        break;
+                    }
+                    if ((inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos2) ||
+                         inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos3)) &&
+                        cull_dist_count > 0u && var_pervertex != 0u && t_ptr_out_f32 != 0u) {
+                        const uint32_t base_c =
+                            (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos3)) ? 4u : 0u;
+                        uint32_t lidx = 0u;
+                        if (is_mesh_stage) {
+                            lidx = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, lidx, var_local_idx});
+                        }
+                        const uint32_t c_i32_1 = get_const_i32(1);
+                        for (uint32_t c = 0u; c < 4u && (base_c + c) < cull_dist_count; ++c) {
+                            const uint32_t fv = get_as_f32(inst.operands[c]);
+                            const uint32_t ptr_cd = alloc_id();
+                            if (is_mesh_stage) {
+                                EmitSpvInst(sec_fn, SpvOpAccessChain,
+                                            {t_ptr_out_f32, ptr_cd, var_pervertex, lidx, c_i32_1,
+                                             get_const_u32(base_c + c)});
+                            } else {
+                                EmitSpvInst(sec_fn, SpvOpAccessChain,
+                                            {t_ptr_out_f32, ptr_cd, var_pervertex, c_i32_1,
+                                             get_const_u32(base_c + c)});
+                            }
+                            EmitSpvInst(sec_fn, SpvOpStore, {ptr_cd, fv});
+                        }
+                        break;
+                    }
                     uint32_t vec_id = alloc_id();
                     EmitSpvInst(sec_fn, SpvOpCompositeConstruct, {
                         t_v4f32, vec_id,
@@ -4675,15 +5373,21 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                             EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_out_v4f32, ptr_pos, var_pervertex, c_i32_0});
                         }
                         EmitSpvInst(sec_fn, SpvOpStore, {ptr_pos, vec_id});
-                    } else if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Param0) && var_param0_out != 0u) {
-                        if (is_mesh_stage) {
-                            uint32_t lidx = alloc_id();
-                            uint32_t ptr_p0 = alloc_id();
-                            EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, lidx, var_local_idx});
-                            EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_out_v4f32, ptr_p0, var_param0_out, lidx});
-                            EmitSpvInst(sec_fn, SpvOpStore, {ptr_p0, vec_id});
-                        } else {
-                            EmitSpvInst(sec_fn, SpvOpStore, {var_param0_out, vec_id});
+                    } else if (inst.export_target >= static_cast<uint8_t>(Rdna2ExportTarget::Param0) &&
+                               inst.export_target <= static_cast<uint8_t>(Rdna2ExportTarget::Param3)) {
+                        const uint32_t pslot = static_cast<uint32_t>(
+                            inst.export_target - static_cast<uint8_t>(Rdna2ExportTarget::Param0));
+                        const uint32_t vout = var_param_out[pslot];
+                        if (vout != 0u) {
+                            if (is_mesh_stage) {
+                                uint32_t lidx = alloc_id();
+                                uint32_t ptr_p = alloc_id();
+                                EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, lidx, var_local_idx});
+                                EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_out_v4f32, ptr_p, vout, lidx});
+                                EmitSpvInst(sec_fn, SpvOpStore, {ptr_p, vec_id});
+                            } else {
+                                EmitSpvInst(sec_fn, SpvOpStore, {vout, vec_id});
+                            }
                         }
                     } else if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Mrt0) && var_mrt0 != 0u) {
                         EmitSpvInst(sec_fn, SpvOpStore, {var_mrt0, vec_id});
@@ -4693,9 +5397,51 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                 default:
                     break;
             }
+
+            if (use_spv_state_machine && inst.id != kInvalidIrValue && res != 0u) {
+                auto it_v = val_fn_var.find(inst.id);
+                if (it_v != val_fn_var.end()) {
+                    EmitSpvInst(sec_fn, SpvOpStore, {it_v->second, res});
+                }
+            }
         }
 
-        // Phi edge coercions right before terminator
+        if (use_spv_state_machine) {
+            if (!bb.instructions.empty()) {
+                const auto& term = bb.instructions.back();
+                if (term.op == IrOp::Branch) {
+                    emit_sm_phi_copies(static_cast<uint32_t>(bi), term.true_block);
+                    EmitSpvInst(sec_fn, SpvOpStore, {var_cfg_state, get_const_u32(term.true_block)});
+                    EmitSpvInst(sec_fn, SpvOpBranch, {lbl_sm_sw_merge});
+                } else if (term.op == IrOp::CondBranch) {
+                    const uint32_t cond = get_as_bool(term.operands[0]);
+                    const uint32_t lbl_t = alloc_id();
+                    const uint32_t lbl_f = alloc_id();
+                    const uint32_t lbl_m = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpSelectionMerge, {lbl_m, 0u});
+                    EmitSpvInst(sec_fn, SpvOpBranchConditional, {cond, lbl_t, lbl_f});
+                    EmitSpvInst(sec_fn, SpvOpLabel, {lbl_t});
+                    emit_sm_phi_copies(static_cast<uint32_t>(bi), term.true_block);
+                    EmitSpvInst(sec_fn, SpvOpStore, {var_cfg_state, get_const_u32(term.true_block)});
+                    EmitSpvInst(sec_fn, SpvOpBranch, {lbl_m});
+                    EmitSpvInst(sec_fn, SpvOpLabel, {lbl_f});
+                    emit_sm_phi_copies(static_cast<uint32_t>(bi), term.false_block);
+                    EmitSpvInst(sec_fn, SpvOpStore, {var_cfg_state, get_const_u32(term.false_block)});
+                    EmitSpvInst(sec_fn, SpvOpBranch, {lbl_m});
+                    EmitSpvInst(sec_fn, SpvOpLabel, {lbl_m});
+                    EmitSpvInst(sec_fn, SpvOpBranch, {lbl_sm_sw_merge});
+                } else {
+                    EmitSpvInst(sec_fn, SpvOpStore, {var_cfg_state, c_u32_allones});
+                    EmitSpvInst(sec_fn, SpvOpBranch, {lbl_sm_sw_merge});
+                }
+            } else {
+                EmitSpvInst(sec_fn, SpvOpStore, {var_cfg_state, c_u32_allones});
+                EmitSpvInst(sec_fn, SpvOpBranch, {lbl_sm_sw_merge});
+            }
+            continue;
+        }
+
+        // Phi edge coercions right before terminator (DAG mode)
         for (const auto& fx : block_exit_fixups[bi]) {
             if (fx.expected_kind == SpvValKind::F32) {
                 uint32_t u = get_as_u32(fx.incoming_val);
@@ -4741,20 +5487,109 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         }
     }
 
+    if (use_spv_state_machine) {
+        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_sm_default});
+        EmitSpvInst(sec_fn, SpvOpStore, {var_cfg_state, c_u32_allones});
+        EmitSpvInst(sec_fn, SpvOpBranch, {lbl_sm_sw_merge});
+
+        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_sm_sw_merge});
+        EmitSpvInst(sec_fn, SpvOpBranch, {lbl_sm_cont});
+
+        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_sm_cont});
+        EmitSpvInst(sec_fn, SpvOpBranch, {lbl_sm_hdr});
+
+        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_sm_exit});
+        if (need_epilogue) {
+            EmitSpvInst(sec_fn, SpvOpBranch, {epilogue_label});
+        } else {
+            EmitSpvInst(sec_fn, SpvOpReturn, {});
+        }
+    }
+
     if (need_epilogue) {
         EmitSpvInst(sec_fn, SpvOpLabel, {epilogue_label});
-        EmitSpvInst(sec_fn, SpvOpReturn, {});
+        if (is_task_stage) {
+            // Synchronize workgroup writes, commit finalized dispatch counts + LDS payload to
+            // TaskPayloadWorkgroupEXT on lane 0, barrier, then broadcast uniform counts into
+            // OpEmitMeshTasksEXT as the TaskEXT function terminator.
+            emit_wg_barrier();
+            const uint32_t gx = alloc_id();
+            const uint32_t gy = alloc_id();
+            const uint32_t gz = alloc_id();
+            EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, gx, var_dm_x});
+            EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, gy, var_dm_y});
+            EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, gz, var_dm_z});
+
+            const uint32_t ep_lidx = alloc_id();
+            const uint32_t ep_is_l0 = alloc_id();
+            const uint32_t lbl_tp_wr = alloc_id();
+            const uint32_t lbl_tp_emit = alloc_id();
+            EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, ep_lidx, var_local_idx});
+            EmitSpvInst(sec_fn, SpvOpIEqual, {t_bool, ep_is_l0, ep_lidx, c_u32_0});
+            EmitSpvInst(sec_fn, SpvOpSelectionMerge, {lbl_tp_emit, 0u});
+            EmitSpvInst(sec_fn, SpvOpBranchConditional, {ep_is_l0, lbl_tp_wr, lbl_tp_emit});
+
+            EmitSpvInst(sec_fn, SpvOpLabel, {lbl_tp_wr});
+            {
+                const uint32_t p_dx = alloc_id();
+                const uint32_t p_dy = alloc_id();
+                const uint32_t p_dz = alloc_id();
+                EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_tp_u32, p_dx, var_task_payload, get_const_i32(1)});
+                EmitSpvInst(sec_fn, SpvOpStore, {p_dx, gx});
+                EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_tp_u32, p_dy, var_task_payload, get_const_i32(2)});
+                EmitSpvInst(sec_fn, SpvOpStore, {p_dy, gy});
+                EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_tp_u32, p_dz, var_task_payload, get_const_i32(3)});
+                EmitSpvInst(sec_fn, SpvOpStore, {p_dz, gz});
+
+                const uint32_t fallback_vals[4] = {gx, gy, gz, c_u32_0};
+                for (uint32_t k = 0u; k < 4u; ++k) {
+                    uint32_t val = fallback_vals[k];
+                    if (ir.uses_lds && var_lds != 0u) {
+                        const uint32_t lds_slot = std::min(k, lds_size_dwords - 1u);
+                        const uint32_t p_lds = alloc_id();
+                        val = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_wg_u32, p_lds, var_lds, get_const_u32(lds_slot)});
+                        EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, val, p_lds});
+                    }
+                    const uint32_t p_d = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpAccessChain,
+                                {t_ptr_tp_u32, p_d, var_task_payload, c_i32_0, get_const_u32(k)});
+                    EmitSpvInst(sec_fn, SpvOpStore, {p_d, val});
+                }
+            }
+            EmitSpvInst(sec_fn, SpvOpBranch, {lbl_tp_emit});
+
+            EmitSpvInst(sec_fn, SpvOpLabel, {lbl_tp_emit});
+            emit_wg_barrier();
+            const uint32_t p_ux = alloc_id();
+            const uint32_t p_uy = alloc_id();
+            const uint32_t p_uz = alloc_id();
+            const uint32_t u_gx = alloc_id();
+            const uint32_t u_gy = alloc_id();
+            const uint32_t u_gz = alloc_id();
+            EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_tp_u32, p_ux, var_task_payload, get_const_i32(1)});
+            EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, u_gx, p_ux});
+            EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_tp_u32, p_uy, var_task_payload, get_const_i32(2)});
+            EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, u_gy, p_uy});
+            EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_tp_u32, p_uz, var_task_payload, get_const_i32(3)});
+            EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, u_gz, p_uz});
+            EmitSpvInst(sec_fn, SpvOpEmitMeshTasksEXT, {u_gx, u_gy, u_gz, var_task_payload});
+        } else {
+            EmitSpvInst(sec_fn, SpvOpReturn, {});
+        }
     }
 
     EmitSpvInst(sec_fn, SpvOpFunctionEnd, {});
 
-    // 7. Assemble final SPIR-V 1.3 / 1.4 binary stream
+    // 7. Assemble final SPIR-V 1.3 / 1.4 / 1.6 binary stream
     const size_t total_words = 5u + sec_caps.size() + sec_exts.size() + sec_ext.size() + sec_mem.size() +
                                sec_entry.size() + sec_exec.size() + sec_decor.size() +
                                sec_types.size() + sec_globals.size() + sec_fn.size();
     out_spirv.reserve(total_words);
     out_spirv.push_back(kSpirvMagic);
-    out_spirv.push_back(is_spirv14 ? kSpirvVersion14 : kSpirvVersion13);
+    const uint32_t spv_version = is_task_stage ? kSpirvVersion16
+                                               : (is_mesh_stage ? kSpirvVersion14 : kSpirvVersion13);
+    out_spirv.push_back(spv_version);
     out_spirv.push_back(kSpirvGeneratorOpenScarlett);
     out_spirv.push_back(next_id);
     out_spirv.push_back(0u);
@@ -4784,8 +5619,8 @@ Status ValidateSpirvBinary(const std::vector<uint32_t>& spirv) {
     if (spirv[0] != kSpirvMagic) {
         return Status::Error(StatusCode::ShaderError, "Invalid SPIR-V magic number");
     }
-    if (spirv[1] != kSpirvVersion13 && spirv[1] != kSpirvVersion14) {
-        return Status::Error(StatusCode::ShaderError, "Unexpected SPIR-V version (expected 1.3 or 1.4)");
+    if (spirv[1] != kSpirvVersion13 && spirv[1] != kSpirvVersion14 && spirv[1] != kSpirvVersion16) {
+        return Status::Error(StatusCode::ShaderError, "Unexpected SPIR-V version (expected 1.3, 1.4, or 1.6)");
     }
     const uint32_t bound = spirv[3];
     if (bound < 2u) {
@@ -4883,8 +5718,33 @@ Status ValidateSpirvBinary(const std::vector<uint32_t>& spirv) {
                     return Status::Error(StatusCode::ShaderError, "Malformed OpBranchConditional");
                 }
                 break;
+            case SpvOpSwitch:
+                if (word_count < 3u || ((word_count - 3u) & 1u) != 0u ||
+                    spirv[pos + 1] == 0u || spirv[pos + 1] >= bound ||
+                    spirv[pos + 2] == 0u || spirv[pos + 2] >= bound) {
+                    return Status::Error(StatusCode::ShaderError, "Malformed OpSwitch");
+                }
+                for (uint16_t k = 4u; k < word_count; k = static_cast<uint16_t>(k + 2u)) {
+                    if (spirv[pos + k] == 0u || spirv[pos + k] >= bound) {
+                        return Status::Error(StatusCode::ShaderError, "OpSwitch target label ID out of bound");
+                    }
+                }
+                break;
+            case SpvOpKill:
+                if (word_count != 1u) return Status::Error(StatusCode::ShaderError, "Malformed OpKill");
+                break;
             case SpvOpReturn:
                 if (word_count != 1u) return Status::Error(StatusCode::ShaderError, "Malformed OpReturn");
+                saw_return = true;
+                break;
+            case SpvOpEmitMeshTasksEXT:
+                if ((word_count != 4u && word_count != 5u) ||
+                    spirv[pos + 1] == 0u || spirv[pos + 1] >= bound ||
+                    spirv[pos + 2] == 0u || spirv[pos + 2] >= bound ||
+                    spirv[pos + 3] == 0u || spirv[pos + 3] >= bound ||
+                    (word_count == 5u && (spirv[pos + 4] == 0u || spirv[pos + 4] >= bound))) {
+                    return Status::Error(StatusCode::ShaderError, "Malformed OpEmitMeshTasksEXT");
+                }
                 saw_return = true;
                 break;
             default:
@@ -5058,29 +5918,34 @@ Status LiftRdna2Xs2Shader(
     const Rdna2LiftOptions& options) {
     out_result = Rdna2LiftResult{};
 
-    XboxDxbcContainer container_info{};
-    if (auto st = ParseXboxShaderContainer(xs2_bytes, container_info); !st.ok()) {
+    XboxParsedShaderContainer full_info{};
+    if (auto st = ParseFullXboxShaderContainer(xs2_bytes, full_info); !st.ok()) {
         CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -1);
         return st;
     }
-    if (!container_info.has_xs2) {
+    if (!full_info.has_xs2) {
         CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -1);
         return Status::Error(StatusCode::UnsupportedFormat,
-                             "Shader container does not carry an Xbox XS2 RDNA2 payload");
+                             "Shader container does not carry an Xbox XS2/RDNA2 payload");
     }
-    out_result.container = std::move(container_info.xs2);
+    out_result.container = full_info.xs2;
 
-    if (auto st = DisassembleRdna2(out_result.container.code_words, out_result.instructions); !st.ok()) {
+    if (auto st = DisassembleRdna2Extended(out_result.container.code_words, out_result.instructions); !st.ok()) {
         CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -2);
         return st;
     }
+    Rdna2LiftOptions eff_opts = options;
+    if (eff_opts.stage_contract.pixel_inputs.empty() && eff_opts.stage_contract.vertex_fetches.empty()) {
+        ApplyXboxContainerToLiftOptions(full_info, eff_opts);
+    }
     const StageContractTable* contract_ptr =
-        (!options.stage_contract.vertex_fetches.empty() ||
-         !options.stage_contract.pixel_inputs.empty() ||
-         options.stage_contract.texture_srv_format != Rdna2TextureFormat::Float4)
-            ? &options.stage_contract
+        (!eff_opts.stage_contract.vertex_fetches.empty() ||
+         !eff_opts.stage_contract.pixel_inputs.empty() ||
+         eff_opts.stage_contract.texture_srv_format != Rdna2TextureFormat::Float4)
+            ? &eff_opts.stage_contract
             : nullptr;
     if (auto st = BuildRdna2Ir(out_result.container, out_result.instructions, out_result.ir, contract_ptr); !st.ok()) {
+        out_result.dxc_diagnostics = st.message;
         CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -3);
         return st;
     }
@@ -5096,6 +5961,7 @@ Status LiftRdna2Xs2Shader(
         (out_result.ir.stage == ShaderStage::Compute ||
          out_result.ir.stage == ShaderStage::Vertex ||
          out_result.ir.stage == ShaderStage::Pixel ||
+         out_result.ir.stage == ShaderStage::Amplification ||
          (out_result.ir.stage == ShaderStage::Mesh && options.emit_mesh_spirv));
 
     if (options.emit_spirv && stage_supports_spirv) {
@@ -5108,9 +5974,12 @@ Status LiftRdna2Xs2Shader(
             return st;
         }
         if (options.validate_spirv_external) {
-            const std::string env = (out_result.ir.stage == ShaderStage::Mesh && options.spirv_target_env == "vulkan1.2")
-                                        ? "vulkan1.3"
-                                        : options.spirv_target_env;
+            const std::string env =
+                ((out_result.ir.stage == ShaderStage::Mesh ||
+                  out_result.ir.stage == ShaderStage::Amplification) &&
+                 options.spirv_target_env == "vulkan1.2")
+                    ? "vulkan1.3"
+                    : options.spirv_target_env;
             if (auto st = ValidateSpirvExternal(out_result.spirv_words, out_result.spirv_val_diagnostics,
                                                 options.spirv_val_path, env);
                 !st.ok()) {

@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Standalone Xbox-ABI Guest Sample (Wave 2):
+// OpenScarlett MIT Standalone Xbox-ABI Guest Sample (Wave 2):
 // SimplePBR — Multi-frame 3D Cook-Torrance PBR workload with 4x MSAA render target
 // (ALLOW_DCC), 4x MSAA D32_FLOAT depth buffer, procedural 256x256 albedo/normal/roughness-metallic
 // textures (CopyTextureRegion + SRV descriptor table + static sampler), per-frame dynamic
@@ -33,7 +33,6 @@ constexpr uint32_t kFrameCount = 3u;
 constexpr uint32_t kObjectsPerFrame = 3u;
 constexpr uint32_t kCbSlotsPerFrame = 4u;
 constexpr uint32_t kExpectedTitleId = 0x5CA01001u;
-constexpr uint32_t D3D12XBOX_RESOURCE_FLAG_ALLOW_DCC = 0x80000000u;
 
 constexpr uint8_t kBgR = 15u;
 constexpr uint8_t kBgG = 20u;
@@ -624,7 +623,6 @@ int main(int argc, char** argv) {
     dev_params.Version = 1;
     dev_params.DisableGeometryShaderAllocations = 1;
     dev_params.DisableTessellationShaderAllocations = 1;
-    dev_params.PreferWarp = use_warp ? 1u : 0u;
 
     GuestComPtr<ID3D12DeviceX> device;
     HRESULT hr = D3D12XboxCreateDevice(
@@ -1189,7 +1187,7 @@ int main(int argc, char** argv) {
         }
 
         D3D12XBOX_FRAME_PIPELINE_TOKEN frame_token = 0;
-        hr = device->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, &frame_token);
+        hr = device->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, 0u, &frame_token);
         if (FAILED(hr) || frame_token == 0) {
             cb_resource->Unmap(0, nullptr);
             ::CloseHandle(fence_event);
@@ -1411,7 +1409,7 @@ int main(int argc, char** argv) {
         D3D12XBOX_PRESENT_PARAMETERS pres_params{};
         pres_params.SyncInterval = 1;
 
-        hr = queue->PresentX(1, &plane, &pres_params, nullptr);
+        hr = queue->PresentX(1, &plane, &pres_params);
         if (FAILED(hr)) {
             cb_resource->Unmap(0, nullptr);
             ::CloseHandle(fence_event);
@@ -1716,7 +1714,7 @@ int main(int argc, char** argv) {
     }
 
     // 14. Clean PresentX(0) blank teardown (Microsoft DeviceResources pattern)
-    hr = queue->PresentX(0, nullptr, nullptr, nullptr);
+    hr = queue->PresentX(0, nullptr, nullptr);
     if (FAILED(hr)) {
         ::CloseHandle(fence_event);
         game_input->Release();

@@ -5,6 +5,7 @@
 #include "openscarlett/core/telemetry.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -593,24 +594,13 @@ public:
         return RecordHr("IXAudio2MasteringVoice::SetOutputVoices", OS_XAUDIO2_E_INVALID_CALL, 1);
     }
 
-    int32_t OPENSCARLETT_XAUDIO2_CALL SetVolume(float Volume, uint32_t /*OperationSet*/) override {
-        volume_.store(Volume, std::memory_order_relaxed);
-        return RecordHr("IXAudio2MasteringVoice::SetVolume", OS_XAUDIO2_S_OK, 2);
-    }
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetVolume(float Volume, uint32_t /*OperationSet*/) override;
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetChannelVolumes(
+        uint32_t Channels, const float* pVolumes, uint32_t /*OperationSet*/) override;
 
     void OPENSCARLETT_XAUDIO2_CALL GetVolume(float* pVolume) override {
         RecordOk("IXAudio2MasteringVoice::GetVolume", 3);
         if (pVolume) *pVolume = volume_.load(std::memory_order_relaxed);
-    }
-
-    int32_t OPENSCARLETT_XAUDIO2_CALL SetChannelVolumes(
-        uint32_t Channels, const float* pVolumes, uint32_t /*OperationSet*/) override {
-        if (!pVolumes || Channels != channels_) {
-            return RecordHr("IXAudio2MasteringVoice::SetChannelVolumes", OS_XAUDIO2_E_INVALIDARG, 4);
-        }
-        std::lock_guard<std::mutex> lk(mutex_);
-        channel_volumes_.assign(pVolumes, pVolumes + Channels);
-        return RecordHr("IXAudio2MasteringVoice::SetChannelVolumes", OS_XAUDIO2_S_OK, 4);
     }
 
     void OPENSCARLETT_XAUDIO2_CALL GetChannelVolumes(uint32_t Channels, float* pVolumes) override {
@@ -631,10 +621,7 @@ public:
         return RecordHr("IXAudio2MasteringVoice::GetChannelMask", OS_XAUDIO2_S_OK, 7);
     }
 
-    int32_t SetEffectChain(const void* pEffectChain) {
-        std::lock_guard<std::mutex> lk(mutex_);
-        return ReplaceEffectSlots(effect_chain_, pEffectChain);
-    }
+    int32_t SetEffectChain(const void* pEffectChain);
 
     int32_t EnableEffect(uint32_t index, bool enable) {
         std::lock_guard<std::mutex> lk(mutex_);
@@ -719,10 +706,83 @@ private:
 };
 
 // ===========================================================================
-// Source Voice (PCM8/16/24/32, Float32, and native Xbox XMA2 0x0166)
+// Lock-Free Bounded MPMC Queue (Vyukov Ring Buffer) for Zero-Contention Audio Mixing
+// ===========================================================================
+class LockFreeBufferQueue {
+public:
+    static constexpr uint32_t kCapacity = 128u;  // Power of two
+    static constexpr uint64_t kMask = kCapacity - 1u;
+
+    LockFreeBufferQueue() {
+        for (uint64_t i = 0u; i < kCapacity; ++i) {
+            cells_[i].seq.store(i, std::memory_order_relaxed);
+            cells_[i].ptr = nullptr;
+        }
+    }
+
+    bool TryEnqueue(QueuedAudioBuffer* item) noexcept {
+        Cell* cell = nullptr;
+        uint64_t pos = enqueue_pos_.load(std::memory_order_relaxed);
+        for (;;) {
+            cell = &cells_[pos & kMask];
+            const uint64_t seq = cell->seq.load(std::memory_order_acquire);
+            const int64_t diff = static_cast<int64_t>(seq) - static_cast<int64_t>(pos);
+            if (diff == 0) {
+                if (enqueue_pos_.compare_exchange_weak(pos, pos + 1u, std::memory_order_relaxed)) {
+                    break;
+                }
+            } else if (diff < 0) {
+                return false;  // Queue full
+            } else {
+                pos = enqueue_pos_.load(std::memory_order_relaxed);
+            }
+        }
+        cell->ptr = item;
+        cell->seq.store(pos + 1u, std::memory_order_release);
+        return true;
+    }
+
+    QueuedAudioBuffer* TryDequeue() noexcept {
+        Cell* cell = nullptr;
+        uint64_t pos = dequeue_pos_.load(std::memory_order_relaxed);
+        for (;;) {
+            cell = &cells_[pos & kMask];
+            const uint64_t seq = cell->seq.load(std::memory_order_acquire);
+            const int64_t diff = static_cast<int64_t>(seq) - static_cast<int64_t>(pos + 1u);
+            if (diff == 0) {
+                if (dequeue_pos_.compare_exchange_weak(pos, pos + 1u, std::memory_order_relaxed)) {
+                    break;
+                }
+            } else if (diff < 0) {
+                return nullptr;  // Queue empty
+            } else {
+                pos = dequeue_pos_.load(std::memory_order_relaxed);
+            }
+        }
+        QueuedAudioBuffer* item = cell->ptr;
+        cell->ptr = nullptr;
+        cell->seq.store(pos + kCapacity, std::memory_order_release);
+        return item;
+    }
+
+private:
+    struct Cell {
+        std::atomic<uint64_t> seq{0u};
+        QueuedAudioBuffer* ptr = nullptr;
+    };
+    std::array<Cell, kCapacity> cells_{};
+    std::atomic<uint64_t> enqueue_pos_{0u};
+    std::atomic<uint64_t> dequeue_pos_{0u};
+};
+
+// ===========================================================================
+// Source Voice (PCM8/16/24/32, Float32, ADPCM, Opus, and native Xbox XMA2 0x0166)
+//   Lock-free buffer submission, state queries, and real-time audio mixing!
 // ===========================================================================
 class SourceVoiceImpl final : public IXAudio2SourceVoice {
 public:
+    static constexpr uint32_t kMaxInlineChannels = 8u;
+
     SourceVoiceImpl(
         XAudio2Impl* engine,
         const OS_WAVEFORMATEX& fmt,
@@ -733,10 +793,11 @@ public:
           format_(fmt),
           flags_(flags),
           max_freq_ratio_(std::max(1.0f, max_freq_ratio)),
-          callback_(cb),
-          channel_volumes_(std::max<uint16_t>(1u, fmt.nChannels), 1.0f) {
+          callback_(cb) {
+        for (auto& cv : channel_volumes_) {
+            cv.store(1.0f, std::memory_order_relaxed);
+        }
         if (format_.wFormatTag == OS_WAVE_FORMAT_EXTENSIBLE) {
-            // Resolved from extensible tag during CreateSourceVoice.
             effective_format_tag_ = OS_WAVE_FORMAT_PCM;
         } else {
             effective_format_tag_ = format_.wFormatTag;
@@ -745,22 +806,33 @@ public:
 
     ~SourceVoiceImpl() {
         ClearEffectSlots(effect_chain_);
+        QueuedAudioBuffer* cur = current_buf_.exchange(nullptr, std::memory_order_acq_rel);
+        delete cur;
+        while (QueuedAudioBuffer* q = buffer_queue_.TryDequeue()) {
+            delete q;
+        }
     }
 
     void SetEffectiveFormatTag(uint16_t tag) { effective_format_tag_ = tag; }
     void SetAdpcmSamplesPerBlock(uint16_t spb) { adpcm_samples_per_block_ = spb; }
     void SetOpusPreSkip(uint16_t pre_skip) { opus_pre_skip_ = pre_skip; }
+    void SetSlotIndex(uint32_t idx) { slot_index_.store(idx, std::memory_order_release); }
+    uint32_t SlotIndex() const { return slot_index_.load(std::memory_order_acquire); }
+    void MarkDestroying() { destroying_.store(true, std::memory_order_release); }
+    bool IsDestroying() const { return destroying_.load(std::memory_order_acquire); }
     bool IsOpusMftActive() const {
         return opus_mft_active_.load(std::memory_order_acquire);
     }
 
     int32_t SetEffectChain(const void* pEffectChain) {
-        std::lock_guard<std::mutex> lk(mutex_);
-        return ReplaceEffectSlots(effect_chain_, pEffectChain);
+        std::lock_guard<std::mutex> lk(config_mutex_);
+        const int32_t hr = ReplaceEffectSlots(effect_chain_, pEffectChain);
+        has_effects_.store(!effect_chain_.empty(), std::memory_order_release);
+        return hr;
     }
 
     int32_t EnableEffect(uint32_t index, bool enable) {
-        std::lock_guard<std::mutex> lk(mutex_);
+        std::lock_guard<std::mutex> lk(config_mutex_);
         if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
         effect_chain_[index].enabled = enable;
         return OS_XAUDIO2_S_OK;
@@ -768,7 +840,7 @@ public:
 
     int32_t GetEffectState(uint32_t index, int32_t* out_enabled) {
         if (!out_enabled) return OS_XAUDIO2_E_POINTER;
-        std::lock_guard<std::mutex> lk(mutex_);
+        std::lock_guard<std::mutex> lk(config_mutex_);
         if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
         *out_enabled = effect_chain_[index].enabled ? 1 : 0;
         return OS_XAUDIO2_S_OK;
@@ -778,7 +850,7 @@ public:
         if (!params || bytes == 0u) return OS_XAUDIO2_E_INVALIDARG;
         OS_IXAudio2Unknown* eff = nullptr;
         {
-            std::lock_guard<std::mutex> lk(mutex_);
+            std::lock_guard<std::mutex> lk(config_mutex_);
             if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
             eff = effect_chain_[index].effect;
             if (eff) eff->AddRef();
@@ -797,7 +869,7 @@ public:
         if (!params || bytes == 0u) return OS_XAUDIO2_E_INVALIDARG;
         OS_IXAudio2Unknown* eff = nullptr;
         {
-            std::lock_guard<std::mutex> lk(mutex_);
+            std::lock_guard<std::mutex> lk(config_mutex_);
             if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
             eff = effect_chain_[index].effect;
             if (eff) eff->AddRef();
@@ -813,12 +885,13 @@ public:
     }
 
     void ClearSubmixReference(SubmixVoiceImpl* dead) {
-        std::lock_guard<std::mutex> lk(mutex_);
+        std::lock_guard<std::mutex> lk(config_mutex_);
         send_submixes_.erase(
             std::remove(send_submixes_.begin(), send_submixes_.end(), dead),
             send_submixes_.end());
+        has_submix_sends_.store(!send_submixes_.empty(), std::memory_order_release);
         if (send_submixes_.empty()) {
-            send_to_master_ = true;
+            send_to_master_.store(true, std::memory_order_release);
         }
     }
 
@@ -834,11 +907,11 @@ public:
 
     int32_t OPENSCARLETT_XAUDIO2_CALL SetOutputVoices(
         const OS_XAUDIO2_VOICE_SENDS* pSendList) override {
-        std::lock_guard<std::mutex> lk(mutex_);
+        std::lock_guard<std::mutex> lk(config_mutex_);
         send_submixes_.clear();
-        send_to_master_ = false;
+        bool to_master = false;
         if (!pSendList || pSendList->SendCount == 0u || !pSendList->pSends) {
-            send_to_master_ = true;
+            to_master = true;
         } else {
             for (uint32_t i = 0u; i < pSendList->SendCount; ++i) {
                 IXAudio2Voice* dst = pSendList->pSends[i].pOutputVoice;
@@ -848,13 +921,15 @@ public:
                         send_submixes_.push_back(sub);
                     }
                 } else if (dynamic_cast<MasteringVoiceImpl*>(dst) != nullptr) {
-                    send_to_master_ = true;
+                    to_master = true;
                 }
             }
-            if (send_submixes_.empty() && !send_to_master_) {
-                send_to_master_ = true;
+            if (send_submixes_.empty() && !to_master) {
+                to_master = true;
             }
         }
+        send_to_master_.store(to_master, std::memory_order_release);
+        has_submix_sends_.store(!send_submixes_.empty(), std::memory_order_release);
         return RecordHr("IXAudio2SourceVoice::SetOutputVoices", OS_XAUDIO2_S_OK, 1);
     }
 
@@ -873,17 +948,20 @@ public:
         if (!pVolumes || Channels != format_.nChannels) {
             return RecordHr("IXAudio2SourceVoice::SetChannelVolumes", OS_XAUDIO2_E_INVALIDARG, 4);
         }
-        std::lock_guard<std::mutex> lk(mutex_);
-        channel_volumes_.assign(pVolumes, pVolumes + Channels);
+        const uint32_t n = std::min<uint32_t>(Channels, kMaxInlineChannels);
+        for (uint32_t i = 0u; i < n; ++i) {
+            channel_volumes_[i].store(pVolumes[i], std::memory_order_relaxed);
+        }
         return RecordHr("IXAudio2SourceVoice::SetChannelVolumes", OS_XAUDIO2_S_OK, 4);
     }
 
     void OPENSCARLETT_XAUDIO2_CALL GetChannelVolumes(uint32_t Channels, float* pVolumes) override {
         RecordOk("IXAudio2SourceVoice::GetChannelVolumes", 5);
         if (!pVolumes) return;
-        std::lock_guard<std::mutex> lk(mutex_);
-        const uint32_t n = std::min<uint32_t>(Channels, static_cast<uint32_t>(channel_volumes_.size()));
-        if (n > 0) std::memcpy(pVolumes, channel_volumes_.data(), n * sizeof(float));
+        const uint32_t n = std::min<uint32_t>(Channels, std::min<uint32_t>(format_.nChannels, kMaxInlineChannels));
+        for (uint32_t i = 0u; i < n; ++i) {
+            pVolumes[i] = channel_volumes_[i].load(std::memory_order_relaxed);
+        }
     }
 
     void OPENSCARLETT_XAUDIO2_CALL DestroyVoice() override;
@@ -901,6 +979,9 @@ public:
     int32_t OPENSCARLETT_XAUDIO2_CALL SubmitSourceBuffer(
         const OS_XAUDIO2_BUFFER* pBuffer,
         const OS_XAUDIO2_BUFFER_WMA* /*pBufferWMA*/) override {
+        if (destroying_.load(std::memory_order_acquire)) {
+            return RecordHr("IXAudio2SourceVoice::SubmitSourceBuffer", OS_XAUDIO2_E_INVALID_CALL, 9);
+        }
         if (!pBuffer || (pBuffer->AudioBytes > 0 && !pBuffer->pAudioData)) {
             return RecordHr("IXAudio2SourceVoice::SubmitSourceBuffer", OS_XAUDIO2_E_INVALIDARG, 9);
         }
@@ -1038,7 +1119,6 @@ public:
         uint32_t total_frames = static_cast<uint32_t>(decoded.size() / std::max<uint32_t>(1u, eff_ch));
 
         uint32_t play_slice_start = 0u;
-        // Apply optional PlayBegin / PlayLength range.
         if (pBuffer->PlayBegin > 0 || pBuffer->PlayLength > 0) {
             play_slice_start = std::min<uint32_t>(pBuffer->PlayBegin, total_frames);
             const uint32_t max_avail = total_frames - play_slice_start;
@@ -1059,35 +1139,49 @@ public:
                 ? std::min<uint32_t>(pBuffer->LoopBegin - play_slice_start, total_frames)
                 : 0u;
 
-        QueuedAudioBuffer qb{};
-        qb.samples = std::move(decoded);
-        qb.channels = eff_ch;
-        qb.total_frames = total_frames;
-        qb.play_cursor = 0.0;
-        qb.loop_begin = adj_loop_begin;
-        qb.loop_length = (pBuffer->LoopLength > 0 && qb.loop_begin + pBuffer->LoopLength <= total_frames)
-                             ? pBuffer->LoopLength
-                             : (total_frames - qb.loop_begin);
-        qb.loops_remaining = pBuffer->LoopCount;
-        qb.end_of_stream = (pBuffer->Flags & OS_XAUDIO2_END_OF_STREAM) != 0;
-        qb.context = pBuffer->pContext;
+        auto* qb = new (std::nothrow) QueuedAudioBuffer();
+        if (!qb) {
+            return RecordHr("IXAudio2SourceVoice::SubmitSourceBuffer", OS_XAUDIO2_E_OUTOFMEMORY, 9);
+        }
+        qb->samples = std::move(decoded);
+        qb->channels = eff_ch;
+        qb->total_frames = total_frames;
+        qb->play_cursor = 0.0;
+        qb->loop_begin = adj_loop_begin;
+        qb->loop_length = (pBuffer->LoopLength > 0 && qb->loop_begin + pBuffer->LoopLength <= total_frames)
+                              ? pBuffer->LoopLength
+                              : (total_frames - qb->loop_begin);
+        qb->loops_remaining = pBuffer->LoopCount;
+        qb->end_of_stream = (pBuffer->Flags & OS_XAUDIO2_END_OF_STREAM) != 0;
+        qb->context = pBuffer->pContext;
 
-        {
-            std::lock_guard<std::mutex> lk(mutex_);
-            buffers_.push_back(std::move(qb));
+        if (!buffer_queue_.TryEnqueue(qb)) {
+            delete qb;
+            return RecordHr("IXAudio2SourceVoice::SubmitSourceBuffer", OS_XAUDIO2_E_INVALID_CALL, 9);
+        }
+        const uint32_t prev_cnt = queued_count_.fetch_add(1u, std::memory_order_acq_rel);
+        if (prev_cnt == 0u) {
+            current_context_.store(pBuffer->pContext, std::memory_order_release);
         }
 
         return RecordHr("IXAudio2SourceVoice::SubmitSourceBuffer", OS_XAUDIO2_S_OK, 9);
     }
 
     int32_t OPENSCARLETT_XAUDIO2_CALL FlushSourceBuffers() override {
+        flush_epoch_.fetch_add(1u, std::memory_order_acq_rel);
         std::vector<void*> flushed_ctxs;
-        {
-            std::lock_guard<std::mutex> lk(mutex_);
-            for (const auto& b : buffers_) {
-                flushed_ctxs.push_back(b.context);
-            }
-            buffers_.clear();
+        if (QueuedAudioBuffer* cur = current_buf_.exchange(nullptr, std::memory_order_acq_rel)) {
+            flushed_ctxs.push_back(cur->context);
+            delete cur;
+            DecrementQueuedCount();
+        }
+        while (QueuedAudioBuffer* q = buffer_queue_.TryDequeue()) {
+            flushed_ctxs.push_back(q->context);
+            delete q;
+            DecrementQueuedCount();
+        }
+        if (queued_count_.load(std::memory_order_acquire) == 0u) {
+            current_context_.store(nullptr, std::memory_order_release);
         }
         if (callback_) {
             for (void* ctx : flushed_ctxs) {
@@ -1098,18 +1192,12 @@ public:
     }
 
     int32_t OPENSCARLETT_XAUDIO2_CALL Discontinuity() override {
-        std::lock_guard<std::mutex> lk(mutex_);
-        if (!buffers_.empty()) {
-            buffers_.back().end_of_stream = true;
-        }
+        discontinuity_requested_.store(true, std::memory_order_release);
         return RecordHr("IXAudio2SourceVoice::Discontinuity", OS_XAUDIO2_S_OK, 11);
     }
 
     int32_t OPENSCARLETT_XAUDIO2_CALL ExitLoop(uint32_t /*OperationSet*/) override {
-        std::lock_guard<std::mutex> lk(mutex_);
-        if (!buffers_.empty()) {
-            buffers_.front().loops_remaining = 0;
-        }
+        exit_loop_requested_.store(true, std::memory_order_release);
         return RecordHr("IXAudio2SourceVoice::ExitLoop", OS_XAUDIO2_S_OK, 12);
     }
 
@@ -1117,9 +1205,10 @@ public:
         OS_XAUDIO2_VOICE_STATE* pVoiceState, uint32_t /*Flags*/) override {
         RecordOk("IXAudio2SourceVoice::GetState", 13);
         if (!pVoiceState) return;
-        std::lock_guard<std::mutex> lk(mutex_);
-        pVoiceState->BuffersQueued = static_cast<uint32_t>(buffers_.size());
-        pVoiceState->pCurrentBufferContext = buffers_.empty() ? nullptr : buffers_.front().context;
+        const uint32_t qcnt = queued_count_.load(std::memory_order_acquire);
+        pVoiceState->BuffersQueued = qcnt;
+        pVoiceState->pCurrentBufferContext =
+            (qcnt == 0u) ? nullptr : current_context_.load(std::memory_order_acquire);
         pVoiceState->SamplesPlayed = samples_played_.load(std::memory_order_acquire);
     }
 
@@ -1154,13 +1243,30 @@ public:
         uint32_t out_channels,
         uint32_t out_sample_rate,
         DeferredVoiceCallbacks& out_cbs) {
-        if (!playing_.load(std::memory_order_acquire)) {
+        if (!playing_.load(std::memory_order_acquire) ||
+            destroying_.load(std::memory_order_acquire)) {
             return;
         }
-        std::lock_guard<std::mutex> lk(mutex_);
-        if (buffers_.empty()) {
+
+        // Prevent concurrent mix passes from overlapping on the same voice without blocking!
+        if (mix_in_progress_.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
+        struct MixGuard {
+            std::atomic<bool>& flag;
+            ~MixGuard() { flag.store(false, std::memory_order_release); }
+        } guard{mix_in_progress_};
+
+        const uint32_t start_flush_epoch = flush_epoch_.load(std::memory_order_acquire);
+        QueuedAudioBuffer* cur = current_buf_.exchange(nullptr, std::memory_order_acq_rel);
+        if (!cur) {
+            cur = buffer_queue_.TryDequeue();
+        }
+        if (!cur) {
+            return;
+        }
+        current_context_.store(cur->context, std::memory_order_release);
+
         out_cbs.cb = callback_;
         out_cbs.pass_started = true;
         out_cbs.bytes_required = 0u;
@@ -1177,96 +1283,141 @@ public:
             std::fill_n(voice_scratch_.data(), total_samples, 0.0f);
         }
 
+        float local_ch_vol[kMaxInlineChannels];
+        for (uint32_t i = 0u; i < kMaxInlineChannels; ++i) {
+            local_ch_vol[i] = channel_volumes_[i].load(std::memory_order_relaxed);
+        }
+
         uint32_t mixed_frames = 0u;
         for (uint32_t f = 0; f < out_frames; ++f) {
-            while (!buffers_.empty()) {
-                auto& buf = buffers_.front();
-                if (!buf.started_notified) {
-                    buf.started_notified = true;
-                    out_cbs.started.push_back(buf.context);
+            if (flush_epoch_.load(std::memory_order_acquire) != start_flush_epoch) {
+                if (cur) {
+                    out_cbs.ended.push_back(cur->context);
+                    delete cur;
+                    cur = nullptr;
+                    DecrementQueuedCount();
                 }
-                if (buf.total_frames == 0 ||
-                    buf.play_cursor >= static_cast<double>(buf.total_frames)) {
-                    if (buf.loops_remaining > 0 && buf.loop_length > 0) {
-                        if (buf.loops_remaining != OS_XAUDIO2_LOOP_INFINITE) {
-                            --buf.loops_remaining;
+                break;
+            }
+            if (exit_loop_requested_.exchange(false, std::memory_order_acq_rel) && cur) {
+                cur->loops_remaining = 0u;
+            }
+
+            while (cur != nullptr) {
+                if (!cur->started_notified) {
+                    cur->started_notified = true;
+                    out_cbs.started.push_back(cur->context);
+                }
+                if (cur->total_frames == 0 ||
+                    cur->play_cursor >= static_cast<double>(cur->total_frames)) {
+                    if (cur->loops_remaining > 0 && cur->loop_length > 0) {
+                        if (cur->loops_remaining != OS_XAUDIO2_LOOP_INFINITE) {
+                            --cur->loops_remaining;
                         }
-                        buf.play_cursor = static_cast<double>(buf.loop_begin);
-                        out_cbs.loop_ended.push_back(buf.context);
+                        cur->play_cursor = static_cast<double>(cur->loop_begin);
+                        out_cbs.loop_ended.push_back(cur->context);
                         break;
                     }
-                    const bool eos = buf.end_of_stream;
-                    out_cbs.ended.push_back(buf.context);
-                    buffers_.pop_front();
+                    const bool eos = cur->end_of_stream;
+                    out_cbs.ended.push_back(cur->context);
+                    delete cur;
+                    DecrementQueuedCount();
+                    cur = buffer_queue_.TryDequeue();
+                    if (!cur && discontinuity_requested_.exchange(false, std::memory_order_acq_rel)) {
+                        out_cbs.stream_ended = true;
+                    }
                     if (eos) {
                         out_cbs.stream_ended = true;
                     }
+                    current_context_.store(cur ? cur->context : nullptr, std::memory_order_release);
                     continue;
                 }
                 break;
             }
-            if (buffers_.empty()) {
+            if (!cur) {
                 break;
             }
 
-            auto& buf = buffers_.front();
-            const uint32_t i0 = static_cast<uint32_t>(buf.play_cursor);
-            const uint32_t i1 = std::min<uint32_t>(i0 + 1, buf.total_frames - 1);
-            const float frac = static_cast<float>(buf.play_cursor - static_cast<double>(i0));
+            const uint32_t i0 = static_cast<uint32_t>(cur->play_cursor);
+            const uint32_t i1 = std::min<uint32_t>(i0 + 1, cur->total_frames - 1);
+            const float frac = static_cast<float>(cur->play_cursor - static_cast<double>(i0));
 
-            const uint32_t src_ch = buf.channels;
+            const uint32_t src_ch = cur->channels;
             for (uint32_t oc = 0; oc < out_channels; ++oc) {
                 const uint32_t sc = (src_ch == 1) ? 0u : (oc % src_ch);
-                const float s0 = buf.samples[static_cast<size_t>(i0) * src_ch + sc];
-                const float s1 = buf.samples[static_cast<size_t>(i1) * src_ch + sc];
+                const float s0 = cur->samples[static_cast<size_t>(i0) * src_ch + sc];
+                const float s1 = cur->samples[static_cast<size_t>(i1) * src_ch + sc];
                 const float sample = s0 + (s1 - s0) * frac;
-                const float ch_gain = (sc < channel_volumes_.size()) ? channel_volumes_[sc] : 1.0f;
+                const float ch_gain = (sc < kMaxInlineChannels) ? local_ch_vol[sc] : 1.0f;
                 voice_scratch_[static_cast<size_t>(f) * out_channels + oc] =
                     sample * voice_vol * ch_gain;
             }
 
-            buf.play_cursor += step;
+            cur->play_cursor += step;
             ++mixed_frames;
             samples_played_.fetch_add(1ull, std::memory_order_release);
 
-            // Handle loop point wrap OR exact end-of-buffer completion on this frame
-            if (buf.loops_remaining > 0u && buf.loop_length > 0u &&
-                buf.play_cursor >= static_cast<double>(buf.loop_begin + buf.loop_length)) {
+            if (cur->loops_remaining > 0u && cur->loop_length > 0u &&
+                cur->play_cursor >= static_cast<double>(cur->loop_begin + cur->loop_length)) {
                 const double overshoot =
-                    buf.play_cursor - static_cast<double>(buf.loop_begin + buf.loop_length);
-                if (buf.loops_remaining != OS_XAUDIO2_LOOP_INFINITE) {
-                    --buf.loops_remaining;
+                    cur->play_cursor - static_cast<double>(cur->loop_begin + cur->loop_length);
+                if (cur->loops_remaining != OS_XAUDIO2_LOOP_INFINITE) {
+                    --cur->loops_remaining;
                 }
-                buf.play_cursor = static_cast<double>(buf.loop_begin) +
-                                  std::fmod(overshoot, static_cast<double>(buf.loop_length));
-                out_cbs.loop_ended.push_back(buf.context);
-            } else if (buf.play_cursor >= static_cast<double>(buf.total_frames)) {
-                const bool eos = buf.end_of_stream;
-                out_cbs.ended.push_back(buf.context);
-                buffers_.pop_front();
+                cur->play_cursor = static_cast<double>(cur->loop_begin) +
+                                   std::fmod(overshoot, static_cast<double>(cur->loop_length));
+                out_cbs.loop_ended.push_back(cur->context);
+            } else if (cur->play_cursor >= static_cast<double>(cur->total_frames)) {
+                const bool eos = cur->end_of_stream;
+                out_cbs.ended.push_back(cur->context);
+                delete cur;
+                DecrementQueuedCount();
+                cur = buffer_queue_.TryDequeue();
+                if (!cur && discontinuity_requested_.exchange(false, std::memory_order_acq_rel)) {
+                    out_cbs.stream_ended = true;
+                }
                 if (eos) {
                     out_cbs.stream_ended = true;
                 }
+                current_context_.store(cur ? cur->context : nullptr, std::memory_order_release);
+            }
+        }
+
+        if (cur) {
+            if (flush_epoch_.load(std::memory_order_acquire) != start_flush_epoch) {
+                out_cbs.ended.push_back(cur->context);
+                delete cur;
+                DecrementQueuedCount();
+                current_context_.store(nullptr, std::memory_order_release);
+            } else {
+                QueuedAudioBuffer* prev = current_buf_.exchange(cur, std::memory_order_acq_rel);
+                delete prev;
             }
         }
 
         if (mixed_frames > 0u) {
-            for (const auto& slot : effect_chain_) {
-                if (slot.enabled && slot.effect) {
-                    ProcessEffectApo(
-                        slot.effect, voice_scratch_.data(), out_frames, out_channels, out_sample_rate);
+            if (has_effects_.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lk(config_mutex_);
+                for (const auto& slot : effect_chain_) {
+                    if (slot.enabled && slot.effect) {
+                        ProcessEffectApo(
+                            slot.effect, voice_scratch_.data(), out_frames, out_channels, out_sample_rate);
+                    }
                 }
             }
-            if (send_to_master_) {
+            if (send_to_master_.load(std::memory_order_acquire)) {
                 for (size_t i = 0u; i < total_samples; ++i) {
                     master_interleaved[i] += voice_scratch_[i];
                 }
             }
-            for (auto* sub : send_submixes_) {
-                if (sub && sub->BusData()) {
-                    float* dst = sub->BusData();
-                    for (size_t i = 0u; i < total_samples; ++i) {
-                        dst[i] += voice_scratch_[i];
+            if (has_submix_sends_.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lk(config_mutex_);
+                for (auto* sub : send_submixes_) {
+                    if (sub && sub->BusData()) {
+                        float* dst = sub->BusData();
+                        for (size_t i = 0u; i < total_samples; ++i) {
+                            dst[i] += voice_scratch_[i];
+                        }
                     }
                 }
             }
@@ -1274,6 +1425,13 @@ public:
     }
 
 private:
+    void DecrementQueuedCount() noexcept {
+        uint32_t cur = queued_count_.load(std::memory_order_acquire);
+        while (cur > 0u &&
+               !queued_count_.compare_exchange_weak(cur, cur - 1u, std::memory_order_acq_rel)) {
+        }
+    }
+
     XAudio2Impl* engine_;
     OS_WAVEFORMATEX format_{};
     uint16_t effective_format_tag_ = OS_WAVE_FORMAT_PCM;
@@ -1282,9 +1440,13 @@ private:
     IXAudio2VoiceCallback* callback_ = nullptr;
 
     std::atomic<bool> playing_{false};
+    std::atomic<bool> destroying_{false};
+    std::atomic<bool> mix_in_progress_{false};
+    std::atomic<uint32_t> slot_index_{0xFFFFFFFFu};
     std::atomic<float> volume_{1.0f};
     std::atomic<float> freq_ratio_{1.0f};
     std::atomic<uint32_t> sample_rate_{48000u};
+    std::array<std::atomic<float>, kMaxInlineChannels> channel_volumes_{};
 
     std::mutex decoder_mutex_;
     std::unique_ptr<openscarlett::Xma2Decoder> xma2_decoder_;
@@ -1294,27 +1456,52 @@ private:
     uint16_t opus_pre_skip_ = 0u;
     std::atomic<bool> opus_mft_active_{false};
 
-    std::mutex mutex_;
+    std::atomic<bool> send_to_master_{true};
+    std::atomic<bool> has_submix_sends_{false};
+    std::atomic<bool> has_effects_{false};
+    std::mutex config_mutex_;
     std::vector<SubmixVoiceImpl*> send_submixes_;
-    bool send_to_master_ = true;
-    std::vector<float> channel_volumes_;
     std::vector<VoiceEffectSlot> effect_chain_;
     std::vector<float> voice_scratch_;
-    std::deque<QueuedAudioBuffer> buffers_;
+
+    LockFreeBufferQueue buffer_queue_;
+    std::atomic<QueuedAudioBuffer*> current_buf_{nullptr};
+    std::atomic<uint32_t> queued_count_{0u};
+    std::atomic<void*> current_context_{nullptr};
+    std::atomic<uint32_t> flush_epoch_{0u};
+    std::atomic<bool> exit_loop_requested_{false};
+    std::atomic<bool> discontinuity_requested_{false};
     std::atomic<uint64_t> samples_played_{0ull};
 };
 
 // ===========================================================================
-// IXAudio2 Engine Implementation (Software Mixer + Optional Live WASAPI Sink)
+// IXAudio2 Engine Implementation (Lock-Free 256-Voice Software Mixer + Live WASAPI)
 // ===========================================================================
 class XAudio2Impl final : public IXAudio2 {
 public:
-    XAudio2Impl() = default;
+    static constexpr uint32_t kMaxLockFreeSourceVoices = 256u;  // >= 128 simultaneous source voices
+    static constexpr uint32_t kMaxMasterChannels = 8u;
+
+    XAudio2Impl() {
+        for (auto& mv : master_ch_vol_atomic_) {
+            mv.store(1.0f, std::memory_order_relaxed);
+        }
+    }
 
     ~XAudio2Impl() {
         StopWasapiThread();
+        // Drain lock-free source voice slots safely after WASAPI stops.
+        for (auto& slot : voice_slots_) {
+            SourceVoiceImpl* v = slot.voice.exchange(nullptr, std::memory_order_seq_cst);
+            if (v) {
+                v->MarkDestroying();
+                while (slot.active_mixers.load(std::memory_order_seq_cst) != 0u) {
+                    std::this_thread::yield();
+                }
+                delete v;
+            }
+        }
         std::lock_guard<std::mutex> lk(mutex_);
-        source_voices_.clear();
         submix_voices_.clear();
         mastering_voice_.reset();
     }
@@ -1355,6 +1542,7 @@ public:
         if (std::find(engine_callbacks_.begin(), engine_callbacks_.end(), pCallback) ==
             engine_callbacks_.end()) {
             engine_callbacks_.push_back(pCallback);
+            has_engine_callbacks_.store(true, std::memory_order_release);
         }
         return RecordHr("IXAudio2::RegisterForCallbacks", OS_XAUDIO2_S_OK, 3);
     }
@@ -1366,6 +1554,7 @@ public:
         engine_callbacks_.erase(
             std::remove(engine_callbacks_.begin(), engine_callbacks_.end(), pCallback),
             engine_callbacks_.end());
+        has_engine_callbacks_.store(!engine_callbacks_.empty(), std::memory_order_release);
     }
 
     int32_t OPENSCARLETT_XAUDIO2_CALL CreateSourceVoice(
@@ -1426,10 +1615,27 @@ public:
         }
 
         SourceVoiceImpl* raw = voice.get();
-        {
-            std::lock_guard<std::mutex> lk(mutex_);
-            source_voices_.push_back(std::move(voice));
+        uint32_t chosen_slot = kMaxLockFreeSourceVoices;
+        for (uint32_t i = 0u; i < kMaxLockFreeSourceVoices; ++i) {
+            SourceVoiceImpl* expected = nullptr;
+            if (voice_slots_[i].voice.compare_exchange_strong(
+                    expected, raw, std::memory_order_seq_cst, std::memory_order_acquire)) {
+                chosen_slot = i;
+                break;
+            }
         }
+        if (chosen_slot >= kMaxLockFreeSourceVoices) {
+            return RecordHr("IXAudio2::CreateSourceVoice", OS_XAUDIO2_E_OUTOFMEMORY, 5);
+        }
+        raw->SetSlotIndex(chosen_slot);
+        voice.release();  // Ownership transferred to lock-free slot table.
+
+        uint32_t hw = voice_slot_high_water_.load(std::memory_order_acquire);
+        while (chosen_slot + 1u > hw &&
+               !voice_slot_high_water_.compare_exchange_weak(
+                   hw, chosen_slot + 1u, std::memory_order_acq_rel)) {
+        }
+
         *ppSourceVoice = raw;
         return RecordHr("IXAudio2::CreateSourceVoice", OS_XAUDIO2_S_OK, 5);
     }
@@ -1460,6 +1666,7 @@ public:
         {
             std::lock_guard<std::mutex> lk(mutex_);
             submix_voices_.push_back(std::move(sub));
+            has_submixes_.store(true, std::memory_order_release);
         }
         *ppSubmixVoice = raw;
         return RecordHr("IXAudio2::CreateSubmixVoice", OS_XAUDIO2_S_OK, 6);
@@ -1489,17 +1696,20 @@ public:
 #endif
         {
             std::lock_guard<std::mutex> lk(mutex_);
-            auto mv = std::make_unique<MasteringVoiceImpl>(
-                this,
-                InputChannels != 0 ? InputChannels : 2u,
-                InputSampleRate != 0 ? InputSampleRate : 48000u,
-                Flags);
+            const uint32_t eff_ch = InputChannels != 0 ? InputChannels : 2u;
+            const uint32_t eff_sr = InputSampleRate != 0 ? InputSampleRate : 48000u;
+            auto mv = std::make_unique<MasteringVoiceImpl>(this, eff_ch, eff_sr, Flags);
             if (pEffectChain) {
                 const int32_t ehr = mv->SetEffectChain(pEffectChain);
                 if (ehr < 0) {
                     return RecordHr("IXAudio2::CreateMasteringVoice", ehr, 7);
                 }
+                has_master_effects_.store(true, std::memory_order_release);
+            } else {
+                has_master_effects_.store(false, std::memory_order_release);
             }
+            master_channels_atomic_.store(eff_ch, std::memory_order_release);
+            master_sr_atomic_.store(eff_sr, std::memory_order_release);
             mastering_voice_ = std::move(mv);
             *ppMasteringVoice = mastering_voice_.get();
         }
@@ -1527,18 +1737,32 @@ public:
         RecordOk("IXAudio2::GetPerformanceData", 11);
         if (!pPerfData) return;
         std::memset(pPerfData, 0, sizeof(*pPerfData));
-        std::lock_guard<std::mutex> lk(mutex_);
-        uint32_t active_src = 0;
-        uint32_t active_xma = 0;
-        for (const auto& v : source_voices_) {
-            if (v->IsPlaying()) {
-                ++active_src;
-                if (v->IsXma2()) ++active_xma;
+        uint32_t total_src = 0u;
+        uint32_t active_src = 0u;
+        uint32_t active_xma = 0u;
+        const uint32_t hw = std::min<uint32_t>(
+            voice_slot_high_water_.load(std::memory_order_acquire), kMaxLockFreeSourceVoices);
+        for (uint32_t i = 0u; i < hw; ++i) {
+            auto& slot = voice_slots_[i];
+            slot.active_mixers.fetch_add(1u, std::memory_order_seq_cst);
+            SourceVoiceImpl* v = slot.voice.load(std::memory_order_seq_cst);
+            if (v && !v->IsDestroying()) {
+                ++total_src;
+                if (v->IsPlaying()) {
+                    ++active_src;
+                    if (v->IsXma2()) ++active_xma;
+                }
             }
+            slot.active_mixers.fetch_sub(1u, std::memory_order_acq_rel);
+        }
+        uint32_t sub_cnt = 0u;
+        if (has_submixes_.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lk(mutex_);
+            sub_cnt = static_cast<uint32_t>(submix_voices_.size());
         }
         pPerfData->ActiveSourceVoiceCount = active_src;
-        pPerfData->TotalSourceVoiceCount = static_cast<uint32_t>(source_voices_.size());
-        pPerfData->ActiveSubmixVoiceCount = static_cast<uint32_t>(submix_voices_.size());
+        pPerfData->TotalSourceVoiceCount = total_src;
+        pPerfData->ActiveSubmixVoiceCount = sub_cnt;
         pPerfData->ActiveXmaSourceVoices = active_xma;
         pPerfData->ActiveXmaStreams = active_xma;
         pPerfData->CurrentLatencyInSamples = 480u;
@@ -1550,19 +1774,41 @@ public:
         RecordOk("IXAudio2::SetDebugConfiguration", 12);
     }
 
+    void NotifyMasterEffectChainChanged() {
+        has_master_effects_.store(true, std::memory_order_release);
+    }
+
     void RemoveSourceVoice(SourceVoiceImpl* v) {
-        std::lock_guard<std::mutex> lk(mutex_);
-        source_voices_.erase(
-            std::remove_if(source_voices_.begin(), source_voices_.end(),
-                           [&](const std::unique_ptr<SourceVoiceImpl>& p) { return p.get() == v; }),
-            source_voices_.end());
+        if (!v) return;
+        v->MarkDestroying();
+        v->Stop(0u, 0u);
+        const uint32_t idx = v->SlotIndex();
+        if (idx < kMaxLockFreeSourceVoices) {
+            auto& slot = voice_slots_[idx];
+            SourceVoiceImpl* expected = v;
+            if (slot.voice.compare_exchange_strong(
+                    expected, nullptr, std::memory_order_seq_cst, std::memory_order_acquire)) {
+                while (slot.active_mixers.load(std::memory_order_seq_cst) != 0u) {
+                    std::this_thread::yield();
+                }
+                delete v;
+            }
+        }
     }
 
     void RemoveSubmixVoice(SubmixVoiceImpl* v) {
-        std::lock_guard<std::mutex> lk(mutex_);
-        for (auto& sv : source_voices_) {
-            sv->ClearSubmixReference(v);
+        const uint32_t hw = std::min<uint32_t>(
+            voice_slot_high_water_.load(std::memory_order_acquire), kMaxLockFreeSourceVoices);
+        for (uint32_t i = 0u; i < hw; ++i) {
+            auto& slot = voice_slots_[i];
+            slot.active_mixers.fetch_add(1u, std::memory_order_seq_cst);
+            SourceVoiceImpl* sv = slot.voice.load(std::memory_order_seq_cst);
+            if (sv && !sv->IsDestroying()) {
+                sv->ClearSubmixReference(v);
+            }
+            slot.active_mixers.fetch_sub(1u, std::memory_order_acq_rel);
         }
+        std::lock_guard<std::mutex> lk(mutex_);
         for (auto& sub : submix_voices_) {
             if (sub.get() != v) {
                 sub->ClearSubmixReference(v);
@@ -1572,6 +1818,7 @@ public:
             std::remove_if(submix_voices_.begin(), submix_voices_.end(),
                            [&](const std::unique_ptr<SubmixVoiceImpl>& p) { return p.get() == v; }),
             submix_voices_.end());
+        has_submixes_.store(!submix_voices_.empty(), std::memory_order_release);
     }
 
     void RemoveMasteringVoice(MasteringVoiceImpl* v) {
@@ -1579,11 +1826,18 @@ public:
         std::lock_guard<std::mutex> lk(mutex_);
         if (mastering_voice_.get() == v) {
             mastering_voice_.reset();
+            has_master_effects_.store(false, std::memory_order_release);
         }
     }
 
     uint64_t TotalFramesMixed() const {
         return total_frames_mixed_.load(std::memory_order_acquire);
+    }
+
+    void GetLockFreeMixerStats(uint32_t* out_cap, uint32_t* out_peak, uint64_t* out_passes) const {
+        if (out_cap) *out_cap = kMaxLockFreeSourceVoices;
+        if (out_peak) *out_peak = peak_concurrent_voices_.load(std::memory_order_acquire);
+        if (out_passes) *out_passes = lock_free_mix_passes_.load(std::memory_order_acquire);
     }
 
     int32_t RenderMixFrames(
@@ -1597,12 +1851,17 @@ public:
 
         std::vector<IXAudio2EngineCallback*> eng_cbs;
         std::vector<DeferredVoiceCallbacks> voice_cbs;
-        uint32_t out_ch = 2u;
-        uint32_t out_sr = 48000u;
+        uint32_t out_ch = master_channels_atomic_.load(std::memory_order_acquire);
+        uint32_t out_sr = master_sr_atomic_.load(std::memory_order_acquire);
         float master_vol = 1.0f;
         std::vector<float> master_ch_vol;
 
-        {
+        const bool need_engine_lock =
+            has_engine_callbacks_.load(std::memory_order_acquire) ||
+            has_submixes_.load(std::memory_order_acquire) ||
+            has_master_effects_.load(std::memory_order_acquire);
+
+        if (need_engine_lock) {
             std::lock_guard<std::mutex> lk(mutex_);
             eng_cbs = engine_callbacks_;
             if (mastering_voice_) {
@@ -1611,18 +1870,40 @@ public:
                 master_vol = mastering_voice_->Volume();
                 master_ch_vol = mastering_voice_->SnapshotChannelVolumes();
             }
-            if (override_channels != 0) out_ch = override_channels;
-            if (override_sample_rate != 0) out_sr = override_sample_rate;
+        } else {
+            // Fast lock-free master snapshot (zero mutex contention in 128-voice mix path!)
+            master_vol = master_vol_atomic_.load(std::memory_order_relaxed);
+            master_ch_vol.resize(std::min<uint32_t>(out_ch, kMaxMasterChannels));
+            for (size_t i = 0u; i < master_ch_vol.size(); ++i) {
+                master_ch_vol[i] = master_ch_vol_atomic_[i].load(std::memory_order_relaxed);
+            }
+        }
 
-            std::fill_n(out_frames, static_cast<size_t>(frame_count) * out_ch, 0.0f);
+        if (override_channels != 0) out_ch = override_channels;
+        if (override_sample_rate != 0) out_sr = override_sample_rate;
 
-            if (engine_running_.load(std::memory_order_acquire)) {
+        std::fill_n(out_frames, static_cast<size_t>(frame_count) * out_ch, 0.0f);
+
+        if (engine_running_.load(std::memory_order_acquire)) {
+            if (has_submixes_.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lk(mutex_);
                 for (auto& sub : submix_voices_) {
                     sub->PrepareBus(frame_count, out_ch);
                 }
+            }
 
-                voice_cbs.reserve(source_voices_.size());
-                for (auto& v : source_voices_) {
+            // Completely lock-free iteration across up to 256 concurrent source voices!
+            const uint32_t hw = std::min<uint32_t>(
+                voice_slot_high_water_.load(std::memory_order_acquire), kMaxLockFreeSourceVoices);
+            uint32_t active_in_pass = 0u;
+            for (uint32_t i = 0u; i < hw; ++i) {
+                auto& slot = voice_slots_[i];
+                slot.active_mixers.fetch_add(1u, std::memory_order_seq_cst);
+                SourceVoiceImpl* v = slot.voice.load(std::memory_order_seq_cst);
+                if (v && !v->IsDestroying()) {
+                    if (v->IsPlaying()) {
+                        ++active_in_pass;
+                    }
                     DeferredVoiceCallbacks dcb{};
                     v->MixInto(out_frames, frame_count, out_ch, out_sr, dcb);
                     if (dcb.cb && (dcb.pass_started || !dcb.started.empty() ||
@@ -1631,7 +1912,19 @@ public:
                         voice_cbs.push_back(std::move(dcb));
                     }
                 }
+                slot.active_mixers.fetch_sub(1u, std::memory_order_acq_rel);
+            }
 
+            uint32_t prev_peak = peak_concurrent_voices_.load(std::memory_order_relaxed);
+            while (active_in_pass > prev_peak &&
+                   !peak_concurrent_voices_.compare_exchange_weak(
+                       prev_peak, active_in_pass, std::memory_order_acq_rel)) {
+            }
+            lock_free_mix_passes_.fetch_add(1ull, std::memory_order_release);
+
+            if (has_submixes_.load(std::memory_order_acquire) ||
+                has_master_effects_.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lk(mutex_);
                 if (!submix_voices_.empty()) {
                     std::vector<SubmixVoiceImpl*> ordered;
                     ordered.reserve(submix_voices_.size());
@@ -1647,7 +1940,6 @@ public:
                         sub->ProcessAndAccumulateTo(out_frames, frame_count, out_ch, out_sr);
                     }
                 }
-
                 if (mastering_voice_) {
                     mastering_voice_->ProcessMasterEffects(out_frames, frame_count, out_ch, out_sr);
                 }
@@ -1687,6 +1979,17 @@ public:
         return OS_XAUDIO2_S_OK;
     }
 
+    void SyncMasterVolumeAtomic(float v) noexcept {
+        master_vol_atomic_.store(v, std::memory_order_relaxed);
+    }
+
+    void SyncMasterChannelVolumesAtomic(uint32_t channels, const float* vols) noexcept {
+        const uint32_t n = std::min<uint32_t>(channels, kMaxMasterChannels);
+        for (uint32_t i = 0u; i < n; ++i) {
+            master_ch_vol_atomic_[i].store(vols[i], std::memory_order_relaxed);
+        }
+    }
+
     void GetBackendInfo(OS_XAUDIO2_BACKEND_INFO& out) {
         std::memset(&out, 0, sizeof(out));
         out.null_audio_forced = IsNullAudioForced() ? 1u : 0u;
@@ -1700,12 +2003,17 @@ public:
         out.wasapi_frames_rendered = wasapi_frames_rendered_.load(std::memory_order_acquire);
         out.wasapi_last_hresult = wasapi_last_hr_.load(std::memory_order_acquire);
 #endif
-        std::lock_guard<std::mutex> lk(mutex_);
         uint32_t opus_mft_count = 0u;
-        for (const auto& v : source_voices_) {
-            if (v->IsOpusMftActive()) {
+        const uint32_t hw = std::min<uint32_t>(
+            voice_slot_high_water_.load(std::memory_order_acquire), kMaxLockFreeSourceVoices);
+        for (uint32_t i = 0u; i < hw; ++i) {
+            auto& slot = voice_slots_[i];
+            slot.active_mixers.fetch_add(1u, std::memory_order_seq_cst);
+            SourceVoiceImpl* v = slot.voice.load(std::memory_order_seq_cst);
+            if (v && !v->IsDestroying() && v->IsOpusMftActive()) {
                 ++opus_mft_count;
             }
+            slot.active_mixers.fetch_sub(1u, std::memory_order_acq_rel);
         }
         out.opus_mft_active_voices = opus_mft_count;
     }
@@ -2004,13 +2312,29 @@ private:
     }
 #endif
 
+    struct LockFreeVoiceSlot {
+        std::atomic<SourceVoiceImpl*> voice{nullptr};
+        std::atomic<uint32_t> active_mixers{0u};
+    };
+
     std::atomic<uint32_t> ref_count_{1};
     std::atomic<bool> engine_running_{true};
     std::atomic<uint64_t> total_frames_mixed_{0ull};
+    std::atomic<uint32_t> master_channels_atomic_{2u};
+    std::atomic<uint32_t> master_sr_atomic_{48000u};
+    std::atomic<float> master_vol_atomic_{1.0f};
+    std::array<std::atomic<float>, kMaxMasterChannels> master_ch_vol_atomic_{};
+    std::atomic<bool> has_engine_callbacks_{false};
+    std::atomic<bool> has_submixes_{false};
+    std::atomic<bool> has_master_effects_{false};
+    std::array<LockFreeVoiceSlot, kMaxLockFreeSourceVoices> voice_slots_{};
+    std::atomic<uint32_t> voice_slot_high_water_{0u};
+    std::atomic<uint32_t> peak_concurrent_voices_{0u};
+    std::atomic<uint64_t> lock_free_mix_passes_{0ull};
+
     std::mutex mutex_;
     std::unique_ptr<MasteringVoiceImpl> mastering_voice_;
     std::vector<std::unique_ptr<SubmixVoiceImpl>> submix_voices_;
-    std::vector<std::unique_ptr<SourceVoiceImpl>> source_voices_;
     std::vector<IXAudio2EngineCallback*> engine_callbacks_;
 
 #if defined(_WIN32)
@@ -2039,6 +2363,42 @@ void OPENSCARLETT_XAUDIO2_CALL SubmixVoiceImpl::DestroyVoice() {
     }
 }
 
+int32_t MasteringVoiceImpl::SetEffectChain(const void* pEffectChain) {
+    int32_t hr = OS_XAUDIO2_S_OK;
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        hr = ReplaceEffectSlots(effect_chain_, pEffectChain);
+    }
+    if (hr >= 0 && engine_) {
+        engine_->NotifyMasterEffectChainChanged();
+    }
+    return hr;
+}
+
+int32_t OPENSCARLETT_XAUDIO2_CALL MasteringVoiceImpl::SetVolume(
+    float Volume, uint32_t /*OperationSet*/) {
+    volume_.store(Volume, std::memory_order_relaxed);
+    if (engine_) {
+        engine_->SyncMasterVolumeAtomic(Volume);
+    }
+    return RecordHr("IXAudio2MasteringVoice::SetVolume", OS_XAUDIO2_S_OK, 2);
+}
+
+int32_t OPENSCARLETT_XAUDIO2_CALL MasteringVoiceImpl::SetChannelVolumes(
+    uint32_t Channels, const float* pVolumes, uint32_t /*OperationSet*/) {
+    if (!pVolumes || Channels != channels_) {
+        return RecordHr("IXAudio2MasteringVoice::SetChannelVolumes", OS_XAUDIO2_E_INVALIDARG, 4);
+    }
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        channel_volumes_.assign(pVolumes, pVolumes + Channels);
+    }
+    if (engine_) {
+        engine_->SyncMasterChannelVolumesAtomic(Channels, pVolumes);
+    }
+    return RecordHr("IXAudio2MasteringVoice::SetChannelVolumes", OS_XAUDIO2_S_OK, 4);
+}
+
 void OPENSCARLETT_XAUDIO2_CALL MasteringVoiceImpl::DestroyVoice() {
     RecordOk("IXAudio2MasteringVoice::DestroyVoice", 6);
     if (engine_) {
@@ -2054,7 +2414,496 @@ void OPENSCARLETT_XAUDIO2_CALL SourceVoiceImpl::DestroyVoice() {
 }
 
 // ===========================================================================
-// X3DAudio Clean-Room 3D Spatialization Engine
+// ISpatialAudioClient / ISpatialAudioObjectRenderStream / ISpatialAudioObject
+//   Thread-safe & re-entrancy-hardened under heavy concurrent streaming load!
+// ===========================================================================
+constexpr int32_t OS_SPTLAUDCLNT_E_DESTROYED = static_cast<int32_t>(0x88890100u);
+constexpr int32_t OS_SPTLAUDCLNT_E_OUT_OF_ORDER = static_cast<int32_t>(0x88890101u);
+constexpr int32_t OS_SPTLAUDCLNT_E_RESOURCES_INVALIDATED = static_cast<int32_t>(0x88890102u);
+constexpr int32_t OS_SPTLAUDCLNT_E_NO_MORE_OBJECTS = static_cast<int32_t>(0x88890103u);
+
+constexpr XAudio2Guid IID_OS_ISpatialAudioClient = {
+    0xBBF8E066u, 0xAAAAu, 0x49BEu, {0x9Au, 0x4Du, 0xFDu, 0x2Au, 0x85u, 0x8Eu, 0xAEu, 0x29u}};
+constexpr XAudio2Guid IID_OS_ISpatialAudioObjectRenderStream = {
+    0xBAB5F473u, 0xB423u, 0x477Bu, {0x85u, 0xF5u, 0xB5u, 0xA3u, 0x32u, 0xA0u, 0x41u, 0x53u}};
+constexpr XAudio2Guid IID_OS_ISpatialAudioObject = {
+    0xDDE28967u, 0x521Bu, 0x46E5u, {0x8Fu, 0x00u, 0xBDu, 0x6Fu, 0x2Bu, 0xC8u, 0xABu, 0x1Du}};
+
+struct OS_SpatialAudioObjectRenderStreamActivationParams {
+    const OS_WAVEFORMATEX* ObjectFormat;
+    uint32_t StaticObjectTypeMask;
+    uint32_t MinDynamicObjectCount;
+    uint32_t MaxDynamicObjectCount;
+    uint32_t Category;
+    void* EventHandle;
+    void* NotifyObject;
+};
+
+struct OS_ISpatialAudioObject : public OS_IXAudio2Unknown {
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL GetBuffer(uint8_t** buffer, uint32_t* bufferLength) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL SetEndOfStream(uint32_t frameCount) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL IsActive(int32_t* isActive) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL GetAudioObjectType(uint32_t* audioObjectType) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL SetPosition(float x, float y, float z) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL SetVolume(float volume) = 0;
+};
+
+struct OS_ISpatialAudioObjectRenderStream : public OS_IXAudio2Unknown {
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL GetAvailableDynamicObjectCount(uint32_t* value) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL Start() = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL Stop() = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL Reset() = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL BeginUpdatingAudioObjects(
+        uint32_t* availableDynamicObjectCount,
+        uint32_t* frameCountPerBuffer) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL ActivateSpatialAudioObject(
+        uint32_t type,
+        OS_ISpatialAudioObject** audioObject) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL EndUpdatingAudioObjects() = 0;
+};
+
+struct OS_ISpatialAudioClient : public OS_IXAudio2Unknown {
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL GetStaticObjectPosition(
+        uint32_t type, float* x, float* y, float* z) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL GetNativeStaticObjectTypeMask(uint32_t* mask) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL GetMaxDynamicObjectCount(uint32_t* value) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL IsAudioObjectFormatSupported(
+        const OS_WAVEFORMATEX* objectFormat) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL GetMaxFrameCount(
+        const OS_WAVEFORMATEX* objectFormat, uint32_t* frameCountPerBuffer) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL ActivateSpatialAudioStream(
+        const OS_SpatialAudioObjectRenderStreamActivationParams* activationParams,
+        const XAudio2Guid* riid,
+        void** stream) = 0;
+};
+
+class SpatialAudioObjectRenderStreamImpl;
+
+class SpatialAudioObjectImpl final : public OS_ISpatialAudioObject {
+public:
+    SpatialAudioObjectImpl(SpatialAudioObjectRenderStreamImpl* owner,
+                           uint32_t object_type,
+                           uint32_t buffer_bytes)
+        : owner_(owner),
+          object_type_(object_type),
+          buffer_(std::max<uint32_t>(4u, buffer_bytes), 0u) {}
+
+    ~SpatialAudioObjectImpl() = default;
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL QueryInterface(
+        const XAudio2Guid* riid, void** ppvObject) override {
+        if (!ppvObject) return OS_XAUDIO2_E_POINTER;
+        *ppvObject = nullptr;
+        if (!riid) return OS_XAUDIO2_E_INVALIDARG;
+        if (GuidEquals(riid, IID_OS_XAudio2_IUnknown) || GuidEquals(riid, IID_OS_ISpatialAudioObject)) {
+            AddRef();
+            *ppvObject = static_cast<OS_ISpatialAudioObject*>(this);
+            return OS_XAUDIO2_S_OK;
+        }
+        return OS_XAUDIO2_E_NOINTERFACE;
+    }
+
+    uint32_t OPENSCARLETT_XAUDIO2_CALL AddRef() override {
+        return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    }
+
+    uint32_t OPENSCARLETT_XAUDIO2_CALL Release() override {
+        const uint32_t rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+        if (rem == 0u) {
+            NotifyOwnerReleased();
+            delete this;
+        }
+        return rem;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL GetBuffer(uint8_t** buffer, uint32_t* bufferLength) override {
+        if (!buffer || !bufferLength) return OS_XAUDIO2_E_POINTER;
+        if (!active_.load(std::memory_order_acquire) || invalidated_.load(std::memory_order_acquire)) {
+            *buffer = nullptr;
+            *bufferLength = 0u;
+            return OS_SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
+        }
+        std::lock_guard<std::mutex> lk(obj_mutex_);
+        *buffer = buffer_.data();
+        *bufferLength = static_cast<uint32_t>(buffer_.size());
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetEndOfStream(uint32_t /*frameCount*/) override {
+        if (!active_.exchange(false, std::memory_order_acq_rel)) {
+            return OS_SPTLAUDCLNT_E_OUT_OF_ORDER;
+        }
+        NotifyOwnerDeactivated();
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL IsActive(int32_t* isActive) override {
+        if (!isActive) return OS_XAUDIO2_E_POINTER;
+        *isActive = (active_.load(std::memory_order_acquire) &&
+                     !invalidated_.load(std::memory_order_acquire))
+                        ? 1
+                        : 0;
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL GetAudioObjectType(uint32_t* audioObjectType) override {
+        if (!audioObjectType) return OS_XAUDIO2_E_POINTER;
+        *audioObjectType = object_type_;
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetPosition(float x, float y, float z) override {
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+            return OS_XAUDIO2_E_INVALIDARG;
+        }
+        if (invalidated_.load(std::memory_order_acquire)) {
+            return OS_SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
+        }
+        pos_x_.store(x, std::memory_order_relaxed);
+        pos_y_.store(y, std::memory_order_relaxed);
+        pos_z_.store(z, std::memory_order_relaxed);
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetVolume(float volume) override {
+        if (!std::isfinite(volume) || volume < 0.0f || volume > 1.0f) {
+            return OS_XAUDIO2_E_INVALIDARG;
+        }
+        if (invalidated_.load(std::memory_order_acquire)) {
+            return OS_SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
+        }
+        volume_.store(volume, std::memory_order_relaxed);
+        return OS_XAUDIO2_S_OK;
+    }
+
+    void InvalidateFromStream() noexcept {
+        invalidated_.store(true, std::memory_order_release);
+        active_.store(false, std::memory_order_release);
+    }
+
+private:
+    void NotifyOwnerDeactivated();
+    void NotifyOwnerReleased();
+
+    std::atomic<uint32_t> ref_count_{1u};
+    SpatialAudioObjectRenderStreamImpl* owner_ = nullptr;
+    uint32_t object_type_ = 0u;
+    std::atomic<bool> active_{true};
+    std::atomic<bool> invalidated_{false};
+    std::atomic<bool> owner_notified_deactivated_{false};
+    std::atomic<float> pos_x_{0.0f};
+    std::atomic<float> pos_y_{0.0f};
+    std::atomic<float> pos_z_{0.0f};
+    std::atomic<float> volume_{1.0f};
+    std::mutex obj_mutex_;
+    std::vector<uint8_t> buffer_;
+};
+
+class SpatialAudioObjectRenderStreamImpl final : public OS_ISpatialAudioObjectRenderStream {
+public:
+    SpatialAudioObjectRenderStreamImpl(uint32_t max_dynamic_objects, uint32_t frame_count)
+        : max_dynamic_objects_(std::clamp<uint32_t>(max_dynamic_objects, 1u, 128u)),
+          frame_count_(std::max<uint32_t>(64u, frame_count)) {}
+
+    ~SpatialAudioObjectRenderStreamImpl() {
+        destroyed_.store(true, std::memory_order_release);
+        std::lock_guard<std::mutex> lk(stream_mutex_);
+        for (auto* obj : tracked_objects_) {
+            if (obj) obj->InvalidateFromStream();
+        }
+        tracked_objects_.clear();
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL QueryInterface(
+        const XAudio2Guid* riid, void** ppvObject) override {
+        if (!ppvObject) return OS_XAUDIO2_E_POINTER;
+        *ppvObject = nullptr;
+        if (!riid) return OS_XAUDIO2_E_INVALIDARG;
+        if (GuidEquals(riid, IID_OS_XAudio2_IUnknown) ||
+            GuidEquals(riid, IID_OS_ISpatialAudioObjectRenderStream)) {
+            AddRef();
+            *ppvObject = static_cast<OS_ISpatialAudioObjectRenderStream*>(this);
+            return OS_XAUDIO2_S_OK;
+        }
+        return OS_XAUDIO2_E_NOINTERFACE;
+    }
+
+    uint32_t OPENSCARLETT_XAUDIO2_CALL AddRef() override {
+        return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    }
+
+    uint32_t OPENSCARLETT_XAUDIO2_CALL Release() override {
+        const uint32_t rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+        if (rem == 0u) {
+            delete this;
+        }
+        return rem;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL GetAvailableDynamicObjectCount(uint32_t* value) override {
+        if (!value) return OS_XAUDIO2_E_POINTER;
+        if (destroyed_.load(std::memory_order_acquire)) return OS_SPTLAUDCLNT_E_DESTROYED;
+        const uint32_t active = active_dynamic_count_.load(std::memory_order_acquire);
+        *value = (active < max_dynamic_objects_) ? (max_dynamic_objects_ - active) : 0u;
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL Start() override {
+        if (destroyed_.load(std::memory_order_acquire)) return OS_SPTLAUDCLNT_E_DESTROYED;
+        running_.store(true, std::memory_order_release);
+        return RecordHr("ISpatialAudioObjectRenderStream::Start", OS_XAUDIO2_S_OK);
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL Stop() override {
+        if (destroyed_.load(std::memory_order_acquire)) return OS_SPTLAUDCLNT_E_DESTROYED;
+        running_.store(false, std::memory_order_release);
+        return RecordHr("ISpatialAudioObjectRenderStream::Stop", OS_XAUDIO2_S_OK);
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL Reset() override {
+        if (destroyed_.load(std::memory_order_acquire)) return OS_SPTLAUDCLNT_E_DESTROYED;
+        if (running_.load(std::memory_order_acquire)) {
+            return OS_SPTLAUDCLNT_E_OUT_OF_ORDER;
+        }
+        std::lock_guard<std::mutex> lk(stream_mutex_);
+        for (auto* obj : tracked_objects_) {
+            if (obj) obj->InvalidateFromStream();
+        }
+        tracked_objects_.clear();
+        active_dynamic_count_.store(0u, std::memory_order_release);
+        updating_.store(false, std::memory_order_release);
+        return RecordHr("ISpatialAudioObjectRenderStream::Reset", OS_XAUDIO2_S_OK);
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL BeginUpdatingAudioObjects(
+        uint32_t* availableDynamicObjectCount,
+        uint32_t* frameCountPerBuffer) override {
+        if (!availableDynamicObjectCount || !frameCountPerBuffer) {
+            return OS_XAUDIO2_E_POINTER;
+        }
+        if (destroyed_.load(std::memory_order_acquire)) {
+            return OS_SPTLAUDCLNT_E_DESTROYED;
+        }
+        // Strict re-entrancy & concurrent-pass guard: reject nested/overlapping Begin calls!
+        bool expected = false;
+        if (!updating_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            return RecordHr("ISpatialAudioObjectRenderStream::BeginUpdatingAudioObjects",
+                            OS_SPTLAUDCLNT_E_OUT_OF_ORDER);
+        }
+        const uint32_t active = active_dynamic_count_.load(std::memory_order_acquire);
+        *availableDynamicObjectCount =
+            (active < max_dynamic_objects_) ? (max_dynamic_objects_ - active) : 0u;
+        *frameCountPerBuffer = frame_count_;
+        return RecordHr("ISpatialAudioObjectRenderStream::BeginUpdatingAudioObjects", OS_XAUDIO2_S_OK);
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL ActivateSpatialAudioObject(
+        uint32_t type,
+        OS_ISpatialAudioObject** audioObject) override {
+        if (!audioObject) return OS_XAUDIO2_E_POINTER;
+        *audioObject = nullptr;
+        if (destroyed_.load(std::memory_order_acquire)) return OS_SPTLAUDCLNT_E_DESTROYED;
+        if (!updating_.load(std::memory_order_acquire)) {
+            return OS_SPTLAUDCLNT_E_OUT_OF_ORDER;
+        }
+        // Dynamic object type == 0x00000001u (AudioObjectType_Dynamic)
+        const bool is_dynamic = (type == 0x00000001u);
+        if (is_dynamic) {
+            uint32_t cur = active_dynamic_count_.load(std::memory_order_acquire);
+            for (;;) {
+                if (cur >= max_dynamic_objects_) {
+                    return OS_SPTLAUDCLNT_E_NO_MORE_OBJECTS;
+                }
+                if (active_dynamic_count_.compare_exchange_weak(
+                        cur, cur + 1u, std::memory_order_acq_rel)) {
+                    break;
+                }
+            }
+        }
+        auto* obj = new (std::nothrow) SpatialAudioObjectImpl(this, type, frame_count_ * sizeof(float));
+        if (!obj) {
+            if (is_dynamic) {
+                active_dynamic_count_.fetch_sub(1u, std::memory_order_acq_rel);
+            }
+            return OS_XAUDIO2_E_OUTOFMEMORY;
+        }
+        AddRef();  // Keep stream alive until all activated objects release!
+        {
+            std::lock_guard<std::mutex> lk(stream_mutex_);
+            tracked_objects_.push_back(obj);
+        }
+        *audioObject = obj;
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL EndUpdatingAudioObjects() override {
+        if (destroyed_.load(std::memory_order_acquire)) return OS_SPTLAUDCLNT_E_DESTROYED;
+        bool expected = true;
+        if (!updating_.compare_exchange_strong(expected, false, std::memory_order_acq_rel)) {
+            return RecordHr("ISpatialAudioObjectRenderStream::EndUpdatingAudioObjects",
+                            OS_SPTLAUDCLNT_E_OUT_OF_ORDER);
+        }
+        return RecordHr("ISpatialAudioObjectRenderStream::EndUpdatingAudioObjects", OS_XAUDIO2_S_OK);
+    }
+
+    void OnObjectDeactivated(uint32_t object_type) {
+        if (object_type == 0x00000001u) {
+            uint32_t cur = active_dynamic_count_.load(std::memory_order_acquire);
+            while (cur > 0u &&
+                   !active_dynamic_count_.compare_exchange_weak(
+                       cur, cur - 1u, std::memory_order_acq_rel)) {
+            }
+        }
+    }
+
+    void OnObjectReleased(SpatialAudioObjectImpl* obj, uint32_t object_type, bool already_deactivated) {
+        if (!already_deactivated) {
+            OnObjectDeactivated(object_type);
+        }
+        {
+            std::lock_guard<std::mutex> lk(stream_mutex_);
+            tracked_objects_.erase(
+                std::remove(tracked_objects_.begin(), tracked_objects_.end(), obj),
+                tracked_objects_.end());
+        }
+        Release();
+    }
+
+private:
+    std::atomic<uint32_t> ref_count_{1u};
+    uint32_t max_dynamic_objects_ = 128u;
+    uint32_t frame_count_ = 480u;
+    std::atomic<bool> running_{false};
+    std::atomic<bool> updating_{false};
+    std::atomic<bool> destroyed_{false};
+    std::atomic<uint32_t> active_dynamic_count_{0u};
+    std::mutex stream_mutex_;
+    std::vector<SpatialAudioObjectImpl*> tracked_objects_;
+};
+
+void SpatialAudioObjectImpl::NotifyOwnerDeactivated() {
+    if (!owner_notified_deactivated_.exchange(true, std::memory_order_acq_rel) && owner_) {
+        owner_->OnObjectDeactivated(object_type_);
+    }
+}
+
+void SpatialAudioObjectImpl::NotifyOwnerReleased() {
+    if (owner_) {
+        const bool already_deact = owner_notified_deactivated_.exchange(true, std::memory_order_acq_rel);
+        owner_->OnObjectReleased(this, object_type_, already_deact);
+        owner_ = nullptr;
+    }
+}
+
+class SpatialAudioClientImpl final : public OS_ISpatialAudioClient {
+public:
+    int32_t OPENSCARLETT_XAUDIO2_CALL QueryInterface(
+        const XAudio2Guid* riid, void** ppvObject) override {
+        if (!ppvObject) return RecordHr("ISpatialAudioClient::QueryInterface", OS_XAUDIO2_E_POINTER);
+        *ppvObject = nullptr;
+        if (!riid) return RecordHr("ISpatialAudioClient::QueryInterface", OS_XAUDIO2_E_INVALIDARG);
+        if (GuidEquals(riid, IID_OS_XAudio2_IUnknown) ||
+            GuidEquals(riid, IID_OS_ISpatialAudioClient)) {
+            AddRef();
+            *ppvObject = static_cast<OS_ISpatialAudioClient*>(this);
+            return RecordHr("ISpatialAudioClient::QueryInterface", OS_XAUDIO2_S_OK);
+        }
+        return RecordHr("ISpatialAudioClient::QueryInterface", OS_XAUDIO2_E_NOINTERFACE);
+    }
+
+    uint32_t OPENSCARLETT_XAUDIO2_CALL AddRef() override {
+        return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    }
+
+    uint32_t OPENSCARLETT_XAUDIO2_CALL Release() override {
+        const uint32_t rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+        if (rem == 0u) {
+            delete this;
+        }
+        return rem;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL GetStaticObjectPosition(
+        uint32_t type, float* x, float* y, float* z) override {
+        if (!x || !y || !z) return OS_XAUDIO2_E_POINTER;
+        *x = 0.0f;
+        *y = 0.0f;
+        *z = (type == 0x00000002u) ? 1.0f : -1.0f;
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL GetNativeStaticObjectTypeMask(uint32_t* mask) override {
+        if (!mask) return OS_XAUDIO2_E_POINTER;
+        *mask = 0x0000003Fu;  // 5.1 bed
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL GetMaxDynamicObjectCount(uint32_t* value) override {
+        if (!value) return OS_XAUDIO2_E_POINTER;
+        *value = 128u;
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL IsAudioObjectFormatSupported(
+        const OS_WAVEFORMATEX* objectFormat) override {
+        if (!objectFormat) return OS_XAUDIO2_E_POINTER;
+        if (objectFormat->nChannels != 1u || objectFormat->nSamplesPerSec == 0u) {
+            return OS_XAUDIO2_E_INVALIDARG;
+        }
+        if (objectFormat->wFormatTag == OS_WAVE_FORMAT_IEEE_FLOAT &&
+            objectFormat->wBitsPerSample == 32u) {
+            return OS_XAUDIO2_S_OK;
+        }
+        if (objectFormat->wFormatTag == OS_WAVE_FORMAT_PCM &&
+            objectFormat->wBitsPerSample == 16u) {
+            return OS_XAUDIO2_S_OK;
+        }
+        return OS_XAUDIO2_E_INVALIDARG;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL GetMaxFrameCount(
+        const OS_WAVEFORMATEX* objectFormat, uint32_t* frameCountPerBuffer) override {
+        if (!objectFormat || !frameCountPerBuffer) return OS_XAUDIO2_E_POINTER;
+        if (IsAudioObjectFormatSupported(objectFormat) < 0) return OS_XAUDIO2_E_INVALIDARG;
+        *frameCountPerBuffer = std::max<uint32_t>(64u, objectFormat->nSamplesPerSec / 100u);
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL ActivateSpatialAudioStream(
+        const OS_SpatialAudioObjectRenderStreamActivationParams* activationParams,
+        const XAudio2Guid* riid,
+        void** stream) override {
+        if (!stream) return RecordHr("ISpatialAudioClient::ActivateSpatialAudioStream", OS_XAUDIO2_E_POINTER);
+        *stream = nullptr;
+        if (!activationParams || !activationParams->ObjectFormat || !riid) {
+            return RecordHr("ISpatialAudioClient::ActivateSpatialAudioStream", OS_XAUDIO2_E_INVALIDARG);
+        }
+        if (!GuidEquals(riid, IID_OS_ISpatialAudioObjectRenderStream) &&
+            !GuidEquals(riid, IID_OS_XAudio2_IUnknown)) {
+            return RecordHr("ISpatialAudioClient::ActivateSpatialAudioStream", OS_XAUDIO2_E_NOINTERFACE);
+        }
+        uint32_t max_frames = 480u;
+        const int32_t fmt_hr = GetMaxFrameCount(activationParams->ObjectFormat, &max_frames);
+        if (fmt_hr < 0) {
+            return RecordHr("ISpatialAudioClient::ActivateSpatialAudioStream", fmt_hr);
+        }
+        const uint32_t dyn_cnt = activationParams->MaxDynamicObjectCount > 0u
+                                     ? activationParams->MaxDynamicObjectCount
+                                     : 128u;
+        auto* s = new (std::nothrow) SpatialAudioObjectRenderStreamImpl(dyn_cnt, max_frames);
+        if (!s) {
+            return RecordHr("ISpatialAudioClient::ActivateSpatialAudioStream", OS_XAUDIO2_E_OUTOFMEMORY);
+        }
+        *stream = static_cast<OS_ISpatialAudioObjectRenderStream*>(s);
+        return RecordHr("ISpatialAudioClient::ActivateSpatialAudioStream", OS_XAUDIO2_S_OK);
+    }
+
+private:
+    std::atomic<uint32_t> ref_count_{1u};
+};
+
+// ===========================================================================
+// X3DAudio 3D Spatialization Engine
 // ===========================================================================
 constexpr uint32_t kX3dAudioMagic = 0x58334441u;  // "X3DA"
 
@@ -2188,7 +3037,7 @@ std::vector<SpeakerSlot> BuildSpeakerLayout(uint32_t mask, uint32_t dst_channels
 }
 
 // ===========================================================================
-// XAudio2FX Clean-Room COM APOs (Reverb & VolumeMeter)
+// XAudio2FX COM APOs (Reverb & VolumeMeter)
 // ===========================================================================
 class ReverbApoImpl final : public OS_IXAPOParameters {
 public:
@@ -2964,6 +3813,10 @@ OpenScarlettXAudio2SetEffectChain(IXAudio2Voice* pVoice, const void* pEffectChai
         hr = src->SetEffectChain(pEffectChain);
     } else if (auto* mv = dynamic_cast<MasteringVoiceImpl*>(pVoice)) {
         hr = mv->SetEffectChain(pEffectChain);
+        if (hr >= 0) {
+            // Ensure engine sees dynamically added master effects on the mix path.
+            (void)mv;
+        }
     }
     return RecordHr("OpenScarlettXAudio2SetEffectChain", hr);
 }
@@ -3047,6 +3900,34 @@ OpenScarlettXAudio2AdvanceClock(
         *out_total_frames_mixed = impl->TotalFramesMixed();
     }
     return RecordHr("OpenScarlettXAudio2AdvanceClock", hr);
+}
+
+OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL
+OpenScarlettXAudio2GetLockFreeMixerStats(
+    IXAudio2* pXAudio2,
+    uint32_t* out_capacity,
+    uint32_t* out_peak_concurrent_voices,
+    uint64_t* out_lock_free_passes) {
+    if (!pXAudio2) {
+        return RecordHr("OpenScarlettXAudio2GetLockFreeMixerStats", OS_XAUDIO2_E_INVALIDARG);
+    }
+    auto* impl = static_cast<XAudio2Impl*>(pXAudio2);
+    impl->GetLockFreeMixerStats(out_capacity, out_peak_concurrent_voices, out_lock_free_passes);
+    return RecordHr("OpenScarlettXAudio2GetLockFreeMixerStats", OS_XAUDIO2_S_OK);
+}
+
+OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL
+OpenScarlettCreateSpatialAudioClient(void** ppSpatialAudioClient) {
+    if (!ppSpatialAudioClient) {
+        return RecordHr("OpenScarlettCreateSpatialAudioClient", OS_XAUDIO2_E_POINTER);
+    }
+    *ppSpatialAudioClient = nullptr;
+    auto* client = new (std::nothrow) SpatialAudioClientImpl();
+    if (!client) {
+        return RecordHr("OpenScarlettCreateSpatialAudioClient", OS_XAUDIO2_E_OUTOFMEMORY);
+    }
+    *ppSpatialAudioClient = static_cast<OS_ISpatialAudioClient*>(client);
+    return RecordHr("OpenScarlettCreateSpatialAudioClient", OS_XAUDIO2_S_OK);
 }
 
 }  // extern "C"

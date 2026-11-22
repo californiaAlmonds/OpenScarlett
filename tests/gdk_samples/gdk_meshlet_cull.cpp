@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Wave 2 Standalone Xbox-ABI Guest Sample:
+// OpenScarlett MIT Wave 2 Standalone Xbox-ABI Guest Sample:
 // MeshletCull — Amplification Shader (as_6_5) + Mesh Shader (ms_6_5) + Pixel Shader (ps_6_5)
 // GPU 6-plane frustum & normal-cone culling pipeline via ID3D12GraphicsCommandListX::DispatchMesh,
 // with graceful Compute (cs_6_2) + Graphics (vs_6_2/ps_6_2) fallback for WARP / non-MeshTier GPUs.
@@ -29,7 +29,6 @@ constexpr uint32_t kExpectedTitleId = 0x5CA01002u;
 constexpr uint32_t kWidth = 256u;
 constexpr uint32_t kHeight = 256u;
 constexpr uint32_t kMeshletCount = 16u;
-constexpr uint32_t D3D12XBOX_RESOURCE_FLAG_ALLOW_DCC = 0x80000000u;
 
 constexpr uint8_t kBgR = 0x12u;
 constexpr uint8_t kBgG = 0x16u;
@@ -458,7 +457,6 @@ int main(int argc, char** argv) {
     OpenScarlettD3D12SetPreferWarp(force_warp ? 1 : 0);
     D3D12XBOX_CREATE_DEVICE_PARAMETERS dev_params{};
     dev_params.Version = 1;
-    dev_params.PreferWarp = force_warp ? 1u : 0u;
 
     GuestComPtr<ID3D12DeviceX> device;
     HRESULT hr = D3D12XboxCreateDevice(
@@ -501,7 +499,7 @@ int main(int argc, char** argv) {
         return Fail("SetFrameIntervalX", hr);
     }
     D3D12XBOX_FRAME_PIPELINE_TOKEN frame_token = 0;
-    hr = device->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, &frame_token);
+    hr = device->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, 0u, &frame_token);
     if (FAILED(hr) || frame_token == 0) {
         PIXEndEventOnCpu();
         return Fail("WaitFrameEventX", hr);
@@ -1040,7 +1038,7 @@ int main(int argc, char** argv) {
     D3D12XBOX_PRESENT_PARAMETERS pres_params{};
     pres_params.SyncInterval = 1;
 
-    hr = queue->PresentX(1, &plane, &pres_params, nullptr);
+    hr = queue->PresentX(1, &plane, &pres_params);
     PIXEndEventOnCommandQueue(queue.Get());
     if (FAILED(hr)) {
         ::CloseHandle(fence_event);
@@ -1261,7 +1259,7 @@ int main(int argc, char** argv) {
         return Fail("Write T:\\metrics.txt", ::GetLastError());
     }
 
-    hr = queue->PresentX(0, nullptr, nullptr, nullptr);
+    hr = queue->PresentX(0, nullptr, nullptr);
     if (FAILED(hr)) {
         PIXEndEventOnCpu();
         return Fail("PresentX(0) blank teardown", hr);

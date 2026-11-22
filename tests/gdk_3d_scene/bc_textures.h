@@ -1,6 +1,6 @@
 #pragma once
 
-// OpenScarlett Clean-Room MIT Procedural BC1 (DXT1) & BC3 (DXT5) Block Compression Encoder.
+// OpenScarlett MIT Procedural BC1 (DXT1) & BC3 (DXT5) Block Compression Encoder.
 // Generates genuine 4x4 block-compressed textures in memory for direct D3D12X upload & sampling.
 
 #include <algorithm>

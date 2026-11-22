@@ -173,7 +173,7 @@ void RenderSolidFrameAndPresent(
     pres.Flags = present_flags;
     pres.SyncInterval = 1u;
 
-    OS_REQUIRE(SUCCEEDED(queue->PresentX(1u, &plane, &pres, nullptr)));
+    OS_REQUIRE(SUCCEEDED(queue->PresentX(1u, &plane, &pres)));
 }
 
 void RunWindowingAndInputSuite(bool use_warp) {
@@ -191,8 +191,6 @@ void RunWindowingAndInputSuite(bool use_warp) {
 
     D3D12XBOX_CREATE_DEVICE_PARAMETERS dev_params{};
     dev_params.Version = 1u;
-    dev_params.OutputWindow = hwnd;
-    dev_params.PreferWarp = use_warp ? 1u : 0u;
 
     TestComPtr<ID3D12DeviceX> dev;
     OS_REQUIRE(SUCCEEDED(D3D12XboxCreateDevice(
@@ -216,6 +214,7 @@ void RunWindowingAndInputSuite(bool use_warp) {
         TestComPtr<IOpenScarlettPresentCapture> cap;
         OS_REQUIRE(SUCCEEDED(queue->QueryInterface(
             IID_IOpenScarlettPresentCapture, reinterpret_cast<void**>(cap.Put()))));
+        OS_REQUIRE(SUCCEEDED(cap->SetOutputWindow(hwnd)));
         TestComPtr<IOpenScarlettPresentWindow> pwin;
         OS_REQUIRE(SUCCEEDED(queue->QueryInterface(
             IID_IOpenScarlettPresentWindow, reinterpret_cast<void**>(pwin.Put()))));
@@ -267,7 +266,7 @@ void RunWindowingAndInputSuite(bool use_warp) {
     std::vector<uint8_t> pixels(static_cast<size_t>(kInitialW) * kInitialH * 4u, 0u);
     for (uint32_t f = 0; f < 6u; ++f) {
         D3D12XBOX_FRAME_PIPELINE_TOKEN tok = 0;
-        OS_REQUIRE(SUCCEEDED(dev->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, &tok)));
+        OS_REQUIRE(SUCCEEDED(dev->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, 0u, &tok)));
         const uint8_t cr = static_cast<uint8_t>(0x20u + f * 32u);
         const uint8_t cg = static_cast<uint8_t>(0xE0u - f * 24u);
         const uint8_t cb = static_cast<uint8_t>(0x30u + f * 36u);
@@ -471,7 +470,7 @@ void RunWindowingAndInputSuite(bool use_warp) {
             queue.Get(), alloc.Get(), cmd.Get(), rt.Get(), rtv_handle,
             0x12u, 0x34u, 0x56u, 0xFFu, D3D12XBOX_PRESENT_FLAG_IMMEDIATE, 406u);
         OS_REQUIRE(SUCCEEDED(cap->SetReadbackCaptureEnabled(TRUE)));
-        OS_REQUIRE(SUCCEEDED(queue->PresentX(0u, nullptr, nullptr, nullptr)));
+        OS_REQUIRE(SUCCEEDED(queue->PresentX(0u, nullptr, nullptr)));
     }
     std::printf("  [WindowEvents] Resize (320x240, 128x192), Minimize/Restore, Alt-Tab, No-Readback OK\n");
 

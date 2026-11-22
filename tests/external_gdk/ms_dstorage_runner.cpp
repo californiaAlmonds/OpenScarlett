@@ -1,4 +1,4 @@
-// Clean-room MIT headless runner driving untouched MIT Microsoft Xbox-GDK-Samples
+// MIT headless runner driving untouched MIT Microsoft Xbox-GDK-Samples
 // SimpleDirectStorageCombo/SampleImplementations/{SimpleLoad,StatusBatch,CompletionEvent,MultipleQueues}.cpp
 // directly against OpenScarlett's dstorage_xs.dll via `openscarlett run <package_dir>`.
 

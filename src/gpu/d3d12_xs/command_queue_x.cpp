@@ -29,6 +29,7 @@ struct WindowCallbackState {
     std::atomic<bool> quit_posted{false};
     std::atomic<bool> is_fullscreen{false};
     std::atomic<bool> in_fullscreen_toggle{false};
+    std::atomic<uint64_t> alt_enter_toggle_count{0ull};
 
     std::mutex fullscreen_mutex;
     LONG_PTR saved_style = 0;
@@ -249,7 +250,9 @@ LRESULT CALLBACK SubclassWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 const bool alt_down = (lParam & (static_cast<LPARAM>(1) << 29)) != 0;
                 const bool is_repeat = (lParam & (static_cast<LPARAM>(1) << 30)) != 0;
                 if (wParam == VK_RETURN && alt_down && !is_repeat) {
-                    ToggleBorderlessFullscreenForWindow(hwnd, *state);
+                    if (SUCCEEDED(ToggleBorderlessFullscreenForWindow(hwnd, *state))) {
+                        state->alt_enter_toggle_count.fetch_add(1ull, std::memory_order_relaxed);
+                    }
                     return 0;
                 }
                 break;
@@ -466,6 +469,59 @@ int64_t QueryQpcNow() noexcept {
     return li.QuadPart;
 }
 
+bool IsWritableCpuVa(uint64_t va, size_t byte_size) noexcept {
+    if (va == 0ull || byte_size == 0u || va > UINT64_MAX - byte_size) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(va)), &mbi, sizeof(mbi)) == 0) {
+        return false;
+    }
+    if (mbi.State != MEM_COMMIT) return false;
+    constexpr DWORD kWritable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if ((mbi.Protect & kWritable) == 0u || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) {
+        return false;
+    }
+    const uint64_t region_end =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mbi.BaseAddress)) +
+        static_cast<uint64_t>(mbi.RegionSize);
+    return (va + byte_size) <= region_end;
+}
+
+bool TryParseEnvFcapFps(uint32_t& out_fps) noexcept {
+    out_fps = 0u;
+    char buf[64]{};
+    const DWORD len = GetEnvironmentVariableA("OPENSCARLETT_FCAP", buf, static_cast<DWORD>(sizeof(buf)));
+    if (len == 0u || len >= sizeof(buf)) return false;
+    char* end = nullptr;
+    const unsigned long v = std::strtoul(buf, &end, 10);
+    if (!end || end == buf) return false;
+    out_fps = static_cast<uint32_t>(std::min<unsigned long>(v, 10000ul));
+    return true;
+}
+
+bool TryParseCmdLineFcapFps(uint32_t& out_fps) noexcept {
+    out_fps = 0u;
+    const char* cmd = GetCommandLineA();
+    if (!cmd) return false;
+    const char* p = cmd;
+    while ((p = std::strstr(p, "--fcap")) != nullptr) {
+        const bool boundary_before = (p == cmd || p[-1] == ' ' || p[-1] == '\t');
+        const char* after = p + 6;
+        if (boundary_before && (*after == ' ' || *after == '\t' || *after == '=')) {
+            while (*after == ' ' || *after == '\t' || *after == '=') ++after;
+            if (*after >= '0' && *after <= '9') {
+                char* end = nullptr;
+                const unsigned long v = std::strtoul(after, &end, 10);
+                if (end && end != after) {
+                    out_fps = static_cast<uint32_t>(std::min<unsigned long>(v, 10000ul));
+                    return true;
+                }
+            }
+        }
+        p += 6;
+    }
+    return false;
+}
+
 bool IsReadableCpuVa(uint64_t va, size_t byte_size) noexcept {
     if (va == 0ull || byte_size == 0u || va > UINT64_MAX - byte_size) return false;
     MEMORY_BASIC_INFORMATION mbi{};
@@ -501,6 +557,107 @@ bool EvaluateWaitOp(T current, T reference, T mask, D3D12XBOX_WAIT_VALUE_OP op) 
     }
 }
 
+D3D12XBOX_COLOR_SPACE DxgiToXboxColorSpace(DXGI_COLOR_SPACE_TYPE dxgi_cs) noexcept {
+    switch (dxgi_cs) {
+        case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020:
+            return D3D12XBOX_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709:
+            return D3D12XBOX_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+        case DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709:
+            return D3D12XBOX_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709;
+        case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709:
+        default:
+            return D3D12XBOX_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    }
+}
+
+std::string ReadEnvStringA(const char* name) {
+    char buf[1024]{};
+    const DWORD len = GetEnvironmentVariableA(name, buf, static_cast<DWORD>(sizeof(buf)));
+    if (len == 0u || len >= sizeof(buf)) return {};
+    return std::string(buf, len);
+}
+
+uint64_t ReadEnvUint64A(const char* name) noexcept {
+    char buf[64]{};
+    const DWORD len = GetEnvironmentVariableA(name, buf, static_cast<DWORD>(sizeof(buf)));
+    if (len == 0u || len >= sizeof(buf)) return 0ull;
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(buf, &end, 10);
+    return (end && end != buf) ? static_cast<uint64_t>(v) : 0ull;
+}
+
+bool EnvFlagTrueA(const char* name) noexcept {
+    char buf[32]{};
+    const DWORD len = GetEnvironmentVariableA(name, buf, static_cast<DWORD>(sizeof(buf)));
+    if (len == 0u || len >= sizeof(buf)) return false;
+    return buf[0] == '1' || buf[0] == 't' || buf[0] == 'T' || buf[0] == 'y' || buf[0] == 'Y';
+}
+
+struct FindMainWindowCtx {
+    DWORD pid = 0;
+    DWORD preferred_tid = 0;
+    HWND best_same_thread = nullptr;
+    HWND best_any_thread = nullptr;
+    HWND best_hidden_same_thread = nullptr;
+};
+
+BOOL CALLBACK EnumProcessMainWindowProc(HWND hwnd, LPARAM lParam) {
+    auto* ctx = reinterpret_cast<FindMainWindowCtx*>(lParam);
+    DWORD wpid = 0;
+    const DWORD wtid = GetWindowThreadProcessId(hwnd, &wpid);
+    if (wpid != ctx->pid) return TRUE;
+    if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+    wchar_t cls[64]{};
+    if (GetClassNameW(hwnd, cls, 64) > 0) {
+        if (wcscmp(cls, L"ConsoleWindowClass") == 0 ||
+            wcscmp(cls, L"MSCTFIME UI") == 0 ||
+            wcscmp(cls, L"IME") == 0 ||
+            wcscmp(cls, L"Default IME") == 0 ||
+            wcscmp(cls, L"tooltips_class32") == 0 ||
+            wcscmp(cls, L"DDEMLEvent") == 0 ||
+            wcscmp(cls, L"CicMarshalWndClass") == 0 ||
+            wcscmp(cls, L"GDI+ Hook Window Class") == 0 ||
+            wcscmp(cls, L"OleMainThreadWndClass") == 0) {
+            return TRUE;
+        }
+    }
+    RECT cr{};
+    if (GetClientRect(hwnd, &cr) == FALSE || (cr.right - cr.left) < 64 || (cr.bottom - cr.top) < 64) {
+        return TRUE;
+    }
+    const bool visible = (IsWindowVisible(hwnd) != FALSE);
+    if (visible) {
+        if (wtid == ctx->preferred_tid) {
+            ctx->best_same_thread = hwnd;
+            return FALSE;  // Exact visible match on calling thread
+        }
+        if (!ctx->best_any_thread) {
+            ctx->best_any_thread = hwnd;
+        }
+    } else if (wtid == ctx->preferred_tid && !ctx->best_hidden_same_thread) {
+        // Title-created offscreen/hidden console window fallback (e.g. Minecraft/GDK startup or headless CI)
+        if (GetWindowTextLengthW(hwnd) > 0) {
+            ctx->best_hidden_same_thread = hwnd;
+        }
+    }
+    return TRUE;
+}
+
+HWND DiscoverProcessMainWindow() noexcept {
+    FindMainWindowCtx ctx{};
+    ctx.pid = GetCurrentProcessId();
+    ctx.preferred_tid = GetCurrentThreadId();
+    EnumThreadWindows(ctx.preferred_tid, &EnumProcessMainWindowProc, reinterpret_cast<LPARAM>(&ctx));
+    if (ctx.best_same_thread) {
+        return ctx.best_same_thread;
+    }
+    EnumWindows(&EnumProcessMainWindowProc, reinterpret_cast<LPARAM>(&ctx));
+    if (ctx.best_same_thread) return ctx.best_same_thread;
+    if (ctx.best_any_thread) return ctx.best_any_thread;
+    return ctx.best_hidden_same_thread;
+}
+
 }  // namespace
 
 CommandQueueX::CommandQueueX(
@@ -534,6 +691,89 @@ CommandQueueX::CommandQueueX(
 void CommandQueueX::SetSubmitHook(QueueSubmitHookFn fn, void* user_ctx) noexcept {
     submit_hook_ctx_.store(user_ctx, std::memory_order_release);
     submit_hook_.store(fn, std::memory_order_release);
+}
+
+HWND CommandQueueX::EffectiveOutputWindow() const noexcept {
+    std::lock_guard<std::mutex> lock(present_mutex_);
+    if (present_config_.OutputWindow && IsWindow(present_config_.OutputWindow) != FALSE) {
+        return present_config_.OutputWindow;
+    }
+    if (attached_hwnd_ && IsWindow(attached_hwnd_) != FALSE) {
+        return attached_hwnd_;
+    }
+    if (!explicit_window_detached_ && device_x_) {
+        HWND dev_hwnd = device_x_->DefaultWindow();
+        if (dev_hwnd && IsWindow(dev_hwnd) != FALSE) {
+            return dev_hwnd;
+        }
+    }
+    return nullptr;
+}
+
+bool CommandQueueX::AdoptTitleWindow(HWND hwnd) noexcept {
+    if (!hwnd || IsWindow(hwnd) == FALSE) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(present_mutex_);
+        explicit_window_detached_ = false;
+        if (swapchain_ && swapchain_hwnd_ != hwnd) {
+            ReleaseSwapChainLocked();
+        }
+        attached_hwnd_ = hwnd;
+        AttachWindowSubclassLocked(hwnd);
+    }
+    if (device_x_) {
+        device_x_->AdoptTitleWindow(hwnd);
+    }
+    return true;
+}
+
+HWND CommandQueueX::ResolveTargetOutputWindowLocked(
+    const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters,
+    bool force_headless) {
+    if (force_headless) {
+        return nullptr;
+    }
+    if (pPresentParameters && pPresentParameters->OutputWindow &&
+        IsWindow(pPresentParameters->OutputWindow) != FALSE) {
+        if (!attached_hwnd_) {
+            attached_hwnd_ = pPresentParameters->OutputWindow;
+            explicit_window_detached_ = false;
+            if (device_x_ && !device_x_->DefaultWindow()) {
+                device_x_->AdoptTitleWindow(pPresentParameters->OutputWindow);
+            }
+        }
+        return pPresentParameters->OutputWindow;
+    }
+    if (present_config_.OutputWindow && IsWindow(present_config_.OutputWindow) != FALSE) {
+        return present_config_.OutputWindow;
+    }
+    if (attached_hwnd_ && IsWindow(attached_hwnd_) != FALSE) {
+        return attached_hwnd_;
+    }
+    if (attached_hwnd_ && IsWindow(attached_hwnd_) == FALSE) {
+        // Attached window was destroyed; clear stale handle so a newly created title window can be adopted.
+        attached_hwnd_ = nullptr;
+    }
+    if (!explicit_window_detached_) {
+        if (device_x_) {
+            HWND dev_hwnd = device_x_->DefaultWindow();
+            if (dev_hwnd && IsWindow(dev_hwnd) != FALSE) {
+                attached_hwnd_ = dev_hwnd;
+                return dev_hwnd;
+            }
+        }
+        HWND discovered = DiscoverProcessMainWindow();
+        if (discovered && IsWindow(discovered) != FALSE) {
+            attached_hwnd_ = discovered;
+            if (device_x_ && !device_x_->DefaultWindow()) {
+                device_x_->AdoptTitleWindow(discovered);
+            }
+            return discovered;
+        }
+    }
+    return nullptr;
 }
 
 CommandQueueX::~CommandQueueX() {
@@ -611,6 +851,12 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::QueryInterface(REFIID riid, void** ppvO
     }
     if (IsEqualIID(riid, IID_IOpenScarlettPresentTiming)) {
         *ppvObject = static_cast<IOpenScarlettPresentTiming*>(this);
+        AddRef();
+        RecordQueue("ID3D12CommandQueueX::QueryInterface", 0, S_OK);
+        return S_OK;
+    }
+    if (IsEqualIID(riid, IID_IOpenScarlettPresentPacing)) {
+        *ppvObject = static_cast<IOpenScarlettPresentPacing*>(this);
         AddRef();
         RecordQueue("ID3D12CommandQueueX::QueryInterface", 0, S_OK);
         return S_OK;
@@ -703,10 +949,10 @@ void STDMETHODCALLTYPE CommandQueueX::CopyTileMappings(
 void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     UINT NumCommandLists,
     ID3D12CommandList* const* ppCommandLists) {
-    // Auto-flush any dirty title unified-memory textures before GPU work samples them.
-    if (device_x_ && device_x_->HasDirtyUnifiedTextures() &&
-        host_queue_ && queue_type_ == D3D12_COMMAND_LIST_TYPE_DIRECT) {
-        device_x_->FlushDirtyUnifiedTextures(host_queue_, nullptr);
+    // Auto-sync all dirty/modified unified-memory textures, unified heap buffers, & TitleVAMirror
+    // pages BEFORE submitting host command lists so GPU shaders never sample stale CPU memory.
+    if (device_x_ && host_queue_) {
+        (void)device_x_->SyncAllUnifiedResourcesBeforeSubmit(host_queue_, queue_type_);
     }
 
     // Unwrap any CommandListX* wrappers back to native host ID3D12CommandList* pointers.
@@ -726,8 +972,25 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
         raw_lists = heap_lists.data();
     }
 
+    std::vector<uint64_t> pending_writeback_vas;
+    std::vector<DeferredCpuWrite32> deferred_writes;
+    std::vector<DeferredCpuWait> deferred_waits;
     for (UINT i = 0; i < NumCommandLists; ++i) {
         raw_lists[i] = CommandListX::UnwrapHostList(ppCommandLists[i]);
+        if (CommandListX* clx = CommandListX::TryFromCommandList(ppCommandLists[i])) {
+            clx->ExtractPendingMirrorWritebacks(pending_writeback_vas);
+            clx->ExtractDeferredCpuOps(deferred_writes, deferred_waits);
+        }
+    }
+
+    // Enforce any CPU/mirrored Wait32BitValueX / Wait64BitValueX recorded on command lists.
+    for (const auto& w : deferred_waits) {
+        if (w.is_64bit) {
+            (void)Wait64BitValueX(w.address, w.value, w.mask, w.op);
+        } else {
+            (void)Wait32BitValueX(
+                w.address, static_cast<uint32_t>(w.value), static_cast<uint32_t>(w.mask), w.op);
+        }
     }
 
     if (const auto hook = submit_hook_.load(std::memory_order_acquire)) {
@@ -735,6 +998,60 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     }
 
     host_queue_->ExecuteCommandLists(NumCommandLists, raw_lists);
+
+    // Schedule fence-tracked GPU->CPU writeback for any TitleVAMirror resources written by these lists.
+    if (device_x_ && !pending_writeback_vas.empty() &&
+        host_queue_ && queue_type_ == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        std::sort(pending_writeback_vas.begin(), pending_writeback_vas.end());
+        pending_writeback_vas.erase(
+            std::unique(pending_writeback_vas.begin(), pending_writeback_vas.end()),
+            pending_writeback_vas.end());
+        std::lock_guard<std::mutex> lock(present_mutex_);
+        if (SUCCEEDED(EnsurePresentHelperObjectsLocked())) {
+            // Wait for any previous use of present_alloc_ before resetting it.
+            if (present_fence_->GetCompletedValue() < present_fence_val_) {
+                if (SUCCEEDED(present_fence_->SetEventOnCompletion(present_fence_val_, present_fence_event_))) {
+                    WaitForSingleObject(present_fence_event_, 15000u);
+                }
+                PumpMirrorReadbackCompletionLocked();
+            }
+            if (SUCCEEDED(present_alloc_->Reset()) &&
+                SUCCEEDED(present_cmd_->Reset(present_alloc_, nullptr))) {
+                const uint64_t rb_fence = ++present_fence_val_;
+                uint32_t scheduled = 0u;
+                for (uint64_t va : pending_writeback_vas) {
+                    openscarlett::TitleVaRegionInfo rinfo{};
+                    if (device_x_->GetTitleVaMirror().LookupRegion(va, rinfo)) {
+                        if (device_x_->GetTitleVaMirror().ScheduleGpuReadback(
+                                present_cmd_, va, rb_fence, 0ull, 0ull, rinfo.current_state).ok()) {
+                            ++scheduled;
+                        }
+                    }
+                }
+                if (scheduled > 0u && SUCCEEDED(present_cmd_->Close())) {
+                    ID3D12CommandList* rb_lists[] = {present_cmd_};
+                    host_queue_->ExecuteCommandLists(1u, rb_lists);
+                    host_queue_->Signal(present_fence_, rb_fence);
+                } else {
+                    present_cmd_->Close();
+                }
+            }
+        }
+    }
+
+    if (!deferred_writes.empty()) {
+        {
+            std::lock_guard<std::mutex> lock(present_mutex_);
+            if (SUCCEEDED(EnsurePresentHelperObjectsLocked())) {
+                WaitForInternalFenceLocked();
+            }
+        }
+        for (const auto& wr : deferred_writes) {
+            if (IsWritableCpuVa(wr.address, sizeof(uint32_t))) {
+                *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(wr.address)) = wr.value;
+            }
+        }
+    }
 
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         for (UINT i = 0; i < NumCommandLists; ++i) {
@@ -1080,25 +1397,64 @@ void STDMETHODCALLTYPE CommandQueueX::EndEvent() {
 
 HRESULT STDMETHODCALLTYPE CommandQueueX::Signal(ID3D12Fence* pFence, UINT64 Value) {
     const HRESULT hr = host_queue_->Signal(UnwrapFence(pFence), Value);
+    {
+        std::lock_guard<std::mutex> lock(present_mutex_);
+        PumpMirrorReadbackCompletionLocked();
+    }
     RecordQueue("ID3D12CommandQueueX::Signal", 14, hr);
     return hr;
 }
 
 HRESULT STDMETHODCALLTYPE CommandQueueX::Wait(ID3D12Fence* pFence, UINT64 Value) {
     const HRESULT hr = host_queue_->Wait(UnwrapFence(pFence), Value);
+    {
+        std::lock_guard<std::mutex> lock(present_mutex_);
+        PumpMirrorReadbackCompletionLocked();
+    }
     RecordQueue("ID3D12CommandQueueX::Wait", 15, hr);
     return hr;
 }
 
 HRESULT STDMETHODCALLTYPE CommandQueueX::GetTimestampFrequency(UINT64* pFrequency) {
-    const HRESULT hr = host_queue_->GetTimestampFrequency(pFrequency);
+    if (!pFrequency) {
+        RecordQueue("ID3D12CommandQueueX::GetTimestampFrequency", 16, E_POINTER);
+        return E_POINTER;
+    }
+    HRESULT hr = host_queue_->GetTimestampFrequency(pFrequency);
+    if (SUCCEEDED(hr) && *pFrequency > 0ull) {
+        cached_gpu_ts_freq_.store(*pFrequency, std::memory_order_release);
+    } else if (qpc_freq_ > 0) {
+        *pFrequency = static_cast<UINT64>(qpc_freq_);
+        cached_gpu_ts_freq_.store(*pFrequency, std::memory_order_release);
+        hr = S_OK;
+    }
     RecordQueue("ID3D12CommandQueueX::GetTimestampFrequency", 16, hr);
     return hr;
 }
 
 HRESULT STDMETHODCALLTYPE CommandQueueX::GetClockCalibration(
     UINT64* pGpuTimestamp, UINT64* pCpuTimestamp) {
-    const HRESULT hr = host_queue_->GetClockCalibration(pGpuTimestamp, pCpuTimestamp);
+    if (!pGpuTimestamp || !pCpuTimestamp) {
+        RecordQueue("ID3D12CommandQueueX::GetClockCalibration", 17, E_POINTER);
+        return E_POINTER;
+    }
+    HRESULT hr = host_queue_->GetClockCalibration(pGpuTimestamp, pCpuTimestamp);
+    if (FAILED(hr)) {
+        const uint64_t qpc_now = static_cast<uint64_t>(QueryQpcNow());
+        uint64_t gpu_freq = cached_gpu_ts_freq_.load(std::memory_order_acquire);
+        if (gpu_freq == 0ull) {
+            (void)GetTimestampFrequency(&gpu_freq);
+        }
+        *pCpuTimestamp = qpc_now;
+        if (qpc_freq_ > 0 && gpu_freq > 0ull) {
+            *pGpuTimestamp = static_cast<uint64_t>(
+                (static_cast<double>(qpc_now) / static_cast<double>(qpc_freq_)) *
+                static_cast<double>(gpu_freq));
+        } else {
+            *pGpuTimestamp = qpc_now;
+        }
+        hr = S_OK;
+    }
     RecordQueue("ID3D12CommandQueueX::GetClockCalibration", 17, hr);
     return hr;
 }
@@ -1714,13 +2070,16 @@ void CommandQueueX::ReleasePresentObjectsLocked() {
     tonemap_upload_capacity_ = 0;
 }
 
-// ID3D12CommandQueueX (slots 19..21)
+// ID3D12CommandQueueX (slots 19..21; real GDKX 3-arg PresentX)
 HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     UINT PlaneCount,
     const D3D12XBOX_PRESENT_PLANE_PARAMETERS* pPlaneParameters,
-    const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters,
-    void* pPresentToken) {
-    (void)pPresentToken;
+    const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters) {
+    if (device_x_ && device_x_->IsDeviceRemoved()) {
+        const HRESULT rem_hr = device_x_->GetDeviceRemovedReason();
+        RecordQueue("ID3D12CommandQueueX::PresentX", 19, rem_hr);
+        return rem_hr;
+    }
     const int64_t total_start_qpc = QueryQpcNow();
 
     // Xbox GDK titles (e.g. Xbox-GDK-Samples DeviceResources::~DeviceResources & resize)
@@ -1769,13 +2128,12 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     const D3D12_RESOURCE_STATES caller_state = pPlaneParameters[0].ResourceState;
 
     // Ensure window subclass is active and pump pending Win32 messages WITHOUT holding present_mutex_.
+    const bool force_headless = EnvFlagTrueA("OPENSCARLETT_PRESENTX_HEADLESS");
     HWND pump_hwnd = nullptr;
     std::shared_ptr<WindowCallbackState> pump_state;
     {
         std::lock_guard<std::mutex> lock(present_mutex_);
-        pump_hwnd = (pPresentParameters && pPresentParameters->OutputWindow)
-                        ? pPresentParameters->OutputWindow
-                        : (present_config_.OutputWindow ? present_config_.OutputWindow : attached_hwnd_);
+        pump_hwnd = ResolveTargetOutputWindowLocked(pPresentParameters, force_headless);
         if (pump_hwnd && IsWindow(pump_hwnd) != FALSE) {
             AttachWindowSubclassLocked(pump_hwnd);
             pump_state = window_state_;
@@ -1809,7 +2167,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         return hr;
     }
 
-    D3D12XBOX_COLOR_SPACE effective_cs = pPlaneParameters[0].ColorSpace;
+    D3D12XBOX_COLOR_SPACE effective_cs = DxgiToXboxColorSpace(pPlaneParameters[0].ColorSpace);
     if (effective_cs == D3D12XBOX_COLOR_SPACE_RGB_FULL_G22_NONE_P709) {
         if (present_config_.ColorSpace != D3D12XBOX_COLOR_SPACE_RGB_FULL_G22_NONE_P709) {
             effective_cs = present_config_.ColorSpace;
@@ -1821,9 +2179,15 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     last_presented_src_format_ = src_desc.Format;
     last_presented_color_space_ = effective_cs;
 
-    HWND target_hwnd = (pPresentParameters && pPresentParameters->OutputWindow)
-                           ? pPresentParameters->OutputWindow
-                           : (present_config_.OutputWindow ? present_config_.OutputWindow : attached_hwnd_);
+    const std::string capture_png_path = ReadEnvStringA("OPENSCARLETT_PRESENTX_CAPTURE_PNG");
+    const uint64_t exit_after_frames = ReadEnvUint64A("OPENSCARLETT_PRESENTX_EXIT_AFTER_FRAMES");
+    const uint64_t this_non_blank_frame = non_blank_present_count_ + 1ull;
+    const bool want_capture_this_frame =
+        !capture_png_path.empty() &&
+        ((exit_after_frames > 0ull && this_non_blank_frame == exit_after_frames) ||
+         (exit_after_frames == 0ull && (this_non_blank_frame == 1ull || this_non_blank_frame == 10ull)));
+
+    HWND target_hwnd = ResolveTargetOutputWindowLocked(pPresentParameters, force_headless);
     const bool use_swapchain = (target_hwnd != nullptr && IsWindow(target_hwnd) != FALSE);
 
     bool window_minimized = false;
@@ -1895,9 +2259,11 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         do_swapchain_present && swapchain_ && !direct_bb_copy_compatible &&
         (swapchain_format_ == DXGI_FORMAT_R8G8B8A8_UNORM ||
          swapchain_format_ == DXGI_FORMAT_B8G8R8A8_UNORM);
+    const bool skip_intermediate_readback =
+        (exit_after_frames > 0ull && !want_capture_this_frame && !need_tonemap_bb_upload && !vk_routing_active);
     const bool need_readback =
-        !has_vk_direct_rt_fb &&
-        (vk_routing_active || (!use_swapchain) || readback_capture_enabled_ || need_tonemap_bb_upload);
+        !has_vk_direct_rt_fb && !skip_intermediate_readback &&
+        (vk_routing_active || (!use_swapchain) || readback_capture_enabled_ || need_tonemap_bb_upload || want_capture_this_frame);
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT num_rows = 0;
@@ -2161,13 +2527,20 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         }
     }
 
-    const uint32_t frame_interval_us = device_x_ ? device_x_->FrameIntervalMicroseconds() : 0u;
+    bool fcap_override = false;
+    uint32_t fcap_fps = 0u;
+    const uint32_t frame_interval_us =
+        ResolveEffectiveFrameIntervalUsLocked(fcap_override, fcap_fps);
+    last_effective_interval_us_ = frame_interval_us;
     const bool immediate_flag =
         (pPresentParameters && (pPresentParameters->Flags & D3D12XBOX_PRESENT_FLAG_IMMEDIATE) != 0);
-    const bool should_pace = (use_swapchain && !window_minimized) && !immediate_flag && frame_interval_us > 0u;
+    const bool should_pace =
+        ((use_swapchain && !window_minimized) || fcap_override) &&
+        !immediate_flag && frame_interval_us > 0u;
 
     if (should_pace) {
         PaceFrameLocked(frame_interval_us);
+        ++paced_frame_count_;
     } else {
         const int64_t now_qpc = QueryQpcNow();
         if (last_present_qpc_ != 0 && qpc_freq_ > 0) {
@@ -2287,6 +2660,34 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     last_present_width_ = has_vk_direct_rt_fb ? vk_direct_rt_fb.width : width;
     last_present_height_ = has_vk_direct_rt_fb ? vk_direct_rt_fb.height : height;
     ++present_count_;
+    ++non_blank_present_count_;
+    if (device_x_) {
+        device_x_->GetQueryAccumulator().BeginFrame(present_count_);
+    }
+
+    if (want_capture_this_frame && !last_present_pixels_.empty() &&
+        last_present_width_ > 0u && last_present_height_ > 0u) {
+        openscarlett::FrameBufferRgba8 fb{};
+        fb.width = last_present_width_;
+        fb.height = last_present_height_;
+        fb.pixels = last_present_pixels_;
+        if (fb.WritePng(capture_png_path).ok()) {
+            capture_png_written_ = true;
+        }
+    }
+
+    if (exit_after_frames > 0ull && non_blank_present_count_ >= exit_after_frames && !auto_exit_posted_) {
+        auto_exit_posted_ = true;
+        const DWORD cur_tid = GetCurrentThreadId();
+        const DWORD win_tid =
+            (target_hwnd && IsWindow(target_hwnd) != FALSE)
+                ? GetWindowThreadProcessId(target_hwnd, nullptr)
+                : cur_tid;
+        PostQuitMessage(0);
+        if (win_tid != 0u && win_tid != cur_tid) {
+            PostThreadMessageW(win_tid, WM_QUIT, 0, 0);
+        }
+    }
 
     const int64_t total_end_qpc = QueryQpcNow();
     last_timing_stats_.fence_signal_qpc = fence_sig_qpc;
@@ -2320,15 +2721,15 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::ResumeX() {
 }
 
 HRESULT STDMETHODCALLTYPE CommandQueueX::KickoffX() {
-    if (device_x_ && device_x_->HasDirtyUnifiedTextures() &&
-        host_queue_ && queue_type_ == D3D12_COMMAND_LIST_TYPE_DIRECT) {
-        device_x_->FlushDirtyUnifiedTextures(host_queue_, nullptr);
+    if (device_x_ && host_queue_) {
+        (void)device_x_->SyncAllUnifiedResourcesBeforeSubmit(host_queue_, queue_type_);
     }
     {
         std::lock_guard<std::mutex> lock(present_mutex_);
         if (present_fence_ && host_queue_) {
             const uint64_t target = ++present_fence_val_;
             host_queue_->Signal(present_fence_, target);
+            PumpMirrorReadbackCompletionLocked();
         }
     }
     kickoff_count_.fetch_add(1ull, std::memory_order_relaxed);
@@ -2344,6 +2745,32 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::Wait32BitValueX(
     if (Address == 0ull) {
         RecordQueue("ID3D12CommandQueueX::Wait32BitValueX", 23, E_INVALIDARG);
         return E_INVALIDARG;
+    }
+    void* cpu_ptr = nullptr;
+    uint64_t rem_bytes = 0ull;
+    if (device_x_ && device_x_->GetTitleVaMirror().ResolveTitleVaToCpu(Address, cpu_ptr, rem_bytes) &&
+        cpu_ptr && rem_bytes >= sizeof(uint32_t)) {
+        // Mirrored Title-VA address: poll CPU backing memory while pumping GPU->CPU writeback completions.
+        const auto* ptr = reinterpret_cast<const volatile uint32_t*>(cpu_ptr);
+        const int64_t start_qpc = QueryQpcNow();
+        const int64_t timeout_ticks = (qpc_freq_ > 0) ? (qpc_freq_ * 2LL) : 0LL;
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(present_mutex_);
+                PumpMirrorReadbackCompletionLocked();
+            }
+            const uint32_t cur = *ptr;
+            if (EvaluateWaitOp<uint32_t>(cur, Value, Mask, Operation)) {
+                RecordQueue("ID3D12CommandQueueX::Wait32BitValueX", 23, S_OK);
+                return S_OK;
+            }
+            if (timeout_ticks > 0 && (QueryQpcNow() - start_qpc) >= timeout_ticks) {
+                const HRESULT hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+                RecordQueue("ID3D12CommandQueueX::Wait32BitValueX", 23, hr);
+                return hr;
+            }
+            SwitchToThread();
+        }
     }
     if (IsReadableCpuVa(Address, sizeof(uint32_t))) {
         const auto* ptr = reinterpret_cast<const volatile uint32_t*>(static_cast<uintptr_t>(Address));
@@ -2385,6 +2812,31 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::Wait64BitValueX(
         RecordQueue("ID3D12CommandQueueX::Wait64BitValueX", 24, E_INVALIDARG);
         return E_INVALIDARG;
     }
+    void* cpu_ptr = nullptr;
+    uint64_t rem_bytes = 0ull;
+    if (device_x_ && device_x_->GetTitleVaMirror().ResolveTitleVaToCpu(Address, cpu_ptr, rem_bytes) &&
+        cpu_ptr && rem_bytes >= sizeof(uint64_t)) {
+        const auto* ptr = reinterpret_cast<const volatile uint64_t*>(cpu_ptr);
+        const int64_t start_qpc = QueryQpcNow();
+        const int64_t timeout_ticks = (qpc_freq_ > 0) ? (qpc_freq_ * 2LL) : 0LL;
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(present_mutex_);
+                PumpMirrorReadbackCompletionLocked();
+            }
+            const uint64_t cur = *ptr;
+            if (EvaluateWaitOp<uint64_t>(cur, Value, Mask, Operation)) {
+                RecordQueue("ID3D12CommandQueueX::Wait64BitValueX", 24, S_OK);
+                return S_OK;
+            }
+            if (timeout_ticks > 0 && (QueryQpcNow() - start_qpc) >= timeout_ticks) {
+                const HRESULT hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+                RecordQueue("ID3D12CommandQueueX::Wait64BitValueX", 24, hr);
+                return hr;
+            }
+            SwitchToThread();
+        }
+    }
     if (IsReadableCpuVa(Address, sizeof(uint64_t))) {
         const auto* ptr = reinterpret_cast<const volatile uint64_t*>(static_cast<uintptr_t>(Address));
         const int64_t start_qpc = QueryQpcNow();
@@ -2416,21 +2868,104 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::Wait64BitValueX(
     return hr;
 }
 
+HRESULT STDMETHODCALLTYPE CommandQueueX::Write32BitValueX(
+    D3D12_GPU_VIRTUAL_ADDRESS Address,
+    uint32_t Value,
+    uint32_t Flags) {
+    if (Address == 0ull) {
+        RecordQueue("ID3D12CommandQueueX::Write32BitValueX", 25, E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+
+    uint64_t buf_off = 0ull;
+    ID3D12Resource* host_buf =
+        device_x_ ? device_x_->ResolveBufferResourceByGpuVa(Address, &buf_off) : nullptr;
+    if (host_buf && host_queue_) {
+        std::lock_guard<std::mutex> lock(present_mutex_);
+        HRESULT hr = EnsurePresentHelperObjectsLocked();
+        if (SUCCEEDED(hr)) {
+            if (present_fence_->GetCompletedValue() < present_fence_val_) {
+                if (SUCCEEDED(present_fence_->SetEventOnCompletion(present_fence_val_, present_fence_event_))) {
+                    WaitForSingleObject(present_fence_event_, 15000u);
+                }
+                PumpMirrorReadbackCompletionLocked();
+            }
+            ID3D12GraphicsCommandList2* cmd2 = nullptr;
+            if (SUCCEEDED(present_cmd_->QueryInterface(
+                    OS_D3D12_IID(ID3D12GraphicsCommandList2), reinterpret_cast<void**>(&cmd2))) &&
+                cmd2) {
+                if (SUCCEEDED(present_alloc_->Reset()) &&
+                    SUCCEEDED(present_cmd_->Reset(present_alloc_, nullptr))) {
+                    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER param{};
+                    param.Dest = device_x_->TranslateGuestGpuVa(Address);
+                    param.Value = Value;
+                    D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT;
+                    if ((Flags & D3D12XBOX_WRITE_VALUE_FLAG_MARKER_IN) != 0u) {
+                        mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN;
+                    } else if ((Flags & D3D12XBOX_WRITE_VALUE_FLAG_MARKER_OUT) != 0u) {
+                        mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+                    }
+                    cmd2->WriteBufferImmediate(1u, &param, &mode);
+                    uint64_t mirror_va = 0ull;
+                    const uint64_t rb_fence = ++present_fence_val_;
+                    if (device_x_->LookupMirroredTitleVaForResource(host_buf, mirror_va) &&
+                        mirror_va != 0ull) {
+                        openscarlett::TitleVaRegionInfo rinfo{};
+                        if (device_x_->GetTitleVaMirror().LookupRegion(mirror_va, rinfo)) {
+                            (void)device_x_->GetTitleVaMirror().ScheduleGpuReadback(
+                                present_cmd_, mirror_va, rb_fence, 0ull, 0ull, rinfo.current_state);
+                        }
+                    }
+                    if (SUCCEEDED(present_cmd_->Close())) {
+                        ID3D12CommandList* lists[] = {present_cmd_};
+                        host_queue_->ExecuteCommandLists(1u, lists);
+                        host_queue_->Signal(present_fence_, rb_fence);
+                    }
+                }
+                cmd2->Release();
+            }
+        }
+        RecordQueue("ID3D12CommandQueueX::Write32BitValueX", 25, hr);
+        return hr;
+    }
+
+    if (IsWritableCpuVa(Address, sizeof(uint32_t))) {
+        if ((Flags & D3D12XBOX_WRITE_VALUE_FLAG_MARKER_OUT) != 0u) {
+            std::lock_guard<std::mutex> lock(present_mutex_);
+            if (SUCCEEDED(EnsurePresentHelperObjectsLocked())) {
+                WaitForInternalFenceLocked();
+            }
+        }
+        *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(Address)) = Value;
+        RecordQueue("ID3D12CommandQueueX::Write32BitValueX", 25, S_OK);
+        return S_OK;
+    }
+
+    RecordQueue("ID3D12CommandQueueX::Write32BitValueX", 25, S_OK);
+    return S_OK;
+}
+
 // IOpenScarlettPresentCapture
 HRESULT STDMETHODCALLTYPE CommandQueueX::SetOutputWindow(HWND hwnd) {
-    std::lock_guard<std::mutex> lock(present_mutex_);
-    if (attached_hwnd_ != hwnd ||
-        subclassed_hwnd_ != hwnd ||
-        (swapchain_ && swapchain_hwnd_ != hwnd)) {
-        if (swapchain_ && swapchain_hwnd_ != hwnd) {
-            ReleaseSwapChainLocked();
+    {
+        std::lock_guard<std::mutex> lock(present_mutex_);
+        explicit_window_detached_ = (hwnd == nullptr);
+        if (attached_hwnd_ != hwnd ||
+            subclassed_hwnd_ != hwnd ||
+            (swapchain_ && swapchain_hwnd_ != hwnd)) {
+            if (swapchain_ && swapchain_hwnd_ != hwnd) {
+                ReleaseSwapChainLocked();
+            }
+            attached_hwnd_ = hwnd;
+            if (hwnd && IsWindow(hwnd) != FALSE) {
+                AttachWindowSubclassLocked(hwnd);
+            } else {
+                DetachWindowSubclassLocked();
+            }
         }
-        attached_hwnd_ = hwnd;
-        if (hwnd && IsWindow(hwnd) != FALSE) {
-            AttachWindowSubclassLocked(hwnd);
-        } else {
-            DetachWindowSubclassLocked();
-        }
+    }
+    if (device_x_ && hwnd && IsWindow(hwnd) != FALSE && !device_x_->DefaultWindow()) {
+        device_x_->AdoptTitleWindow(hwnd);
     }
     return S_OK;
 }
@@ -2477,6 +3012,12 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::GetPresentWindowState(
 
     std::lock_guard<std::mutex> lock(present_mutex_);
     HWND effective_hwnd = subclassed_hwnd_ ? subclassed_hwnd_ : attached_hwnd_;
+    if (!effective_hwnd && !explicit_window_detached_ && device_x_) {
+        HWND dev_hwnd = device_x_->DefaultWindow();
+        if (dev_hwnd && IsWindow(dev_hwnd) != FALSE) {
+            effective_hwnd = dev_hwnd;
+        }
+    }
     const bool has_win = (effective_hwnd != nullptr && IsWindow(effective_hwnd) != FALSE);
 
     if (window_state_) {
@@ -2644,6 +3185,71 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::GetPresentTimingStats(
     if (!out_stats) return E_POINTER;
     std::lock_guard<std::mutex> lock(present_mutex_);
     *out_stats = last_timing_stats_;
+    return S_OK;
+}
+
+uint32_t CommandQueueX::ResolveEffectiveFrameIntervalUsLocked(
+    bool& out_override_active,
+    uint32_t& out_fcap_fps) const noexcept {
+    out_override_active = false;
+    out_fcap_fps = 0u;
+    if (fcap_override_active_) {
+        out_override_active = true;
+        out_fcap_fps = fcap_override_fps_;
+        return (fcap_override_fps_ > 0u) ? (1000000u / fcap_override_fps_) : 0u;
+    }
+    uint32_t env_fps = 0u;
+    if (TryParseEnvFcapFps(env_fps)) {
+        out_override_active = true;
+        out_fcap_fps = env_fps;
+        return (env_fps > 0u) ? (1000000u / env_fps) : 0u;
+    }
+    uint32_t cmd_fps = 0u;
+    if (TryParseCmdLineFcapFps(cmd_fps)) {
+        out_override_active = true;
+        out_fcap_fps = cmd_fps;
+        return (cmd_fps > 0u) ? (1000000u / cmd_fps) : 0u;
+    }
+    return device_x_ ? device_x_->FrameIntervalMicroseconds() : 0u;
+}
+
+void CommandQueueX::PumpMirrorReadbackCompletionLocked() noexcept {
+    if (!device_x_ || !present_fence_) return;
+    const uint64_t completed = present_fence_->GetCompletedValue();
+    (void)device_x_->GetTitleVaMirror().CompleteReadbacksOnFence(completed);
+}
+
+// IOpenScarlettPresentPacing
+HRESULT STDMETHODCALLTYPE CommandQueueX::SetFrameCapFps(
+    uint32_t fps_or_zero_for_uncapped,
+    BOOL override_active) {
+    std::lock_guard<std::mutex> lock(present_mutex_);
+    fcap_override_active_ = (override_active != FALSE);
+    fcap_override_fps_ = fps_or_zero_for_uncapped;
+    last_paced_qpc_ = 0;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE CommandQueueX::GetPresentPacingState(
+    D3D12XBOX_PRESENT_PACING_STATE* out_state) {
+    if (!out_state) return E_POINTER;
+    std::memset(out_state, 0, sizeof(*out_state));
+    std::lock_guard<std::mutex> lock(present_mutex_);
+    bool ov_active = false;
+    uint32_t ov_fps = 0u;
+    const uint32_t eff_us = ResolveEffectiveFrameIntervalUsLocked(ov_active, ov_fps);
+    out_state->set_frame_interval_us = device_x_ ? device_x_->FrameIntervalMicroseconds() : 0u;
+    out_state->fcap_override_fps = ov_fps;
+    out_state->fcap_override_active = ov_active ? 1u : 0u;
+    out_state->effective_frame_interval_us = eff_us;
+    out_state->paced_frame_count = paced_frame_count_;
+    if (window_state_) {
+        out_state->alt_enter_toggle_count =
+            window_state_->alt_enter_toggle_count.load(std::memory_order_acquire);
+        out_state->is_fullscreen =
+            window_state_->is_fullscreen.load(std::memory_order_acquire) ? 1u : 0u;
+    }
+    out_state->last_frame_ms = last_frame_ms_;
     return S_OK;
 }
 

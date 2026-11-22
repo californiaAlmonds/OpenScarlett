@@ -1,8 +1,10 @@
 #include "openscarlett/kernel/title_va_mirror.h"
+#include "openscarlett/kernel/vram_residency_manager.h"
 
 #include <algorithm>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 
 #if defined(_WIN32)
@@ -746,6 +748,367 @@ TitleVaMirrorStats TitleVAMirror::GetStats() const {
     s.clean_pages_skipped = clean_pages_skipped_;
     s.pending_readbacks = static_cast<uint64_t>(pending_readbacks_.size());
     s.completed_readbacks = completed_readbacks_;
+    return s;
+}
+
+// ============================================================================
+// Physical Page Double-Mapping / Aliasing (64 KB / 2 MB / 4 MB)
+// ============================================================================
+
+namespace {
+
+bool IsValidPhysicalGranularity(PhysicalPageGranularity g) noexcept {
+    return g == PhysicalPageGranularity::Page64KB ||
+           g == PhysicalPageGranularity::Page2MB ||
+           g == PhysicalPageGranularity::Page4MB;
+}
+
+}  // namespace
+
+struct PhysicalPageAliasManager::Impl {
+    struct PhysicalBlock {
+        uint64_t phys_id = 0ull;
+        PhysicalPageGranularity granularity = PhysicalPageGranularity::Page64KB;
+        uint32_t page_count = 0u;
+        uint64_t total_size_bytes = 0ull;
+        HANDLE section_handle = nullptr;
+        std::vector<uint8_t> dirty_pages;
+        uint32_t active_alias_count = 0u;
+    };
+
+    mutable std::shared_mutex mutex;
+    uint64_t next_phys_id = 1ull;
+    uint64_t next_alias_id = 1ull;
+    std::unordered_map<uint64_t, PhysicalBlock> blocks;
+    std::unordered_map<uint64_t, PhysicalAliasMapping> aliases;
+
+    uint64_t total_physical_bytes = 0ull;
+    uint64_t total_alias_mappings_created = 0ull;
+    uint64_t dirty_pages_marked = 0ull;
+    uint64_t mirror_sync_flushes = 0ull;
+};
+
+PhysicalPageAliasManager::PhysicalPageAliasManager() : impl_(std::make_unique<Impl>()) {}
+
+PhysicalPageAliasManager::~PhysicalPageAliasManager() {
+    Clear();
+}
+
+Status PhysicalPageAliasManager::AllocatePhysicalBlock(
+    PhysicalPageGranularity granularity,
+    uint32_t page_count,
+    uint64_t& out_phys_id) {
+    out_phys_id = 0ull;
+    if (!IsValidPhysicalGranularity(granularity) || page_count == 0u) {
+        return Status::Error(StatusCode::InvalidArgument,
+                             "AllocatePhysicalBlock requires 64KB/2MB/4MB granularity and page_count > 0");
+    }
+
+    const uint64_t page_bytes = static_cast<uint64_t>(granularity);
+    if (static_cast<uint64_t>(page_count) > (UINT64_MAX / page_bytes)) {
+        return Status::Error(StatusCode::InvalidArgument, "Physical block size overflow");
+    }
+    const uint64_t total_bytes = static_cast<uint64_t>(page_count) * page_bytes;
+    const DWORD size_high = static_cast<DWORD>((total_bytes >> 32u) & 0xFFFFFFFFull);
+    const DWORD size_low = static_cast<DWORD>(total_bytes & 0xFFFFFFFFull);
+
+    HANDLE h_section = CreateFileMappingW(
+        INVALID_HANDLE_VALUE,
+        nullptr,
+        PAGE_READWRITE,
+        size_high,
+        size_low,
+        nullptr);
+    if (!h_section) {
+        return Status::Error(StatusCode::OutOfMemory,
+                             "CreateFileMappingW failed for physical page block");
+    }
+
+    std::unique_lock<std::shared_mutex> lk(impl_->mutex);
+    Impl::PhysicalBlock blk{};
+    blk.phys_id = impl_->next_phys_id++;
+    blk.granularity = granularity;
+    blk.page_count = page_count;
+    blk.total_size_bytes = total_bytes;
+    blk.section_handle = h_section;
+    blk.dirty_pages.assign(page_count, 0u);
+    blk.active_alias_count = 0u;
+
+    const uint64_t id = blk.phys_id;
+    impl_->blocks.emplace(id, std::move(blk));
+    impl_->total_physical_bytes += total_bytes;
+    out_phys_id = id;
+    return Status::Ok();
+}
+
+Status PhysicalPageAliasManager::MapAlias(
+    uint64_t phys_id,
+    uint32_t first_page,
+    uint32_t page_count,
+    uint64_t guest_title_va,
+    PhysicalAliasMapping& out_mapping) {
+    out_mapping = PhysicalAliasMapping{};
+    if (page_count == 0u) {
+        return Status::Error(StatusCode::InvalidArgument, "MapAlias requires page_count > 0");
+    }
+
+    std::unique_lock<std::shared_mutex> lk(impl_->mutex);
+    auto it = impl_->blocks.find(phys_id);
+    if (it == impl_->blocks.end()) {
+        return Status::Error(StatusCode::NotFound, "Physical block not found");
+    }
+    Impl::PhysicalBlock& blk = it->second;
+    if (first_page >= blk.page_count || page_count > blk.page_count - first_page) {
+        return Status::Error(StatusCode::InvalidArgument, "MapAlias page range exceeds physical block");
+    }
+
+    const uint64_t page_bytes = static_cast<uint64_t>(blk.granularity);
+    const uint64_t file_offset = static_cast<uint64_t>(first_page) * page_bytes;
+    const uint64_t view_bytes = static_cast<uint64_t>(page_count) * page_bytes;
+    const DWORD off_high = static_cast<DWORD>((file_offset >> 32u) & 0xFFFFFFFFull);
+    const DWORD off_low = static_cast<DWORD>(file_offset & 0xFFFFFFFFull);
+
+    // 64 KB, 2 MB, and 4 MB are exact multiples of Win32 dwAllocationGranularity (64 KiB),
+    // so MapViewOfFile maps identical OS physical page frames directly into a fresh VA!
+    void* va = MapViewOfFile(
+        blk.section_handle,
+        FILE_MAP_ALL_ACCESS,
+        off_high,
+        off_low,
+        static_cast<SIZE_T>(view_bytes));
+    if (!va) {
+        return Status::Error(StatusCode::OutOfMemory, "MapViewOfFile failed creating physical page alias");
+    }
+
+    PhysicalAliasMapping mapping{};
+    mapping.alias_id = impl_->next_alias_id++;
+    mapping.phys_id = phys_id;
+    mapping.granularity = blk.granularity;
+    mapping.first_page = first_page;
+    mapping.page_count = page_count;
+    mapping.size_bytes = view_bytes;
+    mapping.cpu_va = va;
+    mapping.guest_title_va = guest_title_va ? guest_title_va : reinterpret_cast<uint64_t>(va);
+
+    impl_->aliases.emplace(mapping.alias_id, mapping);
+    ++blk.active_alias_count;
+    ++impl_->total_alias_mappings_created;
+    out_mapping = mapping;
+    return Status::Ok();
+}
+
+Status PhysicalPageAliasManager::UnmapAlias(uint64_t alias_id) {
+    std::unique_lock<std::shared_mutex> lk(impl_->mutex);
+    auto it = impl_->aliases.find(alias_id);
+    if (it == impl_->aliases.end()) {
+        return Status::Error(StatusCode::NotFound, "Physical page alias not found");
+    }
+    const PhysicalAliasMapping m = it->second;
+    if (m.cpu_va) {
+        UnmapViewOfFile(m.cpu_va);
+    }
+    auto blk_it = impl_->blocks.find(m.phys_id);
+    if (blk_it != impl_->blocks.end() && blk_it->second.active_alias_count > 0u) {
+        --blk_it->second.active_alias_count;
+    }
+    impl_->aliases.erase(it);
+    return Status::Ok();
+}
+
+Status PhysicalPageAliasManager::FreePhysicalBlock(uint64_t phys_id) {
+    std::unique_lock<std::shared_mutex> lk(impl_->mutex);
+    auto it = impl_->blocks.find(phys_id);
+    if (it == impl_->blocks.end()) {
+        return Status::Error(StatusCode::NotFound, "Physical block not found");
+    }
+    if (it->second.active_alias_count > 0u) {
+        return Status::Error(StatusCode::InvalidArgument,
+                             "Cannot free physical block while active VA aliases remain mapped");
+    }
+    if (it->second.section_handle) {
+        CloseHandle(it->second.section_handle);
+        it->second.section_handle = nullptr;
+    }
+    if (impl_->total_physical_bytes >= it->second.total_size_bytes) {
+        impl_->total_physical_bytes -= it->second.total_size_bytes;
+    } else {
+        impl_->total_physical_bytes = 0ull;
+    }
+    impl_->blocks.erase(it);
+    return Status::Ok();
+}
+
+void PhysicalPageAliasManager::Clear() {
+    if (!impl_) return;
+    std::unique_lock<std::shared_mutex> lk(impl_->mutex);
+    for (auto& kv : impl_->aliases) {
+        if (kv.second.cpu_va) {
+            UnmapViewOfFile(kv.second.cpu_va);
+        }
+    }
+    impl_->aliases.clear();
+    for (auto& kv : impl_->blocks) {
+        if (kv.second.section_handle) {
+            CloseHandle(kv.second.section_handle);
+        }
+    }
+    impl_->blocks.clear();
+    impl_->total_physical_bytes = 0ull;
+}
+
+Status PhysicalPageAliasManager::MarkAliasRangeDirty(
+    uint64_t alias_id, uint64_t byte_offset, uint64_t byte_size) {
+    if (byte_size == 0ull) return Status::Ok();
+    std::unique_lock<std::shared_mutex> lk(impl_->mutex);
+    auto ait = impl_->aliases.find(alias_id);
+    if (ait == impl_->aliases.end()) {
+        return Status::Error(StatusCode::NotFound, "Physical page alias not found");
+    }
+    const PhysicalAliasMapping& m = ait->second;
+    if (byte_offset >= m.size_bytes || byte_size > m.size_bytes - byte_offset) {
+        return Status::Error(StatusCode::InvalidArgument, "Dirty byte range exceeds alias bounds");
+    }
+    auto bit = impl_->blocks.find(m.phys_id);
+    if (bit == impl_->blocks.end()) {
+        return Status::Error(StatusCode::NotFound, "Underlying physical block missing");
+    }
+    Impl::PhysicalBlock& blk = bit->second;
+    const uint64_t page_bytes = static_cast<uint64_t>(blk.granularity);
+    const uint32_t rel_first = static_cast<uint32_t>(byte_offset / page_bytes);
+    const uint32_t rel_last = static_cast<uint32_t>((byte_offset + byte_size - 1ull) / page_bytes);
+    for (uint32_t p = rel_first; p <= rel_last; ++p) {
+        const uint32_t phys_page = m.first_page + p;
+        if (phys_page < blk.dirty_pages.size()) {
+            if (blk.dirty_pages[phys_page] == 0u) {
+                blk.dirty_pages[phys_page] = 1u;
+                ++impl_->dirty_pages_marked;
+            }
+        }
+    }
+    return Status::Ok();
+}
+
+Status PhysicalPageAliasManager::QueryDirtyPhysicalPages(
+    uint64_t phys_id,
+    bool reset_dirty,
+    std::vector<uint32_t>& out_dirty_pages) {
+    out_dirty_pages.clear();
+    std::unique_lock<std::shared_mutex> lk(impl_->mutex);
+    auto bit = impl_->blocks.find(phys_id);
+    if (bit == impl_->blocks.end()) {
+        return Status::Error(StatusCode::NotFound, "Physical block not found");
+    }
+    Impl::PhysicalBlock& blk = bit->second;
+    for (uint32_t p = 0u; p < blk.page_count; ++p) {
+        if (blk.dirty_pages[p] != 0u) {
+            out_dirty_pages.push_back(p);
+            if (reset_dirty) {
+                blk.dirty_pages[p] = 0u;
+            }
+        }
+    }
+    return Status::Ok();
+}
+
+Status PhysicalPageAliasManager::SyncDirtyPagesToTitleVaMirror(
+    uint64_t phys_id,
+    TitleVAMirror& mirror,
+    uint64_t mirror_title_va,
+    ID3D12GraphicsCommandList* cmd_list,
+    FlushStats* out_flush_stats) {
+    std::vector<uint32_t> dirty_pages;
+    uint64_t page_bytes = 0ull;
+    std::vector<uint8_t> snapshot;
+    uint64_t block_total_bytes = 0ull;
+
+    {
+        std::unique_lock<std::shared_mutex> lk(impl_->mutex);
+        auto bit = impl_->blocks.find(phys_id);
+        if (bit == impl_->blocks.end()) {
+            return Status::Error(StatusCode::NotFound, "Physical block not found");
+        }
+        Impl::PhysicalBlock& blk = bit->second;
+        page_bytes = static_cast<uint64_t>(blk.granularity);
+        block_total_bytes = blk.total_size_bytes;
+
+        for (uint32_t p = 0u; p < blk.page_count; ++p) {
+            if (blk.dirty_pages[p] != 0u) {
+                dirty_pages.push_back(p);
+                blk.dirty_pages[p] = 0u;
+            }
+        }
+        if (dirty_pages.empty()) {
+            if (out_flush_stats) *out_flush_stats = FlushStats{};
+            return Status::Ok();
+        }
+
+        // Map a temporary view over the whole physical block (or find an alias) to copy dirty pages
+        // coherently into the TitleVAMirror's write-watched CPU backing memory.
+        void* mirror_cpu = nullptr;
+        uint64_t mirror_rem = 0ull;
+        if (!mirror.ResolveTitleVaToCpu(mirror_title_va, mirror_cpu, mirror_rem) || !mirror_cpu) {
+            return Status::Error(StatusCode::NotFound, "Target TitleVAMirror region not found");
+        }
+
+        void* view = MapViewOfFile(blk.section_handle, FILE_MAP_READ, 0u, 0u, static_cast<SIZE_T>(block_total_bytes));
+        if (!view) {
+            return Status::Error(StatusCode::OutOfMemory, "MapViewOfFile failed during mirror sync");
+        }
+        const auto* src_bytes = static_cast<const uint8_t*>(view);
+        auto* dst_bytes = static_cast<uint8_t*>(mirror_cpu);
+        for (uint32_t p : dirty_pages) {
+            const uint64_t off = static_cast<uint64_t>(p) * page_bytes;
+            if (off >= mirror_rem) continue;
+            const uint64_t len = std::min<uint64_t>(page_bytes, mirror_rem - off);
+            std::memcpy(dst_bytes + off, src_bytes + off, static_cast<size_t>(len));
+        }
+        UnmapViewOfFile(view);
+        ++impl_->mirror_sync_flushes;
+    }
+
+    return mirror.FlushDirtyPagesToGpu(cmd_list, mirror_title_va, out_flush_stats);
+}
+
+bool PhysicalPageAliasManager::ResolveAliasByVa(
+    const void* cpu_va, PhysicalAliasMapping& out_mapping) const {
+    if (!cpu_va) return false;
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(cpu_va);
+    std::shared_lock<std::shared_mutex> lk(impl_->mutex);
+    for (const auto& kv : impl_->aliases) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(kv.second.cpu_va);
+        const uintptr_t end = base + static_cast<uintptr_t>(kv.second.size_bytes);
+        if (addr >= base && addr < end) {
+            out_mapping = kv.second;
+            return true;
+        }
+    }
+    return false;
+}
+
+Status PhysicalPageAliasManager::GetAliasesForBlock(
+    uint64_t phys_id, std::vector<PhysicalAliasMapping>& out_aliases) const {
+    out_aliases.clear();
+    std::shared_lock<std::shared_mutex> lk(impl_->mutex);
+    if (impl_->blocks.find(phys_id) == impl_->blocks.end()) {
+        return Status::Error(StatusCode::NotFound, "Physical block not found");
+    }
+    for (const auto& kv : impl_->aliases) {
+        if (kv.second.phys_id == phys_id) {
+            out_aliases.push_back(kv.second);
+        }
+    }
+    return Status::Ok();
+}
+
+PhysicalAliasStats PhysicalPageAliasManager::GetStats() const {
+    std::shared_lock<std::shared_mutex> lk(impl_->mutex);
+    PhysicalAliasStats s{};
+    s.active_physical_blocks = static_cast<uint64_t>(impl_->blocks.size());
+    s.active_aliases = static_cast<uint64_t>(impl_->aliases.size());
+    s.total_physical_bytes = impl_->total_physical_bytes;
+    s.total_alias_mappings_created = impl_->total_alias_mappings_created;
+    s.dirty_pages_marked = impl_->dirty_pages_marked;
+    s.mirror_sync_flushes = impl_->mirror_sync_flushes;
     return s;
 }
 

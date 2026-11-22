@@ -86,10 +86,10 @@ bool HostSupportsNativeOpusMft() {
 }
 
 // ===========================================================================
-// 1. Clean-Room IMA-ADPCM (0x0011 WAV & 0x0069 Xbox ADPCM) Roundtrip Tests
+// 1. IMA-ADPCM (0x0011 WAV & 0x0069 Xbox ADPCM) Roundtrip Tests
 // ===========================================================================
 void TestImaAdpcmCodecDirect() {
-    std::printf("[Test 1] Clean-Room IMA-ADPCM (0x0011 Mono/Stereo + 0x0069 Xbox ADPCM)...\n");
+    std::printf("[Test 1] IMA-ADPCM (0x0011 Mono/Stereo + 0x0069 Xbox ADPCM)...\n");
 
     // 1A. Mono 48 kHz 440 Hz sine (WAV 0x0011, 256-byte blocks)
     {
@@ -223,7 +223,7 @@ void TestOpusMftDecoderDirect() {
         // Build 8 valid RFC 6716 CELT fullband 20 ms packets (8 * 960 = 7680 frames)
         std::vector<std::vector<uint8_t>> packets;
         for (uint32_t i = 0u; i < 8u; ++i) {
-            auto pkt = openscarlett::BuildCleanRoomOpusTestPacket(ch, i, 64u);
+            auto pkt = openscarlett::BuildOpusTestPacket(ch, i, 64u);
             openscarlett::OpusTocInfo toc{};
             OS_REQUIRE(openscarlett::ParseOpusToc(pkt.data(), pkt.size(), toc));
             OS_REQUIRE(toc.samples_per_frame_48k == 960u && toc.frames_in_packet == 1u);
@@ -405,7 +405,7 @@ void TestXAudio2CodecsDeterministicNullMode() {
     {
         std::vector<std::vector<uint8_t>> packets;
         for (uint32_t i = 0u; i < 6u; ++i) {
-            packets.push_back(openscarlett::BuildCleanRoomOpusTestPacket(2u, i + 10u, 64u));
+            packets.push_back(openscarlett::BuildOpusTestPacket(2u, i + 10u, 64u));
         }
         const auto stream = openscarlett::PackOpusLengthPrefixedStream(packets, false);
 

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -818,6 +819,15 @@ uint32_t UnpackMtbufFormatComponent(
     }
 }
 
+float RoundNearestEvenF32(float x) noexcept {
+    const float fl = std::floor(x);
+    const float diff = x - fl;
+    if (diff < 0.5f) return fl;
+    if (diff > 0.5f) return fl + 1.0f;
+    const float half_fl = fl * 0.5f;
+    return (std::floor(half_fl) == half_fl) ? fl : (fl + 1.0f);
+}
+
 void PackMtbufFormatComponent(
     uint8_t* bytes,
     size_t buf_size,
@@ -834,15 +844,17 @@ void PackMtbufFormatComponent(
         case Rdna2MtbufFormat::R8G8_UNORM:
         case Rdna2MtbufFormat::R8G8B8A8_UNORM: {
             const float c = std::clamp(std::isnan(fval) ? 0.0f : fval, 0.0f, 1.0f);
-            WriteByte(bytes, buf_size, base_byte_addr + comp_idx, static_cast<uint8_t>(std::lround(c * 255.0f)));
+            const int32_t q = std::clamp(static_cast<int32_t>(RoundNearestEvenF32(c * 255.0f)), 0, 255);
+            WriteByte(bytes, buf_size, base_byte_addr + comp_idx, static_cast<uint8_t>(q));
             break;
         }
         case Rdna2MtbufFormat::R8_SNORM:
         case Rdna2MtbufFormat::R8G8_SNORM:
         case Rdna2MtbufFormat::R8G8B8A8_SNORM: {
             const float c = std::clamp(std::isnan(fval) ? 0.0f : fval, -1.0f, 1.0f);
+            const int32_t q = std::clamp(static_cast<int32_t>(RoundNearestEvenF32(c * 127.0f)), -127, 127);
             WriteByte(bytes, buf_size, base_byte_addr + comp_idx,
-                      static_cast<uint8_t>(static_cast<int8_t>(std::lround(c * 127.0f))));
+                      static_cast<uint8_t>(static_cast<int8_t>(q)));
             break;
         }
         case Rdna2MtbufFormat::R8_UINT:
@@ -857,15 +869,17 @@ void PackMtbufFormatComponent(
         case Rdna2MtbufFormat::R16G16_UNORM:
         case Rdna2MtbufFormat::R16G16B16A16_UNORM: {
             const float c = std::clamp(std::isnan(fval) ? 0.0f : fval, 0.0f, 1.0f);
-            WriteU16(bytes, buf_size, base_byte_addr + comp_idx * 2u, static_cast<uint16_t>(std::lround(c * 65535.0f)));
+            const int32_t q = std::clamp(static_cast<int32_t>(RoundNearestEvenF32(c * 65535.0f)), 0, 65535);
+            WriteU16(bytes, buf_size, base_byte_addr + comp_idx * 2u, static_cast<uint16_t>(q));
             break;
         }
         case Rdna2MtbufFormat::R16_SNORM:
         case Rdna2MtbufFormat::R16G16_SNORM:
         case Rdna2MtbufFormat::R16G16B16A16_SNORM: {
             const float c = std::clamp(std::isnan(fval) ? 0.0f : fval, -1.0f, 1.0f);
+            const int32_t q = std::clamp(static_cast<int32_t>(RoundNearestEvenF32(c * 32767.0f)), -32767, 32767);
             WriteU16(bytes, buf_size, base_byte_addr + comp_idx * 2u,
-                     static_cast<uint16_t>(static_cast<int16_t>(std::lround(c * 32767.0f))));
+                     static_cast<uint16_t>(static_cast<int16_t>(q)));
             break;
         }
         case Rdna2MtbufFormat::R16_UINT:
@@ -1494,7 +1508,7 @@ void SeedDefaultComputeVgprs(MemImgExecState& state) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// Clean-Room CPU Reference Execution Engine (ExecuteMemImgCpu)
+// CPU Reference Execution Engine (ExecuteMemImgCpu)
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -1629,14 +1643,22 @@ void ExecMubufOrMtbufCpu(const MemImgDecodedInst& di, MemImgExecState& state) {
                 }
             } else if (op >= 0x08u && op <= 0x0Bu) {
                 const uint32_t comps = static_cast<uint32_t>(op - 0x08u) + 1u;
-                uint32_t packed[2] = {0u, 0u};
+                uint32_t hs[4] = {0u, 0u, 0u, 0u};
                 for (uint32_t c = 0; c < comps; ++c) {
-                    const uint32_t h = UnpackMtbufFormatComponent(buf.data(), buf.size(), addr, fmt, c, true) & 0xFFFFu;
-                    if ((c & 1u) == 0u) packed[c >> 1] = h;
-                    else packed[c >> 1] |= (h << 16);
+                    hs[c] = UnpackMtbufFormatComponent(buf.data(), buf.size(), addr, fmt, c, true) & 0xFFFFu;
                 }
-                v[vdata & 63u] = packed[0];
-                if (comps > 2u) v[(vdata + 1u) & 63u] = packed[1];
+                if (comps == 1u) {
+                    // GFX10.3 D16_HI=0 hi-preserve: keep upper 16 bits of v[vdata] untouched
+                    v[vdata & 63u] = (v[vdata & 63u] & 0xFFFF0000u) | hs[0];
+                } else {
+                    v[vdata & 63u] = hs[0] | (hs[1] << 16);
+                }
+                if (comps == 3u) {
+                    // GFX10.3 D16_HI=0 hi-preserve: keep upper 16 bits of v[vdata+1] untouched
+                    v[(vdata + 1u) & 63u] = (v[(vdata + 1u) & 63u] & 0xFFFF0000u) | hs[2];
+                } else if (comps == 4u) {
+                    v[(vdata + 1u) & 63u] = hs[2] | (hs[3] << 16);
+                }
             } else if (op >= 0x0Cu && op <= 0x0Fu) {
                 const uint32_t comps = static_cast<uint32_t>(op - 0x0Cu) + 1u;
                 for (uint32_t c = 0; c < comps; ++c) {
@@ -2476,11 +2498,40 @@ void ExecExpCpu(const MemImgDecodedInst& di, MemImgExecState& state) {
     }
 }
 
+Status ValidateMimgUnsupportedModifiers(const std::vector<MemImgDecodedInst>& insts) {
+    for (const auto& di : insts) {
+        if (di.base.encoding != Rdna2Encoding::MIMG) continue;
+        const uint32_t w0 = (di.base.word_count > 0u) ? di.base.raw_words[0] : 0u;
+        const bool has_r128 = di.r128 || (((w0 >> 15) & 1u) != 0u);
+        const bool has_tfe = di.tfe || (((w0 >> 6) & 1u) != 0u);
+        const bool has_lwe = di.lwe || (((w0 >> 17) & 1u) != 0u);
+        if (!has_r128 && !has_tfe && !has_lwe) continue;
+        std::string mods;
+        auto add_mod = [&](const char* name) {
+            if (!mods.empty()) mods += ", ";
+            mods += name;
+        };
+        if (has_r128) add_mod("R128");
+        if (has_tfe) add_mod("TFE");
+        if (has_lwe) add_mod("LWE");
+        const char* mnem = di.entry ? di.entry->mnemonic : "image_unknown";
+        return Status::Error(
+            StatusCode::UnsupportedFormat,
+            std::string("Unsupported MIMG modifier(s) [") + mods + "] on opcode " + mnem +
+                " at word_offset=" + std::to_string(di.base.word_offset) +
+                " (R128 4-dword T#, TFE residency return, and LWE LOD warning are refused)");
+    }
+    return Status::Ok();
+}
+
 }  // namespace
 
 Status ExecuteMemImgCpu(
     const std::vector<MemImgDecodedInst>& insts,
     MemImgExecState& state) {
+    if (auto st = ValidateMimgUnsupportedModifiers(insts); !st.ok()) {
+        return st;
+    }
     if (state.wave_size == 0u || state.wave_size > 64u) {
         return Status::Error(StatusCode::InvalidArgument, "MemImgExecState wave_size must be in 1..64");
     }
@@ -2520,7 +2571,7 @@ Status ExecuteMemImgCpu(
 }
 
 // ---------------------------------------------------------------------------
-// Clean-Room SM 6.5 HLSL Emitter for MemImg / DS / FLAT / EXP Shaders
+// SM 6.5 HLSL Emitter for MemImg / DS / FLAT / EXP Shaders
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -2791,6 +2842,30 @@ void EmitHlslAtomicOp(
         case 0x4D:
             emit_cas_loop("asuint(asfloat(_cur) + asfloat(v[" + std::to_string(d0) + "]))");
             break;
+        case 0x4E:
+            // ds_rsub_u32: mem = data0 - old_mem
+            emit_cas_loop("(v[" + std::to_string(d0) + "] - _cur)");
+            break;
+        case 0x52: {
+            // 64-bit carry-propagating atomic add (buffer_atomic_add_x2 / global_atomic_add_x2 / ds_add_u64)
+            os << "        uint _prev_hi = 0u;\n";
+            if (is_lds) {
+                os << "        uint _idx_hi = (_idx + 1u) & 4095u;\n";
+                os << "        InterlockedAdd(_lds[_idx], v[" << d0 << "], _prev);\n";
+                os << "        uint _carry = ((_prev + v[" << d0 << "]) < _prev) ? 1u : 0u;\n";
+                os << "        InterlockedAdd(_lds[_idx_hi], v[" << d1 << "] + _carry, _prev_hi);\n";
+            } else {
+                os << "        " << buf_name << ".InterlockedAdd(_addr, v[" << d0 << "], _prev);\n";
+                os << "        uint _carry = ((_prev + v[" << d0 << "]) < _prev) ? 1u : 0u;\n";
+                os << "        " << buf_name << ".InterlockedAdd(_addr + 4u, v[" << d1 << "] + _carry, _prev_hi);\n";
+            }
+            if (write_rtn) {
+                os << "        v[" << static_cast<uint32_t>(vdst & 63u) << "] = _prev;\n";
+                os << "        v[" << static_cast<uint32_t>((vdst + 1u) & 63u) << "] = _prev_hi;\n";
+            }
+            os << "    }\n";
+            return;
+        }
         default:
             // 64-bit _x2 emulation on low/high dwords
             if (is_lds) os << "        InterlockedAdd(" << target_lhs() << ", v[" << d0 << "], _prev);\n";
@@ -2876,6 +2951,26 @@ Status EmitMemImgHlsl(
               "    if (fmt == 9u || fmt == 21u || fmt == 51u) return d16 ? (raw & 0xFFFFu) : asuint(f16tof32(raw & 0xFFFFu));\n"
               "    if (fmt == 14u || fmt == 15u) return d16 ? (raw & 0xFFFFu) : raw;\n"
               "    return d16 ? (f32tof16(asfloat(raw)) & 0xFFFFu) : raw;\n"
+              "}\n"
+              "float _os_rne_f32(float x) {\n"
+              "    float fl = floor(x); float diff = x - fl;\n"
+              "    if (diff < 0.5) return fl;\n"
+              "    if (diff > 0.5) return fl + 1.0;\n"
+              "    float h = fl * 0.5;\n"
+              "    return (floor(h) == h) ? fl : (fl + 1.0);\n"
+              "}\n"
+              "uint _os_pack_fmt(uint val, uint fmt, bool from_d16) {\n"
+              "    float f = from_d16 ? f16tof32(val & 0xFFFFu) : asfloat(val);\n"
+              "    uint u = from_d16 ? (val & 0xFFFFu) : val;\n"
+              "    if (fmt == 1u || fmt == 10u || fmt == 28u) { float c = isnan(f) ? 0.0 : clamp(f, 0.0, 1.0); return (uint)clamp((int)_os_rne_f32(c * 255.0), 0, 255); }\n"
+              "    if (fmt == 2u || fmt == 11u || fmt == 29u) { float c = isnan(f) ? 0.0 : clamp(f, -1.0, 1.0); return asuint(clamp((int)_os_rne_f32(c * 127.0), -127, 127)) & 0xFFu; }\n"
+              "    if (fmt == 3u || fmt == 12u || fmt == 30u || fmt == 4u || fmt == 13u || fmt == 31u) return u & 0xFFu;\n"
+              "    if (fmt == 5u || fmt == 17u || fmt == 47u) { float c = isnan(f) ? 0.0 : clamp(f, 0.0, 1.0); return (uint)clamp((int)_os_rne_f32(c * 65535.0), 0, 65535); }\n"
+              "    if (fmt == 6u || fmt == 18u || fmt == 48u) { float c = isnan(f) ? 0.0 : clamp(f, -1.0, 1.0); return asuint(clamp((int)_os_rne_f32(c * 32767.0), -32767, 32767)) & 0xFFFFu; }\n"
+              "    if (fmt == 7u || fmt == 19u || fmt == 49u || fmt == 8u || fmt == 20u || fmt == 50u) return u & 0xFFFFu;\n"
+              "    if (fmt == 9u || fmt == 21u || fmt == 51u) return from_d16 ? (val & 0xFFFFu) : (f32tof16(f) & 0xFFFFu);\n"
+              "    if (fmt == 14u || fmt == 15u) return u;\n"
+              "    return asuint(f);\n"
               "}\n";
     }
 
@@ -3014,9 +3109,15 @@ Status EmitMemImgHlsl(
                                                    : (std::string(load_fn) + btag + "(_ba + " + std::to_string(c * cbytes) + "u)");
                         os << "      uint _h" << c << " = _os_unpack_fmt(" << raw_expr << ", " << fmt << "u, true) & 0xFFFFu;\n";
                     }
-                    os << "      v[" << static_cast<uint32_t>(vd) << "] = _h0" << (comps > 1u ? " | (_h1 << 16u)" : "") << ";\n";
-                    if (comps > 2u) {
-                        os << "      v[" << ((vd + 1u) & 63u) << "] = _h2" << (comps > 3u ? " | (_h3 << 16u)" : "") << ";\n";
+                    if (comps == 1u) {
+                        os << "      v[" << static_cast<uint32_t>(vd) << "] = (v[" << static_cast<uint32_t>(vd) << "] & 0xFFFF0000u) | _h0;\n";
+                    } else {
+                        os << "      v[" << static_cast<uint32_t>(vd) << "] = _h0 | (_h1 << 16u);\n";
+                    }
+                    if (comps == 3u) {
+                        os << "      v[" << ((vd + 1u) & 63u) << "] = (v[" << ((vd + 1u) & 63u) << "] & 0xFFFF0000u) | _h2;\n";
+                    } else if (comps == 4u) {
+                        os << "      v[" << ((vd + 1u) & 63u) << "] = _h2 | (_h3 << 16u);\n";
                     }
                     os << "    }\n";
                 } else if (op == 0x26u || op == 0x10u) {
@@ -3026,13 +3127,33 @@ Status EmitMemImgHlsl(
                     os << "    v[" << static_cast<uint32_t>(vd) << "] = (v[" << static_cast<uint32_t>(vd)
                        << "] & 0xFFFFu) | ((_os_unpack_fmt(" << raw_expr << ", " << fmt << "u, true) & 0xFFFFu) << 16u);\n";
                 } else {
-                    // Format stores (standard / d16 / d16_hi)
+                    // Format stores (standard 0x04..0x07, d16 0x0C..0x0F, d16_hi 0x11/0x27) with exact sub-dword partial writes
+                    const bool is_d16_hi = (op == 0x11u || op == 0x27u);
+                    const bool is_d16 = is_d16_hi || (op >= 0x0Cu && op <= 0x0Fu);
                     const uint32_t comps = (op >= 0x04u && op <= 0x07u)
                                                ? (static_cast<uint32_t>(op - 0x04u) + 1u)
                                                : ((op >= 0x0Cu && op <= 0x0Fu) ? (static_cast<uint32_t>(op - 0x0Cu) + 1u) : 1u);
                     os << "    { uint _ba = " << aexpr << ";\n";
                     for (uint32_t c = 0; c < comps; ++c) {
-                        os << "      " << bname << ".Store((_ba + " << (c * 4u) << "u) & ~3u, v[" << ((vd + c) & 63u) << "]);\n";
+                        std::string src_expr;
+                        if (is_d16_hi) {
+                            src_expr = "(v[" + std::to_string(vd) + "] >> 16u)";
+                        } else if (is_d16) {
+                            const uint32_t r = (vd + (c >> 1u)) & 63u;
+                            src_expr = ((c & 1u) == 0u) ? ("(v[" + std::to_string(r) + "] & 0xFFFFu)")
+                                                        : ("(v[" + std::to_string(r) + "] >> 16u)");
+                        } else {
+                            src_expr = "v[" + std::to_string((vd + c) & 63u) + "]";
+                        }
+                        os << "      uint _pk" << c << " = _os_pack_fmt(" << src_expr << ", " << fmt << "u, "
+                           << (is_d16 ? "true" : "false") << ");\n";
+                        if (cbytes == 1u) {
+                            os << "      _store_u8_" << btag << "(_ba + " << c << "u, _pk" << c << ");\n";
+                        } else if (cbytes == 2u) {
+                            os << "      _store_u16_" << btag << "(_ba + " << (c * 2u) << "u, _pk" << c << ");\n";
+                        } else {
+                            os << "      " << bname << ".Store((_ba + " << (c * 4u) << "u) & ~3u, _pk" << c << ");\n";
+                        }
                     }
                     os << "    }\n";
                 }
@@ -3128,7 +3249,13 @@ Status EmitMemImgHlsl(
                        << "      v[" << static_cast<uint32_t>(vd) << "] = asuint(_lod); v[" << ((vd + 1u) & 63u)
                        << "] = asuint(_lod); }\n";
                 } else {
-                    os << "    v[" << static_cast<uint32_t>(vd) << "] = 0u; v[" << ((vd + 1u) & 63u) << "] = 0u;\n";
+                    uint32_t dst_off = 0u;
+                    for (uint32_t c = 0u; c < 4u; ++c) {
+                        if ((dmask & (1u << c)) != 0u) {
+                            os << "    v[" << ((vd + dst_off) & 63u) << "] = 0u;\n";
+                            ++dst_off;
+                        }
+                    }
                 }
             } else if (e->is_store) {
                 os << "    _rwtex[uint2(v[" << static_cast<uint32_t>(va) << "], v[" << ((va + 1u) & 63u)
@@ -3136,16 +3263,29 @@ Status EmitMemImgHlsl(
                    << "]), asfloat(v[" << ((vd + 2u) & 63u) << "]), asfloat(v[" << ((vd + 3u) & 63u) << "]));\n";
             } else if (e->is_atomic) {
                 os << "    { uint2 _ic = uint2(v[" << static_cast<uint32_t>(va) << "], v[" << ((va + 1u) & 63u) << "]); uint _ip = 0u;\n";
+                auto emit_tex_cas = [&](const std::string& next_expr) {
+                    os << "      uint _cur = _rwtex_u32[_ic];\n"
+                       << "      [allow_uav_condition] for (uint _it = 0u; _it < 64u; ++_it) {\n"
+                       << "          uint _next = " << next_expr << "; uint _orig = 0u;\n"
+                       << "          InterlockedCompareExchange(_rwtex_u32[_ic], _cur, _next, _orig);\n"
+                       << "          if (_orig == _cur) { _ip = _orig; break; }\n"
+                       << "          _cur = _orig;\n"
+                       << "      }\n";
+                };
                 switch (op) {
                     case 0x10: os << "      InterlockedExchange(_rwtex_u32[_ic], v[" << static_cast<uint32_t>(vd) << "], _ip);\n"; break;
                     case 0x11: os << "      InterlockedCompareExchange(_rwtex_u32[_ic], v[" << ((vd + 1u) & 63u) << "], v[" << static_cast<uint32_t>(vd) << "], _ip);\n"; break;
                     case 0x12: os << "      InterlockedAdd(_rwtex_u32[_ic], v[" << static_cast<uint32_t>(vd) << "], _ip);\n"; break;
                     case 0x13: os << "      InterlockedAdd(_rwtex_u32[_ic], (0u - v[" << static_cast<uint32_t>(vd) << "]), _ip);\n"; break;
+                    case 0x14: emit_tex_cas("asuint(min(asint(_cur), asint(v[" + std::to_string(vd) + "])))"); break;
                     case 0x15: os << "      InterlockedMin(_rwtex_u32[_ic], v[" << static_cast<uint32_t>(vd) << "], _ip);\n"; break;
+                    case 0x16: emit_tex_cas("asuint(max(asint(_cur), asint(v[" + std::to_string(vd) + "])))"); break;
                     case 0x17: os << "      InterlockedMax(_rwtex_u32[_ic], v[" << static_cast<uint32_t>(vd) << "], _ip);\n"; break;
                     case 0x18: os << "      InterlockedAnd(_rwtex_u32[_ic], v[" << static_cast<uint32_t>(vd) << "], _ip);\n"; break;
                     case 0x19: os << "      InterlockedOr(_rwtex_u32[_ic], v[" << static_cast<uint32_t>(vd) << "], _ip);\n"; break;
                     case 0x1A: os << "      InterlockedXor(_rwtex_u32[_ic], v[" << static_cast<uint32_t>(vd) << "], _ip);\n"; break;
+                    case 0x1B: emit_tex_cas("(_cur >= v[" + std::to_string(vd) + "]) ? 0u : (_cur + 1u)"); break;
+                    case 0x1C: emit_tex_cas("(_cur == 0u || _cur > v[" + std::to_string(vd) + "]) ? v[" + std::to_string(vd) + "] : (_cur - 1u)"); break;
                     default:   os << "      InterlockedAdd(_rwtex_u32[_ic], v[" << static_cast<uint32_t>(vd) << "], _ip);\n"; break;
                 }
                 if (inst.glc) os << "      v[" << static_cast<uint32_t>(vd) << "] = _ip;\n";
@@ -3318,6 +3458,14 @@ Status EmitMemImgHlsl(
                 for (uint32_t k = 0; k < n; ++k) {
                     os << "    _lds[((" << base_a << " + " << (k * 4u) << "u) >> 2u) & 4095u] = v[" << ((d0 + k) & 63u) << "];\n";
                 }
+            } else if (op == 0x4Eu || op == 0x4Fu) {
+                const uint32_t sc = (op == 0x4Fu) ? 512u : 8u;
+                os << "    { uint _a0 = v[" << static_cast<uint32_t>(vaddr) << "] + " << (static_cast<uint32_t>(inst.ds_offset0) * sc) << "u;\n"
+                   << "      uint _a1 = v[" << static_cast<uint32_t>(vaddr) << "] + " << (static_cast<uint32_t>(inst.ds_offset1) * sc) << "u;\n"
+                   << "      _lds[(_a0 >> 2u) & 4095u] = v[" << static_cast<uint32_t>(d0) << "];\n"
+                   << "      _lds[((_a0 + 4u) >> 2u) & 4095u] = v[" << ((d0 + 1u) & 63u) << "];\n"
+                   << "      _lds[(_a1 >> 2u) & 4095u] = v[" << static_cast<uint32_t>(d1) << "];\n"
+                   << "      _lds[((_a1 + 4u) >> 2u) & 4095u] = v[" << ((d1 + 1u) & 63u) << "]; }\n";
             } else if (op == 0x36u) {
                 os << "    v[" << static_cast<uint32_t>(vdst) << "] = _lds[(" << base_a << " >> 2u) & 4095u];\n";
             } else if (op == 0x37u || op == 0x38u) {
@@ -3337,39 +3485,52 @@ Status EmitMemImgHlsl(
                 for (uint32_t k = 0; k < n; ++k) {
                     os << "    v[" << ((vdst + k) & 63u) << "] = _lds[((" << base_a << " + " << (k * 4u) << "u) >> 2u) & 4095u];\n";
                 }
+            } else if (op == 0x77u || op == 0x78u) {
+                const uint32_t sc = (op == 0x78u) ? 512u : 8u;
+                os << "    { uint _a0 = v[" << static_cast<uint32_t>(vaddr) << "] + " << (static_cast<uint32_t>(inst.ds_offset0) * sc) << "u;\n"
+                   << "      uint _a1 = v[" << static_cast<uint32_t>(vaddr) << "] + " << (static_cast<uint32_t>(inst.ds_offset1) * sc) << "u;\n"
+                   << "      v[" << static_cast<uint32_t>(vdst) << "] = _lds[(_a0 >> 2u) & 4095u];\n"
+                   << "      v[" << ((vdst + 1u) & 63u) << "] = _lds[((_a0 + 4u) >> 2u) & 4095u];\n"
+                   << "      v[" << ((vdst + 2u) & 63u) << "] = _lds[(_a1 >> 2u) & 4095u];\n"
+                   << "      v[" << ((vdst + 3u) & 63u) << "] = _lds[((_a1 + 4u) >> 2u) & 4095u]; }\n";
             } else if (e->is_atomic) {
-                const uint16_t base_op = (op == 0x55u) ? 0x15u
-                                       : ((op >= 0x20u && op <= 0x33u) ? static_cast<uint16_t>(op - 0x20u)
-                                       : ((op >= 0x60u && op <= 0x73u) ? static_cast<uint16_t>(op - 0x60u)
-                                       : ((op >= 0x40u && op <= 0x53u) ? static_cast<uint16_t>(op - 0x40u) : op)));
-                uint16_t mapped_atomic = 0x32u;
-                switch (base_op) {
-                    case 0x00: mapped_atomic = 0x32u; break;
-                    case 0x01: mapped_atomic = 0x33u; break;
-                    case 0x03: mapped_atomic = 0x3Cu; break;
-                    case 0x04: mapped_atomic = 0x3Du; break;
-                    case 0x05: mapped_atomic = 0x35u; break;
-                    case 0x06: mapped_atomic = 0x37u; break;
-                    case 0x07: mapped_atomic = 0x36u; break;
-                    case 0x08: mapped_atomic = 0x38u; break;
-                    case 0x09: mapped_atomic = 0x39u; break;
-                    case 0x0A: mapped_atomic = 0x3Au; break;
-                    case 0x0B: mapped_atomic = 0x3Bu; break;
-                    case 0x0D: mapped_atomic = 0x30u; break;
-                    case 0x12: mapped_atomic = 0x3Fu; break;
-                    case 0x13: mapped_atomic = 0x40u; break;
-                    case 0x15: mapped_atomic = 0x4Du; break;
-                    default:   mapped_atomic = 0x32u; break;
-                }
-                if (base_op == 0x10u || base_op == 0x11u) {
-                    // ds_cmpst: data0 = cmp, data1 = new
-                    os << "    { uint _idx = ((" << base_a << ") >> 2u) & 4095u; uint _prev = 0u;\n"
-                       << "      InterlockedCompareExchange(_lds[_idx], v[" << static_cast<uint32_t>(d0)
-                       << "], v[" << static_cast<uint32_t>(d1) << "], _prev);\n";
-                    if (e->has_rtn) os << "      v[" << static_cast<uint32_t>(vdst) << "] = _prev;\n";
-                    os << "    }\n";
+                if (op == 0x40u || op == 0x60u) {
+                    EmitHlslAtomicOp(os, "_lds", base_a, 0x52u, d0, vdst, e->has_rtn, true);
                 } else {
-                    EmitHlslAtomicOp(os, "_lds", base_a, mapped_atomic, d0, vdst, e->has_rtn, true);
+                    const uint16_t base_op = (op == 0x55u) ? 0x15u
+                                           : ((op >= 0x20u && op <= 0x33u) ? static_cast<uint16_t>(op - 0x20u)
+                                           : ((op >= 0x60u && op <= 0x73u) ? static_cast<uint16_t>(op - 0x60u)
+                                           : ((op >= 0x40u && op <= 0x53u) ? static_cast<uint16_t>(op - 0x40u) : op)));
+                    uint16_t mapped_atomic = 0x32u;
+                    switch (base_op) {
+                        case 0x00: mapped_atomic = 0x32u; break;
+                        case 0x01: mapped_atomic = 0x33u; break;
+                        case 0x02: mapped_atomic = 0x4Eu; break;
+                        case 0x03: mapped_atomic = 0x3Cu; break;
+                        case 0x04: mapped_atomic = 0x3Du; break;
+                        case 0x05: mapped_atomic = 0x35u; break;
+                        case 0x06: mapped_atomic = 0x37u; break;
+                        case 0x07: mapped_atomic = 0x36u; break;
+                        case 0x08: mapped_atomic = 0x38u; break;
+                        case 0x09: mapped_atomic = 0x39u; break;
+                        case 0x0A: mapped_atomic = 0x3Au; break;
+                        case 0x0B: mapped_atomic = 0x3Bu; break;
+                        case 0x0D: mapped_atomic = 0x30u; break;
+                        case 0x12: mapped_atomic = 0x3Fu; break;
+                        case 0x13: mapped_atomic = 0x40u; break;
+                        case 0x15: mapped_atomic = 0x4Du; break;
+                        default:   mapped_atomic = 0x32u; break;
+                    }
+                    if (base_op == 0x10u || base_op == 0x11u) {
+                        // ds_cmpst: data0 = cmp, data1 = new
+                        os << "    { uint _idx = ((" << base_a << ") >> 2u) & 4095u; uint _prev = 0u;\n"
+                           << "      InterlockedCompareExchange(_lds[_idx], v[" << static_cast<uint32_t>(d0)
+                           << "], v[" << static_cast<uint32_t>(d1) << "], _prev);\n";
+                        if (e->has_rtn) os << "      v[" << static_cast<uint32_t>(vdst) << "] = _prev;\n";
+                        os << "    }\n";
+                    } else {
+                        EmitHlslAtomicOp(os, "_lds", base_a, mapped_atomic, d0, vdst, e->has_rtn, true);
+                    }
                 }
             }
         } else if (inst.encoding == Rdna2Encoding::FLAT) {
@@ -3378,16 +3539,37 @@ Status EmitMemImgHlsl(
             const uint8_t vd = static_cast<uint8_t>(inst.src[1].reg_index & 63u);
             const std::string aexpr = "(uint)((int)v[" + std::to_string(va) + "] + " + std::to_string(inst.mem_offset) + ")";
             if (inst.flat_seg == 1u) {
-                // SCRATCH
+                // SCRATCH (byte/short/d16/dword/x2/x3/x4 on private _scratch[64])
                 if (e->is_load) {
-                    const uint32_t n = e->data_dwords;
-                    for (uint32_t k = 0; k < n; ++k) {
-                        os << "    v[" << ((vdst + k) & 63u) << "] = _scratch[(((" << aexpr << ") + " << (k * 4u) << "u) >> 2u) & 63u];\n";
+                    switch (op) {
+                        case 0x08: os << "    { uint _sa = " << aexpr << "; v[" << static_cast<uint32_t>(vdst) << "] = (_scratch[(_sa >> 2u) & 63u] >> ((_sa & 3u) * 8u)) & 0xFFu; }\n"; break;
+                        case 0x09: os << "    { uint _sa = " << aexpr << "; uint _b = (_scratch[(_sa >> 2u) & 63u] >> ((_sa & 3u) * 8u)) & 0xFFu; v[" << static_cast<uint32_t>(vdst) << "] = asuint(((int)(_b << 24u)) >> 24); }\n"; break;
+                        case 0x0A: os << "    { uint _sa = " << aexpr << "; v[" << static_cast<uint32_t>(vdst) << "] = (_scratch[(_sa >> 2u) & 63u] >> ((_sa & 2u) * 8u)) & 0xFFFFu; }\n"; break;
+                        case 0x0B: os << "    { uint _sa = " << aexpr << "; uint _h = (_scratch[(_sa >> 2u) & 63u] >> ((_sa & 2u) * 8u)) & 0xFFFFu; v[" << static_cast<uint32_t>(vdst) << "] = asuint(((int)(_h << 16u)) >> 16); }\n"; break;
+                        case 0x20: os << "    { uint _sa = " << aexpr << "; uint _b = (_scratch[(_sa >> 2u) & 63u] >> ((_sa & 3u) * 8u)) & 0xFFu; v[" << static_cast<uint32_t>(vdst) << "] = (v[" << static_cast<uint32_t>(vdst) << "] & 0xFFFF0000u) | _b; }\n"; break;
+                        case 0x21: os << "    { uint _sa = " << aexpr << "; uint _b = (_scratch[(_sa >> 2u) & 63u] >> ((_sa & 3u) * 8u)) & 0xFFu; v[" << static_cast<uint32_t>(vdst) << "] = (v[" << static_cast<uint32_t>(vdst) << "] & 0xFFFFu) | (_b << 16u); }\n"; break;
+                        case 0x22: os << "    { uint _sa = " << aexpr << "; uint _b = (_scratch[(_sa >> 2u) & 63u] >> ((_sa & 3u) * 8u)) & 0xFFu; uint _s = asuint(((int)(_b << 24u)) >> 24) & 0xFFFFu; v[" << static_cast<uint32_t>(vdst) << "] = (v[" << static_cast<uint32_t>(vdst) << "] & 0xFFFF0000u) | _s; }\n"; break;
+                        case 0x24: os << "    { uint _sa = " << aexpr << "; uint _h = (_scratch[(_sa >> 2u) & 63u] >> ((_sa & 2u) * 8u)) & 0xFFFFu; v[" << static_cast<uint32_t>(vdst) << "] = (v[" << static_cast<uint32_t>(vdst) << "] & 0xFFFF0000u) | _h; }\n"; break;
+                        case 0x25: os << "    { uint _sa = " << aexpr << "; uint _h = (_scratch[(_sa >> 2u) & 63u] >> ((_sa & 2u) * 8u)) & 0xFFFFu; v[" << static_cast<uint32_t>(vdst) << "] = (v[" << static_cast<uint32_t>(vdst) << "] & 0xFFFFu) | (_h << 16u); }\n"; break;
+                        default: {
+                            const uint32_t n = e->data_dwords;
+                            for (uint32_t k = 0; k < n; ++k) {
+                                os << "    v[" << ((vdst + k) & 63u) << "] = _scratch[(((" << aexpr << ") + " << (k * 4u) << "u) >> 2u) & 63u];\n";
+                            }
+                            break;
+                        }
                     }
                 } else {
-                    const uint32_t n = e->data_dwords;
-                    for (uint32_t k = 0; k < n; ++k) {
-                        os << "    _scratch[(((" << aexpr << ") + " << (k * 4u) << "u) >> 2u) & 63u] = v[" << ((vd + k) & 63u) << "];\n";
+                    switch (op) {
+                        case 0x18: os << "    { uint _sa = " << aexpr << "; uint _sh = (_sa & 3u) * 8u; uint _si = (_sa >> 2u) & 63u; _scratch[_si] = (_scratch[_si] & ~(0xFFu << _sh)) | ((v[" << static_cast<uint32_t>(vd) << "] & 0xFFu) << _sh); }\n"; break;
+                        case 0x1A: os << "    { uint _sa = " << aexpr << "; uint _sh = (_sa & 2u) * 8u; uint _si = (_sa >> 2u) & 63u; _scratch[_si] = (_scratch[_si] & ~(0xFFFFu << _sh)) | ((v[" << static_cast<uint32_t>(vd) << "] & 0xFFFFu) << _sh); }\n"; break;
+                        default: {
+                            const uint32_t n = e->data_dwords;
+                            for (uint32_t k = 0; k < n; ++k) {
+                                os << "    _scratch[(((" << aexpr << ") + " << (k * 4u) << "u) >> 2u) & 63u] = v[" << ((vd + k) & 63u) << "];\n";
+                            }
+                            break;
+                        }
                     }
                 }
             } else {
@@ -3460,7 +3642,7 @@ Status EmitMemImgHlsl(
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Clean-Room SPIR-V 1.3 Binary Emitter (spirv-val & Vulkan 1.2/1.4 Verified)
+// SPIR-V 1.3 Binary Emitter (spirv-val & Vulkan 1.2/1.4 Verified)
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -3511,6 +3693,8 @@ enum SpvOp : uint16_t {
     OpImageQuerySizeLod = 103,
     OpImageQuerySize = 104,
     OpImageQueryLevels = 106,
+    OpConvertFToU = 109,
+    OpConvertFToS = 110,
     OpConvertSToF = 111,
     OpConvertUToF = 112,
     OpBitcast = 124,
@@ -3522,10 +3706,12 @@ enum SpvOp : uint16_t {
     OpFMul = 133,
     OpFDiv = 136,
     OpDot = 148,
+    OpIsNan = 156,
     OpLogicalAnd = 167,
     OpSelect = 169,
     OpIEqual = 170,
     OpUGreaterThanEqual = 174,
+    OpULessThan = 176,
     OpFOrdGreaterThan = 186,
     OpFOrdLessThanEqual = 188,
     OpFOrdGreaterThanEqual = 190,
@@ -3549,7 +3735,11 @@ enum SpvOp : uint16_t {
     OpAtomicAnd = 240,
     OpAtomicOr = 241,
     OpAtomicXor = 242,
+    OpPhi = 245,
+    OpLoopMerge = 246,
     OpLabel = 248,
+    OpBranch = 249,
+    OpBranchConditional = 250,
     OpReturn = 253,
 };
 
@@ -3780,6 +3970,7 @@ public:
         EmitInst(sec_fn_, OpFunction, {t_void_, main_id, 0u, t_fn_});
         const uint32_t lbl_entry = AllocId();
         EmitInst(sec_fn_, OpLabel, {lbl_entry});
+        cur_label_ = lbl_entry;
 
         // All Function-scope OpVariables must come first!
         var_vgpr_ = AllocId();
@@ -4003,7 +4194,80 @@ private:
         return addr;
     }
 
+    uint32_t EmitSpvAtomicCas(
+        uint32_t ptr,
+        uint32_t scope,
+        const std::function<uint32_t(uint32_t)>& compute_next) {
+        const uint32_t init_val = AllocId();
+        EmitInst(sec_fn_, OpLoad, {t_u32_, init_val, ptr});
+        const uint32_t pred_lbl = cur_label_;
+        const uint32_t lbl_hdr = AllocId();
+        const uint32_t lbl_body = AllocId();
+        const uint32_t lbl_cont = AllocId();
+        const uint32_t lbl_merge = AllocId();
+        EmitInst(sec_fn_, OpBranch, {lbl_hdr});
+
+        EmitInst(sec_fn_, OpLabel, {lbl_hdr});
+        const uint32_t phi_cur = AllocId();
+        const uint32_t phi_it = AllocId();
+        const uint32_t orig_val = AllocId();
+        const uint32_t next_it = AllocId();
+        EmitInst(sec_fn_, OpPhi, {t_u32_, phi_cur, init_val, pred_lbl, orig_val, lbl_cont});
+        EmitInst(sec_fn_, OpPhi, {t_u32_, phi_it, c_u0_, pred_lbl, next_it, lbl_cont});
+        const uint32_t it_ok = EmitBinary(OpULessThan, t_bool_, phi_it, ConstU32(64u));
+        EmitInst(sec_fn_, OpLoopMerge, {lbl_merge, lbl_cont, 0u});
+        EmitInst(sec_fn_, OpBranchConditional, {it_ok, lbl_body, lbl_merge});
+
+        EmitInst(sec_fn_, OpLabel, {lbl_body});
+        const uint32_t next_val = compute_next(phi_cur);
+        EmitInst(sec_fn_, OpAtomicCompareExchange, {t_u32_, orig_val, ptr, scope, c_u0_, c_u0_, next_val, phi_cur});
+        const uint32_t eq = EmitBinary(OpIEqual, t_bool_, orig_val, phi_cur);
+        EmitInst(sec_fn_, OpBranchConditional, {eq, lbl_merge, lbl_cont});
+
+        EmitInst(sec_fn_, OpLabel, {lbl_cont});
+        EmitInst(sec_fn_, OpIAdd, {t_u32_, next_it, phi_it, c_u1_});
+        EmitInst(sec_fn_, OpBranch, {lbl_hdr});
+
+        EmitInst(sec_fn_, OpLabel, {lbl_merge});
+        const uint32_t out_prev = AllocId();
+        EmitInst(sec_fn_, OpPhi, {t_u32_, out_prev, phi_cur, lbl_hdr, orig_val, lbl_body});
+        cur_label_ = lbl_merge;
+        return out_prev;
+    }
+
+    std::pair<uint32_t, uint32_t> EmitSpvAtomicAdd64(
+        uint32_t ptr_lo,
+        uint32_t ptr_hi,
+        uint32_t scope,
+        uint32_t add_lo,
+        uint32_t add_hi) {
+        const uint32_t prev_lo = AllocId();
+        EmitInst(sec_fn_, OpAtomicIAdd, {t_u32_, prev_lo, ptr_lo, scope, c_u0_, add_lo});
+        const uint32_t sum_lo = EmitBinary(OpIAdd, t_u32_, prev_lo, add_lo);
+        const uint32_t wrapped = EmitBinary(OpULessThan, t_bool_, sum_lo, prev_lo);
+        const uint32_t carry = AllocId();
+        EmitInst(sec_fn_, OpSelect, {t_u32_, carry, wrapped, c_u1_, c_u0_});
+        const uint32_t hi_inc = EmitBinary(OpIAdd, t_u32_, add_hi, carry);
+        const uint32_t prev_hi = AllocId();
+        EmitInst(sec_fn_, OpAtomicIAdd, {t_u32_, prev_hi, ptr_hi, scope, c_u0_, hi_inc});
+        return {prev_lo, prev_hi};
+    }
+
     uint32_t EmitSpvAtomic(uint32_t ptr, uint32_t scope, uint16_t op, uint32_t d0, uint32_t d1) {
+        if (op == 0x4Eu) {
+            return EmitSpvAtomicCas(ptr, scope, [&](uint32_t cur) {
+                return EmitBinary(OpISub, t_u32_, d0, cur);
+            });
+        }
+        if (op == 0x3Fu || op == 0x40u) {
+            const uint32_t glsl_op = (op == 0x3Fu) ? 37u /*FMin*/ : 40u /*FMax*/;
+            const uint32_t f_d0 = BitcastF32(d0);
+            return EmitSpvAtomicCas(ptr, scope, [&](uint32_t cur) {
+                const uint32_t r = AllocId();
+                EmitInst(sec_fn_, OpExtInst, {t_f32_, r, glsl_ext_, glsl_op, BitcastF32(cur), f_d0});
+                return BitcastU32(r);
+            });
+        }
         const uint32_t prev = AllocId();
         switch (op) {
             case 0x30: EmitInst(sec_fn_, OpAtomicExchange, {t_u32_, prev, ptr, scope, c_u0_, d0}); break;
@@ -4047,38 +4311,121 @@ private:
                                                  ? static_cast<Rdna2MtbufFormat>(inst.mtbuf_format)
                                                  : Rdna2MtbufFormat::R32G32B32A32_FLOAT;
                 const uint32_t cb = MtbufFormatComponentBytes(fmt);
+                auto pack_f16_lo = [&](uint32_t nf) -> uint32_t {
+                    const uint32_t v2 = AllocId(); EmitInst(sec_fn_, OpCompositeConstruct, {t_vec2_, v2, nf, c_f0_});
+                    const uint32_t pk = AllocId(); EmitInst(sec_fn_, OpExtInst, {t_u32_, pk, glsl_ext_, 58u, v2});
+                    return EmitBinary(OpBitwiseAnd, t_u32_, pk, ConstU32(0xFFFFu));
+                };
+                auto unpack_f16_lo = [&](uint32_t h) -> uint32_t {
+                    const uint32_t up = AllocId(); EmitInst(sec_fn_, OpExtInst, {t_vec2_, up, glsl_ext_, 62u, h});
+                    const uint32_t f0 = AllocId(); EmitInst(sec_fn_, OpCompositeExtract, {t_f32_, f0, up, 0u});
+                    return f0;
+                };
                 auto load_fmt_comp = [&](uint32_t c, bool d16) -> uint32_t {
                     const uint32_t ca = EmitBinary(OpIAdd, t_u32_, baddr, ConstU32(c * cb));
-                    uint32_t raw = c_u0_;
                     if (cb == 1u) {
-                        raw = LoadSsboByte(ssbo, ca);
+                        const uint32_t raw = LoadSsboByte(ssbo, ca);
                         if (fmt == Rdna2MtbufFormat::R8_UNORM || fmt == Rdna2MtbufFormat::R8G8_UNORM ||
                             fmt == Rdna2MtbufFormat::R8G8B8A8_UNORM) {
                             const uint32_t uf = AllocId(); EmitInst(sec_fn_, OpConvertUToF, {t_f32_, uf, raw});
                             const uint32_t nf = EmitBinary(OpFDiv, t_f32_, uf, ConstF32(255.0f));
-                            if (d16) {
-                                const uint32_t v2 = AllocId(); EmitInst(sec_fn_, OpCompositeConstruct, {t_vec2_, v2, nf, c_f0_});
-                                const uint32_t pk = AllocId(); EmitInst(sec_fn_, OpExtInst, {t_u32_, pk, glsl_ext_, 58u, v2});
-                                return EmitBinary(OpBitwiseAnd, t_u32_, pk, ConstU32(0xFFFFu));
-                            }
-                            return BitcastU32(nf);
+                            return d16 ? pack_f16_lo(nf) : BitcastU32(nf);
+                        }
+                        if (fmt == Rdna2MtbufFormat::R8_SNORM || fmt == Rdna2MtbufFormat::R8G8_SNORM ||
+                            fmt == Rdna2MtbufFormat::R8G8B8A8_SNORM) {
+                            const uint32_t si = EmitBinary(OpShiftRightArithmetic, t_i32_, BitcastI32(EmitBinary(OpShiftLeftLogical, t_u32_, raw, ConstU32(24u))), ConstI32(24));
+                            const uint32_t sf = AllocId(); EmitInst(sec_fn_, OpConvertSToF, {t_f32_, sf, si});
+                            const uint32_t dv = EmitBinary(OpFDiv, t_f32_, sf, ConstF32(127.0f));
+                            const uint32_t cl = AllocId(); EmitInst(sec_fn_, OpExtInst, {t_f32_, cl, glsl_ext_, 43u /*FClamp*/, dv, ConstF32(-1.0f), c_f1_});
+                            return d16 ? pack_f16_lo(cl) : BitcastU32(cl);
+                        }
+                        if (fmt == Rdna2MtbufFormat::R8_SINT || fmt == Rdna2MtbufFormat::R8G8_SINT ||
+                            fmt == Rdna2MtbufFormat::R8G8B8A8_SINT) {
+                            const uint32_t si = EmitBinary(OpShiftRightArithmetic, t_i32_, BitcastI32(EmitBinary(OpShiftLeftLogical, t_u32_, raw, ConstU32(24u))), ConstI32(24));
+                            const uint32_t su = BitcastU32(si);
+                            return d16 ? EmitBinary(OpBitwiseAnd, t_u32_, su, ConstU32(0xFFFFu)) : su;
                         }
                         return raw;
                     }
                     if (cb == 2u) {
-                        raw = LoadSsboU16(ssbo, ca);
+                        const uint32_t raw = LoadSsboU16(ssbo, ca);
+                        if (fmt == Rdna2MtbufFormat::R16_UNORM || fmt == Rdna2MtbufFormat::R16G16_UNORM ||
+                            fmt == Rdna2MtbufFormat::R16G16B16A16_UNORM) {
+                            const uint32_t uf = AllocId(); EmitInst(sec_fn_, OpConvertUToF, {t_f32_, uf, raw});
+                            const uint32_t nf = EmitBinary(OpFDiv, t_f32_, uf, ConstF32(65535.0f));
+                            return d16 ? pack_f16_lo(nf) : BitcastU32(nf);
+                        }
+                        if (fmt == Rdna2MtbufFormat::R16_SNORM || fmt == Rdna2MtbufFormat::R16G16_SNORM ||
+                            fmt == Rdna2MtbufFormat::R16G16B16A16_SNORM) {
+                            const uint32_t si = EmitBinary(OpShiftRightArithmetic, t_i32_, BitcastI32(EmitBinary(OpShiftLeftLogical, t_u32_, raw, ConstU32(16u))), ConstI32(16));
+                            const uint32_t sf = AllocId(); EmitInst(sec_fn_, OpConvertSToF, {t_f32_, sf, si});
+                            const uint32_t dv = EmitBinary(OpFDiv, t_f32_, sf, ConstF32(32767.0f));
+                            const uint32_t cl = AllocId(); EmitInst(sec_fn_, OpExtInst, {t_f32_, cl, glsl_ext_, 43u /*FClamp*/, dv, ConstF32(-1.0f), c_f1_});
+                            return d16 ? pack_f16_lo(cl) : BitcastU32(cl);
+                        }
+                        if (fmt == Rdna2MtbufFormat::R16_SINT || fmt == Rdna2MtbufFormat::R16G16_SINT ||
+                            fmt == Rdna2MtbufFormat::R16G16B16A16_SINT) {
+                            const uint32_t si = EmitBinary(OpShiftRightArithmetic, t_i32_, BitcastI32(EmitBinary(OpShiftLeftLogical, t_u32_, raw, ConstU32(16u))), ConstI32(16));
+                            const uint32_t su = BitcastU32(si);
+                            return d16 ? EmitBinary(OpBitwiseAnd, t_u32_, su, ConstU32(0xFFFFu)) : su;
+                        }
                         if (fmt == Rdna2MtbufFormat::R16_FLOAT || fmt == Rdna2MtbufFormat::R16G16_FLOAT ||
                             fmt == Rdna2MtbufFormat::R16G16B16A16_FLOAT) {
-                            if (d16) return raw;
-                            const uint32_t up = AllocId(); EmitInst(sec_fn_, OpExtInst, {t_vec2_, up, glsl_ext_, 62u, raw});
-                            const uint32_t f0 = AllocId(); EmitInst(sec_fn_, OpCompositeExtract, {t_f32_, f0, up, 0u});
-                            return BitcastU32(f0);
+                            return d16 ? raw : BitcastU32(unpack_f16_lo(raw));
                         }
                         return raw;
                     }
                     const uint32_t w = AllocId();
                     EmitInst(sec_fn_, OpLoad, {t_u32_, w, SsboPtrAtDword(ssbo, EmitBinary(OpShiftRightLogical, t_u32_, ca, c_u2_))});
-                    return w;
+                    if (d16 && fmt != Rdna2MtbufFormat::R32_UINT && fmt != Rdna2MtbufFormat::R32_SINT) {
+                        return pack_f16_lo(BitcastF32(w));
+                    }
+                    return d16 ? EmitBinary(OpBitwiseAnd, t_u32_, w, ConstU32(0xFFFFu)) : w;
+                };
+                auto pack_fmt_comp = [&](uint32_t val_u32, bool from_d16) -> uint32_t {
+                    const uint32_t fval = from_d16 ? unpack_f16_lo(EmitBinary(OpBitwiseAnd, t_u32_, val_u32, ConstU32(0xFFFFu)))
+                                                   : BitcastF32(val_u32);
+                    const uint32_t uval = from_d16 ? EmitBinary(OpBitwiseAnd, t_u32_, val_u32, ConstU32(0xFFFFu)) : val_u32;
+                    auto pack_norm = [&](float lo_f, float hi_f, float scale_f, bool is_signed, uint32_t out_mask) -> uint32_t {
+                        const uint32_t is_n = AllocId(); EmitInst(sec_fn_, OpIsNan, {t_bool_, is_n, fval});
+                        const uint32_t clean = AllocId(); EmitInst(sec_fn_, OpSelect, {t_f32_, clean, is_n, c_f0_, fval});
+                        const uint32_t cl = AllocId(); EmitInst(sec_fn_, OpExtInst, {t_f32_, cl, glsl_ext_, 43u /*FClamp*/, clean, ConstF32(lo_f), ConstF32(hi_f)});
+                        const uint32_t sc = EmitBinary(OpFMul, t_f32_, cl, ConstF32(scale_f));
+                        const uint32_t rne = AllocId(); EmitInst(sec_fn_, OpExtInst, {t_f32_, rne, glsl_ext_, 2u /*RoundEven*/, sc});
+                        if (is_signed) {
+                            const uint32_t si = AllocId(); EmitInst(sec_fn_, OpConvertFToS, {t_i32_, si, rne});
+                            return EmitBinary(OpBitwiseAnd, t_u32_, BitcastU32(si), ConstU32(out_mask));
+                        }
+                        const uint32_t ui = AllocId(); EmitInst(sec_fn_, OpConvertFToU, {t_u32_, ui, rne});
+                        return EmitBinary(OpBitwiseAnd, t_u32_, ui, ConstU32(out_mask));
+                    };
+                    if (fmt == Rdna2MtbufFormat::R8_UNORM || fmt == Rdna2MtbufFormat::R8G8_UNORM || fmt == Rdna2MtbufFormat::R8G8B8A8_UNORM) {
+                        return pack_norm(0.0f, 1.0f, 255.0f, false, 0xFFu);
+                    }
+                    if (fmt == Rdna2MtbufFormat::R8_SNORM || fmt == Rdna2MtbufFormat::R8G8_SNORM || fmt == Rdna2MtbufFormat::R8G8B8A8_SNORM) {
+                        return pack_norm(-1.0f, 1.0f, 127.0f, true, 0xFFu);
+                    }
+                    if (fmt == Rdna2MtbufFormat::R8_UINT || fmt == Rdna2MtbufFormat::R8G8_UINT || fmt == Rdna2MtbufFormat::R8G8B8A8_UINT ||
+                        fmt == Rdna2MtbufFormat::R8_SINT || fmt == Rdna2MtbufFormat::R8G8_SINT || fmt == Rdna2MtbufFormat::R8G8B8A8_SINT) {
+                        return EmitBinary(OpBitwiseAnd, t_u32_, uval, ConstU32(0xFFu));
+                    }
+                    if (fmt == Rdna2MtbufFormat::R16_UNORM || fmt == Rdna2MtbufFormat::R16G16_UNORM || fmt == Rdna2MtbufFormat::R16G16B16A16_UNORM) {
+                        return pack_norm(0.0f, 1.0f, 65535.0f, false, 0xFFFFu);
+                    }
+                    if (fmt == Rdna2MtbufFormat::R16_SNORM || fmt == Rdna2MtbufFormat::R16G16_SNORM || fmt == Rdna2MtbufFormat::R16G16B16A16_SNORM) {
+                        return pack_norm(-1.0f, 1.0f, 32767.0f, true, 0xFFFFu);
+                    }
+                    if (fmt == Rdna2MtbufFormat::R16_UINT || fmt == Rdna2MtbufFormat::R16G16_UINT || fmt == Rdna2MtbufFormat::R16G16B16A16_UINT ||
+                        fmt == Rdna2MtbufFormat::R16_SINT || fmt == Rdna2MtbufFormat::R16G16_SINT || fmt == Rdna2MtbufFormat::R16G16B16A16_SINT) {
+                        return EmitBinary(OpBitwiseAnd, t_u32_, uval, ConstU32(0xFFFFu));
+                    }
+                    if (fmt == Rdna2MtbufFormat::R16_FLOAT || fmt == Rdna2MtbufFormat::R16G16_FLOAT || fmt == Rdna2MtbufFormat::R16G16B16A16_FLOAT) {
+                        return from_d16 ? EmitBinary(OpBitwiseAnd, t_u32_, val_u32, ConstU32(0xFFFFu)) : pack_f16_lo(fval);
+                    }
+                    if (fmt == Rdna2MtbufFormat::R32_UINT || fmt == Rdna2MtbufFormat::R32_SINT) {
+                        return uval;
+                    }
+                    return BitcastU32(fval);
                 };
                 if (op <= 0x03u) {
                     const uint32_t comps = static_cast<uint32_t>(op) + 1u;
@@ -4087,8 +4434,16 @@ private:
                     const uint32_t comps = static_cast<uint32_t>(op - 0x08u) + 1u;
                     uint32_t hs[4] = {c_u0_, c_u0_, c_u0_, c_u0_};
                     for (uint32_t c = 0; c < comps; ++c) hs[c] = load_fmt_comp(c, true);
-                    StoreVgpr(vd, EmitBinary(OpBitwiseOr, t_u32_, hs[0], EmitBinary(OpShiftLeftLogical, t_u32_, hs[1], ConstU32(16u))));
-                    if (comps > 2u) {
+                    if (comps == 1u) {
+                        const uint32_t keep_hi = EmitBinary(OpBitwiseAnd, t_u32_, LoadVgpr(vd), ConstU32(0xFFFF0000u));
+                        StoreVgpr(vd, EmitBinary(OpBitwiseOr, t_u32_, keep_hi, hs[0]));
+                    } else {
+                        StoreVgpr(vd, EmitBinary(OpBitwiseOr, t_u32_, hs[0], EmitBinary(OpShiftLeftLogical, t_u32_, hs[1], ConstU32(16u))));
+                    }
+                    if (comps == 3u) {
+                        const uint32_t keep_hi = EmitBinary(OpBitwiseAnd, t_u32_, LoadVgpr(vd + 1u), ConstU32(0xFFFF0000u));
+                        StoreVgpr(vd + 1u, EmitBinary(OpBitwiseOr, t_u32_, keep_hi, hs[2]));
+                    } else if (comps == 4u) {
                         StoreVgpr(vd + 1u, EmitBinary(OpBitwiseOr, t_u32_, hs[2], EmitBinary(OpShiftLeftLogical, t_u32_, hs[3], ConstU32(16u))));
                     }
                 } else if (op == 0x26u || op == 0x10u) {
@@ -4096,15 +4451,47 @@ private:
                     const uint32_t hi = EmitBinary(OpShiftLeftLogical, t_u32_, load_fmt_comp(0u, true), ConstU32(16u));
                     StoreVgpr(vd, EmitBinary(OpBitwiseOr, t_u32_, lo, hi));
                 } else {
-                    const uint32_t comps = (op >= 0x04u && op <= 0x07u) ? (static_cast<uint32_t>(op - 0x04u) + 1u) : 1u;
+                    const bool is_d16_hi = (op == 0x11u || op == 0x27u);
+                    const bool is_d16 = is_d16_hi || (op >= 0x0Cu && op <= 0x0Fu);
+                    const uint32_t comps = (op >= 0x04u && op <= 0x07u)
+                                               ? (static_cast<uint32_t>(op - 0x04u) + 1u)
+                                               : ((op >= 0x0Cu && op <= 0x0Fu) ? (static_cast<uint32_t>(op - 0x0Cu) + 1u) : 1u);
                     for (uint32_t c = 0; c < comps; ++c) {
-                        EmitInst(sec_fn_, OpStore, {SsboPtrAtDword(ssbo, EmitBinary(OpIAdd, t_u32_, dw0, ConstU32(c))), LoadVgpr(vd + c)});
+                        uint32_t src_u = c_u0_;
+                        if (is_d16_hi) {
+                            src_u = EmitBinary(OpShiftRightLogical, t_u32_, LoadVgpr(vd), ConstU32(16u));
+                        } else if (is_d16) {
+                            const uint32_t w = LoadVgpr(vd + (c >> 1u));
+                            src_u = ((c & 1u) == 0u) ? EmitBinary(OpBitwiseAnd, t_u32_, w, ConstU32(0xFFFFu))
+                                                     : EmitBinary(OpShiftRightLogical, t_u32_, w, ConstU32(16u));
+                        } else {
+                            src_u = LoadVgpr(vd + c);
+                        }
+                        const uint32_t pk = pack_fmt_comp(src_u, is_d16);
+                        const uint32_t ca = EmitBinary(OpIAdd, t_u32_, baddr, ConstU32(c * cb));
+                        if (cb == 1u) {
+                            StoreSsboByte(ssbo, ca, pk);
+                        } else if (cb == 2u) {
+                            StoreSsboU16(ssbo, ca, pk);
+                        } else {
+                            EmitInst(sec_fn_, OpStore, {SsboPtrAtDword(ssbo, EmitBinary(OpShiftRightLogical, t_u32_, ca, c_u2_)), pk});
+                        }
                     }
                 }
             } else if (e->is_atomic) {
-                const uint32_t ptr = SsboPtrAtDword(ssbo, dw0);
-                const uint32_t prev = EmitSpvAtomic(ptr, c_u1_, op, LoadVgpr(vd), LoadVgpr(vd + 1u));
-                if (inst.glc) StoreVgpr(vd, prev);
+                if (op == 0x52u) {
+                    const uint32_t ptr_lo = SsboPtrAtDword(ssbo, dw0);
+                    const uint32_t ptr_hi = SsboPtrAtDword(ssbo, EmitBinary(OpIAdd, t_u32_, dw0, c_u1_));
+                    const auto prev64 = EmitSpvAtomicAdd64(ptr_lo, ptr_hi, c_u1_, LoadVgpr(vd), LoadVgpr(vd + 1u));
+                    if (inst.glc) {
+                        StoreVgpr(vd, prev64.first);
+                        StoreVgpr(vd + 1u, prev64.second);
+                    }
+                } else {
+                    const uint32_t ptr = SsboPtrAtDword(ssbo, dw0);
+                    const uint32_t prev = EmitSpvAtomic(ptr, c_u1_, op, LoadVgpr(vd), LoadVgpr(vd + 1u));
+                    if (inst.glc) StoreVgpr(vd, prev);
+                }
             } else {
                 switch (op) {
                     case 0x10: StoreVgpr(vd, LoadSsboByte(ssbo, baddr)); break;
@@ -4435,6 +4822,14 @@ private:
                 for (uint32_t k = 0; k < e->data_dwords; ++k) {
                     EmitInst(sec_fn_, OpStore, {lds_ptr(EmitBinary(OpIAdd, t_u32_, base_a, ConstU32(k * 4u))), LoadVgpr(d0 + k)});
                 }
+            } else if (op == 0x4Eu || op == 0x4Fu) {
+                const uint32_t sc = (op == 0x4Fu) ? 512u : 8u;
+                const uint32_t a0 = EmitBinary(OpIAdd, t_u32_, LoadVgpr(vaddr), ConstU32(static_cast<uint32_t>(inst.ds_offset0) * sc));
+                const uint32_t a1 = EmitBinary(OpIAdd, t_u32_, LoadVgpr(vaddr), ConstU32(static_cast<uint32_t>(inst.ds_offset1) * sc));
+                EmitInst(sec_fn_, OpStore, {lds_ptr(a0), LoadVgpr(d0)});
+                EmitInst(sec_fn_, OpStore, {lds_ptr(EmitBinary(OpIAdd, t_u32_, a0, c_u4_)), LoadVgpr(d0 + 1u)});
+                EmitInst(sec_fn_, OpStore, {lds_ptr(a1), LoadVgpr(d1)});
+                EmitInst(sec_fn_, OpStore, {lds_ptr(EmitBinary(OpIAdd, t_u32_, a1, c_u4_)), LoadVgpr(d1 + 1u)});
             } else if (op == 0x36u) {
                 const uint32_t r = AllocId(); EmitInst(sec_fn_, OpLoad, {t_u32_, r, lds_ptr(base_a)});
                 StoreVgpr(vdst, r);
@@ -4448,6 +4843,15 @@ private:
                     const uint32_t r = AllocId(); EmitInst(sec_fn_, OpLoad, {t_u32_, r, lds_ptr(EmitBinary(OpIAdd, t_u32_, base_a, ConstU32(k * 4u)))});
                     StoreVgpr(vdst + k, r);
                 }
+            } else if (op == 0x77u || op == 0x78u) {
+                const uint32_t sc = (op == 0x78u) ? 512u : 8u;
+                const uint32_t a0 = EmitBinary(OpIAdd, t_u32_, LoadVgpr(vaddr), ConstU32(static_cast<uint32_t>(inst.ds_offset0) * sc));
+                const uint32_t a1 = EmitBinary(OpIAdd, t_u32_, LoadVgpr(vaddr), ConstU32(static_cast<uint32_t>(inst.ds_offset1) * sc));
+                const uint32_t r0 = AllocId(); EmitInst(sec_fn_, OpLoad, {t_u32_, r0, lds_ptr(a0)});
+                const uint32_t r1 = AllocId(); EmitInst(sec_fn_, OpLoad, {t_u32_, r1, lds_ptr(EmitBinary(OpIAdd, t_u32_, a0, c_u4_))});
+                const uint32_t r2 = AllocId(); EmitInst(sec_fn_, OpLoad, {t_u32_, r2, lds_ptr(a1)});
+                const uint32_t r3 = AllocId(); EmitInst(sec_fn_, OpLoad, {t_u32_, r3, lds_ptr(EmitBinary(OpIAdd, t_u32_, a1, c_u4_))});
+                StoreVgpr(vdst, r0); StoreVgpr(vdst + 1u, r1); StoreVgpr(vdst + 2u, r2); StoreVgpr(vdst + 3u, r3);
             } else if (op == 0x1Eu || op == 0x1Fu || op == 0xA0u || op == 0xA1u) {
                 const bool is16 = (op == 0x1Fu || op == 0xA1u);
                 const uint32_t val = (op == 0xA0u || op == 0xA1u) ? EmitBinary(OpShiftRightLogical, t_u32_, LoadVgpr(d0), ConstU32(16u)) : LoadVgpr(d0);
@@ -4469,33 +4873,48 @@ private:
                 }
                 StoreVgpr(vdst, v);
             } else if (e->is_atomic) {
-                const uint32_t p = lds_ptr(base_a);
-                const uint16_t base_op = (op == 0x55u) ? 0x15u
-                                       : ((op >= 0x20u && op <= 0x33u) ? static_cast<uint16_t>(op - 0x20u)
-                                       : ((op >= 0x60u && op <= 0x73u) ? static_cast<uint16_t>(op - 0x60u)
-                                       : ((op >= 0x40u && op <= 0x53u) ? static_cast<uint16_t>(op - 0x40u) : op)));
-                uint32_t prev = c_u0_;
-                if (base_op == 0x10u || base_op == 0x11u) {
-                    prev = AllocId();
-                    EmitInst(sec_fn_, OpAtomicCompareExchange, {t_u32_, prev, p, c_u2_, c_u0_, c_u0_, LoadVgpr(d1), LoadVgpr(d0)});
-                } else {
-                    uint16_t mapped = 0x32u;
-                    switch (base_op) {
-                        case 0x00: mapped = 0x32u; break;
-                        case 0x01: mapped = 0x33u; break;
-                        case 0x05: mapped = 0x35u; break;
-                        case 0x06: mapped = 0x37u; break;
-                        case 0x07: mapped = 0x36u; break;
-                        case 0x08: mapped = 0x38u; break;
-                        case 0x09: mapped = 0x39u; break;
-                        case 0x0A: mapped = 0x3Au; break;
-                        case 0x0B: mapped = 0x3Bu; break;
-                        case 0x0D: mapped = 0x30u; break;
-                        default:   mapped = 0x32u; break;
+                if (op == 0x40u || op == 0x60u) {
+                    const uint32_t p_lo = lds_ptr(base_a);
+                    const uint32_t p_hi = lds_ptr(EmitBinary(OpIAdd, t_u32_, base_a, c_u4_));
+                    const auto prev64 = EmitSpvAtomicAdd64(p_lo, p_hi, c_u2_, LoadVgpr(d0), LoadVgpr(d0 + 1u));
+                    if (e->has_rtn) {
+                        StoreVgpr(vdst, prev64.first);
+                        StoreVgpr(vdst + 1u, prev64.second);
                     }
-                    prev = EmitSpvAtomic(p, c_u2_, mapped, LoadVgpr(d0), LoadVgpr(d1));
+                } else {
+                    const uint32_t p = lds_ptr(base_a);
+                    const uint16_t base_op = (op == 0x55u) ? 0x15u
+                                           : ((op >= 0x20u && op <= 0x33u) ? static_cast<uint16_t>(op - 0x20u)
+                                           : ((op >= 0x60u && op <= 0x73u) ? static_cast<uint16_t>(op - 0x60u)
+                                           : ((op >= 0x40u && op <= 0x53u) ? static_cast<uint16_t>(op - 0x40u) : op)));
+                    uint32_t prev = c_u0_;
+                    if (base_op == 0x10u || base_op == 0x11u) {
+                        prev = AllocId();
+                        EmitInst(sec_fn_, OpAtomicCompareExchange, {t_u32_, prev, p, c_u2_, c_u0_, c_u0_, LoadVgpr(d1), LoadVgpr(d0)});
+                    } else {
+                        uint16_t mapped = 0x32u;
+                        switch (base_op) {
+                            case 0x00: mapped = 0x32u; break;
+                            case 0x01: mapped = 0x33u; break;
+                            case 0x02: mapped = 0x4Eu; break;
+                            case 0x03: mapped = 0x3Cu; break;
+                            case 0x04: mapped = 0x3Du; break;
+                            case 0x05: mapped = 0x35u; break;
+                            case 0x06: mapped = 0x37u; break;
+                            case 0x07: mapped = 0x36u; break;
+                            case 0x08: mapped = 0x38u; break;
+                            case 0x09: mapped = 0x39u; break;
+                            case 0x0A: mapped = 0x3Au; break;
+                            case 0x0B: mapped = 0x3Bu; break;
+                            case 0x0D: mapped = 0x30u; break;
+                            case 0x12: mapped = 0x3Fu; break;
+                            case 0x13: mapped = 0x40u; break;
+                            default:   mapped = 0x32u; break;
+                        }
+                        prev = EmitSpvAtomic(p, c_u2_, mapped, LoadVgpr(d0), LoadVgpr(d1));
+                    }
+                    if (e->has_rtn) StoreVgpr(vdst, prev);
                 }
-                if (e->has_rtn) StoreVgpr(vdst, prev);
             }
         } else if (inst.encoding == Rdna2Encoding::FLAT) {
             const uint8_t vdst = static_cast<uint8_t>(inst.dst.reg_index & 63u);
@@ -4504,26 +4923,91 @@ private:
             const uint32_t baddr = EmitBinary(OpIAdd, t_u32_, LoadVgpr(va), ConstU32(static_cast<uint32_t>(inst.mem_offset)));
             const uint32_t dw0 = EmitBinary(OpShiftRightLogical, t_u32_, baddr, c_u2_);
             if (inst.flat_seg == 1u) {
-                for (uint32_t k = 0; k < e->data_dwords; ++k) {
-                    const uint32_t idx = EmitBinary(OpBitwiseAnd, t_u32_, EmitBinary(OpIAdd, t_u32_, dw0, ConstU32(k)), ConstU32(63u));
+                auto scratch_ptr = [&](uint32_t dw_i) -> uint32_t {
+                    const uint32_t idx = EmitBinary(OpBitwiseAnd, t_u32_, dw_i, ConstU32(63u));
                     const uint32_t sp = AllocId();
                     EmitInst(sec_fn_, OpAccessChain, {t_ptr_fn_u32_, sp, var_scratch_, idx});
-                    if (e->is_load) {
-                        const uint32_t r = AllocId(); EmitInst(sec_fn_, OpLoad, {t_u32_, r, sp});
-                        StoreVgpr(vdst + k, r);
+                    return sp;
+                };
+                if (e->is_load) {
+                    if (op == 0x08u || op == 0x09u || op == 0x20u || op == 0x21u || op == 0x22u) {
+                        const uint32_t w = AllocId(); EmitInst(sec_fn_, OpLoad, {t_u32_, w, scratch_ptr(dw0)});
+                        const uint32_t sh = EmitBinary(OpShiftLeftLogical, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, baddr, c_u3_), c_u3_);
+                        uint32_t b = EmitBinary(OpBitwiseAnd, t_u32_, EmitBinary(OpShiftRightLogical, t_u32_, w, sh), ConstU32(0xFFu));
+                        if (op == 0x09u || op == 0x22u) {
+                            b = BitcastU32(EmitBinary(OpShiftRightArithmetic, t_i32_, BitcastI32(EmitBinary(OpShiftLeftLogical, t_u32_, b, ConstU32(24u))), ConstI32(24)));
+                        }
+                        if (op == 0x20u || op == 0x22u) {
+                            const uint32_t lo = EmitBinary(OpBitwiseAnd, t_u32_, b, ConstU32(0xFFFFu));
+                            StoreVgpr(vdst, EmitBinary(OpBitwiseOr, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, LoadVgpr(vdst), ConstU32(0xFFFF0000u)), lo));
+                        } else if (op == 0x21u) {
+                            StoreVgpr(vdst, EmitBinary(OpBitwiseOr, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, LoadVgpr(vdst), ConstU32(0xFFFFu)), EmitBinary(OpShiftLeftLogical, t_u32_, b, ConstU32(16u))));
+                        } else {
+                            StoreVgpr(vdst, b);
+                        }
+                    } else if (op == 0x0Au || op == 0x0Bu || op == 0x24u || op == 0x25u) {
+                        const uint32_t w = AllocId(); EmitInst(sec_fn_, OpLoad, {t_u32_, w, scratch_ptr(dw0)});
+                        const uint32_t sh = EmitBinary(OpShiftLeftLogical, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, baddr, c_u2_), c_u3_);
+                        uint32_t h = EmitBinary(OpBitwiseAnd, t_u32_, EmitBinary(OpShiftRightLogical, t_u32_, w, sh), ConstU32(0xFFFFu));
+                        if (op == 0x0Bu) {
+                            h = BitcastU32(EmitBinary(OpShiftRightArithmetic, t_i32_, BitcastI32(EmitBinary(OpShiftLeftLogical, t_u32_, h, ConstU32(16u))), ConstI32(16)));
+                        }
+                        if (op == 0x24u) {
+                            StoreVgpr(vdst, EmitBinary(OpBitwiseOr, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, LoadVgpr(vdst), ConstU32(0xFFFF0000u)), h));
+                        } else if (op == 0x25u) {
+                            StoreVgpr(vdst, EmitBinary(OpBitwiseOr, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, LoadVgpr(vdst), ConstU32(0xFFFFu)), EmitBinary(OpShiftLeftLogical, t_u32_, h, ConstU32(16u))));
+                        } else {
+                            StoreVgpr(vdst, h);
+                        }
                     } else {
-                        EmitInst(sec_fn_, OpStore, {sp, LoadVgpr(vd + k)});
+                        for (uint32_t k = 0; k < e->data_dwords; ++k) {
+                            const uint32_t r = AllocId(); EmitInst(sec_fn_, OpLoad, {t_u32_, r, scratch_ptr(EmitBinary(OpIAdd, t_u32_, dw0, ConstU32(k)))});
+                            StoreVgpr(vdst + k, r);
+                        }
+                    }
+                } else {
+                    if (op == 0x18u || op == 0x1Au) {
+                        const bool is16 = (op == 0x1Au);
+                        const uint32_t sp = scratch_ptr(dw0);
+                        const uint32_t cur = AllocId(); EmitInst(sec_fn_, OpLoad, {t_u32_, cur, sp});
+                        const uint32_t sh = EmitBinary(OpShiftLeftLogical, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, baddr, is16 ? c_u2_ : c_u3_), c_u3_);
+                        const uint32_t fm = ConstU32(is16 ? 0xFFFFu : 0xFFu);
+                        const uint32_t clrm = AllocId(); EmitInst(sec_fn_, OpNot, {t_u32_, clrm, EmitBinary(OpShiftLeftLogical, t_u32_, fm, sh)});
+                        const uint32_t val = EmitBinary(OpShiftLeftLogical, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, LoadVgpr(vd), fm), sh);
+                        EmitInst(sec_fn_, OpStore, {sp, EmitBinary(OpBitwiseOr, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, cur, clrm), val)});
+                    } else {
+                        for (uint32_t k = 0; k < e->data_dwords; ++k) {
+                            EmitInst(sec_fn_, OpStore, {scratch_ptr(EmitBinary(OpIAdd, t_u32_, dw0, ConstU32(k))), LoadVgpr(vd + k)});
+                        }
                     }
                 }
             } else {
                 const uint32_t ssbo = (inst.saddr != 0x7Fu && inst.saddr != 0u) ? var_uav1_ : var_uav0_;
                 if (e->is_atomic) {
-                    const uint32_t prev = EmitSpvAtomic(SsboPtrAtDword(ssbo, dw0), c_u1_, op, LoadVgpr(vd), LoadVgpr(vd + 1u));
-                    if (inst.glc) StoreVgpr(vdst, prev);
+                    if (op == 0x52u) {
+                        const uint32_t ptr_lo = SsboPtrAtDword(ssbo, dw0);
+                        const uint32_t ptr_hi = SsboPtrAtDword(ssbo, EmitBinary(OpIAdd, t_u32_, dw0, c_u1_));
+                        const auto prev64 = EmitSpvAtomicAdd64(ptr_lo, ptr_hi, c_u1_, LoadVgpr(vd), LoadVgpr(vd + 1u));
+                        if (inst.glc) {
+                            StoreVgpr(vdst, prev64.first);
+                            StoreVgpr(vdst + 1u, prev64.second);
+                        }
+                    } else {
+                        const uint32_t prev = EmitSpvAtomic(SsboPtrAtDword(ssbo, dw0), c_u1_, op, LoadVgpr(vd), LoadVgpr(vd + 1u));
+                        if (inst.glc) StoreVgpr(vdst, prev);
+                    }
                 } else if (e->is_load) {
-                    if (op == 0x08u) StoreVgpr(vdst, LoadSsboByte(ssbo, baddr));
-                    else if (op == 0x0Au) StoreVgpr(vdst, LoadSsboU16(ssbo, baddr));
-                    else {
+                    if (op == 0x08u) {
+                        StoreVgpr(vdst, LoadSsboByte(ssbo, baddr));
+                    } else if (op == 0x09u) {
+                        const uint32_t b = LoadSsboByte(ssbo, baddr);
+                        StoreVgpr(vdst, BitcastU32(EmitBinary(OpShiftRightArithmetic, t_i32_, BitcastI32(EmitBinary(OpShiftLeftLogical, t_u32_, b, ConstU32(24u))), ConstI32(24))));
+                    } else if (op == 0x0Au) {
+                        StoreVgpr(vdst, LoadSsboU16(ssbo, baddr));
+                    } else if (op == 0x0Bu) {
+                        const uint32_t h = LoadSsboU16(ssbo, baddr);
+                        StoreVgpr(vdst, BitcastU32(EmitBinary(OpShiftRightArithmetic, t_i32_, BitcastI32(EmitBinary(OpShiftLeftLogical, t_u32_, h, ConstU32(16u))), ConstI32(16))));
+                    } else {
                         for (uint32_t k = 0; k < e->data_dwords; ++k) {
                             const uint32_t w = AllocId(); EmitInst(sec_fn_, OpLoad, {t_u32_, w, SsboPtrAtDword(ssbo, EmitBinary(OpIAdd, t_u32_, dw0, ConstU32(k)))});
                             StoreVgpr(vdst + k, w);
@@ -4574,6 +5058,7 @@ private:
     const MemImgResourceUsage& usage_;
 
     uint32_t next_id_ = 1u;
+    uint32_t cur_label_ = 0u;
     uint32_t glsl_ext_ = 0u;
     uint32_t t_void_ = 0, t_bool_ = 0, t_u32_ = 0, t_i32_ = 0, t_f32_ = 0;
     uint32_t t_uvec2_ = 0, t_uvec3_ = 0, t_uvec4_ = 0, t_ivec2_ = 0, t_ivec3_ = 0;
@@ -4607,6 +5092,10 @@ Status LiftMemImgShader(
     Rdna2LiftResult& out_result,
     const Rdna2LiftOptions& options) {
     out_result = Rdna2LiftResult{};
+    if (auto st = ValidateMimgUnsupportedModifiers(insts); !st.ok()) {
+        out_result.dxc_diagnostics = st.message;
+        return st;
+    }
     out_result.container = container;
     out_result.instructions.reserve(insts.size());
     for (const auto& di : insts) {

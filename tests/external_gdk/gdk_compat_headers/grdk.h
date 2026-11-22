@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Microsoft GDK version & platform compatibility definitions
+// MIT Microsoft GDK version & platform compatibility definitions
 // for external Xbox Series X|S (Scarlett) ABI bring-up binaries.
 
 #ifndef _GRDK_EDITION

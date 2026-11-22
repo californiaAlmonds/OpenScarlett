@@ -48,11 +48,12 @@ struct Rdna2LiftResult {
     std::string dxc_diagnostics;
 };
 
-// Emits a strictly valid SPIR-V 1.3 binary module (generator ID 0x4F533200) from an RDNA2 SSA IR module.
+// Emits a strictly valid SPIR-V 1.3 / 1.4 / 1.6 binary module (generator ID 0x4F533200)
+// from an RDNA2 SSA IR module (Compute, Vertex, Pixel, MeshEXT, and TaskEXT Amplification).
 Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv);
 
-// Structurally validates a SPIR-V 1.3 binary word stream (header, word counts, ID bounds,
-// required sections, entry point, function balance).
+// Structurally validates a SPIR-V 1.3 / 1.4 / 1.6 binary word stream (header, word counts, ID bounds,
+// required sections, entry point, function balance, and OpReturn / OpEmitMeshTasksEXT terminators).
 Status ValidateSpirvBinary(const std::vector<uint32_t>& spirv);
 
 // Validates a SPIR-V binary using Khronos spirv-val.exe (temp files strictly under E:\OpenScarlett\.tmp\).
@@ -78,10 +79,63 @@ Status CompileHlslWithDxc(
     std::string& out_diagnostics,
     const std::string& dxc_path = {});
 
-// Full RDNA2 XS2\0 or Xbox-wrapped DXBC lifting pipeline: Parse -> Disasm -> SSA IR -> Optimize -> SPIR-V 1.3 + HLSL (+ optional spirv-val/DXC).
+// Full RDNA2 XS2\0 or Xbox-wrapped DXBC lifting pipeline: Parse -> Disasm -> SSA IR -> Optimize -> SPIR-V + HLSL (+ optional spirv-val/DXC).
 Status LiftRdna2Xs2Shader(
     const std::vector<uint8_t>& xs2_bytes,
     Rdna2LiftResult& out_result,
     const Rdna2LiftOptions& options = {});
+
+// ---------------------------------------------------------------------------
+// LDS-backed 64-lane Wave64-on-Wave32 Emulation Helper Emission
+// (ballot64, mbcnt64_lo/hi, readlane64, cross-half lane exchange via LDS + barrier)
+// ---------------------------------------------------------------------------
+struct Wave64LdsEmulationConfig {
+    uint32_t threadgroup_size = 64u;       // Rounded up to multiple of 64 (64, 128, 256, ...)
+    uint32_t max_guest_waves = 1u;         // Minimum guest Wave64 slots allocated in LDS
+    bool emit_ballot64 = true;
+    bool emit_mbcnt64 = true;
+    bool emit_readlane64 = true;
+    bool emit_cross_half_exchange = true;
+};
+
+// Emits reusable HLSL Wave64-on-Wave32 LDS emulation helper functions (ballot64, mbcnt64_lo/hi,
+// readlane64, cross_half_exchange64) backed by groupshared memory + GroupMemoryBarrierWithGroupSync().
+std::string EmitWave64On32LdsHlslLibrary(const Wave64LdsEmulationConfig& config = {});
+
+// Emits a strictly valid SPIR-V 1.3 compute module implementing multi-wave isolated LDS-backed
+// Wave64-on-Wave32 emulation (ballot64, mbcnt64_lo/hi, readlane64, cross-half lane exchange).
+Status EmitWave64On32LdsSpirv(
+    const Wave64LdsEmulationConfig& config,
+    std::vector<uint32_t>& out_spirv);
+
+// ---------------------------------------------------------------------------
+// Paired Barycentric & Vertex Cull-Distance Stage Lowering (VS / GS / MS)
+// Preserves paired (I, J) / float3 barycentrics and SV_CullDistance / BuiltIn CullDistance.
+// ---------------------------------------------------------------------------
+struct Rdna2BarycentricCullStageDesc {
+    ShaderStage stage = ShaderStage::Vertex;  // Vertex, Geometry, or Mesh
+    uint32_t cull_distance_count = 4u;        // 1..8 floats (clamped to [1, 8] when enabled)
+    bool preserve_paired_barycentrics = true;
+    bool preserve_cull_distance = true;
+    uint32_t max_vertices = 3u;               // GS maxvertexcount or MS OutputVertices
+    uint32_t max_primitives = 1u;             // MS OutputPrimitivesEXT
+    uint32_t threadgroup_x = 32u;             // MS LocalSize.x
+};
+
+struct Rdna2BarycentricCullLiftResult {
+    ShaderStage stage = ShaderStage::Unknown;
+    std::string hlsl_source;
+    std::string hlsl_target;
+    std::vector<uint32_t> spirv_words;
+    uint32_t preserved_cull_distances = 0u;
+    bool has_paired_barycentrics = false;
+};
+
+// Lowers VS, GS, or MS stage preserving paired barycentric coordinates and vertex cull-distance
+// outputs (SV_CullDistance in SM 6.5 HLSL; OpCapability CullDistance + BuiltIn CullDistance in SPIR-V).
+Status LowerRdna2StageWithBarycentricAndCullDistance(
+    const Xs2ShaderContainer& xs2,
+    const Rdna2BarycentricCullStageDesc& desc,
+    Rdna2BarycentricCullLiftResult& out_result);
 
 }  // namespace openscarlett

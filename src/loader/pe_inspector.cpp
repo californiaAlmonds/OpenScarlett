@@ -565,7 +565,7 @@ DllRoutingTable::DllRoutingTable() {
         {"KernelTraceControl.dll", 1, true, false},
         {"hix_xs.dll", 1, true, false},
         {"xbtp.dll", 1, true, false},
-        // Sprint 7 clean-room fixed-return stub shims (6 -> 30 total)
+        // Sprint 7 fixed-return stub shims (6 -> 30 total)
         {"mflnmhelp.dll", 1, true, true},
         {"mfhevcdec.dll", 1, true, true},
         {"gamecoreclient.dll", 1, true, true},

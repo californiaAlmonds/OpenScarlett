@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Standalone Xbox-ABI Guest Sample (Wave 4):
+// OpenScarlett MIT Standalone Xbox-ABI Guest Sample (Wave 4):
 // HDRCubeMap — High-Dynamic-Range FP16 6-face TextureCube + Default (nullptr desc)
 // Texture2DArray SRV slice preservation (ScarlettX #46) + Reflective 3D Sphere +
 // HDR10 ST.2084 PQ Encode Pass (R10G10B10A2_UNORM + G2084_NONE_P2020 + HDR10 Metadata) +
@@ -31,7 +31,6 @@ constexpr uint32_t kCubeFaceSize = 64u;
 constexpr uint32_t kCubeFaceCount = 6u;
 constexpr uint32_t kFrameCount = 2u;
 constexpr uint32_t kExpectedTitleId = 0x5CA01003u;
-constexpr uint32_t D3D12XBOX_RESOURCE_FLAG_ALLOW_DCC = 0x80000000u;
 constexpr float kPi = 3.14159265358979323846f;
 
 template <typename T>
@@ -563,8 +562,6 @@ int main(int argc, char** argv) {
     dev_params.Version = 1;
     dev_params.DisableGeometryShaderAllocations = 1;
     dev_params.DisableTessellationShaderAllocations = 1;
-    dev_params.OutputWindow = hwnd;
-    dev_params.PreferWarp = use_warp ? 1u : 0u;
 
     GuestComPtr<ID3D12DeviceX> device;
     HRESULT hr = D3D12XboxCreateDevice(
@@ -1103,7 +1100,7 @@ int main(int argc, char** argv) {
 
     for (uint32_t frame = 0; frame < kFrameCount; ++frame) {
         D3D12XBOX_FRAME_PIPELINE_TOKEN frame_token = 0;
-        hr = device->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, &frame_token);
+        hr = device->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, 0u, &frame_token);
         if (FAILED(hr) || frame_token == 0) {
             cb_res->Unmap(0, nullptr);
             ::CloseHandle(fence_event);
@@ -1275,7 +1272,7 @@ int main(int argc, char** argv) {
         plane.Token = frame_token;
         plane.ResourceCount = 1;
         plane.ppResources = plane_res;
-        plane.ColorSpace = D3D12XBOX_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        plane.ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
         plane.ResourceState = D3D12_RESOURCE_STATE_PRESENT;
 
         D3D12XBOX_PRESENT_PARAMETERS pres_params{};
@@ -1283,7 +1280,7 @@ int main(int argc, char** argv) {
         pres_params.SyncInterval = 0;
         pres_params.OutputWindow = hwnd;
 
-        hr = queue->PresentX(1, &plane, &pres_params, nullptr);
+        hr = queue->PresentX(1, &plane, &pres_params);
         if (FAILED(hr)) {
             cb_res->Unmap(0, nullptr);
             ::CloseHandle(fence_event);
@@ -1627,7 +1624,7 @@ int main(int argc, char** argv) {
     }
 
     // 15. Clean PresentX(0) blank teardown
-    hr = queue->PresentX(0, nullptr, nullptr, nullptr);
+    hr = queue->PresentX(0, nullptr, nullptr);
     if (FAILED(hr)) {
         ::CloseHandle(fence_event);
         if (hwnd) ::DestroyWindow(hwnd);

@@ -1,7 +1,7 @@
 #pragma once
 
 // OpenScarlett - MIT License
-// Clean-room GFX10.3 (RDNA2) 779-opcode ISA coverage auditor & 3,000+ shader corpus bench.
+// GFX10.3 (RDNA2) 779-opcode ISA coverage auditor & 3,000+ shader corpus bench.
 
 #include <cstdint>
 #include <string>
@@ -17,7 +17,7 @@ inline constexpr uint32_t kRdna2CoverageSchemaVersion = 1u;
 struct Rdna2BenchOptions {
     bool full_corpus = false;
     uint32_t corpus_count = 3120u;
-    uint32_t external_val_sample = 60u;
+    uint32_t external_val_sample = 432u;
     bool run_live_gpu = true;
     bool run_external_validators = true;
     bool validate_all_external = false;

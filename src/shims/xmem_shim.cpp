@@ -1,4 +1,4 @@
-// Clean-room MIT xmem.dll shim forwarding Xbox memory allocations to kernelx.dll
+// MIT xmem.dll shim forwarding Xbox memory allocations to kernelx.dll
 // while recording xmem.dll call telemetry.
 
 #if defined(_WIN32)

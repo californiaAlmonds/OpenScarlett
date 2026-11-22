@@ -71,7 +71,7 @@ void Bink2InverseDct8x8(const float in[64], float out[64]) noexcept;
 void Bink2RgbToYCbCr709(uint8_t r, uint8_t g, uint8_t b, uint8_t& y, uint8_t& cb, uint8_t& cr) noexcept;
 void Bink2YCbCr709ToRgb(uint8_t y, uint8_t cb, uint8_t cr, uint8_t& r, uint8_t& g, uint8_t& b) noexcept;
 
-// Clean-room encoder: generates a valid Bink2 (KB2i/KB2j/BIKi) container from RGBA8 frames
+// Encoder: generates a valid Bink2 (KB2i/KB2j/BIKi) container from RGBA8 frames
 // using BT.709 YCbCr 4:2:0 / 4:4:4 planes, 8x8 2D DCT keyframes, and motion/residual P-frames.
 Status Bink2EncodeTestStream(
     const std::vector<std::vector<uint8_t>>& rgba_frames,

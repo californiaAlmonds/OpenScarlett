@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Microsoft GDK <XUser.h> public C/C++ ABI header.
+// MIT Microsoft GDK <XUser.h> public C/C++ ABI header.
 
 #include "XAsync.h"
 

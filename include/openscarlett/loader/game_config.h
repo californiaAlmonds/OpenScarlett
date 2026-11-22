@@ -46,7 +46,7 @@ struct ResolvedPackageTarget {
     GameConfig config;
 };
 
-// Clean-room parser for MicrosoftGame.Config / .mgc XML text in memory.
+// Parser for MicrosoftGame.Config / .mgc XML text in memory.
 Status ParseGameConfigXml(std::string_view xml_text,
                           const std::string& label,
                           GameConfig& out_config);

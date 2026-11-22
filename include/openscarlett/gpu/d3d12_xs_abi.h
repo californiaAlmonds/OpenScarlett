@@ -20,7 +20,7 @@
 
 #if defined(_WIN32)
 
-// Clean-room Xbox Series X|S (Scarlett) D3D12X ABI definitions based on public GDK documentation.
+// Xbox Series X|S (Scarlett) D3D12X ABI definitions.
 
 using D3D12XBOX_FRAME_PIPELINE_TOKEN = uint64_t;
 constexpr D3D12XBOX_FRAME_PIPELINE_TOKEN D3D12XBOX_FRAME_PIPELINE_TOKEN_NULL = 0ull;
@@ -31,6 +31,31 @@ enum D3D12XBOX_PROCESS_DEBUG_FLAGS : uint32_t {
     D3D12XBOX_PROCESS_DEBUG_FLAG_VALIDATED = 0x2u,
     D3D12XBOX_PROCESS_DEBUG_FLAG_INSTRUMENTED = 0x4u,
 };
+
+enum D3D12XBOX_CREATE_DEVICE_FLAGS : uint32_t {
+    D3D12XBOX_CREATE_DEVICE_FLAG_NONE = 0x0u,
+};
+
+enum D3D12XBOX_FRAME_INTERVAL_FLAGS : uint32_t {
+    D3D12XBOX_FRAME_INTERVAL_FLAG_NONE = 0x0u,
+};
+
+enum D3D12XBOX_SCHEDULE_FRAME_EVENT_FLAGS : uint32_t {
+    D3D12XBOX_SCHEDULE_FRAME_EVENT_FLAG_NONE = 0x0u,
+};
+
+enum D3D12XBOX_WAIT_FRAME_EVENT_FLAGS : uint32_t {
+    D3D12XBOX_WAIT_FRAME_EVENT_FLAG_NONE = 0x0u,
+};
+
+constexpr SIZE_T D3D12XBOX_DEFAULT_SIZE_BYTES = 0u;
+constexpr uint32_t D3D12XBOX_FRAME_INTERVAL_60_HZ = 16667u;
+inline const D3D12_RESOURCE_FLAGS D3D12XBOX_RESOURCE_FLAG_ALLOW_DCC =
+    static_cast<D3D12_RESOURCE_FLAGS>(0x80000000u);
+inline const D3D12_RESOURCE_FLAGS D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY =
+    static_cast<D3D12_RESOURCE_FLAGS>(0x40000000u);
+inline const D3D12_RESOURCE_FLAGS D3D12XBOX_RESOURCE_FLAG_ALLOW_AUTOMATIC_GAMEDVR_TONE_MAP =
+    static_cast<D3D12_RESOURCE_FLAGS>(0x20000000u);
 
 enum D3D12XBOX_FRAME_EVENT : uint32_t {
     D3D12XBOX_FRAME_EVENT_ORIGIN = 0u,
@@ -65,6 +90,28 @@ enum D3D12XBOX_WAIT_VALUE_OP : uint32_t {
     D3D12XBOX_WAIT_VALUE_OP_GREATER_EQUAL = 5u,
     D3D12XBOX_WAIT_VALUE_OP_GREATER = 6u,
 };
+
+enum D3D12XBOX_WRITE_VALUE_FLAGS : uint32_t {
+    D3D12XBOX_WRITE_VALUE_FLAG_NONE = 0x0u,
+    D3D12XBOX_WRITE_VALUE_FLAG_MARKER_IN = 0x1u,
+    D3D12XBOX_WRITE_VALUE_FLAG_MARKER_OUT = 0x2u,
+};
+
+enum D3D12XBOX_FLUSH_FLAGS : uint32_t {
+    D3D12XBOX_FLUSH_NONE = 0x0u,
+    D3D12XBOX_FLUSH_TEXTURE_L1_INVALIDATE = 0x1u,
+    D3D12XBOX_FLUSH_L2_INVALIDATE = 0x2u,
+    D3D12XBOX_FLUSH_L2_WRITEBACK = 0x4u,
+    D3D12XBOX_FLUSH_ALL = 0x7u,
+};
+
+enum D3D12XBOX_PREDICATION_FLAGS : uint32_t {
+    D3D12XBOX_PREDICATION_FLAG_NONE = 0x0u,
+    D3D12XBOX_PREDICATION_FLAG_INVERT = 0x1u,
+};
+
+// Xbox GFX10 texture layout tag base in D3D12_RESOURCE_DESC::Layout (0x100 + XG_TILE_MODE).
+inline constexpr uint32_t D3D12XBOX_TEXTURE_LAYOUT_GFX10_BASE = 0x100u;
 
 struct D3D12XBOX_HDR10_METADATA {
     uint16_t RedPrimary[2] = {35400u, 14600u};    // BT.2020 (0.708, 0.292) in 0.00002 units
@@ -120,19 +167,20 @@ struct D3D12XBOX_UNIFIED_TEXTURE_STATS {
     uint64_t TotalBytesUploaded = 0ull;
 };
 
+// Real GXDK 221000+ D3D12XBOX_CREATE_DEVICE_PARAMETERS layout.
 struct D3D12XBOX_CREATE_DEVICE_PARAMETERS {
     uint32_t Version;
     uint32_t ProcessDebugFlags;
     uint32_t GraphicsCommandQueueRingSizeBytes;
     uint32_t GraphicsScratchMemorySizeBytes;
     uint32_t ComputeScratchMemorySizeBytes;
-    uint32_t DisableGeometryShaderAllocations;
-    uint32_t DisableTessellationShaderAllocations;
-    uint32_t DisableDXR;
+    BOOL DisableGeometryShaderAllocations;
+    BOOL DisableTessellationShaderAllocations;
+    BOOL DisableDXR;
     uint32_t CreateDeviceFlags;
     uint32_t AutoAttachPix;
-    HWND OutputWindow;
-    uint32_t PreferWarp;
+    uint32_t AmplificationShaderIndirectArgsBufferSize;
+    uint32_t AmplificationShaderPayloadBufferSize;
 };
 
 struct D3D12XBOX_GPU_HARDWARE_INFO {
@@ -148,11 +196,12 @@ struct D3D12XBOX_GPU_HARDWARE_INFO {
     char AdapterName[128];
 };
 
+// Real GDKX PresentX plane parameters (standard DXGI_COLOR_SPACE_TYPE).
 struct D3D12XBOX_PRESENT_PLANE_PARAMETERS {
     D3D12XBOX_FRAME_PIPELINE_TOKEN Token;
     uint32_t ResourceCount;
     ID3D12Resource* const* ppResources;
-    D3D12XBOX_COLOR_SPACE ColorSpace;
+    DXGI_COLOR_SPACE_TYPE ColorSpace;
     D3D12_RECT SourceRect;
     D3D12_RECT DestRect;
     uint32_t Flags;
@@ -227,7 +276,7 @@ struct D3D12XBOX_VULKAN_ROUTING_STATS {
     char vulkan_device_name[128] = {};
 };
 
-// Clean-room OpenScarlett COM interface IIDs for Xbox D3D12X proxy interfaces.
+// OpenScarlett COM interface IIDs for Xbox D3D12X proxy interfaces.
 // {4F534431-3258-4445-5600-000000000001}
 inline constexpr GUID IID_ID3D12DeviceX = {
     0x4F534431u, 0x3258u, 0x4445u, {0x56u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x01u}};
@@ -264,13 +313,111 @@ inline constexpr GUID IID_IOpenScarlettPresentTiming = {
 inline constexpr GUID IID_IOpenScarlettVulkanRouting = {
     0x4F534431u, 0x3258u, 0x564Bu, {0x52u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x09u}};
 
+// {4F534431-3258-4141-4100-00000000000A}
+inline constexpr GUID IID_IOpenScarlettAaaRuntime = {
+    0x4F534431u, 0x3258u, 0x4141u, {0x41u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x0Au}};
+
+// {4F534431-3258-4141-4100-00000000000C}
+inline constexpr GUID IID_IOpenScarlettPresentPacing = {
+    0x4F534431u, 0x3258u, 0x4141u, {0x41u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x0Cu}};
+
+// Live telemetry snapshot for Sprint 12 wired GPU islands & GXDK extensions.
+struct D3D12XBOX_AAA_WIRING_STATS {
+    // SamplerFeedbackManager
+    uint32_t sf_host_tier = 0u;
+    uint32_t sf_active_maps = 0u;
+    uint32_t sf_preserved_views = 0u;
+    uint64_t sf_total_clears = 0ull;
+    uint64_t sf_total_resolves = 0ull;
+    uint64_t sf_decode_intercepts = 0ull;
+    uint64_t sf_encode_intercepts = 0ull;
+
+    // QueryAccumulatorX
+    uint32_t qa_initialized = 0u;
+    uint64_t qa_begin_count = 0ull;
+    uint64_t qa_end_count = 0ull;
+    uint64_t qa_resolve_count = 0ull;
+    uint64_t qa_cl_begin_count = 0ull;
+    uint64_t qa_cl_end_count = 0ull;
+    uint64_t qa_cl_resolve_count = 0ull;
+    uint64_t qa_gpu_accumulate_dispatches = 0ull;
+    uint64_t qa_active_frame = 0ull;
+
+    // TitleVAMirror
+    uint64_t va_active_regions = 0ull;
+    uint64_t va_dirty_pages_flushed = 0ull;
+    uint64_t va_bytes_uploaded = 0ull;
+    uint64_t va_bytes_readback = 0ull;
+    uint64_t va_pending_readbacks = 0ull;
+    uint64_t va_completed_readbacks = 0ull;
+    uint64_t va_queue_flushes = 0ull;
+    uint64_t va_indirect_flushes = 0ull;
+
+    // DescriptorSgprBridge
+    uint32_t db_initialized = 0u;
+    uint32_t db_resource_slots = 0u;
+    uint32_t db_sampler_slots = 0u;
+    uint64_t db_vsharp_bindings = 0ull;
+    uint64_t db_tsharp_bindings = 0ull;
+    uint64_t db_ssharp_bindings = 0ull;
+    uint64_t db_heap_binds = 0ull;
+    uint64_t db_table_binds = 0ull;
+    uint64_t db_root_const_updates = 0ull;
+    uint64_t db_root_cbv_updates = 0ull;
+    uint32_t db_root_sgprs[16] = {};
+
+    // XgGpuUntiler
+    uint32_t xg_untiler_ready = 0u;
+    uint32_t xg_tagged_resources = 0u;
+    uint64_t xg_gpu_untile_dispatches = 0ull;
+    uint64_t xg_gpu_retile_dispatches = 0ull;
+    uint64_t xg_cpu_fallbacks = 0ull;
+
+    // GXDK CommandListX / DeviceX extensions
+    uint64_t cmdlist_kickoffs = 0ull;
+    uint64_t cmdlist_write32_calls = 0ull;
+    uint64_t cmdlist_predicationx_calls = 0ull;
+    uint64_t cmdlist_flush_cache_calls = 0ull;
+    uint64_t cmdlist_dispatch_mesh_calls = 0ull;
+    uint32_t last_mesh_x = 0u;
+    uint32_t last_mesh_y = 0u;
+    uint32_t last_mesh_z = 0u;
+    uint64_t total_mesh_groups = 0ull;
+    int32_t device_removed_reason = 0;
+};
+
+struct D3D12XBOX_PRESENT_PACING_STATE {
+    uint32_t set_frame_interval_us = 0u;
+    uint32_t fcap_override_fps = 0u;
+    uint32_t fcap_override_active = 0u;
+    uint32_t effective_frame_interval_us = 0u;
+    uint64_t paced_frame_count = 0ull;
+    uint64_t alt_enter_toggle_count = 0ull;
+    uint32_t is_fullscreen = 0u;
+    double last_frame_ms = 0.0;
+};
+
+struct D3D12XBOX_CLOCK_CALIBRATION_SUMMARY {
+    uint32_t valid = 0u;
+    uint64_t gpu_timestamp_frequency_hz = 0ull;
+    uint64_t cpu_qpc_frequency_hz = 0ull;
+    uint64_t anchor_gpu_ticks = 0ull;
+    uint64_t anchor_cpu_qpc_ticks = 0ull;
+    double estimated_offset_seconds = 0.0;
+    double max_bracket_error_us = 0.0;
+    double estimated_drift_ppm = 0.0;
+};
+
 #if defined(_MSC_VER)
 #define OPENSCARLETT_COM_UUID(guid_str) __declspec(uuid(guid_str))
 #else
 #define OPENSCARLETT_COM_UUID(guid_str)
 #endif
 
-struct OPENSCARLETT_COM_UUID("4F534431-3258-4445-5600-000000000001") ID3D12DeviceX : public ID3D12Device6 {
+// Primary COM interface for DeviceX: inherits ID3D12Device8 so GDKX binaries querying
+// IID_ID3D12Device8 receive the exact vtable with SetFrameIntervalX / ScheduleFrameEventX /
+// WaitFrameEventX immediately following ID3D12Device8 (slots 73..75).
+struct OPENSCARLETT_COM_UUID("4F534431-3258-4445-5600-000000000001") ID3D12DeviceX : public ID3D12Device8 {
     virtual HRESULT STDMETHODCALLTYPE SetFrameIntervalX(
         IDXGIOutput* pOutput,
         uint32_t PeriodMicroseconds,
@@ -287,6 +434,7 @@ struct OPENSCARLETT_COM_UUID("4F534431-3258-4445-5600-000000000001") ID3D12Devic
         D3D12XBOX_FRAME_EVENT Event,
         uint32_t TimeoutMilliseconds,
         void* pReserved,
+        uint32_t Flags,
         D3D12XBOX_FRAME_PIPELINE_TOKEN* pOutToken) = 0;
 
     virtual HRESULT STDMETHODCALLTYPE CreatePlacedResourceX(
@@ -305,12 +453,13 @@ struct OPENSCARLETT_COM_UUID("4F534431-3258-4445-5600-000000000001") ID3D12Devic
 __CRT_UUID_DECL(ID3D12DeviceX, 0x4F534431, 0x3258, 0x4445, 0x56, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01)
 #endif
 
+// Primary COM interface for CommandQueueX: inherits ID3D12CommandQueue so GDKX binaries
+// calling PresentX / SuspendX / ResumeX on ID3D12CommandQueue hit exact slots 19..21.
 struct OPENSCARLETT_COM_UUID("4F534431-3258-434D-5100-000000000002") ID3D12CommandQueueX : public ID3D12CommandQueue {
     virtual HRESULT STDMETHODCALLTYPE PresentX(
         UINT PlaneCount,
         const D3D12XBOX_PRESENT_PLANE_PARAMETERS* pPlaneParameters,
-        const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters,
-        void* pPresentToken) = 0;
+        const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters) = 0;
 
     virtual HRESULT STDMETHODCALLTYPE SuspendX(uint32_t Flags) = 0;
     virtual HRESULT STDMETHODCALLTYPE ResumeX() = 0;
@@ -325,6 +474,10 @@ struct OPENSCARLETT_COM_UUID("4F534431-3258-434D-5100-000000000002") ID3D12Comma
         uint64_t Value,
         uint64_t Mask,
         D3D12XBOX_WAIT_VALUE_OP Operation) = 0;
+    virtual HRESULT STDMETHODCALLTYPE Write32BitValueX(
+        D3D12_GPU_VIRTUAL_ADDRESS Address,
+        uint32_t Value,
+        uint32_t Flags) = 0;
 };
 #ifdef __CRT_UUID_DECL
 __CRT_UUID_DECL(ID3D12CommandQueueX, 0x4F534431, 0x3258, 0x434D, 0x51, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02)
@@ -348,6 +501,18 @@ struct OPENSCARLETT_COM_UUID("4F534431-3258-434D-4C00-000000000003") ID3D12Graph
         FLOAT DepthBias,
         FLOAT DepthBiasClamp,
         FLOAT SlopeScaledDepthBias) = 0;
+    virtual void STDMETHODCALLTYPE Write32BitValueX(
+        D3D12_GPU_VIRTUAL_ADDRESS Address,
+        uint32_t Value,
+        uint32_t Flags) = 0;
+    virtual void STDMETHODCALLTYPE SetPredicationX(
+        D3D12_GPU_VIRTUAL_ADDRESS BufferAddress,
+        D3D12_PREDICATION_OP Operation,
+        uint32_t Flags) = 0;
+    virtual void STDMETHODCALLTYPE FlushGpuCacheRange(
+        uint32_t Flags,
+        D3D12_GPU_VIRTUAL_ADDRESS BaseAddress,
+        SIZE_T SizeInBytes) = 0;
 };
 #ifdef __CRT_UUID_DECL
 __CRT_UUID_DECL(ID3D12GraphicsCommandListX, 0x4F534431, 0x3258, 0x434D, 0x4C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03)
@@ -445,6 +610,71 @@ struct OPENSCARLETT_COM_UUID("4F534431-3258-564B-5200-000000000009") IOpenScarle
 };
 #ifdef __CRT_UUID_DECL
 __CRT_UUID_DECL(IOpenScarlettVulkanRouting, 0x4F534431, 0x3258, 0x564B, 0x52, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09)
+#endif
+
+struct OPENSCARLETT_COM_UUID("4F534431-3258-4141-4100-00000000000A") IOpenScarlettAaaRuntime : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetAaaWiringStats(
+        D3D12XBOX_AAA_WIRING_STATS* out_stats) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetResourceTileMode(
+        ID3D12Resource* resource,
+        uint32_t xg_tile_mode) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetResourceTileMode(
+        ID3D12Resource* resource,
+        uint32_t* out_xg_tile_mode) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetQueryAccumulatorHeap(
+        uint32_t query_kind,
+        ID3D12QueryHeap** out_heap) = 0;
+    virtual HRESULT STDMETHODCALLTYPE FlushTitleVaMirrorOnQueue(
+        ID3D12CommandQueue* queue,
+        uint64_t* out_bytes_uploaded) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ScheduleTitleVaWriteback(
+        ID3D12GraphicsCommandList* cmd_list,
+        uint64_t title_va,
+        uint64_t fence_value,
+        uint64_t offset,
+        uint64_t size_bytes) = 0;
+    virtual HRESULT STDMETHODCALLTYPE CompleteTitleVaWritebacks(
+        uint64_t completed_fence_value,
+        uint64_t* out_completed_count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ClearFeedbackMap(
+        ID3D12GraphicsCommandList* cmd_list,
+        ID3D12Resource* feedback_resource) = 0;
+    virtual HRESULT STDMETHODCALLTYPE WriteFeedbackSamples(
+        ID3D12GraphicsCommandList* cmd_list,
+        ID3D12Resource* feedback_resource,
+        const uint32_t* packed_xy_slice_mip_quads,
+        uint32_t sample_count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ReadbackFeedbackMinMip(
+        ID3D12CommandQueue* queue,
+        ID3D12Resource* feedback_resource,
+        uint8_t* out_tiles,
+        uint32_t max_tiles,
+        uint32_t* out_tiles_x,
+        uint32_t* out_tiles_y) = 0;
+    virtual HRESULT STDMETHODCALLTYPE CalibrateQueueClock(
+        ID3D12CommandQueue* queue,
+        D3D12XBOX_CLOCK_CALIBRATION_SUMMARY* out_summary) = 0;
+    virtual HRESULT STDMETHODCALLTYPE BindBridgeBufferSrv(
+        ID3D12Resource* resource,
+        uint32_t num_elements,
+        uint32_t stride_bytes,
+        uint32_t* out_bindless_index) = 0;
+    virtual HRESULT STDMETHODCALLTYPE BindBridgeHeaps(
+        ID3D12GraphicsCommandList* cmd_list) = 0;
+};
+#ifdef __CRT_UUID_DECL
+__CRT_UUID_DECL(IOpenScarlettAaaRuntime, 0x4F534431, 0x3258, 0x4141, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A)
+#endif
+
+struct OPENSCARLETT_COM_UUID("4F534431-3258-4141-4100-00000000000C") IOpenScarlettPresentPacing : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE SetFrameCapFps(
+        uint32_t fps_or_zero_for_uncapped,
+        BOOL override_active) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetPresentPacingState(
+        D3D12XBOX_PRESENT_PACING_STATE* out_state) = 0;
+};
+#ifdef __CRT_UUID_DECL
+__CRT_UUID_DECL(IOpenScarlettPresentPacing, 0x4F534431, 0x3258, 0x4141, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C)
 #endif
 
 extern "C" {

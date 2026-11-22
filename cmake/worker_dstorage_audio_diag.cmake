@@ -1,4 +1,4 @@
-# OpenScarlett Clean-Room MIT DirectStorage, Media Foundation, Console Diagnostic
+# OpenScarlett MIT DirectStorage, Media Foundation, Console Diagnostic
 # Shims & Audio/XMem/XThread Conformance Targets.
 # Owned by Worker 4 (wt-dstorage-audio-diag / feat/dstorage-mfplat-audio-shims).
 

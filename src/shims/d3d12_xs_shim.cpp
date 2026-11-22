@@ -101,6 +101,14 @@ using PfnD3D12GetDebugInterface = HRESULT(WINAPI*)(REFIID, void**);
 using PfnD3D12EnableExperimentalFeatures = HRESULT(WINAPI*)(
     UINT, const IID*, void*, UINT*);
 
+bool EnvPrefersWarp() noexcept {
+    char buf[32]{};
+    const DWORD len = GetEnvironmentVariableA(
+        "OPENSCARLETT_PREFER_WARP", buf, static_cast<DWORD>(sizeof(buf)));
+    if (len == 0u || len >= sizeof(buf)) return false;
+    return buf[0] == '1' || buf[0] == 't' || buf[0] == 'T' || buf[0] == 'y' || buf[0] == 'Y';
+}
+
 HRESULT CreateWrappedDeviceInternal(
     IUnknown* pAdapter,
     D3D_FEATURE_LEVEL min_level,
@@ -170,7 +178,7 @@ HRESULT WINAPI OS_D3D12CreateDevice(
     const HRESULT hr = CreateWrappedDeviceInternal(
         pAdapter,
         MinimumFeatureLevel,
-        g_prefer_warp.load(std::memory_order_acquire) != 0,
+        (g_prefer_warp.load(std::memory_order_acquire) != 0) || EnvPrefersWarp(),
         false,
         nullptr,
         riid,
@@ -187,7 +195,7 @@ OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12CreateDeviceX(
     const HRESULT hr = CreateWrappedDeviceInternal(
         pAdapter,
         MinimumFeatureLevel,
-        g_prefer_warp.load(std::memory_order_acquire) != 0,
+        (g_prefer_warp.load(std::memory_order_acquire) != 0) || EnvPrefersWarp(),
         false,
         nullptr,
         riid,
@@ -201,18 +209,19 @@ OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxCreateDevice(
     const D3D12XBOX_CREATE_DEVICE_PARAMETERS* pParameters,
     REFIID riid,
     void** ppDevice) {
-    const bool param_warp = (pParameters && pParameters->PreferWarp != 0);
-    const bool global_warp = (g_prefer_warp.load(std::memory_order_acquire) != 0);
+    // Real GXDK 221000+ D3D12XBOX_CREATE_DEVICE_PARAMETERS does NOT carry OutputWindow or
+    // PreferWarp fields — never misinterpret AmplificationShader* sizes as HWND/flags!
+    const bool global_warp =
+        (g_prefer_warp.load(std::memory_order_acquire) != 0) || EnvPrefersWarp();
     const bool debug_layer =
         (pParameters && (pParameters->ProcessDebugFlags & D3D12XBOX_PROCESS_DEBUG_FLAG_DEBUG) != 0);
-    const HWND default_hwnd = pParameters ? pParameters->OutputWindow : nullptr;
 
     const HRESULT hr = CreateWrappedDeviceInternal(
         pAdapter,
         D3D_FEATURE_LEVEL_12_0,
-        param_warp || global_warp,
+        global_warp,
         debug_layer,
-        default_hwnd,
+        nullptr,
         riid,
         ppDevice);
     RecordExport("D3D12XboxCreateDevice", hr);

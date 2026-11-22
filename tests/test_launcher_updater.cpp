@@ -69,7 +69,7 @@ std::string ReadTextFile(const fs::path& p) {
     return oss.str();
 }
 
-// Clean-room standard CRC-32 (IEEE 802.3) for building a valid minimal stored PKZIP archive
+// Standard CRC-32 (IEEE 802.3) for building a valid minimal stored PKZIP archive
 // without any third-party compression libraries.
 uint32_t ComputeCrc32(const uint8_t* data, size_t len) {
     uint32_t crc = 0xFFFFFFFFu;

@@ -1,4 +1,5 @@
 #include "openscarlett/gpu/rt_bvh.h"
+#include "openscarlett/gpu/rdna2_rayquery_bridge.h"
 
 #include <algorithm>
 #include <array>
@@ -154,6 +155,128 @@ Status FrameBufferRgba8::WritePpm(const std::string& file_path) const {
     return Status::Ok();
 }
 
+namespace {
+
+uint32_t PngCrc32(const uint8_t* data, size_t len) noexcept {
+    static const auto kTable = []() {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t n = 0; n < 256u; ++n) {
+            uint32_t c = n;
+            for (int k = 0; k < 8; ++k) {
+                c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            }
+            t[n] = c;
+        }
+        return t;
+    }();
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc = kTable[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
+    }
+    return ~crc;
+}
+
+void AppendBe32(std::vector<uint8_t>& out, uint32_t v) {
+    out.push_back(static_cast<uint8_t>((v >> 24) & 0xFFu));
+    out.push_back(static_cast<uint8_t>((v >> 16) & 0xFFu));
+    out.push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
+    out.push_back(static_cast<uint8_t>(v & 0xFFu));
+}
+
+void AppendPngChunk(std::vector<uint8_t>& out, const char type[4],
+                    const uint8_t* payload, size_t payload_size) {
+    AppendBe32(out, static_cast<uint32_t>(payload_size));
+    const size_t type_start = out.size();
+    out.insert(out.end(), type, type + 4);
+    if (payload && payload_size > 0u) {
+        out.insert(out.end(), payload, payload + payload_size);
+    }
+    const uint32_t crc = PngCrc32(out.data() + type_start, 4u + payload_size);
+    AppendBe32(out, crc);
+}
+
+}  // namespace
+
+Status FrameBufferRgba8::WritePng(const std::string& file_path) const {
+    if (width == 0 || height == 0 ||
+        pixels.size() < static_cast<size_t>(width) * static_cast<size_t>(height) * 4u) {
+        return Status::Error(StatusCode::InvalidArgument, "FrameBufferRgba8 dimensions/buffer invalid");
+    }
+
+    const size_t row_bytes = static_cast<size_t>(width) * 4u;
+    const size_t raw_size = static_cast<size_t>(height) * (1u + row_bytes);
+
+    std::vector<uint8_t> raw;
+    raw.reserve(raw_size);
+    uint32_t s1 = 1u;
+    uint32_t s2 = 0u;
+    for (uint32_t y = 0; y < height; ++y) {
+        raw.push_back(0u);
+        s2 += s1;
+        if (s2 >= 65521u) s2 -= 65521u;
+        const uint8_t* src_row = pixels.data() + static_cast<size_t>(y) * row_bytes;
+        raw.insert(raw.end(), src_row, src_row + row_bytes);
+        for (size_t x = 0; x < row_bytes; ++x) {
+            s1 += src_row[x];
+            if (s1 >= 65521u) s1 -= 65521u;
+            s2 += s1;
+            if (s2 >= 65521u) s2 -= 65521u;
+        }
+    }
+    const uint32_t adler32 = (s2 << 16) | s1;
+
+    constexpr size_t kMaxBlock = 65535u;
+    const size_t num_blocks = (raw.size() + kMaxBlock - 1u) / kMaxBlock;
+    std::vector<uint8_t> idat;
+    idat.reserve(2u + num_blocks * 5u + raw.size() + 4u);
+    idat.push_back(0x78u);
+    idat.push_back(0x01u);
+
+    size_t offset = 0u;
+    while (offset < raw.size()) {
+        const size_t chunk_len = std::min<size_t>(kMaxBlock, raw.size() - offset);
+        const bool is_final = (offset + chunk_len >= raw.size());
+        const uint16_t len16 = static_cast<uint16_t>(chunk_len);
+        const uint16_t nlen16 = static_cast<uint16_t>(~len16);
+        idat.push_back(is_final ? 0x01u : 0x00u);
+        idat.push_back(static_cast<uint8_t>(len16 & 0xFFu));
+        idat.push_back(static_cast<uint8_t>((len16 >> 8) & 0xFFu));
+        idat.push_back(static_cast<uint8_t>(nlen16 & 0xFFu));
+        idat.push_back(static_cast<uint8_t>((nlen16 >> 8) & 0xFFu));
+        idat.insert(idat.end(), raw.data() + offset, raw.data() + offset + chunk_len);
+        offset += chunk_len;
+    }
+    AppendBe32(idat, adler32);
+
+    std::vector<uint8_t> png;
+    png.reserve(64u + idat.size());
+    const uint8_t sig[8] = {0x89u, 'P', 'N', 'G', 0x0Du, 0x0Au, 0x1Au, 0x0Au};
+    png.insert(png.end(), sig, sig + 8);
+
+    std::vector<uint8_t> ihdr;
+    ihdr.reserve(13u);
+    AppendBe32(ihdr, width);
+    AppendBe32(ihdr, height);
+    ihdr.push_back(8u);
+    ihdr.push_back(6u);
+    ihdr.push_back(0u);
+    ihdr.push_back(0u);
+    ihdr.push_back(0u);
+    AppendPngChunk(png, "IHDR", ihdr.data(), ihdr.size());
+    AppendPngChunk(png, "IDAT", idat.data(), idat.size());
+    AppendPngChunk(png, "IEND", nullptr, 0u);
+
+    std::ofstream ofs(file_path, std::ios::binary | std::ios::trunc);
+    if (!ofs) {
+        return Status::Error(StatusCode::IoError, "Failed to open PNG output path: " + file_path);
+    }
+    ofs.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+    if (!ofs.good()) {
+        return Status::Error(StatusCode::IoError, "Failed writing PNG image: " + file_path);
+    }
+    return Status::Ok();
+}
+
 void RtAabb::Expand(Vec3 p) noexcept {
     min.x = std::min(min.x, p.x);
     min.y = std::min(min.y, p.y);
@@ -282,6 +405,74 @@ bool IntersectRayTriangle(const RtTriangle& tri,
                           float& out_v,
                           Vec3& out_normal) noexcept {
     return IntersectTriangle(tri, ray, t_best, out_t, out_u, out_v, out_normal);
+}
+
+bool IntersectRayAabbSlabs(const RtAabb& box,
+                           const RtRay& ray,
+                           float t_best,
+                           float& out_t_near) noexcept {
+    return IntersectAabb(box, ray, t_best, out_t_near);
+}
+
+bool IntersectRayTriangleEx(const RtTriangle& tri,
+                            const RtRay& ray,
+                            float t_best,
+                            uint32_t ray_flags,
+                            uint32_t instance_flags,
+                            float& out_t,
+                            float& out_u,
+                            float& out_v,
+                            Vec3& out_normal,
+                            bool& out_front_face) noexcept {
+    const Vec3 e1 = Sub(tri.v1, tri.v0);
+    const Vec3 e2 = Sub(tri.v2, tri.v0);
+    const Vec3 pvec = Cross(ray.direction, e2);
+    const float det = Dot(e1, pvec);
+    if (std::fabs(det) < 1e-7f) {
+        return false;
+    }
+
+    // Standard D3D12/DXR winding convention: det > 0 is front-facing unless
+    // D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_FRONT_COUNTERCLOCKWISE flips it.
+    const bool front_ccw = (instance_flags & kDxrInstanceTriangleFrontCounterClockwise) != 0u;
+    const bool front_face = front_ccw ? (det < 0.0f) : (det > 0.0f);
+
+    const bool cull_disable = (instance_flags & kDxrInstanceTriangleCullDisable) != 0u;
+    if (!cull_disable) {
+        if ((ray_flags & kRdna2RayFlagCullBackFacingTriangles) != 0u && !front_face) {
+            return false;
+        }
+        if ((ray_flags & kRdna2RayFlagCullFrontFacingTriangles) != 0u && front_face) {
+            return false;
+        }
+    }
+
+    const float inv_det = 1.0f / det;
+    const Vec3 tvec = Sub(ray.origin, tri.v0);
+    const float u = Dot(tvec, pvec) * inv_det;
+    if (u < 0.0f || u > 1.0f) {
+        return false;
+    }
+    const Vec3 qvec = Cross(tvec, e1);
+    const float v = Dot(ray.direction, qvec) * inv_det;
+    if (v < 0.0f || u + v > 1.0f) {
+        return false;
+    }
+    const float t = Dot(e2, qvec) * inv_det;
+    if (t < ray.t_min || t >= t_best) {
+        return false;
+    }
+
+    out_t = t;
+    out_u = u;
+    out_v = v;
+    out_front_face = front_face;
+    Vec3 n = Normalize(Cross(e1, e2));
+    if (Dot(n, ray.direction) > 0.0f) {
+        n = Mul(n, -1.0f);
+    }
+    out_normal = n;
+    return true;
 }
 
 bool BvhAccelerationStructure::GetNodeView(uint32_t index, BvhNodeView& out_node) const noexcept {

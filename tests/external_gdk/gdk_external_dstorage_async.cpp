@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Standalone External Xbox-ABI Binary #1:
+// OpenScarlett MIT Standalone External Xbox-ABI Binary #1:
 // Written PURELY against standard Microsoft GDK public headers (ZERO openscarlett/ includes,
 // ZERO openscarlett_core link!).
 //

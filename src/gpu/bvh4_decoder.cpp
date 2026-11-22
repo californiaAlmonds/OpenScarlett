@@ -1,4 +1,5 @@
 #include "openscarlett/gpu/bvh4_decoder.h"
+#include "openscarlett/gpu/rdna2_rayquery_bridge.h"
 
 #include <algorithm>
 #include <array>
@@ -1523,6 +1524,457 @@ bool Rdna2Bvh4Tree::TraceShadowRay(const RtRay& ray, RtStats* stats) const {
     }
 
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// 64-bit Multi-Window RDNA2 BVH4 Traversal (image_bvh64_intersect_ray)
+// ---------------------------------------------------------------------------
+Status Rdna2Bvh64MultiWindow::RegisterWindow(uint64_t base_gpu_va, const uint8_t* data, size_t size) {
+    if (base_gpu_va == 0ull || (base_gpu_va & (kRdna2BvhNodeAlignment - 1u)) != 0ull) {
+        return Status::Error(StatusCode::InvalidArgument,
+                             "BVH64 window base_gpu_va must be non-zero and 64-byte aligned");
+    }
+    if (!data || size < kRdna2BvhHeaderSize) {
+        return Status::Error(StatusCode::InvalidArgument, "BVH64 window buffer invalid or too small");
+    }
+
+    Rdna2BvhValidationReport report{};
+    Status st = ValidateRdna2Bvh4(data, size, &report);
+    if (!st.ok()) {
+        return st;
+    }
+
+    Rdna2BvhHeader hdr{};
+    st = DecodeRdna2BvhHeader(data, size, hdr);
+    if (!st.ok()) {
+        return st;
+    }
+
+    const uint64_t new_end = base_gpu_va + static_cast<uint64_t>(hdr.total_size_bytes);
+    if (new_end < base_gpu_va) {
+        return Status::Error(StatusCode::InvalidArgument, "BVH64 window virtual address overflow");
+    }
+
+    // Replace existing window at identical base VA or verify non-overlapping range.
+    for (auto& existing : windows_) {
+        if (existing.base_gpu_va == base_gpu_va) {
+            existing.header = hdr;
+            existing.buffer.assign(data, data + hdr.total_size_bytes);
+            return Status::Ok();
+        }
+        const uint64_t ex_end = existing.base_gpu_va + existing.buffer.size();
+        if (base_gpu_va < ex_end && new_end > existing.base_gpu_va) {
+            return Status::Error(StatusCode::InvalidArgument,
+                                 "BVH64 window overlaps an already registered 64-bit VA range");
+        }
+    }
+
+    Rdna2Bvh64Window win{};
+    win.base_gpu_va = base_gpu_va;
+    win.header = hdr;
+    win.buffer.assign(data, data + hdr.total_size_bytes);
+    windows_.push_back(std::move(win));
+    return Status::Ok();
+}
+
+Status Rdna2Bvh64MultiWindow::RegisterWindow(uint64_t base_gpu_va, std::vector<uint8_t> buffer) {
+    return RegisterWindow(base_gpu_va, buffer.data(), buffer.size());
+}
+
+bool Rdna2Bvh64MultiWindow::UnregisterWindow(uint64_t base_gpu_va) {
+    for (auto it = windows_.begin(); it != windows_.end(); ++it) {
+        if (it->base_gpu_va == base_gpu_va) {
+            windows_.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
+void Rdna2Bvh64MultiWindow::Clear() {
+    windows_.clear();
+}
+
+const Rdna2Bvh64Window* Rdna2Bvh64MultiWindow::FindWindow(uint64_t base_gpu_va) const noexcept {
+    for (const auto& w : windows_) {
+        if (w.base_gpu_va == base_gpu_va) {
+            return &w;
+        }
+    }
+    return nullptr;
+}
+
+Status Rdna2Bvh64MultiWindow::StepBvh64IntersectRay(
+    uint64_t window_base_va,
+    uint32_t node_ptr,
+    const RtRay& ray,
+    float t_best,
+    uint32_t ray_flags,
+    uint32_t instance_mask,
+    uint32_t active_instance_flags,
+    Rdna2Bvh64SingleStepResult& out_step) const {
+    out_step = Rdna2Bvh64SingleStepResult{};
+    if (!IsRdna2NodePtrValid(node_ptr)) {
+        return Status::Error(StatusCode::InvalidArgument, "Invalid BVH4 node pointer");
+    }
+
+    const Rdna2Bvh64Window* win = FindWindow(window_base_va);
+    if (!win) {
+        return Status::Error(StatusCode::NotFound, "64-bit BVH4 window VA not registered");
+    }
+
+    const Rdna2BvhNodeType type = DecodeRdna2NodeType(node_ptr);
+    out_step.node_type = type;
+
+    if (IsRdna2TriangleNodeType(type)) {
+        out_step.is_triangle = true;
+        Rdna2BvhTriangleNode tnode{};
+        Status st = DecodeRdna2TriangleNode(win->buffer.data(), win->buffer.size(), node_ptr, tnode);
+        if (!st.ok()) {
+            return st;
+        }
+
+        const bool is_opaque = (tnode.geometry_flags & 1u) != 0u;
+        const bool effective_opaque =
+            ((ray_flags & kRdna2RayFlagForceOpaque) != 0u ||
+             (active_instance_flags & kDxrInstanceForceOpaque) != 0u)
+                ? true
+                : (((ray_flags & kRdna2RayFlagForceNonOpaque) != 0u ||
+                    (active_instance_flags & kDxrInstanceForceNonOpaque) != 0u)
+                       ? false
+                       : is_opaque);
+        if ((ray_flags & kRdna2RayFlagCullOpaque) != 0u && effective_opaque) {
+            return Status::Ok();
+        }
+        if ((ray_flags & kRdna2RayFlagCullNonOpaque) != 0u && !effective_opaque) {
+            return Status::Ok();
+        }
+
+        const uint32_t tri_count = std::min<uint32_t>(2u, tnode.triangle_id & 0x3u);
+        float best_local_t = t_best;
+        for (uint32_t ti = 0; ti < tri_count; ++ti) {
+            RtTriangle tri{};
+            uint32_t prim_idx = tnode.primitive_index;
+            if (ti == 0u) {
+                tri.v0 = tnode.v0;
+                tri.v1 = tnode.v1;
+                tri.v2 = tnode.v2;
+            } else {
+                tri.v0 = tnode.v1;
+                tri.v1 = tnode.v2;
+                tri.v2 = tnode.v3;
+                prim_idx = tnode.extra_index;
+            }
+
+            float t = 0.0f;
+            float u = 0.0f;
+            float v = 0.0f;
+            Vec3 normal{};
+            bool front_face = true;
+            if (IntersectRayTriangleEx(
+                    tri, ray, best_local_t, ray_flags, active_instance_flags, t, u, v, normal, front_face)) {
+                best_local_t = t;
+                out_step.triangle_hit = true;
+                out_step.hit_t = t;
+                out_step.bary_u = u;
+                out_step.bary_v = v;
+                out_step.primitive_index = prim_idx;
+                out_step.geometry_index = tnode.geometry_index;
+                out_step.front_face = front_face;
+                if ((ray_flags & kRdna2RayFlagAcceptFirstHitAndEndSearch) != 0u) {
+                    break;
+                }
+            }
+        }
+        return Status::Ok();
+    }
+
+    if (type == Rdna2BvhNodeType::Box32 || type == Rdna2BvhNodeType::Box16) {
+        out_step.is_box = true;
+        std::array<uint32_t, 4> children{};
+        std::array<RtAabb, 4> boxes{};
+        if (type == Rdna2BvhNodeType::Box32) {
+            Rdna2BvhBox32Node b32{};
+            Status st = DecodeRdna2Box32Node(win->buffer.data(), win->buffer.size(), node_ptr, b32);
+            if (!st.ok()) {
+                return st;
+            }
+            children = b32.children;
+            boxes = b32.bbox;
+        } else {
+            Rdna2BvhBox16Node b16{};
+            Status st = DecodeRdna2Box16Node(win->buffer.data(), win->buffer.size(), node_ptr, b16);
+            if (!st.ok()) {
+                return st;
+            }
+            children = b16.children;
+            for (uint32_t c = 0; c < 4u; ++c) {
+                boxes[c] = DecodeBox16ChildAabb(b16, c);
+            }
+        }
+
+        struct ChildHit {
+            uint32_t ptr = kRdna2BvhInvalidNodePtr;
+            float t_near = 1e30f;
+        };
+        ChildHit hits[4]{};
+        uint32_t hit_count = 0u;
+        for (uint32_t c = 0; c < 4u; ++c) {
+            if (!IsRdna2NodePtrValid(children[c])) {
+                continue;
+            }
+            float t_near = 0.0f;
+            if (IntersectRayAabbSlabs(boxes[c], ray, t_best, t_near)) {
+                hits[hit_count++] = {children[c], t_near};
+            }
+        }
+        // Sort ascending by t_near (closest first in sorted_children[0..hit_child_count-1]).
+        for (uint32_t i = 0; i < hit_count; ++i) {
+            for (uint32_t j = i + 1u; j < hit_count; ++j) {
+                if (hits[j].t_near < hits[i].t_near) {
+                    std::swap(hits[i], hits[j]);
+                }
+            }
+        }
+        out_step.hit_child_count = hit_count;
+        for (uint32_t i = 0; i < hit_count; ++i) {
+            out_step.sorted_children[i] = hits[i].ptr;
+        }
+        return Status::Ok();
+    }
+
+    if (type == Rdna2BvhNodeType::Instance) {
+        out_step.is_instance = true;
+        Rdna2BvhInstanceNode inode{};
+        Status st = DecodeRdna2InstanceNode(win->buffer.data(), win->buffer.size(), node_ptr, inode);
+        if (!st.ok()) {
+            return st;
+        }
+        if ((inode.instance_mask & (instance_mask & 0xFFu)) == 0u) {
+            return Status::Ok();
+        }
+        out_step.next_blas_base_va = inode.blas_base_va;
+        out_step.next_blas_root_ptr = inode.blas_root_ptr;
+        out_step.instance_index = inode.instance_index;
+        out_step.instance_id = inode.instance_id;
+        out_step.instance_flags = inode.instance_flags;
+        out_step.sbt_offset = inode.sbt_offset;
+
+        out_step.transformed_ray = ray;
+        out_step.transformed_ray.origin = TransformPoint3x4(inode.world_to_object, ray.origin);
+        out_step.transformed_ray.direction = TransformVector3x4(inode.world_to_object, ray.direction);
+        return Status::Ok();
+    }
+
+    if (type == Rdna2BvhNodeType::Procedural) {
+        out_step.is_procedural = true;
+        Rdna2BvhProceduralNode pnode{};
+        Status st = DecodeRdna2ProceduralNode(win->buffer.data(), win->buffer.size(), node_ptr, pnode);
+        if (!st.ok()) {
+            return st;
+        }
+        float t_near = 0.0f;
+        if (IntersectRayAabbSlabs(pnode.bounds, ray, t_best, t_near)) {
+            out_step.triangle_hit = true;
+            out_step.hit_t = t_near;
+            out_step.primitive_index = pnode.primitive_index;
+            out_step.geometry_index = pnode.geometry_index;
+        }
+        return Status::Ok();
+    }
+
+    return Status::Error(StatusCode::ParseError, "Unsupported RDNA2 BVH4 node type");
+}
+
+Status Rdna2Bvh64MultiWindow::TraceRay64(
+    uint64_t tlas_base_va,
+    const Rdna2RayQueryInput& ray_in,
+    Rdna2RayQueryHit& out_hit,
+    RtStats* out_stats) const {
+    out_hit = Rdna2RayQueryHit{};
+    out_hit.committed_status = kRdna2CommittedNothing;
+    out_hit.t = ray_in.t_max;
+
+    const Rdna2Bvh64Window* root_win = FindWindow(tlas_base_va);
+    if (!root_win) {
+        return Status::Error(StatusCode::NotFound, "Root 64-bit BVH4 window VA not found");
+    }
+
+    RtRay world_ray{};
+    world_ray.origin = ray_in.origin;
+    world_ray.direction = ray_in.direction;
+    world_ray.t_min = ray_in.t_min;
+    world_ray.t_max = ray_in.t_max;
+
+    float root_near = 0.0f;
+    if (out_stats) ++out_stats->aabb_tests;
+    if (!IntersectRayAabbSlabs(root_win->header.root_aabb, world_ray, out_hit.t, root_near)) {
+        return Status::Ok();
+    }
+
+    const bool accept_first = (ray_in.ray_flags & kRdna2RayFlagAcceptFirstHitAndEndSearch) != 0u;
+
+    constexpr int kStackCap = 128;
+    uint32_t top_stack[kStackCap];
+    int top_sp = 0;
+    top_stack[top_sp++] = root_win->header.root_node_ptr;
+
+    while (top_sp > 0) {
+        const uint32_t ptr = top_stack[--top_sp];
+        Rdna2Bvh64SingleStepResult step{};
+        Status st = StepBvh64IntersectRay(
+            tlas_base_va, ptr, world_ray, out_hit.t, ray_in.ray_flags, ray_in.instance_mask, 0u, step);
+        if (!st.ok()) {
+            return st;
+        }
+
+        if (step.is_box) {
+            if (out_stats) out_stats->aabb_tests += 4u;
+            // Push far-to-near so closest child is popped first.
+            for (int i = static_cast<int>(step.hit_child_count) - 1; i >= 0; --i) {
+                if (top_sp < kStackCap) {
+                    top_stack[top_sp++] = step.sorted_children[static_cast<size_t>(i)];
+                }
+            }
+            continue;
+        }
+
+        if (step.is_triangle) {
+            if (out_stats) ++out_stats->triangle_tests;
+            if (step.triangle_hit && step.hit_t < out_hit.t) {
+                out_hit.committed_status = kRdna2CommittedTriangleHit;
+                out_hit.t = step.hit_t;
+                out_hit.bary_u = step.bary_u;
+                out_hit.bary_v = step.bary_v;
+                out_hit.primitive_index = step.primitive_index;
+                out_hit.instance_index = 0u;
+                out_hit.instance_id = 0u;
+                out_hit.geometry_index = step.geometry_index;
+                out_hit.sbt_offset = 0u;
+                out_hit.front_face = step.front_face ? 1u : 0u;
+                if (accept_first) {
+                    return Status::Ok();
+                }
+            }
+            continue;
+        }
+
+        if (step.is_procedural) {
+            if (step.triangle_hit && step.hit_t < out_hit.t) {
+                out_hit.committed_status = kRdna2CommittedProceduralHit;
+                out_hit.t = step.hit_t;
+                out_hit.primitive_index = step.primitive_index;
+                out_hit.geometry_index = step.geometry_index;
+                if (accept_first) {
+                    return Status::Ok();
+                }
+            }
+            continue;
+        }
+
+        if (step.is_instance && step.next_blas_base_va != 0ull && IsRdna2NodePtrValid(step.next_blas_root_ptr)) {
+            const Rdna2Bvh64Window* blas_win = FindWindow(step.next_blas_base_va);
+            if (!blas_win) {
+                continue;
+            }
+            uint32_t blas_stack[kStackCap];
+            int blas_sp = 0;
+            blas_stack[blas_sp++] = step.next_blas_root_ptr;
+
+            while (blas_sp > 0) {
+                const uint32_t bptr = blas_stack[--blas_sp];
+                Rdna2Bvh64SingleStepResult bstep{};
+                Status bst = StepBvh64IntersectRay(
+                    step.next_blas_base_va,
+                    bptr,
+                    step.transformed_ray,
+                    out_hit.t,
+                    ray_in.ray_flags,
+                    ray_in.instance_mask,
+                    step.instance_flags,
+                    bstep);
+                if (!bst.ok()) {
+                    return bst;
+                }
+                if (bstep.is_box) {
+                    if (out_stats) out_stats->aabb_tests += 4u;
+                    for (int i = static_cast<int>(bstep.hit_child_count) - 1; i >= 0; --i) {
+                        if (blas_sp < kStackCap) {
+                            blas_stack[blas_sp++] = bstep.sorted_children[static_cast<size_t>(i)];
+                        }
+                    }
+                } else if (bstep.is_triangle) {
+                    if (out_stats) ++out_stats->triangle_tests;
+                    if (bstep.triangle_hit && bstep.hit_t < out_hit.t) {
+                        out_hit.committed_status = kRdna2CommittedTriangleHit;
+                        out_hit.t = bstep.hit_t;
+                        out_hit.bary_u = bstep.bary_u;
+                        out_hit.bary_v = bstep.bary_v;
+                        out_hit.primitive_index = bstep.primitive_index;
+                        out_hit.instance_index = step.instance_index;
+                        out_hit.instance_id = step.instance_id;
+                        out_hit.geometry_index = bstep.geometry_index;
+                        out_hit.sbt_offset = step.sbt_offset;
+                        out_hit.front_face = bstep.front_face ? 1u : 0u;
+                        if (accept_first) {
+                            return Status::Ok();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return Status::Ok();
+}
+
+Status Rdna2Bvh64MultiWindow::PackForGpuCompute(
+    uint64_t tlas_base_va,
+    std::vector<Rdna2GpuBvhWindowDesc>& out_window_table,
+    std::vector<uint32_t>& out_bvh_dwords,
+    uint32_t& out_tlas_window_index) const {
+    out_window_table.clear();
+    out_bvh_dwords.clear();
+    out_tlas_window_index = 0xFFFFFFFFu;
+
+    if (windows_.empty()) {
+        return Status::Error(StatusCode::RaytracingError, "No BVH64 windows registered to pack");
+    }
+
+    out_window_table.reserve(windows_.size());
+    for (size_t i = 0; i < windows_.size(); ++i) {
+        const auto& w = windows_[i];
+        if ((w.buffer.size() % 4u) != 0u) {
+            return Status::Error(StatusCode::ParseError, "BVH4 window buffer size is not 4-byte aligned");
+        }
+        const uint32_t dw_offset = static_cast<uint32_t>(out_bvh_dwords.size());
+        const uint32_t dw_count = static_cast<uint32_t>(w.buffer.size() / 4u);
+        out_bvh_dwords.resize(out_bvh_dwords.size() + dw_count);
+        for (uint32_t d = 0; d < dw_count; ++d) {
+            out_bvh_dwords[dw_offset + d] = ReadLe32(w.buffer.data() + static_cast<size_t>(d) * 4u);
+        }
+
+        Rdna2GpuBvhWindowDesc desc{};
+        desc.base_va_lo = static_cast<uint32_t>(w.base_gpu_va & 0xFFFFFFFFull);
+        desc.base_va_hi = static_cast<uint32_t>((w.base_gpu_va >> 32u) & 0xFFFFFFFFull);
+        desc.dword_offset = dw_offset;
+        desc.dword_count = dw_count;
+        desc.root_node_ptr = w.header.root_node_ptr;
+        desc.as_type = static_cast<uint32_t>(w.header.as_type);
+        out_window_table.push_back(desc);
+
+        if (w.base_gpu_va == tlas_base_va) {
+            out_tlas_window_index = static_cast<uint32_t>(i);
+        }
+    }
+
+    if (out_tlas_window_index == 0xFFFFFFFFu) {
+        out_window_table.clear();
+        out_bvh_dwords.clear();
+        return Status::Error(StatusCode::NotFound, "Requested TLAS base_gpu_va not found in registered windows");
+    }
+
+    return Status::Ok();
 }
 
 }  // namespace openscarlett

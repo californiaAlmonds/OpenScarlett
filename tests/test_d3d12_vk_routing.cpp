@@ -533,10 +533,10 @@ StandardTriangleRun RunStandardD3D12Triangle(bool use_vulkan_env, bool prefer_wa
     StandardTriangleRun out{};
     OpenScarlettD3D12SetBackendMode(D3D12XBOX_BACKEND_AUTO);
     ScopedEnvVar backend_env("OPENSCARLETT_BACKEND", use_vulkan_env ? "VULKAN" : "d3d12");
+    ScopedEnvVar warp_env("OPENSCARLETT_PREFER_WARP", prefer_warp ? "1" : "0");
 
     D3D12XBOX_CREATE_DEVICE_PARAMETERS params{};
     params.Version = 1u;
-    params.PreferWarp = prefer_warp ? 1u : 0u;
 
     ComPtr<ID3D12DeviceX> dev;
     OS_REQUIRE(SUCCEEDED(D3D12XboxCreateDevice(nullptr, &params, IID_ID3D12DeviceX,
@@ -656,11 +656,11 @@ float4 PSMain(VSOut i) : SV_Target { return i.col; }
     plane.ResourceState = D3D12_RESOURCE_STATE_PRESENT;
     D3D12XBOX_PRESENT_PARAMETERS pres{};
 
-    OS_REQUIRE(SUCCEEDED(queue->PresentX(1u, &plane, &pres, nullptr)));
+    OS_REQUIRE(SUCCEEDED(queue->PresentX(1u, &plane, &pres)));
     OS_REQUIRE(SUCCEEDED(OpenScarlettD3D12GetPresentTimingStats(queue.Get(), &out.timing1)));
 
     // Present a 2nd frame to verify monotonic fence value & present counter.
-    OS_REQUIRE(SUCCEEDED(queue->PresentX(1u, &plane, &pres, nullptr)));
+    OS_REQUIRE(SUCCEEDED(queue->PresentX(1u, &plane, &pres)));
     OS_REQUIRE(SUCCEEDED(OpenScarlettD3D12GetPresentTimingStats(queue.Get(), &out.timing2)));
 
     uint32_t w = 0u, h = 0u;
@@ -673,7 +673,7 @@ float4 PSMain(VSOut i) : SV_Target { return i.col; }
     OS_REQUIRE(copied == out.pixels.size());
 
     // Blank present (PlaneCount == 0) timing verification.
-    OS_REQUIRE(SUCCEEDED(queue->PresentX(0u, nullptr, nullptr, nullptr)));
+    OS_REQUIRE(SUCCEEDED(queue->PresentX(0u, nullptr, nullptr)));
     OS_REQUIRE(SUCCEEDED(OpenScarlettD3D12GetPresentTimingStats(queue.Get(), &out.timing_blank)));
 
     OS_REQUIRE(SUCCEEDED(OpenScarlettD3D12GetVulkanRoutingStats(dev.Get(), &out.vk_stats)));
@@ -743,7 +743,6 @@ void Test1_D3D12ToVulkanRoutingParityAndDirectSpirv(bool prefer_warp) {
 
     D3D12XBOX_CREATE_DEVICE_PARAMETERS params{};
     params.Version = 1u;
-    params.PreferWarp = prefer_warp ? 1u : 0u;
 
     ComPtr<ID3D12DeviceX> dev;
     OS_REQUIRE(SUCCEEDED(D3D12XboxCreateDevice(nullptr, &params, IID_ID3D12DeviceX,
@@ -913,7 +912,7 @@ void Test1_D3D12ToVulkanRoutingParityAndDirectSpirv(bool prefer_warp) {
     plane.ppResources = planes;
     plane.ResourceState = D3D12_RESOURCE_STATE_RENDER_TARGET;
     D3D12XBOX_PRESENT_PARAMETERS pres{};
-    OS_REQUIRE(SUCCEEDED(queue->PresentX(1u, &plane, &pres, nullptr)));
+    OS_REQUIRE(SUCCEEDED(queue->PresentX(1u, &plane, &pres)));
 
     std::vector<uint8_t> gfx_px(kRtW * kRtH * 4u, 0u);
     uint32_t copied = 0u;
@@ -972,7 +971,7 @@ void Test1_D3D12ToVulkanRoutingParityAndDirectSpirv(bool prefer_warp) {
     OS_REQUIRE(SUCCEEDED(cl->Close()));
 
     queue->ExecuteCommandLists(1u, lists);
-    OS_REQUIRE(SUCCEEDED(queue->PresentX(1u, &plane, &pres, nullptr)));
+    OS_REQUIRE(SUCCEEDED(queue->PresentX(1u, &plane, &pres)));
     OS_REQUIRE(SUCCEEDED(OpenScarlettD3D12CopyLastPresentPixels(
         queue.Get(), gfx_px.data(), static_cast<uint32_t>(gfx_px.size()), &copied)));
     // Mesh shader outputs pure green (0, 255, 0, 255) at center pixel!

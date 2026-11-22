@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Standalone External Xbox-ABI Binary #2:
+// OpenScarlett MIT Standalone External Xbox-ABI Binary #2:
 // Full 19-DLL Live Stack Verification — written PURELY against GDK/Xbox public headers
 // (ZERO openscarlett/ includes, ZERO openscarlett_core link!).
 //
@@ -185,7 +185,6 @@ bool RunXs2ComputeOnDeviceX(
     OpenScarlettD3D12SetPreferWarp(use_warp ? 1 : 0);
     D3D12XBOX_CREATE_DEVICE_PARAMETERS dp{};
     dp.Version = 1;
-    dp.PreferWarp = use_warp ? 1u : 0u;
 
     ComPtr<ID3D12DeviceX> dev;
     if (FAILED(D3D12XboxCreateDevice(nullptr, &dp, IID_ID3D12DeviceX,
@@ -194,7 +193,7 @@ bool RunXs2ComputeOnDeviceX(
     }
     if (FAILED(dev->GetGpuHardwareInfoX(&out_info))) return false;
     D3D12XBOX_FRAME_PIPELINE_TOKEN tok = 0;
-    if (FAILED(dev->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, &tok)) || tok == 0) {
+    if (FAILED(dev->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, 0u, &tok)) || tok == 0) {
         return false;
     }
 

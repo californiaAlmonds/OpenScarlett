@@ -240,7 +240,6 @@ uint64_t RunClearAndPresentXTest(bool use_warp, bool expect_mesh_shaders) {
 
     D3D12XBOX_CREATE_DEVICE_PARAMETERS dev_params{};
     dev_params.Version = 1;
-    dev_params.PreferWarp = use_warp ? 1u : 0u;
 
     TestComPtr<ID3D12DeviceX> dev;
     HRESULT hr = D3D12XboxCreateDevice(
@@ -257,7 +256,7 @@ uint64_t RunClearAndPresentXTest(bool use_warp, bool expect_mesh_shaders) {
     }
     OS_REQUIRE(SUCCEEDED(dev->SetFrameIntervalX(nullptr, 16667u, 2u, 0u)));
     D3D12XBOX_FRAME_PIPELINE_TOKEN frame_token = 0;
-    OS_REQUIRE(SUCCEEDED(dev->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, &frame_token)));
+    OS_REQUIRE(SUCCEEDED(dev->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, 0u, &frame_token)));
     OS_REQUIRE(frame_token >= 1ull);
     OS_REQUIRE(SUCCEEDED(dev->SuspendX(0u)));
     OS_REQUIRE(SUCCEEDED(dev->ResumeX()));
@@ -411,7 +410,7 @@ uint64_t RunClearAndPresentXTest(bool use_warp, bool expect_mesh_shaders) {
     D3D12XBOX_PRESENT_PARAMETERS pres_params{};
     pres_params.SyncInterval = 1;
 
-    hr = queue->PresentX(1, &plane, &pres_params, nullptr);
+    hr = queue->PresentX(1, &plane, &pres_params);
     OS_REQUIRE(SUCCEEDED(hr));
 
     uint64_t hash = 0;
@@ -536,7 +535,6 @@ float4 PsMain(VertexOut input) : SV_Target0 {
 
     D3D12XBOX_CREATE_DEVICE_PARAMETERS dev_params{};
     dev_params.Version = 1;
-    dev_params.PreferWarp = 0;
 
     TestComPtr<ID3D12DeviceX> dev;
     HRESULT hr = D3D12XboxCreateDevice(
@@ -698,7 +696,7 @@ float4 PsMain(VertexOut input) : SV_Target0 {
     plane.ResourceState = D3D12_RESOURCE_STATE_PRESENT;
     D3D12XBOX_PRESENT_PARAMETERS pres_params{};
     pres_params.SyncInterval = 1;
-    OS_REQUIRE(SUCCEEDED(queue->PresentX(1, &plane, &pres_params, nullptr)));
+    OS_REQUIRE(SUCCEEDED(queue->PresentX(1, &plane, &pres_params)));
 
     uint64_t mesh_hash = 0;
     uint32_t out_w = 0;

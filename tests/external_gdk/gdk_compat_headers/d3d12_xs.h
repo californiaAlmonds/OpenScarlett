@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Xbox Series X|S D3D12X (<d3d12_xs.h>) public COM ABI header.
+// MIT Xbox Series X|S D3D12X (<d3d12_xs.h>) public COM ABI header.
 
 #include <cstdint>
 #include <d3d12.h>
@@ -41,13 +41,13 @@ struct D3D12XBOX_CREATE_DEVICE_PARAMETERS {
     uint32_t GraphicsCommandQueueRingSizeBytes;
     uint32_t GraphicsScratchMemorySizeBytes;
     uint32_t ComputeScratchMemorySizeBytes;
-    uint32_t DisableGeometryShaderAllocations;
-    uint32_t DisableTessellationShaderAllocations;
-    uint32_t DisableDXR;
+    BOOL DisableGeometryShaderAllocations;
+    BOOL DisableTessellationShaderAllocations;
+    BOOL DisableDXR;
     uint32_t CreateDeviceFlags;
     uint32_t AutoAttachPix;
-    HWND OutputWindow;
-    uint32_t PreferWarp;
+    uint32_t AmplificationShaderIndirectArgsBufferSize;
+    uint32_t AmplificationShaderPayloadBufferSize;
 };
 
 struct D3D12XBOX_GPU_HARDWARE_INFO {
@@ -67,7 +67,7 @@ struct D3D12XBOX_PRESENT_PLANE_PARAMETERS {
     D3D12XBOX_FRAME_PIPELINE_TOKEN Token;
     uint32_t ResourceCount;
     ID3D12Resource* const* ppResources;
-    D3D12XBOX_COLOR_SPACE ColorSpace;
+    DXGI_COLOR_SPACE_TYPE ColorSpace;
     D3D12_RECT SourceRect;
     D3D12_RECT DestRect;
     uint32_t Flags;
@@ -88,7 +88,7 @@ inline constexpr GUID IID_ID3D12CommandQueueX = {
 inline constexpr GUID IID_ID3D12GraphicsCommandListX = {
     0x4F534431u, 0x3258u, 0x434Du, {0x4Cu, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x03u}};
 
-struct __declspec(uuid("4F534431-3258-4445-5600-000000000001")) ID3D12DeviceX : public ID3D12Device6 {
+struct __declspec(uuid("4F534431-3258-4445-5600-000000000001")) ID3D12DeviceX : public ID3D12Device8 {
     virtual HRESULT STDMETHODCALLTYPE SetFrameIntervalX(
         IDXGIOutput* pOutput,
         uint32_t PeriodMicroseconds,
@@ -103,6 +103,7 @@ struct __declspec(uuid("4F534431-3258-4445-5600-000000000001")) ID3D12DeviceX : 
         D3D12XBOX_FRAME_EVENT Event,
         uint32_t TimeoutMilliseconds,
         void* pReserved,
+        uint32_t Flags,
         D3D12XBOX_FRAME_PIPELINE_TOKEN* pOutToken) = 0;
     virtual HRESULT STDMETHODCALLTYPE CreatePlacedResourceX(
         D3D12_GPU_VIRTUAL_ADDRESS VirtualAddress,
@@ -120,8 +121,7 @@ struct __declspec(uuid("4F534431-3258-434D-5100-000000000002")) ID3D12CommandQue
     virtual HRESULT STDMETHODCALLTYPE PresentX(
         UINT PlaneCount,
         const D3D12XBOX_PRESENT_PLANE_PARAMETERS* pPlaneParameters,
-        const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters,
-        void* pPresentToken) = 0;
+        const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters) = 0;
     virtual HRESULT STDMETHODCALLTYPE SuspendX(uint32_t Flags) = 0;
     virtual HRESULT STDMETHODCALLTYPE ResumeX() = 0;
 };

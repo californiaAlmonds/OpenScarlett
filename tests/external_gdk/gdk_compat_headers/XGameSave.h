@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Microsoft GDK <XGameSave.h> public C/C++ ABI header.
+// MIT Microsoft GDK <XGameSave.h> public C/C++ ABI header.
 
 #include "XAsync.h"
 #include "XUser.h"

@@ -115,6 +115,20 @@ foreach(_os_module_cmake
     cmake/sprint7_launcher.cmake
     cmake/sprint8_rdna2.cmake
     cmake/sprint9_10_compat.cmake
+    cmake/gdkx_bringup_targets.cmake
+    cmake/sprint11_as_spirv.cmake
+    cmake/sprint11_d3d12_feedback_queries.cmake
+    cmake/sprint11_xvd_loader_lsa.cmake
+    cmake/sprint11_rdna2_gpu_verify.cmake
+    cmake/sprint12_d3d12_aaa.cmake
+    cmake/sprint12_xbox_shader.cmake
+    cmake/sprint12_rayquery.cmake
+    cmake/sprint12_streaming_vram.cmake
+    cmake/sprint12_os_loader.cmake
+    cmake/sprint13_live_xbox_shader.cmake
+    cmake/sprint13_vk_xg_tiled.cmake
+    cmake/sprint13_shader_cfg.cmake
+    cmake/sprint13_gdk_offline.cmake
 )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
         include("${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")

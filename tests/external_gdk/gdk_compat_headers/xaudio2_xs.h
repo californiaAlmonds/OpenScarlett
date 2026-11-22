@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Microsoft XAudio2 2.9 (<xaudio2_xs.h>) public COM ABI header
+// MIT Microsoft XAudio2 2.9 (<xaudio2_xs.h>) public COM ABI header
 // backed by XAudio2_9.dll (PCM16, IEEE Float, XMA2 0x0166, IMA-ADPCM 0x0011/0x0069, Opus 0x704F).
 
 #include <cstddef>

@@ -1,19 +1,24 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "openscarlett/gpu/vulkan_backend.h"
 #include "rdna2_coverage_tool.h"
+#include "openscarlett/kernel/console_lsa_policy.h"
 #include "openscarlett/loader/apc_injector.h"
 #include "openscarlett/loader/game_config.h"
+#include "openscarlett/loader/pe_forwarder.h"
 #include "openscarlett/loader/pe_inspector.h"
 #include "openscarlett/loader/vfs_mounts.h"
+#include "openscarlett/loader/xvd_inspector.h"
 
 #if defined(_WIN32)
 #include <d3d12.h>
@@ -566,11 +571,294 @@ int RunGuestExecutable(int argc, char** argv) {
     return static_cast<int>(res.exit_code);
 }
 
+std::string EscapeJsonMain(std::string_view input) {
+    std::string out;
+    out.reserve(input.size() + 8u);
+    for (char c : input) {
+        switch (c) {
+            case '"': out.append("\\\""); break;
+            case '\\': out.append("\\\\"); break;
+            case '\n': out.append("\\n"); break;
+            case '\r': out.append("\\r"); break;
+            case '\t': out.append("\\t"); break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20u) {
+                    char esc[8]{};
+                    std::snprintf(esc, sizeof(esc), "\\u%04X", static_cast<unsigned char>(c));
+                    out.append(esc);
+                } else {
+                    out.push_back(c);
+                }
+                break;
+        }
+    }
+    return out;
+}
+
+std::string ToLowerAsciiMain(std::string_view s) {
+    std::string out(s);
+    for (char& c : out) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return out;
+}
+
+bool HasXvdExtensionOrMagic(const std::filesystem::path& p) {
+    const std::string ext = ToLowerAsciiMain(p.extension().string());
+    if (ext == ".xvd" || ext == ".xvc") {
+        return true;
+    }
+    std::ifstream ifs(p, std::ios::binary);
+    if (!ifs) {
+        return false;
+    }
+    ifs.seekg(static_cast<std::streamoff>(openscarlett::kXvdMagicOffset), std::ios::beg);
+    char magic[8]{};
+    ifs.read(magic, 8);
+    return ifs.gcount() == 8 && std::memcmp(magic, "msft-xvd", 8) == 0;
+}
+
+int RunProbe(int argc, char** argv) {
+    std::string target_path;
+    bool json_mode = false;
+    for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--json") {
+            json_mode = true;
+        } else if (!arg.empty() && arg[0] == '-') {
+            std::fprintf(stderr, "probe: unknown option: %s\n", arg.c_str());
+            return 1;
+        } else if (target_path.empty()) {
+            target_path = arg;
+        } else {
+            std::fprintf(stderr, "probe: unexpected argument: %s\n", arg.c_str());
+            return 1;
+        }
+    }
+    if (target_path.empty()) {
+        std::fprintf(stderr, "probe: missing target path (<exe|dir|xvd>)\n");
+        return 1;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path input_p(target_path);
+    if (!std::filesystem::exists(input_p, ec)) {
+        std::fprintf(stderr, "probe: target does not exist: %s\n", target_path.c_str());
+        return 1;
+    }
+
+    // Case 1: Direct .xvd / .xvc container file (12 KiB header geometry inspection).
+    if (std::filesystem::is_regular_file(input_p, ec) && HasXvdExtensionOrMagic(input_p)) {
+        openscarlett::XvdInspectionReport xvd{};
+        const auto st = openscarlett::InspectXvdFile(target_path, xvd);
+        if (!st.ok()) {
+            std::fprintf(stderr, "probe: XVD inspection failed: %s\n", st.message.c_str());
+            return 1;
+        }
+        if (json_mode) {
+            std::ostringstream oss;
+            oss << "{\n"
+                << "  \"probe_kind\": \"xvd\",\n"
+                << "  \"target\": \"" << EscapeJsonMain(target_path) << "\",\n"
+                << "  \"ready_to_launch\": " << (xvd.can_inspect_filesystem_directly ? "true" : "false") << ",\n"
+                << "  \"xvd\": " << openscarlett::FormatXvdInspectionJson(xvd) << "\n"
+                << "}\n";
+            std::fputs(oss.str().c_str(), stdout);
+        } else {
+            std::printf("=== OpenScarlett Preflight Compatibility Probe (XVD/XVC) ===\n");
+            std::fputs(openscarlett::FormatXvdInspectionText(xvd).c_str(), stdout);
+        }
+        return 0;
+    }
+
+    // Case 2: Executable, MicrosoftGame.Config/.mgc, or unpacked game directory.
+    openscarlett::ResolvedPackageTarget pkg_target{};
+    std::string exe_path;
+    std::string package_root;
+    std::vector<openscarlett::XvdInspectionReport> dir_xvds;
+
+    if (openscarlett::ResolvePackageLaunchTarget(target_path, pkg_target).ok() &&
+        !pkg_target.exe_path.empty()) {
+        exe_path = pkg_target.exe_path;
+        package_root = pkg_target.package_root;
+    } else if (std::filesystem::is_directory(input_p, ec)) {
+        package_root = std::filesystem::absolute(input_p, ec).string();
+        std::vector<std::filesystem::path> found_exes;
+        std::vector<std::filesystem::path> found_xvds;
+        for (const auto& entry : std::filesystem::directory_iterator(input_p, ec)) {
+            if (!entry.is_regular_file(ec)) continue;
+            const std::string ext = ToLowerAsciiMain(entry.path().extension().string());
+            if (ext == ".exe") {
+                found_exes.push_back(entry.path());
+            } else if (ext == ".xvd" || ext == ".xvc") {
+                found_xvds.push_back(entry.path());
+            }
+        }
+        std::sort(found_exes.begin(), found_exes.end());
+        std::sort(found_xvds.begin(), found_xvds.end());
+        if (!found_exes.empty()) {
+            exe_path = found_exes.front().string();
+        } else if (!found_xvds.empty()) {
+            openscarlett::XvdInspectionReport xvd{};
+            const auto st = openscarlett::InspectXvdFile(found_xvds.front().string(), xvd);
+            if (!st.ok()) {
+                std::fprintf(stderr, "probe: XVD inspection failed: %s\n", st.message.c_str());
+                return 1;
+            }
+            if (json_mode) {
+                std::ostringstream oss;
+                oss << "{\n"
+                    << "  \"probe_kind\": \"xvd\",\n"
+                    << "  \"target\": \"" << EscapeJsonMain(found_xvds.front().string()) << "\",\n"
+                    << "  \"ready_to_launch\": " << (xvd.can_inspect_filesystem_directly ? "true" : "false") << ",\n"
+                    << "  \"xvd\": " << openscarlett::FormatXvdInspectionJson(xvd) << "\n"
+                    << "}\n";
+                std::fputs(oss.str().c_str(), stdout);
+            } else {
+                std::printf("=== OpenScarlett Preflight Compatibility Probe (XVD/XVC) ===\n");
+                std::fputs(openscarlett::FormatXvdInspectionText(xvd).c_str(), stdout);
+            }
+            return 0;
+        }
+    } else if (std::filesystem::is_regular_file(input_p, ec)) {
+        exe_path = std::filesystem::absolute(input_p, ec).string();
+        package_root = std::filesystem::path(exe_path).parent_path().string();
+    }
+
+    if (exe_path.empty()) {
+        std::fprintf(stderr, "probe: no PE32+ executable or XVD/XVC container found at: %s\n",
+                     target_path.c_str());
+        return 1;
+    }
+
+    openscarlett::PeInspectionReport pe_rep{};
+    const auto pe_st = openscarlett::InspectPeFile(exe_path, pe_rep);
+    if (!pe_st.ok()) {
+        std::fprintf(stderr, "probe: PE inspection failed for %s: %s\n",
+                     exe_path.c_str(), pe_st.message.c_str());
+        return 1;
+    }
+
+    openscarlett::ConsoleLsaPolicy lsa_policy;
+    bool has_lsa_config = false;
+    if (pkg_target.has_config && !pkg_target.config_path.empty()) {
+        if (lsa_policy.LoadFromMicrosoftGameConfigFile(pkg_target.config_path).ok()) {
+            has_lsa_config = true;
+        } else {
+            lsa_policy.ApplyGameConfig(pkg_target.config);
+            has_lsa_config = true;
+        }
+    }
+
+    openscarlett::PeForwarderResolver resolver(openscarlett::DllRoutingTable::CreateWithEnvOverrides());
+    auto register_local_dlls_and_xvds = [&](const std::string& dir_str) {
+        if (dir_str.empty()) return;
+        std::error_code lec;
+        const std::filesystem::path dir_p(dir_str);
+        if (!std::filesystem::is_directory(dir_p, lec)) return;
+        for (const auto& entry : std::filesystem::directory_iterator(dir_p, lec)) {
+            if (!entry.is_regular_file(lec)) continue;
+            const std::string ext = ToLowerAsciiMain(entry.path().extension().string());
+            if (ext == ".dll") {
+                resolver.RegisterNativeGuestDll(entry.path().filename().string());
+            } else if (ext == ".xvd" || ext == ".xvc") {
+                openscarlett::XvdInspectionReport xvd{};
+                if (openscarlett::InspectXvdFile(entry.path().string(), xvd).ok()) {
+                    dir_xvds.push_back(std::move(xvd));
+                }
+            }
+        }
+    };
+    register_local_dlls_and_xvds(package_root);
+    const std::string exe_dir = std::filesystem::path(exe_path).parent_path().string();
+    if (!exe_dir.empty() && exe_dir != package_root) {
+        register_local_dlls_and_xvds(exe_dir);
+    }
+
+    const openscarlett::PeForwarderPreflightReport preflight = resolver.BuildPreflightReport(pe_rep);
+    const uint32_t missing_imports =
+        preflight.unresolved_count + preflight.cycle_error_count + preflight.malformed_error_count;
+    const openscarlett::ConsolePackageIdentity pkg_id = lsa_policy.GetPackageIdentity();
+
+    if (json_mode) {
+        std::ostringstream oss;
+        oss << "{\n"
+            << "  \"probe_kind\": \"" << (pkg_target.has_config ? "package" : "pe") << "\",\n"
+            << "  \"target\": \"" << EscapeJsonMain(target_path) << "\",\n"
+            << "  \"exe_path\": \"" << EscapeJsonMain(exe_path) << "\",\n"
+            << "  \"package_root\": \"" << EscapeJsonMain(package_root) << "\",\n"
+            << "  \"has_game_config\": " << (pkg_target.has_config ? "true" : "false") << ",\n"
+            << "  \"config_path\": \"" << EscapeJsonMain(pkg_target.config_path) << "\",\n";
+        if (has_lsa_config) {
+            oss << "  \"game_config\": {\n"
+                << "    \"identity_name\": \"" << EscapeJsonMain(pkg_id.package_name) << "\",\n"
+                << "    \"version\": \"" << EscapeJsonMain(pkg_id.version) << "\",\n"
+                << "    \"display_name\": \"" << EscapeJsonMain(pkg_id.display_name) << "\",\n"
+                << "    \"title_id\": \"" << EscapeJsonMain(pkg_id.title_id_hex) << "\",\n"
+                << "    \"package_family_name\": \"" << EscapeJsonMain(pkg_id.package_family_name) << "\",\n"
+                << "    \"store_id\": \"" << EscapeJsonMain(pkg_id.store_id) << "\",\n"
+                << "    \"sandbox_id\": \"" << EscapeJsonMain(pkg_id.sandbox_id) << "\"\n"
+                << "  },\n";
+        }
+        oss << "  \"summary\": {\n"
+            << "    \"total_imports\": " << preflight.total_entries << ",\n"
+            << "    \"shimmed_imports\": " << preflight.openscarlett_shim_count << ",\n"
+            << "    \"windows_system_imports\": " << preflight.windows_system_count << ",\n"
+            << "    \"apiset_redirected_imports\": " << preflight.apiset_redirected_count << ",\n"
+            << "    \"native_guest_imports\": " << preflight.native_guest_count << ",\n"
+            << "    \"missing_imports\": " << missing_imports << ",\n"
+            << "    \"ready_to_launch\": " << (preflight.ready_to_launch ? "true" : "false") << "\n"
+            << "  },\n"
+            << "  \"forwarder_preflight\": " << openscarlett::FormatPeForwarderPreflightJson(preflight) << ",\n"
+            << "  \"xvd_containers\": [";
+        for (size_t i = 0; i < dir_xvds.size(); ++i) {
+            if (i > 0) oss << ",";
+            oss << "\n" << openscarlett::FormatXvdInspectionJson(dir_xvds[i]);
+        }
+        oss << "]\n"
+            << "}\n";
+        std::fputs(oss.str().c_str(), stdout);
+    } else {
+        std::printf("=== OpenScarlett Preflight Compatibility Probe ===\n");
+        std::printf("Target       : %s\n", target_path.c_str());
+        std::printf("Executable   : %s (PE32+ x64 %s, %u sections)\n",
+                    exe_path.c_str(), pe_rep.is_dll ? "DLL" : "EXE", pe_rep.section_count);
+        if (pkg_target.has_config) {
+            std::printf("Game Config  : %s\n", pkg_target.config_path.c_str());
+            std::printf("Title        : %s | TitleId=%s | PFN=%s | Sandbox=%s\n",
+                        pkg_id.display_name.empty() ? pkg_id.package_name.c_str() : pkg_id.display_name.c_str(),
+                        pkg_id.title_id_hex.c_str(),
+                        pkg_id.package_family_name.c_str(),
+                        pkg_id.sandbox_id.c_str());
+        }
+        std::printf("Summary      : total=%u | shimmed=%u | windows=%u | apiset=%u | guest_dll=%u | missing=%u | ready=%s\n",
+                    preflight.total_entries,
+                    preflight.openscarlett_shim_count,
+                    preflight.windows_system_count,
+                    preflight.apiset_redirected_count,
+                    preflight.native_guest_count,
+                    missing_imports,
+                    preflight.ready_to_launch ? "YES" : "NO");
+        std::fputs(openscarlett::FormatPeForwarderPreflightText(preflight).c_str(), stdout);
+        if (!dir_xvds.empty()) {
+            std::printf("XVD Containers Found: %zu\n", dir_xvds.size());
+            for (const auto& xvd : dir_xvds) {
+                std::fputs(openscarlett::FormatXvdInspectionText(xvd).c_str(), stdout);
+            }
+        }
+    }
+    return 0;
+}
+
 void PrintUsage() {
     std::printf(
-        "OpenScarlett - Clean-room Xbox Series X|S (Scarlett) translation layer for Windows x64\n"
+        "OpenScarlett - Xbox Series X|S (Scarlett) translation layer for Windows x64\n"
         "Usage:\n"
         "  openscarlett probe-gpu               Probe host D3D12, Vulkan, and DXC capabilities\n"
+        "  openscarlett probe <exe|dir|xvd> [--json]\n"
+        "                                       Preflight compatibility report (PE imports, forwarders, config, XVD)\n"
         "  openscarlett inspect <exe_or_dll>    Inspect PE32+ x64 imports, exports, TLS & .pdata\n"
         "  openscarlett rdna2-bench [options]   Audit 779 GFX10.3 opcodes & validate 3,000+ shader corpus\n"
         "      --full | --fast                  Run full 3,120-shader corpus or fast 240-shader sweep\n"
@@ -598,6 +886,7 @@ int main(int argc, char** argv) {
     }
     std::string cmd = argv[1];
     if (cmd == "probe-gpu") return RunProbeGpu();
+    if (cmd == "probe") return RunProbe(argc, argv);
     if (cmd == "inspect" && argc >= 3) return RunInspect(argv[2]);
     if (cmd == "rdna2-bench") return openscarlett::RunRdna2BenchCli(argc, argv);
     if (cmd == "run") return RunGuestExecutable(argc, argv);

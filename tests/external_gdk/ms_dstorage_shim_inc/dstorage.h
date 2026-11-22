@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT adapter header enabling untouched MIT Microsoft Xbox-GDK-Samples
+// MIT adapter header enabling untouched MIT Microsoft Xbox-GDK-Samples
 // SimpleDirectStorageCombo/SampleImplementations/*.cpp to link directly against dstorage_xs.dll.
 
 #include <dstorage_xs.h>

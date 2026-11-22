@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Microsoft DirectStorage for Xbox (<dstorage_xs.h>) public COM ABI header.
+// MIT Microsoft DirectStorage for Xbox (<dstorage_xs.h>) public COM ABI header.
 // Binary-compatible with dstorage_xs.dll and Microsoft::WRL::ComPtr / __uuidof().
 
 #include <cstddef>

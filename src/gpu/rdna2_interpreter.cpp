@@ -188,7 +188,7 @@ uint16_t CvtUnorm16F32(float x) noexcept {
 uint32_t EvalSBfeU32(uint32_t src0, uint32_t src1) noexcept {
     const uint32_t off = src1 & 31u;
     const uint32_t wid = (src1 >> 16) & 0x7Fu;
-    if (wid == 0u) return 0u;
+    if (wid == 0u || off >= 32u) return 0u;
     if (off + wid < 32u) return (src0 >> off) & ((1u << wid) - 1u);
     return src0 >> off;
 }
@@ -197,6 +197,7 @@ uint32_t EvalSBfeI32(uint32_t src0, uint32_t src1) noexcept {
     const uint32_t off = src1 & 31u;
     const uint32_t wid = (src1 >> 16) & 0x7Fu;
     if (wid == 0u) return 0u;
+    if (off >= 32u) return static_cast<uint32_t>(static_cast<int32_t>(src0) >> 31);
     if (off + wid < 32u) {
         return static_cast<uint32_t>(static_cast<int32_t>(src0 << (32u - off - wid)) >> (32u - wid));
     }
@@ -679,7 +680,7 @@ uint32_t Rdna2CpuTexture::AtomicCmpSwapR32u(
 }
 
 // ---------------------------------------------------------------------------
-// Clean-Room CPU RDNA2 Wave32 / Wave64 Interpreter
+// CPU RDNA2 Wave32 / Wave64 Interpreter
 // ---------------------------------------------------------------------------
 Status ExecuteRdna2Cpu(
     const Xs2ShaderContainer& container,
@@ -1947,11 +1948,12 @@ Status ExecuteRdna2Cpu(
                                         if (is_d16) {
                                             const uint32_t nregs = (comps + 1u) / 2u;
                                             for (uint32_t r = 0; r < nregs; ++r) {
+                                                const uint8_t dst_reg = static_cast<uint8_t>(dst_b + r);
                                                 const uint32_t lo = DecodeFormatComponentCpu(buf, addr, fmt, r * 2u, true) & 0xFFFFu;
                                                 const uint32_t hi = (r * 2u + 1u < comps)
                                                                         ? (DecodeFormatComponentCpu(buf, addr, fmt, r * 2u + 1u, true) & 0xFFFFu)
-                                                                        : 0u;
-                                                wv.vgpr[l][static_cast<uint8_t>(dst_b + r)] = lo | (hi << 16);
+                                                                        : ((wv.vgpr[l][dst_reg] >> 16u) & 0xFFFFu);
+                                                wv.vgpr[l][dst_reg] = lo | (hi << 16);
                                             }
                                         } else {
                                             for (uint32_t c = 0; c < comps; ++c) {

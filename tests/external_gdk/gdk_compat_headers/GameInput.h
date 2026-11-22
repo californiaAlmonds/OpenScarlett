@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Microsoft GameInput (<GameInput.h>) public COM ABI header.
+// MIT Microsoft GameInput (<GameInput.h>) public COM ABI header.
 
 #include <cstddef>
 #include <cstdint>

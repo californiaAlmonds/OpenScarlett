@@ -40,7 +40,7 @@ enum class D3D12XProxyKind : uint32_t {
     StateObject = 10u,
 };
 
-// Clean-room OpenScarlett COM IIDs for Xbox D3D12X child object proxies & diagnostics.
+// OpenScarlett COM IIDs for Xbox D3D12X child object proxies & diagnostics.
 // {4F534431-3258-5052-5800-000000000010}
 inline constexpr GUID IID_IOpenScarlettProxyInspect = {
     0x4F534431u, 0x3258u, 0x5052u, {0x58u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x10u}};

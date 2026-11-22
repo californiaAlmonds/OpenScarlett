@@ -29,6 +29,7 @@ struct FrameBufferRgba8 {
 
     uint64_t ComputeFnv1aHash() const noexcept;
     Status WritePpm(const std::string& file_path) const;
+    Status WritePng(const std::string& file_path) const;
 };
 
 }  // namespace openscarlett

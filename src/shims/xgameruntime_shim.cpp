@@ -1,6 +1,8 @@
 #define OPENSCARLETT_BUILDING_XGAMERUNTIME 1
 #include "openscarlett/gdk/xgameruntime_abi.h"
 #include "openscarlett/core/telemetry.h"
+#include "openscarlett/kernel/console_lsa_policy.h"
+#include "openscarlett/kernel/plm_notifications.h"
 
 #include <algorithm>
 #include <atomic>
@@ -75,6 +77,62 @@ std::string GetEnvString(const char* name) {
     const char* v = std::getenv(name);
     return v ? std::string(v) : std::string{};
 #endif
+}
+
+// Canonical GDK E_GAMEUSER_NO_TOKEN_REQUIRED (0x89245105) returned by default when
+// offline-first token policy is active so real titles immediately take offline paths
+// instead of hanging on online Xbox Live auth handshakes.
+constexpr XGameResult kHrGameUserNoTokenRequired = static_cast<XGameResult>(0x89245105u);
+
+// Valid Microsoft GDK XErrorOptions 3-bit flag mask:
+//   0x00 = XErrorOptions_None
+//   0x01 = XErrorOptions_OutputDebugStringOnError
+//   0x02 = XErrorOptions_DebugBreakOnError
+//   0x04 = XErrorOptions_FailFastOnError
+constexpr uint32_t kValidXErrorOptionsMask =
+    static_cast<uint32_t>(XErrorOptions_OutputDebugStringOnError) |
+    static_cast<uint32_t>(XErrorOptions_DebugBreakOnError) |
+    static_cast<uint32_t>(XErrorOptions_FailFastOnError);
+
+bool IsMockXstsEnabled() {
+    std::string v = GetEnvString("OPENSCARLETT_MOCK_XSTS");
+    if (v.empty()) {
+        return false;
+    }
+    std::transform(v.begin(), v.end(), v.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return v == "1" || v == "true" || v == "yes" || v == "on";
+}
+
+bool HasDialogButtonText(const char* text) noexcept {
+    return text != nullptr && text[0] != '\0';
+}
+
+bool IsDialogButtonIndexValid(
+    uint32_t button_index,
+    const char* first_text,
+    const char* second_text,
+    const char* third_text) noexcept {
+    switch (button_index) {
+        case 0u:
+            return HasDialogButtonText(first_text);
+        case 1u:
+            return HasDialogButtonText(second_text);
+        case 2u:
+            return HasDialogButtonText(third_text);
+        default:
+            return false;
+    }
+}
+
+bool ValidateMessageDialogButtons(
+    uint32_t default_button,
+    uint32_t cancel_button,
+    const char* first_text,
+    const char* second_text,
+    const char* third_text) noexcept {
+    return IsDialogButtonIndexValid(default_button, first_text, second_text, third_text) &&
+           IsDialogButtonIndexValid(cancel_button, first_text, second_text, third_text);
 }
 
 fs::path ResolveSaveRoot() {
@@ -270,12 +328,15 @@ struct MonitorEntry {
 struct WaiterEntry {
     uint64_t token = 0;
     XTaskQueueHandle queue = nullptr;
+    std::weak_ptr<XTaskQueueObject> queue_weak;
     XTaskQueuePort port = XTaskQueuePort_Work;
     XTaskQueueCallback callback = nullptr;
     void* context = nullptr;
     std::atomic<bool> active{true};
 #if defined(_WIN32)
-    HANDLE reg_wait_handle = nullptr;
+    std::mutex wait_mutex;
+    HANDLE wait_handle = nullptr;
+    PTP_WAIT tp_wait = nullptr;
 #endif
 };
 
@@ -314,24 +375,125 @@ struct XTaskQueueObject {
     std::vector<std::shared_ptr<WaiterEntry>> retired_waiters;
 
     std::mutex terminate_mutex;
-    bool terminated = false;
+    std::atomic<bool> terminated{false};
+    XTaskQueueTerminatedCallback terminated_cb = nullptr;
+    void* terminated_ctx = nullptr;
+    bool terminated_cb_fired = false;
 };
 
 namespace {
 
-thread_local bool g_in_waiter_bridge_cb = false;
+struct WaiterDispatchCtx {
+    std::shared_ptr<WaiterEntry> entry;
+};
 
 #if defined(_WIN32)
-void CALLBACK WaiterBridgeCallback(PVOID param, BOOLEAN /*timed_out*/) {
-    auto* entry = static_cast<WaiterEntry*>(param);
-    if (!entry || !entry->active.load(std::memory_order_acquire)) {
+thread_local PTP_WAIT g_current_tp_wait = nullptr;
+
+void OPENSCARLETT_GDK_CALL WaiterDispatchTrampoline(void* context, bool canceled) {
+    std::unique_ptr<WaiterDispatchCtx> holder(static_cast<WaiterDispatchCtx*>(context));
+    auto entry = holder->entry;
+    if (!entry) {
         return;
     }
-    g_in_waiter_bridge_cb = true;
-    (void)XTaskQueueSubmitCallback(entry->queue, entry->port, entry->context, entry->callback);
-    g_in_waiter_bridge_cb = false;
+
+    const bool still_active = entry->active.load(std::memory_order_acquire);
+    if (entry->callback && (canceled || still_active)) {
+        entry->callback(entry->context, canceled);
+    }
+
+    // Re-arm the one-shot threadpool wait AFTER the user callback finishes so both
+    // auto-reset and manual-reset events fire cleanly on every signal without spin storms
+    // or lost wakeups, until unregistered or queue termination.
+    if (!canceled && entry->active.load(std::memory_order_acquire)) {
+        auto q = entry->queue_weak.lock();
+        if (q && !q->terminated.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lk(entry->wait_mutex);
+            if (entry->active.load(std::memory_order_acquire) &&
+                entry->tp_wait != nullptr &&
+                entry->wait_handle != nullptr &&
+                !q->terminated.load(std::memory_order_acquire)) {
+                SetThreadpoolWait(entry->tp_wait, entry->wait_handle, nullptr);
+            }
+        }
+    }
+}
+
+void CALLBACK WaiterTpCallback(
+    PTP_CALLBACK_INSTANCE /*instance*/,
+    PVOID param,
+    PTP_WAIT wait,
+    TP_WAIT_RESULT /*wait_result*/) {
+    auto* raw_entry = static_cast<WaiterEntry*>(param);
+    if (!raw_entry || !raw_entry->active.load(std::memory_order_acquire)) {
+        return;
+    }
+    auto q = raw_entry->queue_weak.lock();
+    if (!q || q->terminated.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    std::shared_ptr<WaiterEntry> pinned;
+    {
+        std::lock_guard<std::mutex> lk(q->waiter_mutex);
+        for (const auto& w : q->waiters) {
+            if (w.get() == raw_entry) {
+                pinned = w;
+                break;
+            }
+        }
+    }
+    if (!pinned || !pinned->active.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    auto* dctx = new (std::nothrow) WaiterDispatchCtx{pinned};
+    if (!dctx) {
+        return;
+    }
+
+    PTP_WAIT prev_tp = g_current_tp_wait;
+    g_current_tp_wait = wait;
+    const XGameResult hr = XTaskQueueSubmitCallback(
+        pinned->queue, pinned->port, dctx, &WaiterDispatchTrampoline);
+    g_current_tp_wait = prev_tp;
+    if (hr < 0) {
+        delete dctx;
+    }
 }
 #endif
+
+void DisarmAndCloseWaiter(std::shared_ptr<WaiterEntry> w, XTaskQueueObject* obj) {
+    if (!w) {
+        return;
+    }
+    w->active.store(false, std::memory_order_release);
+#if defined(_WIN32)
+    PTP_WAIT tp = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(w->wait_mutex);
+        tp = w->tp_wait;
+        w->tp_wait = nullptr;
+        if (tp) {
+            SetThreadpoolWait(tp, nullptr, nullptr);
+        }
+    }
+    if (tp) {
+        if (g_current_tp_wait == tp) {
+            if (obj) {
+                std::lock_guard<std::mutex> lk(obj->waiter_mutex);
+                obj->retired_waiters.push_back(std::move(w));
+            }
+            CloseThreadpoolWait(tp);
+        } else {
+            WaitForThreadpoolWaitCallbacks(tp, TRUE);
+            CloseThreadpoolWait(tp);
+        }
+    }
+#else
+    (void)obj;
+#endif
+}
 
 size_t FindEarliestItemIndexLocked(const PortState& port) {
     size_t best = 0;
@@ -435,36 +597,73 @@ void ShutdownQueueWaiters(XTaskQueueObject* queue) {
         active_waiters.swap(queue->waiters);
     }
     for (auto& w : active_waiters) {
-        w->active.store(false, std::memory_order_release);
-#if defined(_WIN32)
-        if (w->reg_wait_handle) {
-            HANDLE h = w->reg_wait_handle;
-            w->reg_wait_handle = nullptr;
-            UnregisterWaitEx(h, g_in_waiter_bridge_cb ? nullptr : INVALID_HANDLE_VALUE);
-        }
-#endif
+        DisarmAndCloseWaiter(std::move(w), queue);
     }
 }
 
-void ShutdownQueueInternal(XTaskQueueObject* queue, bool wait_for_completion) {
-    if (!queue) return;
-
-    ShutdownQueueWaiters(queue);
-
-    // Drain manual/immediate pending callbacks as canceled and wake owned worker ports.
-    std::vector<ScheduledCallback> manual_canceled;
+bool HasPendingManualPortItems(const XTaskQueueObject* queue) {
+    if (!queue) return false;
     for (uint32_t p = 0; p < 2; ++p) {
         if (!queue->owns_port[p] || !queue->ports[p]) {
             continue;
         }
         PortState& port = *queue->ports[p];
         std::lock_guard<std::mutex> lk(port.mutex);
-        port.terminating = true;
-        if (port.workers.empty()) {
-            while (!port.items.empty()) {
-                const size_t idx = FindEarliestItemIndexLocked(port);
-                manual_canceled.push_back(port.items[idx]);
-                port.items.erase(port.items.begin() + static_cast<std::ptrdiff_t>(idx));
+        if (port.workers.empty() && (!port.items.empty() || port.active_callbacks > 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void TryFireDeferredTerminatedCallback(XTaskQueueObject* queue) {
+    if (!queue || !queue->terminated.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (HasPendingManualPortItems(queue)) {
+        return;
+    }
+    XTaskQueueTerminatedCallback cb = nullptr;
+    void* ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(queue->terminate_mutex);
+        if (!queue->terminated_cb_fired && queue->terminated_cb != nullptr) {
+            queue->terminated_cb_fired = true;
+            cb = queue->terminated_cb;
+            ctx = queue->terminated_ctx;
+            queue->terminated_cb = nullptr;
+            queue->terminated_ctx = nullptr;
+        }
+    }
+    if (cb) {
+        cb(ctx);
+    }
+}
+
+void ShutdownQueueInternal(XTaskQueueObject* queue, bool wait_for_completion) {
+    if (!queue) return;
+
+    queue->terminated.store(true, std::memory_order_release);
+    ShutdownQueueWaiters(queue);
+
+    // When wait_for_completion is true (or during final handle destruction), synchronously
+    // drain pending manual items as canceled. When wait_for_completion is false, leave
+    // manual items queued so XTaskQueueDispatch drains them cleanly before returning false!
+    std::vector<ScheduledCallback> manual_canceled;
+    for (uint32_t p = 0; p < 2; ++p) {
+        if (!queue->ports[p]) {
+            continue;
+        }
+        PortState& port = *queue->ports[p];
+        std::lock_guard<std::mutex> lk(port.mutex);
+        if (queue->owns_port[p]) {
+            port.terminating = true;
+            if (wait_for_completion && port.workers.empty()) {
+                while (!port.items.empty()) {
+                    const size_t idx = FindEarliestItemIndexLocked(port);
+                    manual_canceled.push_back(port.items[idx]);
+                    port.items.erase(port.items.begin() + static_cast<std::ptrdiff_t>(idx));
+                }
             }
         }
         port.cv.notify_all();
@@ -500,6 +699,8 @@ void ShutdownQueueInternal(XTaskQueueObject* queue, bool wait_for_completion) {
             }
         }
     }
+
+    TryFireDeferredTerminatedCallback(queue);
 }
 
 // ===========================================================================
@@ -658,6 +859,13 @@ enum RegFamily : uint32_t {
 
 thread_local bool g_thread_time_sensitive = false;
 
+struct UserChangeListenerEntry {
+    uint64_t token = 0;
+    XTaskQueueHandle queue = nullptr;
+    void* context = nullptr;
+    XUserChangeEventCallback callback = nullptr;
+};
+
 struct RuntimeState {
     std::mutex mutex;
     std::atomic<int32_t> init_count{0};
@@ -717,6 +925,7 @@ struct RuntimeState {
     std::mutex reg_mutex;
     uint64_t next_reg_token = 1;
     std::unordered_map<uint64_t, uint32_t> live_reg_tokens;
+    std::vector<UserChangeListenerEntry> user_change_listeners;
 
     // XSystem handle registry (XSystemHandleTrack / XSystemIsHandleValid)
     std::mutex handle_mutex;
@@ -1230,7 +1439,7 @@ void AppendPngChunk(std::vector<uint8_t>& out, const char type[4], const std::ve
     AppendBe32(out, crc);
 }
 
-std::vector<uint8_t> BuildCleanRoomGamerPicPng(uint32_t dim) {
+std::vector<uint8_t> BuildDefaultGamerPicPng(uint32_t dim) {
     // Uncompressed zlib-stored RGBA PNG (100% valid RFC 2083 + RFC 1950).
     std::vector<uint8_t> png = {0x89u, 'P', 'N', 'G', 0x0Du, 0x0Au, 0x1Au, 0x0Au};
     std::vector<uint8_t> ihdr;
@@ -1297,7 +1506,7 @@ XGameResult OPENSCARLETT_GDK_CALL UserGamerPicProvider(
             if (ctx->size_enum == XUserGamerPictureSize_Small) dim = 4u;
             else if (ctx->size_enum == XUserGamerPictureSize_Large) dim = 16u;
             else if (ctx->size_enum == XUserGamerPictureSize_ExtraLarge) dim = 16u;
-            ctx->png_bytes = BuildCleanRoomGamerPicPng(dim);
+            ctx->png_bytes = BuildDefaultGamerPicPng(dim);
             XAsyncComplete(data->async, XGR_S_OK, ctx->png_bytes.size());
             return XGR_E_PENDING;
         }
@@ -1511,10 +1720,15 @@ bool ReleaseRegToken(uint32_t family, XTaskQueueRegistrationToken token) {
 
 std::string CurrentPackageIdentifier() {
     std::string pkg_id = GetEnvString("OPENSCARLETT_PACKAGE_ID");
-    if (pkg_id.empty()) {
-        pkg_id = "OpenScarlett.Title_1.0.0.0_x64__openscarlett0";
+    if (!pkg_id.empty()) {
+        return pkg_id;
     }
-    return pkg_id;
+    const auto lsa_pkg = openscarlett::ConsoleLsaPolicy::Global().GetPackageIdentity();
+    if (!lsa_pkg.package_full_name.empty() &&
+        lsa_pkg.package_name != "OpenScarlett.DefaultTitle") {
+        return lsa_pkg.package_full_name;
+    }
+    return "OpenScarlett.Title_1.0.0.0_x64__openscarlett0";
 }
 
 std::string CurrentPackageMountPath() {
@@ -1722,6 +1936,236 @@ GameConfigMetadata LoadGameConfigMetadata() {
     return meta;
 }
 
+void SyncConsoleLsaPolicyFromConfig() {
+    fs::path cfg_path;
+    std::error_code ec;
+
+    const std::string env_cfg = TrimAscii(GetEnvString("OPENSCARLETT_GAME_CONFIG"));
+    if (!env_cfg.empty()) {
+        const fs::path p(env_cfg);
+        if (fs::is_regular_file(p, ec)) {
+            cfg_path = p;
+        } else {
+            ec.clear();
+            if (fs::is_directory(p, ec)) {
+                (void)TryFindGameConfigInDir(p, cfg_path);
+            }
+        }
+    }
+    if (cfg_path.empty()) {
+        const fs::path cwd = fs::current_path(ec);
+        if (!ec && !cwd.empty()) {
+            (void)TryFindGameConfigInDir(cwd, cfg_path);
+        }
+    }
+#if defined(_WIN32)
+    if (cfg_path.empty()) {
+        wchar_t exe_buf[MAX_PATH]{};
+        const DWORD len = ::GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
+        if (len > 0 && len < MAX_PATH) {
+            fs::path cur = fs::path(exe_buf).parent_path();
+            for (int depth = 0; depth < 3 && !cur.empty(); ++depth) {
+                if (TryFindGameConfigInDir(cur, cfg_path)) {
+                    break;
+                }
+                const fs::path parent = cur.parent_path();
+                if (parent == cur) break;
+                cur = parent;
+            }
+        }
+    }
+#endif
+
+    auto& lsa = openscarlett::ConsoleLsaPolicy::Global();
+    if (!cfg_path.empty()) {
+        (void)lsa.LoadFromMicrosoftGameConfigFile(cfg_path.string());
+    }
+    const std::string env_sandbox = TrimAscii(GetEnvString("OPENSCARLETT_SANDBOX_ID"));
+    if (!env_sandbox.empty()) {
+        lsa.SetSandboxId(env_sandbox);
+    }
+    const std::string env_store = TrimAscii(GetEnvString("OPENSCARLETT_STORE_ID"));
+    if (!env_store.empty()) {
+        lsa.SetStoreId(env_store);
+    }
+    const std::string env_content = TrimAscii(GetEnvString("OPENSCARLETT_CONTENT_ID"));
+    if (!env_content.empty()) {
+        lsa.SetContentId(env_content);
+    }
+    const std::string env_tid = TrimAscii(GetEnvString("OPENSCARLETT_TITLE_ID"));
+    if (!env_tid.empty() && env_tid[0] != '-') {
+        char* end_ptr = nullptr;
+        errno = 0;
+        const unsigned long long parsed = std::strtoull(env_tid.c_str(), &end_ptr, 16);
+        if (errno == 0 && end_ptr && *end_ptr == '\0' && parsed <= 0xFFFFFFFFULL) {
+            lsa.SetTitleId(static_cast<uint32_t>(parsed));
+        }
+    }
+}
+
+std::string ToLowerAsciiStr(std::string_view s) {
+    std::string out(s);
+    for (char& c : out) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return out;
+}
+
+std::vector<std::string> SplitDelimitedTokens(std::string_view input, char delim) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    while (pos <= input.size()) {
+        size_t sep = input.find(delim, pos);
+        if (sep == std::string_view::npos) {
+            sep = input.size();
+        }
+        std::string tok = TrimAscii(std::string(input.substr(pos, sep - pos)));
+        if (!tok.empty()) {
+            out.push_back(std::move(tok));
+        }
+        if (sep == input.size()) {
+            break;
+        }
+        pos = sep + 1;
+    }
+    return out;
+}
+
+std::vector<std::string> ActiveInstalledLanguagesLower() {
+    std::vector<std::string> langs;
+    const std::string env_langs = GetEnvString("OPENSCARLETT_INSTALLED_LANGUAGES");
+    if (!env_langs.empty()) {
+        std::string normalized = env_langs;
+        for (char& c : normalized) {
+            if (c == ',') c = ';';
+        }
+        for (const auto& tok : SplitDelimitedTokens(normalized, ';')) {
+            langs.push_back(ToLowerAsciiStr(tok));
+        }
+    }
+    if (langs.empty()) {
+        std::string loc = TrimAscii(GetEnvString("OPENSCARLETT_LOCALE"));
+        if (loc.empty()) {
+            loc = "en-US";
+        }
+        langs.push_back(ToLowerAsciiStr(loc));
+    }
+    return langs;
+}
+
+bool LanguageTokenMatchesInstalled(std::string_view token,
+                                   const std::vector<std::string>& installed_lower) {
+    const std::string tlo = ToLowerAsciiStr(TrimAscii(std::string(token)));
+    if (tlo.empty()) {
+        return false;
+    }
+    const size_t t_dash = tlo.find('-');
+    const std::string t_primary = (t_dash == std::string::npos) ? tlo : tlo.substr(0, t_dash);
+
+    for (const auto& inst : installed_lower) {
+        if (inst == tlo) {
+            return true;
+        }
+        // Match primary language tag when either side specifies base language only (e.g. "en" <-> "en-us").
+        const size_t i_dash = inst.find('-');
+        const std::string i_primary = (i_dash == std::string::npos) ? inst : inst.substr(0, i_dash);
+        if ((t_dash == std::string::npos || i_dash == std::string::npos) && t_primary == i_primary) {
+            return true;
+        }
+    }
+    return false;
+}
+
+XGameResult ValidateAndEvaluateSelectors(uint32_t selectorCount,
+                                         const XPackageChunkSelector* selectors,
+                                         XPackageChunkAvailability& out_availability) {
+    out_availability = XPackageChunkAvailability_Ready;
+    if (selectorCount > 0u && !selectors) {
+        return XGR_E_INVALIDARG;
+    }
+    if (selectorCount == 0u || !selectors) {
+        return XGR_S_OK;
+    }
+
+    const std::vector<std::string> installed = ActiveInstalledLanguagesLower();
+    bool any_unavailable = false;
+    for (uint32_t i = 0u; i < selectorCount; ++i) {
+        const XPackageChunkSelector& sel = selectors[i];
+        switch (sel.type) {
+            case XPackageChunkSelectorType_Language: {
+                if (!sel.language || !*sel.language) {
+                    return XGR_E_INVALIDARG;
+                }
+                const auto tokens = SplitDelimitedTokens(sel.language, ';');
+                if (tokens.empty()) {
+                    return XGR_E_INVALIDARG;
+                }
+                bool any_lang_matched = false;
+                for (const auto& tok : tokens) {
+                    if (LanguageTokenMatchesInstalled(tok, installed)) {
+                        any_lang_matched = true;
+                        break;
+                    }
+                }
+                if (!any_lang_matched) {
+                    any_unavailable = true;
+                }
+                break;
+            }
+            case XPackageChunkSelectorType_Tag:
+                if (!sel.tag || !*sel.tag) {
+                    return XGR_E_INVALIDARG;
+                }
+                break;
+            case XPackageChunkSelectorType_Feature:
+                if (!sel.feature || !*sel.feature) {
+                    return XGR_E_INVALIDARG;
+                }
+                break;
+            case XPackageChunkSelectorType_Chunk:
+                break;
+            default:
+                return XGR_E_INVALIDARG;
+        }
+    }
+
+    out_availability = any_unavailable ? XPackageChunkAvailability_Unavailable
+                                       : XPackageChunkAvailability_Ready;
+    return XGR_S_OK;
+}
+
+bool IsValidOfflineIdentifier(const char* raw, size_t max_len) {
+    if (!raw || !*raw) {
+        return false;
+    }
+    const std::string trimmed = TrimAscii(raw);
+    if (trimmed.empty() || trimmed.size() > max_len) {
+        return false;
+    }
+    for (char c : trimmed) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20u || uc >= 0x7Fu) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<std::string> ConfiguredOwnedPackages() {
+    std::vector<std::string> out;
+    const std::string env = GetEnvString("OPENSCARLETT_STORE_OWNED_PACKAGES");
+    if (env.empty()) {
+        return out;
+    }
+    std::string norm = env;
+    for (char& c : norm) {
+        if (c == ',') c = ';';
+    }
+    return SplitDelimitedTokens(norm, ';');
+}
+
 std::string CurrentStoreId() {
     const std::string env = TrimAscii(GetEnvString("OPENSCARLETT_STORE_ID"));
     if (!env.empty()) {
@@ -1789,7 +2233,7 @@ XStoreProductQueryHandle CreateStoreProductQueryHandle(bool include_current_game
         XStoreProductBacking& b = q->products.back();
         b.store_id = cur_store_id;
         b.title = cfg.display_name.empty() ? "OpenScarlett Title" : cfg.display_name;
-        b.description = "Clean-room local OpenScarlett title";
+        b.description = "Local OpenScarlett title";
         b.language = "en-US";
         b.offer_token = "";
         b.link_uri = "ms-windows-store://pdp/?productid=" + cur_store_id;
@@ -1875,7 +2319,7 @@ XPackageInstallationMonitorHandle CreateInstallMonitorHandle(const char* pkg_id)
 }
 
 // ===========================================================================
-// Reusable Clean-Room Async Providers
+// Reusable Async Providers
 // ===========================================================================
 struct VoidAsyncCtx {
     XGameResult result = XGR_S_OK;
@@ -2071,6 +2515,7 @@ const char kIdPackageInstallChunks[] = "XPackageInstallChunksAsync";
 
 // Specialized async providers
 struct TokenSigAsyncCtx {
+    XGameResult result_hr = XGR_S_OK;
     std::string token;
     std::string signature;
 };
@@ -2083,6 +2528,10 @@ XGameResult OPENSCARLETT_GDK_CALL TokenSigProvider(
         case XAsyncOp_Begin:
             return XGR_S_OK;
         case XAsyncOp_DoWork: {
+            if (ctx->result_hr < 0) {
+                XAsyncComplete(data->async, ctx->result_hr, 0);
+                return XGR_E_PENDING;
+            }
             const size_t req = sizeof(XUserGetTokenAndSignatureData) +
                                (ctx->token.size() + 1) +
                                (ctx->signature.size() + 1);
@@ -2090,6 +2539,9 @@ XGameResult OPENSCARLETT_GDK_CALL TokenSigProvider(
             return XGR_E_PENDING;
         }
         case XAsyncOp_GetResult: {
+            if (ctx->result_hr < 0) {
+                return ctx->result_hr;
+            }
             const size_t tok_sz = ctx->token.size() + 1;
             const size_t sig_sz = ctx->signature.size() + 1;
             const size_t req = sizeof(XUserGetTokenAndSignatureData) + tok_sz + sig_sz;
@@ -2117,6 +2569,7 @@ XGameResult OPENSCARLETT_GDK_CALL TokenSigProvider(
 }
 
 struct TokenSigUtf16AsyncCtx {
+    XGameResult result_hr = XGR_S_OK;
     std::wstring token;
     std::wstring signature;
 };
@@ -2129,6 +2582,10 @@ XGameResult OPENSCARLETT_GDK_CALL TokenSigUtf16Provider(
         case XAsyncOp_Begin:
             return XGR_S_OK;
         case XAsyncOp_DoWork: {
+            if (ctx->result_hr < 0) {
+                XAsyncComplete(data->async, ctx->result_hr, 0);
+                return XGR_E_PENDING;
+            }
             const size_t req = sizeof(XUserGetTokenAndSignatureUtf16Data) +
                                (ctx->token.size() + 1) * sizeof(wchar_t) +
                                (ctx->signature.size() + 1) * sizeof(wchar_t);
@@ -2136,6 +2593,9 @@ XGameResult OPENSCARLETT_GDK_CALL TokenSigUtf16Provider(
             return XGR_E_PENDING;
         }
         case XAsyncOp_GetResult: {
+            if (ctx->result_hr < 0) {
+                return ctx->result_hr;
+            }
             const size_t tok_cnt = ctx->token.size() + 1;
             const size_t sig_cnt = ctx->signature.size() + 1;
             const size_t req = sizeof(XUserGetTokenAndSignatureUtf16Data) +
@@ -2378,6 +2838,7 @@ extern "C" {
 XGameResult OPENSCARLETT_GDK_CALL XGameRuntimeInitialize(void) {
     auto& rt = GetRuntime();
     rt.init_count.fetch_add(1, std::memory_order_acq_rel);
+    SyncConsoleLsaPolicyFromConfig();
     return RecordHr("XGameRuntimeInitialize", XGR_S_OK);
 }
 
@@ -2704,13 +3165,15 @@ bool OPENSCARLETT_GDK_CALL XTaskQueueDispatch(
     {
         std::unique_lock<std::mutex> lk(p.mutex);
         for (;;) {
+            const bool is_terminated =
+                p.terminating || obj->terminated.load(std::memory_order_acquire);
             if (!p.items.empty()) {
                 const size_t idx = FindEarliestItemIndexLocked(p);
                 const auto now = SteadyClock::now();
-                if (p.terminating || p.items[idx].ready_time <= now) {
+                if (is_terminated || p.items[idx].ready_time <= now) {
                     item = p.items[idx];
                     p.items.erase(p.items.begin() + static_cast<std::ptrdiff_t>(idx));
-                    canceled = p.terminating;
+                    canceled = is_terminated;
                     has_item = true;
                     ++p.active_callbacks;
                     break;
@@ -2724,7 +3187,10 @@ bool OPENSCARLETT_GDK_CALL XTaskQueueDispatch(
                 p.cv.wait_until(lk, wait_until_tp);
                 continue;
             }
-            if (p.terminating || timeoutInMs == 0 || (!infinite_wait && SteadyClock::now() >= deadline)) {
+            // Once terminated and completely drained (zero remaining queued items),
+            // return false immediately even when timeoutInMs is INFINITE!
+            if (is_terminated || timeoutInMs == 0 ||
+                (!infinite_wait && SteadyClock::now() >= deadline)) {
                 break;
             }
             if (infinite_wait) {
@@ -2737,11 +3203,18 @@ bool OPENSCARLETT_GDK_CALL XTaskQueueDispatch(
 
     if (has_item && item.callback) {
         item.callback(item.context, canceled);
-        std::lock_guard<std::mutex> lk(p.mutex);
-        if (p.active_callbacks > 0) {
-            --p.active_callbacks;
+    }
+    if (has_item) {
+        {
+            std::lock_guard<std::mutex> lk(p.mutex);
+            if (p.active_callbacks > 0) {
+                --p.active_callbacks;
+            }
+            p.cv.notify_all();
         }
-        p.cv.notify_all();
+        if (obj->terminated.load(std::memory_order_acquire)) {
+            TryFireDeferredTerminatedCallback(obj.get());
+        }
     }
 
     RecordOk("XTaskQueueDispatch");
@@ -2763,13 +3236,31 @@ XGameResult OPENSCARLETT_GDK_CALL XTaskQueueTerminate(
 
     {
         std::lock_guard<std::mutex> lk(obj->terminate_mutex);
-        obj->terminated = true;
+        obj->terminated.store(true, std::memory_order_release);
+        if (callback && !obj->terminated_cb_fired) {
+            obj->terminated_cb = callback;
+            obj->terminated_ctx = callbackContext;
+        }
     }
 
     ShutdownQueueInternal(obj.get(), wait);
 
-    if (callback) {
-        callback(callbackContext);
+    if (wait) {
+        XTaskQueueTerminatedCallback pending_cb = nullptr;
+        void* pending_ctx = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(obj->terminate_mutex);
+            if (!obj->terminated_cb_fired && obj->terminated_cb != nullptr) {
+                obj->terminated_cb_fired = true;
+                pending_cb = obj->terminated_cb;
+                pending_ctx = obj->terminated_ctx;
+                obj->terminated_cb = nullptr;
+                obj->terminated_ctx = nullptr;
+            }
+        }
+        if (pending_cb) {
+            pending_cb(pending_ctx);
+        }
     }
     return RecordHr("XTaskQueueTerminate", XGR_S_OK);
 }
@@ -2868,33 +3359,50 @@ XGameResult OPENSCARLETT_GDK_CALL XTaskQueueRegisterWaiter(
     if (!obj) {
         return RecordHr("XTaskQueueRegisterWaiter", XGR_E_HANDLE);
     }
+    if (obj->terminated.load(std::memory_order_acquire)) {
+        return RecordHr("XTaskQueueRegisterWaiter", XGR_E_ABORT);
+    }
 
     auto entry = std::make_shared<WaiterEntry>();
     entry->queue = queue;
+    entry->queue_weak = obj;
     entry->port = port;
     entry->callback = callback;
     entry->context = callbackContext;
 
 #if defined(_WIN32)
-    HANDLE reg_h = nullptr;
-    if (!RegisterWaitForSingleObject(
-            &reg_h,
-            static_cast<HANDLE>(waitHandle),
-            &WaiterBridgeCallback,
-            entry.get(),
-            INFINITE,
-            WT_EXECUTEDEFAULT)) {
+    PTP_WAIT tp_wait = CreateThreadpoolWait(&WaiterTpCallback, entry.get(), nullptr);
+    if (!tp_wait) {
         return RecordHr("XTaskQueueRegisterWaiter", XGR_E_FAIL);
     }
-    entry->reg_wait_handle = reg_h;
+    entry->wait_handle = static_cast<HANDLE>(waitHandle);
+    entry->tp_wait = tp_wait;
 #endif
 
     {
         std::lock_guard<std::mutex> lk(obj->waiter_mutex);
+        if (obj->terminated.load(std::memory_order_acquire)) {
+#if defined(_WIN32)
+            CloseThreadpoolWait(tp_wait);
+            entry->tp_wait = nullptr;
+#endif
+            return RecordHr("XTaskQueueRegisterWaiter", XGR_E_ABORT);
+        }
         entry->token = obj->next_waiter_token++;
         token->token = entry->token;
-        obj->waiters.push_back(std::move(entry));
+        obj->waiters.push_back(entry);
     }
+
+#if defined(_WIN32)
+    {
+        std::lock_guard<std::mutex> wlk(entry->wait_mutex);
+        if (entry->active.load(std::memory_order_acquire) &&
+            entry->tp_wait != nullptr &&
+            !obj->terminated.load(std::memory_order_acquire)) {
+            SetThreadpoolWait(entry->tp_wait, entry->wait_handle, nullptr);
+        }
+    }
+#endif
     return RecordHr("XTaskQueueRegisterWaiter", XGR_S_OK);
 }
 
@@ -2919,20 +3427,7 @@ void OPENSCARLETT_GDK_CALL XTaskQueueUnregisterWaiter(
         }
     }
     if (removed) {
-        removed->active.store(false, std::memory_order_release);
-#if defined(_WIN32)
-        if (removed->reg_wait_handle) {
-            HANDLE h = removed->reg_wait_handle;
-            removed->reg_wait_handle = nullptr;
-            if (g_in_waiter_bridge_cb) {
-                UnregisterWaitEx(h, nullptr);
-                std::lock_guard<std::mutex> lk(obj->waiter_mutex);
-                obj->retired_waiters.push_back(std::move(removed));
-            } else {
-                UnregisterWaitEx(h, INVALID_HANDLE_VALUE);
-            }
-        }
-#endif
+        DisarmAndCloseWaiter(std::move(removed), obj.get());
     }
 }
 
@@ -3542,7 +4037,15 @@ XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureAsync(
     if (!ctx) {
         return RecordHr("XUserGetTokenAndSignatureAsync", XGR_E_OUTOFMEMORY);
     }
-    BuildOfflineXstsTokenAndSig(*u, method, url, ctx->token, ctx->signature);
+    // Offline-first Xbox Live token policy: default to clean E_GAMEUSER_NO_TOKEN_REQUIRED
+    // completion so real titles immediately follow offline paths instead of hanging on live
+    // Xbox Live handshakes. Opt in to synthetic XBL3.0 JWT tokens via OPENSCARLETT_MOCK_XSTS=1.
+    if (IsMockXstsEnabled()) {
+        ctx->result_hr = XGR_S_OK;
+        BuildOfflineXstsTokenAndSig(*u, method, url, ctx->token, ctx->signature);
+    } else {
+        ctx->result_hr = kHrGameUserNoTokenRequired;
+    }
     XGameResult hr = XAsyncBegin(async, ctx, kIdUserTokenSig, kIdUserTokenSig, &TokenSigProvider);
     if (hr < 0) {
         delete ctx;
@@ -3561,6 +4064,7 @@ XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureResultSize(
     if (!async || !bufferSize) {
         return RecordHr("XUserGetTokenAndSignatureResultSize", XGR_E_INVALIDARG);
     }
+    *bufferSize = 0;
     XGameResult hr = XAsyncGetStatus(async, true);
     if (hr < 0) {
         return RecordHr("XUserGetTokenAndSignatureResultSize", hr);
@@ -3579,6 +4083,9 @@ XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureResult(
         return RecordHr("XUserGetTokenAndSignatureResult", XGR_E_INVALIDARG);
     }
     *ptrToBuffer = nullptr;
+    if (bufferUsed) {
+        *bufferUsed = 0;
+    }
     XGameResult hr = XAsyncGetStatus(async, true);
     if (hr < 0) {
         return RecordHr("XUserGetTokenAndSignatureResult", hr);
@@ -3611,19 +4118,24 @@ XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureUtf16Async(
     if (!ctx) {
         return RecordHr("XUserGetTokenAndSignatureUtf16Async", XGR_E_OUTOFMEMORY);
     }
-    std::string narrow_method;
-    for (const wchar_t* p = method; *p; ++p) {
-        narrow_method.push_back((*p < 0x80) ? static_cast<char>(*p) : '?');
+    if (IsMockXstsEnabled()) {
+        ctx->result_hr = XGR_S_OK;
+        std::string narrow_method;
+        for (const wchar_t* p = method; *p; ++p) {
+            narrow_method.push_back((*p < 0x80) ? static_cast<char>(*p) : '?');
+        }
+        std::string narrow_url;
+        for (const wchar_t* p = url; *p; ++p) {
+            narrow_url.push_back((*p < 0x80) ? static_cast<char>(*p) : '?');
+        }
+        std::string tok_utf8;
+        std::string sig_utf8;
+        BuildOfflineXstsTokenAndSig(*u, narrow_method, narrow_url, tok_utf8, sig_utf8);
+        ctx->token.assign(tok_utf8.begin(), tok_utf8.end());
+        ctx->signature.assign(sig_utf8.begin(), sig_utf8.end());
+    } else {
+        ctx->result_hr = kHrGameUserNoTokenRequired;
     }
-    std::string narrow_url;
-    for (const wchar_t* p = url; *p; ++p) {
-        narrow_url.push_back((*p < 0x80) ? static_cast<char>(*p) : '?');
-    }
-    std::string tok_utf8;
-    std::string sig_utf8;
-    BuildOfflineXstsTokenAndSig(*u, narrow_method, narrow_url, tok_utf8, sig_utf8);
-    ctx->token.assign(tok_utf8.begin(), tok_utf8.end());
-    ctx->signature.assign(sig_utf8.begin(), sig_utf8.end());
     XGameResult hr = XAsyncBegin(
         async, ctx, kIdUserTokenSigUtf16, kIdUserTokenSigUtf16, &TokenSigUtf16Provider);
     if (hr < 0) {
@@ -3643,6 +4155,7 @@ XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureUtf16ResultSize(
     if (!async || !bufferSize) {
         return RecordHr("XUserGetTokenAndSignatureUtf16ResultSize", XGR_E_INVALIDARG);
     }
+    *bufferSize = 0;
     XGameResult hr = XAsyncGetStatus(async, true);
     if (hr < 0) {
         return RecordHr("XUserGetTokenAndSignatureUtf16ResultSize", hr);
@@ -3661,6 +4174,9 @@ XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureUtf16Result(
         return RecordHr("XUserGetTokenAndSignatureUtf16Result", XGR_E_INVALIDARG);
     }
     *ptrToBuffer = nullptr;
+    if (bufferUsed) {
+        *bufferUsed = 0;
+    }
     XGameResult hr = XAsyncGetStatus(async, true);
     if (hr < 0) {
         return RecordHr("XUserGetTokenAndSignatureUtf16Result", hr);
@@ -3706,14 +4222,26 @@ void OPENSCARLETT_GDK_CALL XUserCloseSignOutDeferralHandle(XUserSignOutDeferralH
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XUserRegisterForChangeEvent(
-    XTaskQueueHandle /*queue*/,
-    void* /*context*/,
+    XTaskQueueHandle queue,
+    void* context,
     XUserChangeEventCallback callback,
     XTaskQueueRegistrationToken* token) {
+    if (token) {
+        token->token = 0ull;
+    }
     if (!callback || !token) {
         return RecordHr("XUserRegisterForChangeEvent", XGR_E_INVALIDARG);
     }
-    *token = AllocateRegToken(kRegUserChange);
+    if (queue != nullptr && !LookupQueue(queue)) {
+        return RecordHr("XUserRegisterForChangeEvent", XGR_E_HANDLE);
+    }
+    const XTaskQueueRegistrationToken reg = AllocateRegToken(kRegUserChange);
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.reg_mutex);
+        rt.user_change_listeners.push_back(UserChangeListenerEntry{reg.token, queue, context, callback});
+    }
+    *token = reg;
     return RecordHr("XUserRegisterForChangeEvent", XGR_S_OK);
 }
 
@@ -3721,16 +4249,39 @@ bool OPENSCARLETT_GDK_CALL XUserUnregisterForChangeEvent(
     XTaskQueueRegistrationToken token,
     bool /*wait*/) {
     RecordOk("XUserUnregisterForChangeEvent");
-    return ReleaseRegToken(kRegUserChange, token);
+    const bool removed = ReleaseRegToken(kRegUserChange, token);
+    if (removed) {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.reg_mutex);
+        rt.user_change_listeners.erase(
+            std::remove_if(rt.user_change_listeners.begin(), rt.user_change_listeners.end(),
+                           [&](const UserChangeListenerEntry& e) { return e.token == token.token; }),
+            rt.user_change_listeners.end());
+    }
+    return removed;
+}
+
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XUserIsStoreUser(XUserHandle user) {
+    RecordOk("XUserIsStoreUser");
+    if (!user) {
+        return false;
+    }
+    return LookupUser(user) != nullptr;
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XUserRegisterForDefaultAudioEndpointUtf16Changed(
-    XTaskQueueHandle /*queue*/,
+    XTaskQueueHandle queue,
     void* /*context*/,
     XUserDefaultAudioEndpointUtf16ChangedCallback callback,
     XTaskQueueRegistrationToken* token) {
+    if (token) {
+        token->token = 0ull;
+    }
     if (!callback || !token) {
         return RecordHr("XUserRegisterForDefaultAudioEndpointUtf16Changed", XGR_E_INVALIDARG);
+    }
+    if (queue != nullptr && !LookupQueue(queue)) {
+        return RecordHr("XUserRegisterForDefaultAudioEndpointUtf16Changed", XGR_E_HANDLE);
     }
     *token = AllocateRegToken(kRegUserAudioEndpoint);
     return RecordHr("XUserRegisterForDefaultAudioEndpointUtf16Changed", XGR_S_OK);
@@ -3744,12 +4295,18 @@ bool OPENSCARLETT_GDK_CALL XUserUnregisterForDefaultAudioEndpointUtf16Changed(
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XUserRegisterForDeviceAssociationChanged(
-    XTaskQueueHandle /*queue*/,
+    XTaskQueueHandle queue,
     void* /*context*/,
     XUserDeviceAssociationChangedCallback callback,
     XTaskQueueRegistrationToken* token) {
+    if (token) {
+        token->token = 0ull;
+    }
     if (!callback || !token) {
         return RecordHr("XUserRegisterForDeviceAssociationChanged", XGR_E_INVALIDARG);
+    }
+    if (queue != nullptr && !LookupQueue(queue)) {
+        return RecordHr("XUserRegisterForDeviceAssociationChanged", XGR_E_HANDLE);
     }
     *token = AllocateRegToken(kRegUserDeviceAssoc);
     return RecordHr("XUserRegisterForDeviceAssociationChanged", XGR_S_OK);
@@ -4708,7 +5265,7 @@ XGameResult OPENSCARLETT_GDK_CALL XSystemGetAppSpecificDeviceId(
     size_t appSpecificDeviceIdSize,
     char* appSpecificDeviceId,
     size_t* appSpecificDeviceIdUsed) {
-    // Clean-room deterministic 44-character base64 app-specific device ID (+ null = 45 bytes).
+    // Deterministic 44-character base64 app-specific device ID (+ null = 45 bytes).
     const std::string asid = "T3BlblNjYXJsZXR0QXBwU3BlY2lmaWNEZXZpY2VJZA==";
     return RecordHr("XSystemGetAppSpecificDeviceId",
                     CopyStringResult(asid, appSpecificDeviceIdSize, appSpecificDeviceId,
@@ -4745,7 +5302,7 @@ XGameResult OPENSCARLETT_GDK_CALL XSystemHandleTrack(
 }
 
 // ===========================================================================
-// XGameStreaming (Clean-Room Local-PC Compatibility Surface)
+// XGameStreaming (Local-PC Compatibility Surface)
 // ===========================================================================
 XGameResult OPENSCARLETT_GDK_CALL XGameStreamingInitialize(void) {
     auto& rt = GetRuntime();
@@ -4956,10 +5513,7 @@ XGameResult OPENSCARLETT_GDK_CALL XMemSetAllocationHooks(
 XGameResult OPENSCARLETT_GDK_CALL XPackageGetCurrentProcessPackageIdentifier(
     size_t bufferSize,
     char* buffer) {
-    std::string pkg_id = GetEnvString("OPENSCARLETT_PACKAGE_ID");
-    if (pkg_id.empty()) {
-        pkg_id = "OpenScarlett.Title_1.0.0.0_x64__openscarlett0";
-    }
+    const std::string pkg_id = CurrentPackageIdentifier();
     return RecordHr("XPackageGetCurrentProcessPackageIdentifier",
                     CopyStringResult(pkg_id, bufferSize, buffer, nullptr));
 }
@@ -4970,18 +5524,47 @@ bool OPENSCARLETT_GDK_CALL XPackageIsPackagedProcess(void) {
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XPackageEnumerateChunkAvailability(
-    const char* /*packageIdentifier*/,
+    const char* packageIdentifier,
     uint32_t selectorCount,
     const XPackageChunkSelector* selectors,
     void* context,
     XPackageChunkAvailabilityCallback callback) {
-    if (!callback) {
+    if (!callback || (selectorCount > 0u && !selectors)) {
         return RecordHr("XPackageEnumerateChunkAvailability", XGR_E_INVALIDARG);
     }
-    if (selectors && selectorCount > 0) {
-        for (uint32_t i = 0; i < selectorCount; ++i) {
-            if (!callback(context, &selectors[i], XPackageChunkAvailability_Ready)) {
-                break;
+    (void)packageIdentifier;
+    if (selectors && selectorCount > 0u) {
+        XPackageChunkAvailability overall = XPackageChunkAvailability_Ready;
+        const XGameResult val_hr = ValidateAndEvaluateSelectors(selectorCount, selectors, overall);
+        if (val_hr < 0) {
+            return RecordHr("XPackageEnumerateChunkAvailability", val_hr);
+        }
+        const std::vector<std::string> installed = ActiveInstalledLanguagesLower();
+        for (uint32_t i = 0u; i < selectorCount; ++i) {
+            const XPackageChunkSelector& sel = selectors[i];
+            if (sel.type == XPackageChunkSelectorType_Language) {
+                const auto langs = SplitDelimitedTokens(sel.language, ';');
+                bool keep_going = true;
+                for (const auto& lang : langs) {
+                    XPackageChunkSelector single{};
+                    single.type = XPackageChunkSelectorType_Language;
+                    single.language = lang.c_str();
+                    const XPackageChunkAvailability avail =
+                        LanguageTokenMatchesInstalled(lang, installed)
+                            ? XPackageChunkAvailability_Ready
+                            : XPackageChunkAvailability_Unavailable;
+                    if (!callback(context, &single, avail)) {
+                        keep_going = false;
+                        break;
+                    }
+                }
+                if (!keep_going) {
+                    break;
+                }
+            } else {
+                if (!callback(context, &sel, XPackageChunkAvailability_Ready)) {
+                    break;
+                }
             }
         }
     } else {
@@ -5197,7 +5780,7 @@ XGameResult OPENSCARLETT_GDK_CALL XPackageEnumeratePackages(
         details.version.revision = 0;
         details.kind = XPackageKind_Game;
         details.displayName = disp_name.c_str();
-        details.description = "Clean-room local OpenScarlett title";
+        details.description = "Local OpenScarlett title";
         details.publisher = "OpenScarlett";
         details.storeId = cur_store_id.c_str();
         details.installing = false;
@@ -5230,24 +5813,34 @@ XGameResult OPENSCARLETT_GDK_CALL XPackageEnumerateFeatures(
 
 XGameResult OPENSCARLETT_GDK_CALL XPackageFindChunkAvailability(
     const char* packageIdentifier,
-    uint32_t /*selectorCount*/,
-    const XPackageChunkSelector* /*selectors*/,
+    uint32_t selectorCount,
+    const XPackageChunkSelector* selectors,
     XPackageChunkAvailability* availability) {
     if (!packageIdentifier || !*packageIdentifier || !availability) {
         return RecordHr("XPackageFindChunkAvailability", XGR_E_INVALIDARG);
     }
-    *availability = XPackageChunkAvailability_Ready;
+    XPackageChunkAvailability computed = XPackageChunkAvailability_Ready;
+    const XGameResult hr = ValidateAndEvaluateSelectors(selectorCount, selectors, computed);
+    if (hr < 0) {
+        return RecordHr("XPackageFindChunkAvailability", hr);
+    }
+    *availability = computed;
     return RecordHr("XPackageFindChunkAvailability", XGR_S_OK);
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XPackageEstimateDownloadSize(
     const char* packageIdentifier,
-    uint32_t /*selectorCount*/,
-    const XPackageChunkSelector* /*selectors*/,
+    uint32_t selectorCount,
+    const XPackageChunkSelector* selectors,
     uint64_t* downloadSize,
     bool* shouldPresentUserConfirmation) {
     if (!packageIdentifier || !*packageIdentifier || !downloadSize) {
         return RecordHr("XPackageEstimateDownloadSize", XGR_E_INVALIDARG);
+    }
+    XPackageChunkAvailability avail = XPackageChunkAvailability_Ready;
+    const XGameResult hr = ValidateAndEvaluateSelectors(selectorCount, selectors, avail);
+    if (hr < 0) {
+        return RecordHr("XPackageEstimateDownloadSize", hr);
     }
     *downloadSize = 0ULL;
     if (shouldPresentUserConfirmation) {
@@ -5762,20 +6355,43 @@ XGameResult OPENSCARLETT_GDK_CALL XGameUIShowMessageDialogAsync(
     XAsyncBlock* async,
     const char* /*titleText*/,
     const char* /*contentText*/,
-    const char* /*firstButtonText*/,
-    const char* /*secondButtonText*/,
-    const char* /*thirdButtonText*/,
+    const char* firstButtonText,
+    const char* secondButtonText,
+    const char* thirdButtonText,
     XGameUIMessageDialogButton defaultButton,
-    XGameUIMessageDialogButton /*cancelButton*/) {
-    if (!async) {
+    XGameUIMessageDialogButton cancelButton) {
+    if (!async ||
+        !ValidateMessageDialogButtons(
+            static_cast<uint32_t>(defaultButton),
+            static_cast<uint32_t>(cancelButton),
+            firstButtonText,
+            secondButtonText,
+            thirdButtonText)) {
         return RecordHr("XGameUIShowMessageDialogAsync", XGR_E_INVALIDARG);
     }
     XGameUIMessageDialogButton chosen = defaultButton;
     const std::string env_btn = GetEnvString("OPENSCARLETT_UI_DIALOG_BUTTON");
     if (!env_btn.empty()) {
-        if (env_btn == "0" || env_btn == "first") chosen = XGameUIMessageDialogButton_First;
-        else if (env_btn == "1" || env_btn == "second") chosen = XGameUIMessageDialogButton_Second;
-        else if (env_btn == "2" || env_btn == "third") chosen = XGameUIMessageDialogButton_Third;
+        XGameUIMessageDialogButton cand = chosen;
+        bool matched = false;
+        if (env_btn == "0" || env_btn == "first") {
+            cand = XGameUIMessageDialogButton_First;
+            matched = true;
+        } else if (env_btn == "1" || env_btn == "second") {
+            cand = XGameUIMessageDialogButton_Second;
+            matched = true;
+        } else if (env_btn == "2" || env_btn == "third") {
+            cand = XGameUIMessageDialogButton_Third;
+            matched = true;
+        }
+        if (matched &&
+            IsDialogButtonIndexValid(
+                static_cast<uint32_t>(cand),
+                firstButtonText,
+                secondButtonText,
+                thirdButtonText)) {
+            chosen = cand;
+        }
     }
     auto* ctx = new (std::nothrow) GameUiMessageDialogCtx{chosen};
     if (!ctx) {
@@ -6430,7 +7046,7 @@ XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerCloseStreamHandle(
 }
 
 // ===========================================================================
-// XSpeechToText (XAccessibility clean-room local defaults)
+// XSpeechToText (XAccessibility local defaults)
 // ===========================================================================
 XGameResult OPENSCARLETT_GDK_CALL XSpeechToTextSetPositionHint(
     XSpeechToTextPositionHint position) {
@@ -6514,7 +7130,7 @@ XGameResult OPENSCARLETT_GDK_CALL XSpeechToTextCancelHypothesisString(uint32_t h
 }
 
 // ===========================================================================
-// XAppBroadcast & XAppCapture (clean-room offline/local defaults)
+// XAppBroadcast & XAppCapture (offline/local defaults)
 // ===========================================================================
 XGameResult OPENSCARLETT_GDK_CALL XAppBroadcastGetStatus(
     XUserHandle requestingUser,
@@ -6715,7 +7331,7 @@ XGameResult OPENSCARLETT_GDK_CALL XAppCaptureTakeDiagnosticScreenshot(
     }
     const std::string prefix = (filenamePrefix && *filenamePrefix) ? filenamePrefix : "diag";
     const fs::path out_path = cap_dir / (prefix + "_" + std::to_string(seq) + ".png");
-    const std::vector<uint8_t> png = BuildCleanRoomGamerPicPng(16u);
+    const std::vector<uint8_t> png = BuildDefaultGamerPicPng(16u);
     (void)WriteBinaryFileAtomic(out_path, png.data(), png.size());
 
     result->fileCount = 1u;
@@ -6775,7 +7391,7 @@ XGameResult OPENSCARLETT_GDK_CALL XAppCaptureTakeScreenshot(
     }
     std::memset(result, 0, sizeof(*result));
     std::string local_id;
-    std::vector<uint8_t> png = BuildCleanRoomGamerPicPng(16u);
+    std::vector<uint8_t> png = BuildDefaultGamerPicPng(16u);
     {
         auto& rt = GetRuntime();
         std::lock_guard<std::mutex> lk(rt.capture_mutex);
@@ -6807,7 +7423,7 @@ XGameResult OPENSCARLETT_GDK_CALL XAppCaptureOpenScreenshotStream(
         if (it != rt.capture_screenshots.end()) {
             stream->bytes = it->second;
         } else {
-            stream->bytes = BuildCleanRoomGamerPicPng(16u);
+            stream->bytes = BuildDefaultGamerPicPng(16u);
         }
         XAppCaptureScreenshotStreamHandle raw = stream.get();
         *totalBytes = static_cast<uint64_t>(stream->bytes.size());
@@ -6872,7 +7488,7 @@ XGameResult OPENSCARLETT_GDK_CALL XAppCaptureDisableRecord(void) {
 }
 
 // ===========================================================================
-// XStore (clean-room offline/owned-title defaults)
+// XStore (offline/owned-title defaults)
 // ===========================================================================
 XGameResult OPENSCARLETT_GDK_CALL XStoreCreateContext(
     XUserHandle user,
@@ -7332,15 +7948,39 @@ XGameResult OPENSCARLETT_GDK_CALL XStoreCanAcquireLicenseForPackageAsync(
     XStoreContextHandle storeContextHandle,
     const char* packageIdentifier,
     XAsyncBlock* async) {
-    if (!storeContextHandle || !packageIdentifier || !*packageIdentifier || !async) {
+    if (!storeContextHandle || !IsValidOfflineIdentifier(packageIdentifier, 256u) ||
+        !async) {
         return RecordHr("XStoreCanAcquireLicenseForPackageAsync", XGR_E_INVALIDARG);
     }
     if (!LookupStoreContext(storeContextHandle)) {
         return RecordHr("XStoreCanAcquireLicenseForPackageAsync", XGR_E_HANDLE);
     }
+    const std::string req_lo = ToLowerAsciiStr(TrimAscii(packageIdentifier));
+    const std::string cur_pkg_lo = ToLowerAsciiStr(CurrentPackageIdentifier());
+    const auto lsa_pkg = openscarlett::ConsoleLsaPolicy::Global().GetPackageIdentity();
+    const std::string lsa_full_lo = ToLowerAsciiStr(lsa_pkg.package_full_name);
+    const std::string lsa_pfn_lo = ToLowerAsciiStr(lsa_pkg.package_family_name);
+
+    bool owned = (req_lo == cur_pkg_lo) ||
+                 (!lsa_full_lo.empty() && req_lo == lsa_full_lo) ||
+                 (!lsa_pfn_lo.empty() && req_lo == lsa_pfn_lo);
+    if (!owned) {
+        for (const auto& p : ConfiguredOwnedPackages()) {
+            if (ToLowerAsciiStr(p) == req_lo) {
+                owned = true;
+                break;
+            }
+        }
+    }
+
     XStoreCanAcquireLicenseResult res{};
-    std::snprintf(res.licensableSku, sizeof(res.licensableSku), "%s", "0001");
-    res.status = XStoreCanLicenseStatus_Licensable;
+    if (owned) {
+        std::snprintf(res.licensableSku, sizeof(res.licensableSku), "%s", "0001");
+        res.status = XStoreCanLicenseStatus_Licensable;
+    } else {
+        res.licensableSku[0] = '\0';
+        res.status = XStoreCanLicenseStatus_NotLicensableToUser;
+    }
     return RecordHr(
         "XStoreCanAcquireLicenseForPackageAsync",
         StartPodAsync<XStoreCanAcquireLicenseResult>(
@@ -7367,15 +8007,54 @@ XGameResult OPENSCARLETT_GDK_CALL XStoreCanAcquireLicenseForStoreIdAsync(
     XStoreContextHandle storeContextHandle,
     const char* storeProductId,
     XAsyncBlock* async) {
-    if (!storeContextHandle || !storeProductId || !*storeProductId || !async) {
+    if (!storeContextHandle || !IsValidOfflineIdentifier(storeProductId, 64u) || !async) {
         return RecordHr("XStoreCanAcquireLicenseForStoreIdAsync", XGR_E_INVALIDARG);
     }
     if (!LookupStoreContext(storeContextHandle)) {
         return RecordHr("XStoreCanAcquireLicenseForStoreIdAsync", XGR_E_HANDLE);
     }
+    const std::string req_lo = ToLowerAsciiStr(TrimAscii(storeProductId));
+    const std::string cur_sid_lo = ToLowerAsciiStr(CurrentStoreId());
+    const std::string default_sid_lo = ToLowerAsciiStr(kDefaultStoreId);
+    const auto lsa_pkg = openscarlett::ConsoleLsaPolicy::Global().GetPackageIdentity();
+    const bool lsa_is_explicit =
+        !lsa_pkg.package_name.empty() &&
+        lsa_pkg.package_name != "OpenScarlett.DefaultTitle";
+    const std::string lsa_sid_lo =
+        lsa_is_explicit ? ToLowerAsciiStr(lsa_pkg.store_id) : std::string();
+    const std::vector<std::string> addons = ConfiguredAddOnStoreIds();
+
+    bool owned = (req_lo == cur_sid_lo) ||
+                 (!lsa_sid_lo.empty() && req_lo == lsa_sid_lo);
+    if (!owned) {
+        for (const auto& addon : addons) {
+            if (ToLowerAsciiStr(addon) == req_lo) {
+                owned = true;
+                break;
+            }
+        }
+    }
+    if (!owned) {
+        // When no title-specific StoreId or add-on catalog is configured (standalone offline
+        // mode without MicrosoftGame.Config StoreId), allow valid non-empty store product IDs
+        // so unpacked titles and offline tests are not blocked.
+        const bool has_explicit_catalog =
+            (cur_sid_lo != default_sid_lo) ||
+            (!lsa_sid_lo.empty() && lsa_sid_lo != default_sid_lo) ||
+            !addons.empty();
+        if (!has_explicit_catalog) {
+            owned = true;
+        }
+    }
+
     XStoreCanAcquireLicenseResult res{};
-    std::snprintf(res.licensableSku, sizeof(res.licensableSku), "%s", "0001");
-    res.status = XStoreCanLicenseStatus_Licensable;
+    if (owned) {
+        std::snprintf(res.licensableSku, sizeof(res.licensableSku), "%s", "0001");
+        res.status = XStoreCanLicenseStatus_Licensable;
+    } else {
+        res.licensableSku[0] = '\0';
+        res.status = XStoreCanLicenseStatus_NotLicensableToUser;
+    }
     return RecordHr(
         "XStoreCanAcquireLicenseForStoreIdAsync",
         StartPodAsync<XStoreCanAcquireLicenseResult>(
@@ -7970,18 +8649,48 @@ XGameResult OPENSCARLETT_GDK_CALL XGameUiShowMessageDialogAsync(
     XAsyncBlock* async,
     const char* /*titleText*/,
     const char* /*contentText*/,
-    const char* /*firstButtonText*/,
-    const char* /*secondButtonText*/,
-    const char* /*thirdButtonText*/,
+    const char* firstButtonText,
+    const char* secondButtonText,
+    const char* thirdButtonText,
     XGameUiMessageDialogButton defaultButton,
-    XGameUiMessageDialogButton /*cancelButton*/) {
-    if (!async) {
+    XGameUiMessageDialogButton cancelButton) {
+    if (!async ||
+        !ValidateMessageDialogButtons(
+            static_cast<uint32_t>(defaultButton),
+            static_cast<uint32_t>(cancelButton),
+            firstButtonText,
+            secondButtonText,
+            thirdButtonText)) {
         return RecordHr("XGameUiShowMessageDialogAsync", XGR_E_INVALIDARG);
+    }
+    XGameUiMessageDialogButton chosen = defaultButton;
+    const std::string env_btn = GetEnvString("OPENSCARLETT_UI_DIALOG_BUTTON");
+    if (!env_btn.empty()) {
+        XGameUiMessageDialogButton cand = chosen;
+        bool matched = false;
+        if (env_btn == "0" || env_btn == "first") {
+            cand = XGameUiMessageDialogButton_First;
+            matched = true;
+        } else if (env_btn == "1" || env_btn == "second") {
+            cand = XGameUiMessageDialogButton_Second;
+            matched = true;
+        } else if (env_btn == "2" || env_btn == "third") {
+            cand = XGameUiMessageDialogButton_Third;
+            matched = true;
+        }
+        if (matched &&
+            IsDialogButtonIndexValid(
+                static_cast<uint32_t>(cand),
+                firstButtonText,
+                secondButtonText,
+                thirdButtonText)) {
+            chosen = cand;
+        }
     }
     return RecordHr(
         "XGameUiShowMessageDialogAsync",
         StartPodAsync<XGameUiMessageDialogButton>(
-            async, kIdUiMessageDialog, kIdUiMessageDialog, defaultButton));
+            async, kIdUiMessageDialog, kIdUiMessageDialog, chosen));
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XGameUiShowMessageDialogResult(
@@ -8294,7 +9003,7 @@ XGameResult OPENSCARLETT_GDK_CALL XGameUiShowWebAuthenticationResult(
 }
 
 // ===========================================================================
-// XNetworking (clean-room PC/local connectivity & TLS info)
+// XNetworking (PC/local connectivity & TLS info)
 // ===========================================================================
 XGameResult OPENSCARLETT_GDK_CALL XNetworkingGetConnectivityHint(
     XNetworkingConnectivityHint* connectivityHint) {
@@ -8613,14 +9322,45 @@ void OPENSCARLETT_GDK_CALL XErrorReport(XGameResult hr, const char* msg) {
     RecordOk("XErrorReport");
     XErrorCallback cb = nullptr;
     void* ctx = nullptr;
+    XErrorOptions opts_dbg = XErrorOptions_None;
+    XErrorOptions opts_nodbg = XErrorOptions_None;
     {
         auto& rt = GetRuntime();
         std::lock_guard<std::mutex> lk(rt.error_mutex);
         cb = rt.error_callback;
         ctx = rt.error_callback_ctx;
+        opts_dbg = rt.error_opts_debugger;
+        opts_nodbg = rt.error_opts_no_debugger;
     }
+    bool run_default_actions = true;
     if (cb) {
-        (void)cb(hr, msg ? msg : "", ctx);
+        run_default_actions = cb(hr, msg ? msg : "", ctx);
+    }
+    if (run_default_actions) {
+#if defined(_WIN32)
+        const bool dbg_present = (::IsDebuggerPresent() != FALSE);
+        const uint32_t active_opts = static_cast<uint32_t>(dbg_present ? opts_dbg : opts_nodbg);
+        if ((active_opts & static_cast<uint32_t>(XErrorOptions_OutputDebugStringOnError)) != 0u) {
+            char dbg_buf[512]{};
+            std::snprintf(
+                dbg_buf,
+                sizeof(dbg_buf),
+                "[OpenScarlett XErrorReport] hr=0x%08X msg=%s\n",
+                static_cast<unsigned>(hr),
+                msg ? msg : "");
+            ::OutputDebugStringA(dbg_buf);
+        }
+        // DebugBreakOnError (0x02) and FailFastOnError (0x04) are validated and stored, but
+        // guarded against terminating headless/compatibility runs unless explicitly opted in.
+        if (dbg_present &&
+            (active_opts & static_cast<uint32_t>(XErrorOptions_DebugBreakOnError)) != 0u &&
+            GetEnvString("OPENSCARLETT_XERROR_BREAK") == "1") {
+            ::DebugBreak();
+        }
+#else
+        (void)opts_dbg;
+        (void)opts_nodbg;
+#endif
     }
 }
 
@@ -8632,14 +9372,44 @@ void OPENSCARLETT_GDK_CALL XErrorSetCallback(XErrorCallback callback, void* cont
     rt.error_callback_ctx = context;
 }
 
+// Validates and stores GDK XErrorOptions bitmasks:
+//   - Bit 0 (0x01): XErrorOptions_OutputDebugStringOnError
+//   - Bit 1 (0x02): XErrorOptions_DebugBreakOnError
+//   - Bit 2 (0x04): XErrorOptions_FailFastOnError
+// Unknown/reserved bits (~0x07u) are stripped before storage and logged as XGR_E_INVALIDARG
+// in CallTelemetry so buggy callers cannot corrupt runtime error-handling state.
 void OPENSCARLETT_GDK_CALL XErrorSetOptions(
     XErrorOptions optionsDebuggerPresent,
     XErrorOptions optionsDebuggerNotPresent) {
-    RecordOk("XErrorSetOptions");
+    const uint32_t raw_dbg = static_cast<uint32_t>(optionsDebuggerPresent);
+    const uint32_t raw_nodbg = static_cast<uint32_t>(optionsDebuggerNotPresent);
+    const bool has_unknown_bits =
+        ((raw_dbg & ~kValidXErrorOptionsMask) != 0u) ||
+        ((raw_nodbg & ~kValidXErrorOptionsMask) != 0u);
+    if (has_unknown_bits) {
+        (void)RecordHr("XErrorSetOptions", XGR_E_INVALIDARG);
+    } else {
+        RecordOk("XErrorSetOptions");
+    }
+    const auto clean_dbg = static_cast<XErrorOptions>(raw_dbg & kValidXErrorOptionsMask);
+    const auto clean_nodbg = static_cast<XErrorOptions>(raw_nodbg & kValidXErrorOptionsMask);
     auto& rt = GetRuntime();
     std::lock_guard<std::mutex> lk(rt.error_mutex);
-    rt.error_opts_debugger = optionsDebuggerPresent;
-    rt.error_opts_no_debugger = optionsDebuggerNotPresent;
+    rt.error_opts_debugger = clean_dbg;
+    rt.error_opts_no_debugger = clean_nodbg;
+}
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XErrorGetOptions(
+    XErrorOptions* optionsDebuggerPresent,
+    XErrorOptions* optionsDebuggerNotPresent) {
+    if (!optionsDebuggerPresent || !optionsDebuggerNotPresent) {
+        return RecordHr("XErrorGetOptions", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.error_mutex);
+    *optionsDebuggerPresent = rt.error_opts_debugger;
+    *optionsDebuggerNotPresent = rt.error_opts_no_debugger;
+    return RecordHr("XErrorGetOptions", XGR_S_OK);
 }
 
 uint32_t OPENSCARLETT_GDK_CALL XGameEventWrite(
@@ -9933,6 +10703,7 @@ extern "C" {
 XGameResult OPENSCARLETT_GDK_CALL InitializeApiImpl(void) {
     auto& rt = GetRuntime();
     rt.api_impl_init_count.fetch_add(1, std::memory_order_acq_rel);
+    SyncConsoleLsaPolicyFromConfig();
     return RecordHr("InitializeApiImpl", XGR_S_OK);
 }
 
@@ -9942,6 +10713,7 @@ XGameResult OPENSCARLETT_GDK_CALL InitializeApiImplEx(
     uint64_t /*options*/) {
     auto& rt = GetRuntime();
     rt.api_impl_init_count.fetch_add(1, std::memory_order_acq_rel);
+    SyncConsoleLsaPolicyFromConfig();
     return RecordHr("InitializeApiImplEx", XGR_S_OK);
 }
 
@@ -10055,6 +10827,82 @@ int32_t OPENSCARLETT_GDK_CALL XgrGetTelemetryCallCountForTest(
     if (outTotalCalls) *outTotalCalls = 0;
     if (outNotImplCalls) *outNotImplCalls = 0;
     return 0;
+}
+
+// ===========================================================================
+// Xbox Game Core PLM Notifications (appnotify.h) exported from xgameruntime.dll
+// ===========================================================================
+}  // extern "C"
+
+namespace {
+
+openscarlett::PlmNotificationRegistry& GetXgrPlmRegistry() {
+    static openscarlett::PlmNotificationRegistry reg;
+    return reg;
+}
+
+}  // namespace
+
+extern "C" {
+
+OPENSCARLETT_GDK_API uint32_t OPENSCARLETT_GDK_CALL RegisterAppStateChangeNotification(
+    openscarlett::PlmStateChangeCallback Routine,
+    void* Context,
+    void** Registration) {
+    const uint32_t err = GetXgrPlmRegistry().RegisterStateChange(Routine, Context, Registration);
+    if (err == 0u) {
+        RecordOk("RegisterAppStateChangeNotification");
+    } else {
+        (void)RecordHr("RegisterAppStateChangeNotification", XGR_E_INVALIDARG);
+    }
+    return err;
+}
+
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL UnregisterAppStateChangeNotification(
+    void* Registration) {
+    (void)GetXgrPlmRegistry().UnregisterStateChange(Registration);
+    RecordOk("UnregisterAppStateChangeNotification");
+}
+
+OPENSCARLETT_GDK_API uint32_t OPENSCARLETT_GDK_CALL RegisterAppConstrainedChangeNotification(
+    openscarlett::PlmConstrainedChangeCallback Routine,
+    void* Context,
+    void** Registration) {
+    const uint32_t err = GetXgrPlmRegistry().RegisterConstrainedChange(Routine, Context, Registration);
+    if (err == 0u) {
+        RecordOk("RegisterAppConstrainedChangeNotification");
+    } else {
+        (void)RecordHr("RegisterAppConstrainedChangeNotification", XGR_E_INVALIDARG);
+    }
+    return err;
+}
+
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL UnregisterAppConstrainedChangeNotification(
+    void* Registration) {
+    (void)GetXgrPlmRegistry().UnregisterConstrainedChange(Registration);
+    RecordOk("UnregisterAppConstrainedChangeNotification");
+}
+
+OPENSCARLETT_GDK_API uint32_t OPENSCARLETT_GDK_CALL XgrDispatchAppStateChange(uint8_t Quiesced) {
+    return GetXgrPlmRegistry().DispatchStateChange(Quiesced);
+}
+
+OPENSCARLETT_GDK_API uint32_t OPENSCARLETT_GDK_CALL XgrDispatchAppConstrainedChange(uint8_t Constrained) {
+    return GetXgrPlmRegistry().DispatchConstrainedChange(Constrained);
+}
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XgrGetConsoleLsaIdentityForTest(
+    char* pfnBuf,
+    size_t pfnSize,
+    uint32_t* outTitleId) {
+    const auto pkg = openscarlett::ConsoleLsaPolicy::Global().GetPackageIdentity();
+    if (outTitleId) {
+        *outTitleId = pkg.title_id;
+    }
+    if (pfnBuf && pfnSize > 0u) {
+        return CopyStringResult(pkg.package_family_name, pfnSize, pfnBuf, nullptr);
+    }
+    return XGR_S_OK;
 }
 
 }  // extern "C"

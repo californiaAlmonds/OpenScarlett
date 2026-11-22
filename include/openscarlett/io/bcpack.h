@@ -212,7 +212,7 @@ Status BcPackDecompressMipChain(
     std::vector<std::vector<uint8_t>>& out_mip_surfaces,
     BcPackMipChainHeader* out_header = nullptr);
 
-// Generates a deterministic clean-room synthetic BC1..BC7 surface for round-trip testing.
+// Generates a deterministic synthetic BC1..BC7 surface for round-trip testing.
 Status BcGenerateSyntheticSurface(
     BcFormat format,
     uint32_t width,

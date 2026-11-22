@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Xbox WinRT Activation & HSTRING (<winrt_xs.h>) public ABI header
+// MIT Xbox WinRT Activation & HSTRING (<winrt_xs.h>) public ABI header
 // backed by winrt_xs.dll. Reuses Windows SDK <roapi.h> / <winstring.h> declarations
 // so callers can also include <wrl/client.h> without extern "C" overload conflicts.
 

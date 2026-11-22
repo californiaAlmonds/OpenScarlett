@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Microsoft Xbox Services GDK C API (Microsoft.Xbox.Services.GDK.C.dll) ABI.
+// Microsoft Xbox Services GDK C API (Microsoft.Xbox.Services.GDK.C.dll) ABI.
 
 #include <cstddef>
 #include <cstdint>
@@ -540,7 +540,7 @@ XblProfileGetUserProfilesForSocialGroupResult(
     XblUserProfile* profiles);
 
 // ---------------------------------------------------------------------------
-// Title Storage (Clean-Room Local + Persistent Blob Store)
+// Title Storage (Local + Persistent Blob Store)
 // ---------------------------------------------------------------------------
 typedef struct XblTitleStorageBlobMetadataResult* XblTitleStorageBlobMetadataResultHandle;
 

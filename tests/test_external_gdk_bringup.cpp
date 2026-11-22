@@ -702,7 +702,7 @@ int main() {
         {
             std::vector<std::vector<uint8_t>> pkts;
             for (uint32_t i = 0; i < 6u; ++i) {
-                pkts.push_back(openscarlett::BuildCleanRoomOpusTestPacket(2u, i + 1u, 64u));
+                pkts.push_back(openscarlett::BuildOpusTestPacket(2u, i + 1u, 64u));
             }
             const auto opus_stream = openscarlett::PackOpusLengthPrefixedStream(pkts, false);
             WriteBinaryFile(pkg_dir / "tone_opus.opus", opus_stream.data(), opus_stream.size());

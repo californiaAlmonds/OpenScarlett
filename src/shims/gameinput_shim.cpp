@@ -61,6 +61,18 @@ struct OsGameInputRumbleTelemetry {
     uint64_t lastTimestampUs;
 };
 
+struct OsGameInputUserAssociationEvent {
+    uint8_t deviceId[32];
+    uint64_t oldUserLocalId;
+    uint64_t newUserLocalId;
+    uint64_t timestampUs;
+    uint64_t eventSequence;
+};
+
+using OsGameInputUserAssociationCallback = void(OPENSCARLETT_GAMEINPUT_CALL*)(
+    void* context,
+    const OsGameInputUserAssociationEvent* event);
+
 using OsGameInputDeviceCallback = void(OPENSCARLETT_GAMEINPUT_CALL*)(
     uint64_t callbackToken,
     void* context,
@@ -262,8 +274,91 @@ uint32_t DeriveUiNavigationButtons(
     return nav;
 }
 
+void ApplyVirtualGamepadFallback(
+    GameInputGamepadState& out_gamepad,
+    const std::vector<GameInputKeyState>& keys,
+    uint32_t mouse_buttons,
+    int64_t mouse_dx,
+    int64_t mouse_dy) {
+    float kb_lx = 0.0f;
+    float kb_ly = 0.0f;
+    float kb_rx = 0.0f;
+    float kb_ry = 0.0f;
+
+    for (const auto& k : keys) {
+        switch (k.virtualKey) {
+            case 'W': kb_ly += 1.0f; break;
+            case 'S': kb_ly -= 1.0f; break;
+            case 'D': kb_lx += 1.0f; break;
+            case 'A': kb_lx -= 1.0f; break;
+            case 'I': kb_ry += 1.0f; break;
+            case 'K': kb_ry -= 1.0f; break;
+            case 'L': kb_rx += 1.0f; break;
+            case 'J': kb_rx -= 1.0f; break;
+            case 0x26u: out_gamepad.buttons |= GameInputGamepadDPadUp; break;     // VK_UP
+            case 0x28u: out_gamepad.buttons |= GameInputGamepadDPadDown; break;   // VK_DOWN
+            case 0x25u: out_gamepad.buttons |= GameInputGamepadDPadLeft; break;   // VK_LEFT
+            case 0x27u: out_gamepad.buttons |= GameInputGamepadDPadRight; break;  // VK_RIGHT
+            case 0x20u:                                                           // VK_SPACE
+            case 0x0Du: out_gamepad.buttons |= GameInputGamepadA; break;          // VK_RETURN
+            case 0x08u:                                                           // VK_BACK
+            case 0xA2u:                                                           // VK_LCONTROL
+            case 0xA3u: out_gamepad.buttons |= GameInputGamepadB; break;          // VK_RCONTROL
+            case 'E': out_gamepad.buttons |= GameInputGamepadX; break;
+            case 'Q': out_gamepad.buttons |= GameInputGamepadY; break;
+            case 0xA0u: out_gamepad.buttons |= GameInputGamepadLeftShoulder; break;   // VK_LSHIFT
+            case 0xA1u: out_gamepad.buttons |= GameInputGamepadRightShoulder; break;  // VK_RSHIFT
+            case 0x1Bu: out_gamepad.buttons |= GameInputGamepadMenu; break;           // VK_ESCAPE
+            case 0x09u: out_gamepad.buttons |= GameInputGamepadView; break;           // VK_TAB
+            case 'Z': out_gamepad.leftTrigger = std::max(out_gamepad.leftTrigger, 1.0f); break;
+            case 'C': out_gamepad.rightTrigger = std::max(out_gamepad.rightTrigger, 1.0f); break;
+            default: break;
+        }
+    }
+
+    if (kb_lx != 0.0f) {
+        out_gamepad.leftThumbstickX = std::clamp(out_gamepad.leftThumbstickX + kb_lx, -1.0f, 1.0f);
+    }
+    if (kb_ly != 0.0f) {
+        out_gamepad.leftThumbstickY = std::clamp(out_gamepad.leftThumbstickY + kb_ly, -1.0f, 1.0f);
+    }
+    if (kb_rx != 0.0f) {
+        out_gamepad.rightThumbstickX = std::clamp(out_gamepad.rightThumbstickX + kb_rx, -1.0f, 1.0f);
+    }
+    if (kb_ry != 0.0f) {
+        out_gamepad.rightThumbstickY = std::clamp(out_gamepad.rightThumbstickY + kb_ry, -1.0f, 1.0f);
+    }
+
+    // Mouse buttons & relative look delta -> virtual gamepad fallback
+    if ((mouse_buttons & GameInputMouseLeftButton) != 0u) {
+        out_gamepad.rightTrigger = std::max(out_gamepad.rightTrigger, 1.0f);
+    }
+    if ((mouse_buttons & GameInputMouseRightButton) != 0u) {
+        out_gamepad.leftTrigger = std::max(out_gamepad.leftTrigger, 1.0f);
+    }
+    if ((mouse_buttons & GameInputMouseMiddleButton) != 0u) {
+        out_gamepad.buttons |= GameInputGamepadRightThumbstick;
+    }
+    if ((mouse_buttons & GameInputMouseButton4) != 0u) {
+        out_gamepad.buttons |= GameInputGamepadLeftShoulder;
+    }
+    if ((mouse_buttons & GameInputMouseButton5) != 0u) {
+        out_gamepad.buttons |= GameInputGamepadRightShoulder;
+    }
+    if (mouse_dx != 0 && std::fabs(out_gamepad.rightThumbstickX) < 0.01f) {
+        out_gamepad.rightThumbstickX = std::clamp(static_cast<float>(mouse_dx) / 25.0f, -1.0f, 1.0f);
+    }
+    if (mouse_dy != 0 && std::fabs(out_gamepad.rightThumbstickY) < 0.01f) {
+        out_gamepad.rightThumbstickY = std::clamp(static_cast<float>(-mouse_dy) / 25.0f, -1.0f, 1.0f);
+    }
+}
+
 void PollGamepadAndKeyboard(
     uint32_t preferred_slot,
+    bool virtual_gamepad_fallback_enabled,
+    uint32_t raw_mouse_buttons,
+    int64_t raw_mouse_dx,
+    int64_t raw_mouse_dy,
     GameInputGamepadState& out_gamepad,
     std::vector<GameInputKeyState>& out_keys,
     uint32_t& out_active_slot) {
@@ -272,23 +367,23 @@ void PollGamepadAndKeyboard(
     out_active_slot = preferred_slot;
 
 #if defined(_WIN32)
+    bool physical_pad_found = false;
     const XInputApi& xi = GetXInput();
     if (xi.get_state) {
         OsXInputState st{};
-        bool found = false;
         if (xi.get_state(preferred_slot, &st) == ERROR_SUCCESS) {
-            found = true;
+            physical_pad_found = true;
             out_active_slot = preferred_slot;
         } else {
             for (DWORD slot = 0; slot < 4; ++slot) {
                 if (xi.get_state(slot, &st) == ERROR_SUCCESS) {
-                    found = true;
+                    physical_pad_found = true;
                     out_active_slot = static_cast<uint32_t>(slot);
                     break;
                 }
             }
         }
-        if (found) {
+        if (physical_pad_found) {
             const uint16_t b = st.Gamepad.wButtons;
             uint32_t gb = GameInputGamepadNone;
             if (b & kXiDpadUp) gb |= GameInputGamepadDPadUp;
@@ -319,49 +414,6 @@ void PollGamepadAndKeyboard(
         return (GetAsyncKeyState(vk) & 0x8000) != 0;
     };
 
-    float kb_lx = 0.0f;
-    float kb_ly = 0.0f;
-    if (is_down('W')) kb_ly += 1.0f;
-    if (is_down('S')) kb_ly -= 1.0f;
-    if (is_down('D')) kb_lx += 1.0f;
-    if (is_down('A')) kb_lx -= 1.0f;
-    if (kb_lx != 0.0f) {
-        out_gamepad.leftThumbstickX = std::clamp(out_gamepad.leftThumbstickX + kb_lx, -1.0f, 1.0f);
-    }
-    if (kb_ly != 0.0f) {
-        out_gamepad.leftThumbstickY = std::clamp(out_gamepad.leftThumbstickY + kb_ly, -1.0f, 1.0f);
-    }
-
-    float kb_rx = 0.0f;
-    float kb_ry = 0.0f;
-    if (is_down('I')) kb_ry += 1.0f;
-    if (is_down('K')) kb_ry -= 1.0f;
-    if (is_down('L')) kb_rx += 1.0f;
-    if (is_down('J')) kb_rx -= 1.0f;
-    if (kb_rx != 0.0f) {
-        out_gamepad.rightThumbstickX = std::clamp(out_gamepad.rightThumbstickX + kb_rx, -1.0f, 1.0f);
-    }
-    if (kb_ry != 0.0f) {
-        out_gamepad.rightThumbstickY = std::clamp(out_gamepad.rightThumbstickY + kb_ry, -1.0f, 1.0f);
-    }
-
-    if (is_down(VK_UP)) out_gamepad.buttons |= GameInputGamepadDPadUp;
-    if (is_down(VK_DOWN)) out_gamepad.buttons |= GameInputGamepadDPadDown;
-    if (is_down(VK_LEFT)) out_gamepad.buttons |= GameInputGamepadDPadLeft;
-    if (is_down(VK_RIGHT)) out_gamepad.buttons |= GameInputGamepadDPadRight;
-    if (is_down(VK_SPACE) || is_down(VK_RETURN)) out_gamepad.buttons |= GameInputGamepadA;
-    if (is_down(VK_BACK) || is_down(VK_LCONTROL) || is_down(VK_RCONTROL)) {
-        out_gamepad.buttons |= GameInputGamepadB;
-    }
-    if (is_down('E')) out_gamepad.buttons |= GameInputGamepadX;
-    if (is_down('Q')) out_gamepad.buttons |= GameInputGamepadY;
-    if (is_down(VK_LSHIFT)) out_gamepad.buttons |= GameInputGamepadLeftShoulder;
-    if (is_down(VK_RSHIFT)) out_gamepad.buttons |= GameInputGamepadRightShoulder;
-    if (is_down(VK_ESCAPE)) out_gamepad.buttons |= GameInputGamepadMenu;
-    if (is_down(VK_TAB)) out_gamepad.buttons |= GameInputGamepadView;
-    if (is_down('Z')) out_gamepad.leftTrigger = std::max(out_gamepad.leftTrigger, 1.0f);
-    if (is_down('C')) out_gamepad.rightTrigger = std::max(out_gamepad.rightTrigger, 1.0f);
-
     static constexpr uint8_t kTrackedVks[] = {
         'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
         'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
@@ -382,8 +434,21 @@ void PollGamepadAndKeyboard(
             out_keys.push_back(ks);
         }
     }
+
+    if (!physical_pad_found || virtual_gamepad_fallback_enabled) {
+        uint32_t eff_mouse_buttons = raw_mouse_buttons;
+        if (is_down(VK_LBUTTON)) eff_mouse_buttons |= GameInputMouseLeftButton;
+        if (is_down(VK_RBUTTON)) eff_mouse_buttons |= GameInputMouseRightButton;
+        if (is_down(VK_MBUTTON)) eff_mouse_buttons |= GameInputMouseMiddleButton;
+        if (is_down(VK_XBUTTON1)) eff_mouse_buttons |= GameInputMouseButton4;
+        if (is_down(VK_XBUTTON2)) eff_mouse_buttons |= GameInputMouseButton5;
+        ApplyVirtualGamepadFallback(out_gamepad, out_keys, eff_mouse_buttons, raw_mouse_dx, raw_mouse_dy);
+    }
 #else
     (void)preferred_slot;
+    if (virtual_gamepad_fallback_enabled) {
+        ApplyVirtualGamepadFallback(out_gamepad, out_keys, raw_mouse_buttons, raw_mouse_dx, raw_mouse_dy);
+    }
 #endif
 }
 
@@ -460,12 +525,15 @@ public:
 
     void OPENSCARLETT_GAMEINPUT_CALL SetRumbleState(const GameInputRumbleParams* params) override {
         RecordOk("IGameInputDevice::SetRumbleState", 5);
+        auto sanitize_unit = [](float v) -> float {
+            return std::isfinite(v) ? std::clamp(v, 0.0f, 1.0f) : 0.0f;
+        };
         GameInputRumbleParams clamped{};
         if (params) {
-            clamped.lowFrequency = std::clamp(params->lowFrequency, 0.0f, 1.0f);
-            clamped.highFrequency = std::clamp(params->highFrequency, 0.0f, 1.0f);
-            clamped.leftTrigger = std::clamp(params->leftTrigger, 0.0f, 1.0f);
-            clamped.rightTrigger = std::clamp(params->rightTrigger, 0.0f, 1.0f);
+            clamped.lowFrequency = sanitize_unit(params->lowFrequency);
+            clamped.highFrequency = sanitize_unit(params->highFrequency);
+            clamped.leftTrigger = sanitize_unit(params->leftTrigger);
+            clamped.rightTrigger = sanitize_unit(params->rightTrigger);
         }
 
         // Mix Xbox impulse triggers (LT -> low/left motor, RT -> high/right motor) cleanly
@@ -502,7 +570,7 @@ public:
                 OsXInputVibration vib{};
                 vib.wLeftMotorSpeed = xi_left;
                 vib.wRightMotorSpeed = xi_right;
-                xi.set_state(slot, &vib);
+                (void)xi.set_state(slot, &vib);  // Safely no-ops if no physical XInput pad is attached
             }
         }
 #endif
@@ -531,6 +599,28 @@ public:
         return status_.exchange(new_status, std::memory_order_acq_rel);
     }
 
+    uint64_t SetUserAssociation(uint64_t user_local_id, uint64_t assoc_seq) {
+        const uint64_t old_id = associated_user_local_id_.exchange(user_local_id, std::memory_order_acq_rel);
+        user_assoc_seq_.store(assoc_seq, std::memory_order_release);
+        return old_id;
+    }
+
+    void RecordConnectSequence(uint64_t seq) {
+        connect_seq_.store(seq, std::memory_order_release);
+    }
+
+    uint64_t AssociatedUserLocalId() const {
+        return associated_user_local_id_.load(std::memory_order_acquire);
+    }
+
+    uint64_t UserAssociationSequence() const {
+        return user_assoc_seq_.load(std::memory_order_acquire);
+    }
+
+    uint64_t ConnectSequence() const {
+        return connect_seq_.load(std::memory_order_acquire);
+    }
+
     uint32_t SupportedInput() const { return info_.supportedInput; }
 
     // Per-device timestamped reading history ring buffer (bounded to kPerDeviceRingCap)
@@ -544,8 +634,10 @@ private:
 
     std::atomic<uint32_t> ref_count_{1};
     std::atomic<uint32_t> xinput_slot_{0};
-    std::atomic<uint32_t> status_{
-        GameInputDeviceConnected | GameInputDeviceInputEnabled | GameInputDeviceOutputEnabled};
+    std::atomic<uint32_t> status_{GameInputDeviceNoStatus};
+    std::atomic<uint64_t> associated_user_local_id_{0ull};
+    std::atomic<uint64_t> user_assoc_seq_{0ull};
+    std::atomic<uint64_t> connect_seq_{0ull};
     GameInputDeviceInfo info_{};
     std::mutex mutex_;
     GameInputRumbleParams last_rumble_{};
@@ -789,6 +881,21 @@ public:
             GameInputRumbleNone,
             "OpenScarlett Raw Input Mouse");
 
+        // Report gamepad device connected strictly AFTER establishing user association (local user 1),
+        // matching real Xbox Series X|S title binding expectations.
+        constexpr uint32_t kConnectedFlags =
+            GameInputDeviceConnected | GameInputDeviceInputEnabled | GameInputDeviceOutputEnabled;
+        const uint64_t assoc_seq = event_seq_.fetch_add(1ull, std::memory_order_acq_rel) + 1ull;
+        default_device_->SetUserAssociation(1ull, assoc_seq);
+        const uint64_t connect_seq = event_seq_.fetch_add(1ull, std::memory_order_acq_rel) + 1ull;
+        default_device_->SetStatus(kConnectedFlags);
+        default_device_->RecordConnectSequence(connect_seq);
+
+        keyboard_device_->SetStatus(kConnectedFlags);
+        keyboard_device_->RecordConnectSequence(event_seq_.fetch_add(1ull, std::memory_order_acq_rel) + 1ull);
+        mouse_device_->SetStatus(kConnectedFlags);
+        mouse_device_->RecordConnectSequence(event_seq_.fetch_add(1ull, std::memory_order_acq_rel) + 1ull);
+
         slot_devices_[0u] = default_device_;
         slot_devices_[1u] = keyboard_device_;
         slot_devices_[2u] = mouse_device_;
@@ -895,23 +1002,55 @@ public:
             }
         }
 
+        const bool input_allowed = ShouldAllowInput();
+        GameInputMouseState mouse_snapshot{};
+        int64_t raw_dx = 0;
+        int64_t raw_dy = 0;
+        {
+            std::lock_guard<std::mutex> mlk(raw_mouse_mutex_);
+            if (input_allowed) {
+                mouse_snapshot.buttons = mouse_buttons_;
+                mouse_snapshot.positionX = mouse_cumulative_x_;
+                mouse_snapshot.positionY = mouse_cumulative_y_;
+                mouse_snapshot.wheelX = mouse_cumulative_wheel_x_;
+                mouse_snapshot.wheelY = mouse_cumulative_wheel_y_;
+                raw_dx = pending_mouse_dx_;
+                raw_dy = pending_mouse_dy_;
+            }
+        }
+
         GameInputGamepadState gp{};
         std::vector<GameInputKeyState> keys;
-        const bool input_allowed = ShouldAllowInput();
+        const bool vpad_fallback = virtual_gamepad_fallback_.load(std::memory_order_acquire);
 
         bool use_injected = false;
+        bool injected_gp_explicit = false;
         if (input_allowed) {
             std::lock_guard<std::mutex> lk(mutex_);
             if (test_inject_enabled_) {
                 gp = injected_gamepad_;
                 keys = injected_keys_;
                 use_injected = true;
+                injected_gp_explicit = injected_gamepad_explicit_;
             }
+        }
+
+        if (input_allowed && use_injected && !injected_gp_explicit && vpad_fallback) {
+            // Synthesize virtual gamepad state from injected keyboard + raw mouse state.
+            ApplyVirtualGamepadFallback(gp, keys, mouse_snapshot.buttons, raw_dx, raw_dy);
         }
 
         if (input_allowed && !use_injected) {
             uint32_t active_slot = target_dev->ActiveSlot();
-            PollGamepadAndKeyboard(active_slot, gp, keys, active_slot);
+            PollGamepadAndKeyboard(
+                active_slot,
+                vpad_fallback,
+                mouse_snapshot.buttons,
+                raw_dx,
+                raw_dy,
+                gp,
+                keys,
+                active_slot);
             if (target_dev == default_device_) {
                 target_dev->SetActiveSlot(active_slot);
             }
@@ -922,18 +1061,6 @@ public:
                 ? static_cast<GameInputKind>(GameInputKindGamepad | GameInputKindKeyboard |
                                              GameInputKindMouse | GameInputKindUiNavigation)
                 : inputKind;
-
-        GameInputMouseState mouse_snapshot{};
-        {
-            std::lock_guard<std::mutex> mlk(raw_mouse_mutex_);
-            if (input_allowed) {
-                mouse_snapshot.buttons = mouse_buttons_;
-                mouse_snapshot.positionX = mouse_cumulative_x_;
-                mouse_snapshot.positionY = mouse_cumulative_y_;
-                mouse_snapshot.wheelX = mouse_cumulative_wheel_x_;
-                mouse_snapshot.wheelY = mouse_cumulative_wheel_y_;
-            }
-        }
 
         const uint32_t ui_nav = input_allowed ? DeriveUiNavigationButtons(gp, keys) : kUiNavNone;
 
@@ -1137,6 +1264,58 @@ public:
         return device_callbacks_.size() < before;
     }
 
+    int32_t RegisterUserAssociationCallback(
+        void* context,
+        OsGameInputUserAssociationCallback callback,
+        uint64_t* out_token) {
+        if (!callback) {
+            return GAMEINPUT_E_INVALIDARG;
+        }
+        std::lock_guard<std::mutex> lk(mutex_);
+        const uint64_t tok = next_user_assoc_token_++;
+        user_assoc_callbacks_.push_back(UserAssocCallbackEntry{tok, context, callback});
+        if (out_token) {
+            *out_token = tok;
+        }
+        return GAMEINPUT_S_OK;
+    }
+
+    bool UnregisterUserAssociationCallback(uint64_t token) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        const size_t before = user_assoc_callbacks_.size();
+        user_assoc_callbacks_.erase(
+            std::remove_if(user_assoc_callbacks_.begin(), user_assoc_callbacks_.end(),
+                           [&](const UserAssocCallbackEntry& e) { return e.token == token; }),
+            user_assoc_callbacks_.end());
+        return user_assoc_callbacks_.size() < before;
+    }
+
+    void NotifyUserAssociationForDevice(GameInputDeviceImpl* dev, uint64_t new_user_local_id) {
+        if (!dev) return;
+        const uint64_t seq = event_seq_.fetch_add(1ull, std::memory_order_acq_rel) + 1ull;
+        const uint64_t old_user = dev->SetUserAssociation(new_user_local_id, seq);
+        OsGameInputUserAssociationEvent ev{};
+        const GameInputDeviceInfo* info = dev->GetDeviceInfo();
+        if (info) {
+            std::memcpy(ev.deviceId, info->deviceId, sizeof(ev.deviceId));
+        }
+        ev.oldUserLocalId = old_user;
+        ev.newUserLocalId = new_user_local_id;
+        ev.timestampUs = QueryTimestampMicros();
+        ev.eventSequence = seq;
+
+        std::vector<UserAssocCallbackEntry> cbs;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            cbs = user_assoc_callbacks_;
+        }
+        for (const auto& cb : cbs) {
+            if (cb.func) {
+                cb.func(cb.context, &ev);
+            }
+        }
+    }
+
     int32_t SimulateDeviceHotPlug(
         uint32_t device_slot,
         GameInputKind supported_input,
@@ -1148,6 +1327,8 @@ public:
             ? (GameInputDeviceConnected | GameInputDeviceInputEnabled | GameInputDeviceOutputEnabled)
             : GameInputDeviceNoStatus;
         std::vector<DeviceCallbackEntry> matching_cbs;
+        bool need_user_assoc_before_connect = false;
+        uint64_t assoc_user_id = 0ull;
 
         {
             std::lock_guard<std::mutex> lk(mutex_);
@@ -1173,8 +1354,28 @@ public:
             } else {
                 target = it->second;
             }
-            prev_status = target->SetStatus(curr_status);
             target->AddRef();
+
+            if (connected && (target->SupportedInput() & GameInputKindGamepad) != 0u) {
+                need_user_assoc_before_connect = true;
+                assoc_user_id = (target->AssociatedUserLocalId() != 0ull)
+                                    ? target->AssociatedUserLocalId()
+                                    : (1ull + static_cast<uint64_t>(device_slot));
+            }
+        }
+
+        // CRITICAL GDK ORDERING: Establish and notify user association STRICTLY BEFORE
+        // transitioning the gamepad device to GameInputDeviceConnected and firing device callbacks!
+        if (need_user_assoc_before_connect) {
+            NotifyUserAssociationForDevice(target, assoc_user_id);
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            prev_status = target->SetStatus(curr_status);
+            if (connected) {
+                target->RecordConnectSequence(event_seq_.fetch_add(1ull, std::memory_order_acq_rel) + 1ull);
+            }
 
             const uint32_t changed = prev_status ^ curr_status;
             for (const auto& cb : device_callbacks_) {
@@ -1198,6 +1399,12 @@ public:
         const uint64_t ts = QueryTimestampMicros();
         for (const auto& cb : matching_cbs) {
             cb.func(cb.token, cb.context, target, ts, curr_status, prev_status);
+        }
+
+        // On disconnect, disassociate user AFTER device disconnected callback fires.
+        if (!connected && (target->SupportedInput() & GameInputKindGamepad) != 0u &&
+            target->AssociatedUserLocalId() != 0ull) {
+            NotifyUserAssociationForDevice(target, 0ull);
         }
 
         if (out_device) {
@@ -1230,6 +1437,10 @@ public:
         target_hwnd_.store(hwnd, std::memory_order_release);
     }
 
+    void SetVirtualGamepadFallback(bool enable) {
+        virtual_gamepad_fallback_.store(enable, std::memory_order_release);
+    }
+
     void SetInjectedTestState(
         const GameInputGamepadState* gp,
         const GameInputKeyState* keys,
@@ -1238,10 +1449,12 @@ public:
         std::lock_guard<std::mutex> lk(mutex_);
         test_inject_enabled_ = enable;
         if (!enable) {
+            injected_gamepad_explicit_ = false;
             injected_gamepad_ = GameInputGamepadState{};
             injected_keys_.clear();
             return;
         }
+        injected_gamepad_explicit_ = (gp != nullptr);
         injected_gamepad_ = gp ? *gp : GameInputGamepadState{};
         injected_keys_.clear();
         if (keys && key_count > 0u) {
@@ -1359,6 +1572,12 @@ public:
     }
 
 private:
+    struct UserAssocCallbackEntry {
+        uint64_t token = 0ull;
+        void* context = nullptr;
+        OsGameInputUserAssociationCallback func = nullptr;
+    };
+
     struct DeviceCallbackEntry {
         uint64_t token = 0ull;
         IGameInputDevice* device_filter = nullptr;
@@ -1471,12 +1690,17 @@ private:
     GameInputDeviceImpl* mouse_device_ = nullptr;
     std::unordered_map<uint32_t, GameInputDeviceImpl*> slot_devices_;
     std::mutex mutex_;
+    std::atomic<uint64_t> event_seq_{0ull};
+    std::atomic<bool> virtual_gamepad_fallback_{true};
     uint64_t next_seq_ = 1u;
     uint64_t last_ts_ = 0u;
     uint64_t next_cb_token_ = 1u;
+    uint64_t next_user_assoc_token_ = 1u;
     std::deque<GameInputReadingImpl*> history_;
     std::vector<DeviceCallbackEntry> device_callbacks_;
+    std::vector<UserAssocCallbackEntry> user_assoc_callbacks_;
     bool test_inject_enabled_ = false;
+    bool injected_gamepad_explicit_ = false;
     GameInputGamepadState injected_gamepad_{};
     std::vector<GameInputKeyState> injected_keys_;
 
@@ -1721,6 +1945,73 @@ OpenScarlettGameInputGetUiNavigationState(
     const bool ok = r->GetUiNavigationState(static_cast<OsGameInputUiNavigationState*>(outState));
     return RecordHr("OpenScarlettGameInputGetUiNavigationState",
                     ok ? GAMEINPUT_S_OK : GAMEINPUT_E_INVALIDARG);
+}
+
+// --- Sprint 12 User-Before-Connect Association & Virtual Gamepad Fallback Controls ---
+
+OPENSCARLETT_GAMEINPUT_API int32_t OPENSCARLETT_GAMEINPUT_CALL
+OpenScarlettGameInputRegisterUserAssociationCallback(
+    IGameInput* input,
+    void* context,
+    OsGameInputUserAssociationCallback callbackFunc,
+    uint64_t* callbackToken) {
+    GameInputImpl* impl = AcquireLiveGameInput(input);
+    if (!impl) {
+        return RecordHr("OpenScarlettGameInputRegisterUserAssociationCallback", GAMEINPUT_E_INVALIDARG);
+    }
+    const int32_t hr = impl->RegisterUserAssociationCallback(context, callbackFunc, callbackToken);
+    impl->Release();
+    return RecordHr("OpenScarlettGameInputRegisterUserAssociationCallback", hr);
+}
+
+OPENSCARLETT_GAMEINPUT_API int32_t OPENSCARLETT_GAMEINPUT_CALL
+OpenScarlettGameInputUnregisterUserAssociationCallback(
+    IGameInput* input,
+    uint64_t callbackToken) {
+    GameInputImpl* impl = AcquireLiveGameInput(input);
+    if (!impl) {
+        return RecordHr("OpenScarlettGameInputUnregisterUserAssociationCallback", GAMEINPUT_E_INVALIDARG);
+    }
+    const bool removed = impl->UnregisterUserAssociationCallback(callbackToken);
+    impl->Release();
+    return RecordHr("OpenScarlettGameInputUnregisterUserAssociationCallback",
+                    removed ? GAMEINPUT_S_OK : GAMEINPUT_E_INVALIDARG);
+}
+
+OPENSCARLETT_GAMEINPUT_API int32_t OPENSCARLETT_GAMEINPUT_CALL
+OpenScarlettGameInputGetDeviceUserAssociation(
+    IGameInputDevice* device,
+    uint64_t* outUserLocalId,
+    uint64_t* outAssocSeq,
+    uint64_t* outConnectSeq) {
+    if (!device) {
+        return RecordHr("OpenScarlettGameInputGetDeviceUserAssociation", GAMEINPUT_E_INVALIDARG);
+    }
+    auto* dev = static_cast<GameInputDeviceImpl*>(device);
+    {
+        auto& reg = GetLiveGameInputRegistry();
+        std::lock_guard<std::mutex> lk(reg.mutex);
+        if (reg.devices.find(dev) == reg.devices.end()) {
+            return RecordHr("OpenScarlettGameInputGetDeviceUserAssociation", GAMEINPUT_E_INVALIDARG);
+        }
+    }
+    if (outUserLocalId) *outUserLocalId = dev->AssociatedUserLocalId();
+    if (outAssocSeq) *outAssocSeq = dev->UserAssociationSequence();
+    if (outConnectSeq) *outConnectSeq = dev->ConnectSequence();
+    return RecordHr("OpenScarlettGameInputGetDeviceUserAssociation", GAMEINPUT_S_OK);
+}
+
+OPENSCARLETT_GAMEINPUT_API int32_t OPENSCARLETT_GAMEINPUT_CALL
+OpenScarlettGameInputSetVirtualGamepadFallback(
+    IGameInput* input,
+    int enable) {
+    GameInputImpl* impl = AcquireLiveGameInput(input);
+    if (!impl) {
+        return RecordHr("OpenScarlettGameInputSetVirtualGamepadFallback", GAMEINPUT_E_INVALIDARG);
+    }
+    impl->SetVirtualGamepadFallback(enable != 0);
+    impl->Release();
+    return RecordHr("OpenScarlettGameInputSetVirtualGamepadFallback", GAMEINPUT_S_OK);
 }
 
 }  // extern "C"

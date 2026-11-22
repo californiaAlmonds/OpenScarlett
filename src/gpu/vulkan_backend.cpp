@@ -22,7 +22,7 @@ namespace openscarlett {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Clean-room minimal Vulkan 1.2/1.3/1.4 C ABI declarations (zero SDK headers).
+// Minimal Vulkan 1.2/1.3/1.4 C ABI declarations (zero SDK headers).
 // Follows the public Khronos Vulkan 1.2/1.3/1.4 Specification ABI for x86-64.
 // ---------------------------------------------------------------------------
 using VkFlags = uint32_t;
@@ -124,12 +124,18 @@ inline constexpr int32_t kVkStypeRenderPassBeginInfo = 43;
 inline constexpr int32_t kVkStypeBufferMemoryBarrier = 44;
 inline constexpr int32_t kVkStypeImageMemoryBarrier = 45;
 inline constexpr int32_t kVkStypeMemoryBarrier = 46;
+inline constexpr int32_t kVkStypePhysicalDeviceVulkan12Features = 51;
+inline constexpr int32_t kVkStypePhysicalDeviceVulkan13Features = 53;
 inline constexpr int32_t kVkStypeSwapchainCreateInfoKhr = 1000001000;
 inline constexpr int32_t kVkStypePresentInfoKhr = 1000001001;
 inline constexpr int32_t kVkStypeWin32SurfaceCreateInfoKhr = 1000009000;
 inline constexpr int32_t kVkStypePhysicalDeviceFeatures2 = 1000059000;
 inline constexpr int32_t kVkStypePhysicalDeviceProperties2 = 1000059001;
 inline constexpr int32_t kVkStypePhysicalDeviceSubgroupProperties = 1000094000;
+inline constexpr int32_t kVkStypePhysicalDeviceSampleLocationsPropertiesExt = 1000143003;
+inline constexpr int32_t kVkStypeSamplerCustomBorderColorCreateInfoExt = 1000287000;
+inline constexpr int32_t kVkStypePhysicalDeviceCustomBorderColorPropertiesExt = 1000287001;
+inline constexpr int32_t kVkStypePhysicalDeviceCustomBorderColorFeaturesExt = 1000287002;
 inline constexpr int32_t kVkStypePhysicalDeviceMeshShaderFeaturesExt = 1000328000;
 
 // Flags & enums
@@ -142,11 +148,22 @@ inline constexpr uint32_t kVkSparseImageFormatSingleMiptailBit = 0x00000001u;
 inline constexpr uint32_t kVkSparseImageFormatAlignedMipSizeBit = 0x00000002u;
 inline constexpr uint32_t kVkSparseImageFormatNonstandardBlockSizeBit = 0x00000004u;
 inline constexpr uint32_t kVkSparseMemoryBindMetadataBit = 0x00000001u;
+inline constexpr uint32_t kVkFeatDepthBounds = 14u;
 inline constexpr uint32_t kVkFeatTextureCompressionBC = 22u;
+inline constexpr uint32_t kVkFeatFragmentStoresAndAtomics = 26u;
+inline constexpr uint32_t kVkFeatShaderResourceResidency = 42u;
+inline constexpr uint32_t kVkFeatShaderResourceMinLod = 43u;
 inline constexpr uint32_t kVkFeatSparseBinding = 44u;
 inline constexpr uint32_t kVkFeatSparseResidencyBuffer = 45u;
 inline constexpr uint32_t kVkFeatSparseResidencyImage2D = 46u;
 inline constexpr uint32_t kVkFeatSparseResidencyImage3D = 47u;
+inline constexpr uint32_t kVkFeat12DescriptorIndexing = 9u;
+inline constexpr uint32_t kVkFeat12SamplerFilterMinmax = 30u;
+inline constexpr uint32_t kVkFeat12TimelineSemaphore = 37u;
+inline constexpr uint32_t kVkFeat12BufferDeviceAddress = 38u;
+inline constexpr uint32_t kVkFeat13Synchronization2 = 9u;
+inline constexpr uint32_t kVkFeat13DynamicRendering = 12u;
+inline constexpr uint32_t kVkFeat13Maintenance4 = 14u;
 inline constexpr uint32_t kVkMemoryPropertyDeviceLocalBit = 0x00000001u;
 inline constexpr uint32_t kVkMemoryPropertyHostVisibleBit = 0x00000002u;
 inline constexpr uint32_t kVkMemoryPropertyHostCoherentBit = 0x00000004u;
@@ -226,7 +243,19 @@ inline constexpr int32_t kVkFilterNearest = 0;
 inline constexpr int32_t kVkFilterLinear = 1;
 inline constexpr int32_t kVkSamplerMipmapModeNearest = 0;
 inline constexpr int32_t kVkSamplerMipmapModeLinear = 1;
+inline constexpr int32_t kVkSamplerAddressModeRepeat = 0;
+inline constexpr int32_t kVkSamplerAddressModeMirroredRepeat = 1;
 inline constexpr int32_t kVkSamplerAddressModeClampToEdge = 2;
+inline constexpr int32_t kVkSamplerAddressModeClampToBorder = 3;
+inline constexpr int32_t kVkSamplerAddressModeMirrorClampToEdge = 4;
+inline constexpr int32_t kVkBorderColorFloatTransparentBlack = 0;
+inline constexpr int32_t kVkBorderColorIntTransparentBlack = 1;
+inline constexpr int32_t kVkBorderColorFloatOpaqueBlack = 2;
+inline constexpr int32_t kVkBorderColorIntOpaqueBlack = 3;
+inline constexpr int32_t kVkBorderColorFloatOpaqueWhite = 4;
+inline constexpr int32_t kVkBorderColorIntOpaqueWhite = 5;
+inline constexpr int32_t kVkBorderColorFloatCustomExt = 1000287003;
+inline constexpr int32_t kVkBorderColorIntCustomExt = 1000287004;
 inline constexpr int32_t kVkPresentModeFifoKhr = 2;
 inline constexpr uint32_t kVkCompositeAlphaOpaqueBitKhr = 0x00000001u;
 
@@ -300,6 +329,61 @@ struct VkPhysicalDeviceMeshShaderFeaturesEXT {
     VkBool32 primitiveFragmentShadingRateMeshShader;
     VkBool32 meshShaderQueries;
 };
+
+struct VkPhysicalDeviceVulkan12Features {
+    int32_t sType;
+    void* pNext;
+    VkBool32 fields[47];
+};
+static_assert(sizeof(VkPhysicalDeviceVulkan12Features) == 208, "VkPhysicalDeviceVulkan12Features x64 size");
+
+struct VkPhysicalDeviceVulkan13Features {
+    int32_t sType;
+    void* pNext;
+    VkBool32 fields[15];
+};
+static_assert(sizeof(VkPhysicalDeviceVulkan13Features) == 80, "VkPhysicalDeviceVulkan13Features x64 size");
+
+struct VkPhysicalDeviceCustomBorderColorFeaturesEXT {
+    int32_t sType;
+    void* pNext;
+    VkBool32 customBorderColors;
+    VkBool32 customBorderColorWithoutFormat;
+};
+static_assert(sizeof(VkPhysicalDeviceCustomBorderColorFeaturesEXT) == 24, "VkPhysicalDeviceCustomBorderColorFeaturesEXT x64 size");
+
+struct VkPhysicalDeviceCustomBorderColorPropertiesEXT {
+    int32_t sType;
+    void* pNext;
+    uint32_t maxCustomBorderColorSamplers;
+    uint32_t pad;
+};
+static_assert(sizeof(VkPhysicalDeviceCustomBorderColorPropertiesEXT) == 24, "VkPhysicalDeviceCustomBorderColorPropertiesEXT x64 size");
+
+struct VkPhysicalDeviceSampleLocationsPropertiesEXT {
+    int32_t sType;
+    void* pNext;
+    VkFlags sampleLocationSampleCounts;
+    uint32_t maxSampleLocationGridSizeWidth;
+    uint32_t maxSampleLocationGridSizeHeight;
+    float sampleLocationCoordinateRange[2];
+    uint32_t sampleLocationSubPixelBits;
+    VkBool32 variableSampleLocations;
+    uint32_t pad;
+};
+static_assert(sizeof(VkPhysicalDeviceSampleLocationsPropertiesEXT) == 48, "VkPhysicalDeviceSampleLocationsPropertiesEXT x64 size");
+
+struct VkSamplerCustomBorderColorCreateInfoEXT {
+    int32_t sType;
+    const void* pNext;
+    union {
+        float float32[4];
+        int32_t int32[4];
+        uint32_t uint32[4];
+    } customBorderColor;
+    int32_t format;
+};
+static_assert(sizeof(VkSamplerCustomBorderColorCreateInfoEXT) == 40, "VkSamplerCustomBorderColorCreateInfoEXT x64 size");
 
 struct alignas(8) VkPhysicalDevicePropertiesRaw {
     uint32_t apiVersion;
@@ -1622,7 +1706,7 @@ bool ReadSpirvString(const std::vector<uint32_t>& words,
     return false;
 }
 
-// Deterministic clean-room SPIR-V compute interpreter (fallback when no ICD is present).
+// Deterministic SPIR-V compute interpreter (fallback when no ICD is present).
 Status ExecuteSpirvComputeSoftware(const std::vector<uint32_t>& spirv,
                                    const SpirvValidationInfo& val_info,
                                    const std::vector<uint32_t>& input_u32,
@@ -1863,7 +1947,7 @@ Status ExecuteSpirvComputeSoftware(const std::vector<uint32_t>& spirv,
 }
 
 // ---------------------------------------------------------------------------
-// Clean-room SPIR-V Graphics & Mesh Shader Software Fallback Evaluator
+// SPIR-V Graphics & Mesh Shader Software Fallback Evaluator
 // Executes real SPIR-V VS+PS and TaskEXT+MeshEXT+PS shaders deterministically
 // when no Vulkan ICD or VK_EXT_mesh_shader hardware is available (e.g. CI).
 // ---------------------------------------------------------------------------
@@ -2100,15 +2184,122 @@ struct SwShaderExecEnv {
     std::vector<uint8_t>* task_payload = nullptr;
 };
 
-SwVec4 SwSampleTexture2D(const VulkanTextureDesc& tex, float u, float v, bool linear, uint32_t mip_index = 0u) {
+// Chooses the nearest standard Vulkan border color when VK_EXT_custom_border_color
+// is unsupported or explicitly bypassed via fallback mode.
+VulkanBorderColorMode ChooseStandardBorderColorFallback(
+    VulkanBorderColorMode requested,
+    const float custom_float[4],
+    const int32_t custom_int[4],
+    float out_effective_float[4],
+    int32_t out_effective_int[4]) noexcept {
+    VulkanBorderColorMode eff = requested;
+    if (requested == VulkanBorderColorMode::FloatCustom) {
+        const float a = custom_float ? custom_float[3] : 0.0f;
+        const float lum = custom_float
+            ? (custom_float[0] + custom_float[1] + custom_float[2]) / 3.0f
+            : 0.0f;
+        if (a < 0.5f) {
+            eff = VulkanBorderColorMode::FloatTransparentBlack;
+        } else if (lum >= 0.5f) {
+            eff = VulkanBorderColorMode::FloatOpaqueWhite;
+        } else {
+            eff = VulkanBorderColorMode::FloatOpaqueBlack;
+        }
+    } else if (requested == VulkanBorderColorMode::IntCustom) {
+        const int32_t a = custom_int ? custom_int[3] : 0;
+        const bool bright = custom_int && (custom_int[0] > 0 || custom_int[1] > 0 || custom_int[2] > 0);
+        if (a == 0) {
+            eff = VulkanBorderColorMode::IntTransparentBlack;
+        } else if (bright) {
+            eff = VulkanBorderColorMode::IntOpaqueWhite;
+        } else {
+            eff = VulkanBorderColorMode::IntOpaqueBlack;
+        }
+    }
+
+    auto set_f = [&](float r, float g, float b, float a) {
+        if (out_effective_float) {
+            out_effective_float[0] = r; out_effective_float[1] = g;
+            out_effective_float[2] = b; out_effective_float[3] = a;
+        }
+    };
+    auto set_i = [&](int32_t r, int32_t g, int32_t b, int32_t a) {
+        if (out_effective_int) {
+            out_effective_int[0] = r; out_effective_int[1] = g;
+            out_effective_int[2] = b; out_effective_int[3] = a;
+        }
+    };
+
+    switch (eff) {
+        case VulkanBorderColorMode::FloatOpaqueWhite:
+            set_f(1.0f, 1.0f, 1.0f, 1.0f); set_i(1, 1, 1, 1); break;
+        case VulkanBorderColorMode::FloatOpaqueBlack:
+            set_f(0.0f, 0.0f, 0.0f, 1.0f); set_i(0, 0, 0, 1); break;
+        case VulkanBorderColorMode::IntOpaqueWhite:
+            set_f(1.0f, 1.0f, 1.0f, 1.0f); set_i(1, 1, 1, 1); break;
+        case VulkanBorderColorMode::IntOpaqueBlack:
+            set_f(0.0f, 0.0f, 0.0f, 1.0f); set_i(0, 0, 0, 1); break;
+        case VulkanBorderColorMode::IntTransparentBlack:
+        case VulkanBorderColorMode::FloatTransparentBlack:
+        default:
+            set_f(0.0f, 0.0f, 0.0f, 0.0f); set_i(0, 0, 0, 0); break;
+    }
+    return eff;
+}
+
+SwVec4 ResolveSwBorderColor(const VulkanDescriptorBinding* samp_desc) noexcept {
+    if (!samp_desc) return {{0.0f, 0.0f, 0.0f, 1.0f}};
+    if (!samp_desc->force_standard_border_fallback) {
+        if (samp_desc->border_color_mode == VulkanBorderColorMode::FloatCustom) {
+            return {{samp_desc->custom_border_color_float[0],
+                     samp_desc->custom_border_color_float[1],
+                     samp_desc->custom_border_color_float[2],
+                     samp_desc->custom_border_color_float[3]}};
+        }
+        if (samp_desc->border_color_mode == VulkanBorderColorMode::IntCustom) {
+            return {{static_cast<float>(samp_desc->custom_border_color_int[0]),
+                     static_cast<float>(samp_desc->custom_border_color_int[1]),
+                     static_cast<float>(samp_desc->custom_border_color_int[2]),
+                     static_cast<float>(samp_desc->custom_border_color_int[3])}};
+        }
+    }
+    float ef[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int32_t ei[4] = {0, 0, 0, 0};
+    ChooseStandardBorderColorFallback(
+        samp_desc->border_color_mode,
+        samp_desc->custom_border_color_float,
+        samp_desc->custom_border_color_int,
+        ef, ei);
+    return {{ef[0], ef[1], ef[2], ef[3]}};
+}
+
+SwVec4 SwSampleTexture2D(const VulkanTextureDesc& tex, float u, float v, bool linear,
+                         uint32_t mip_index = 0u,
+                         const VulkanDescriptorBinding* samp_desc = nullptr) {
     if (tex.mips.empty()) return {{0, 0, 0, 1}};
     const uint32_t clamped_mip = std::min<uint32_t>(mip_index, static_cast<uint32_t>(tex.mips.size() - 1u));
     const auto& mip = tex.mips[clamped_mip];
     if (mip.data.empty()) return {{0, 0, 0, 1}};
     const uint32_t w = std::max<uint32_t>(1, mip.width);
     const uint32_t h = std::max<uint32_t>(1, mip.height);
-    const float cu = std::clamp(u, 0.0f, 0.99999f);
-    const float cv = std::clamp(v, 0.0f, 0.99999f);
+
+    const auto addr_u = samp_desc ? samp_desc->address_mode_u : VulkanSamplerAddressMode::ClampToEdge;
+    const auto addr_v = samp_desc ? samp_desc->address_mode_v : VulkanSamplerAddressMode::ClampToEdge;
+    const bool u_oob = (addr_u == VulkanSamplerAddressMode::ClampToBorder) && (u < 0.0f || u >= 1.0f);
+    const bool v_oob = (addr_v == VulkanSamplerAddressMode::ClampToBorder) && (v < 0.0f || v >= 1.0f);
+    if (u_oob || v_oob) {
+        return ResolveSwBorderColor(samp_desc);
+    }
+
+    auto wrap_coord = [](float c, VulkanSamplerAddressMode mode) noexcept -> float {
+        if (mode == VulkanSamplerAddressMode::Repeat) {
+            float f = c - std::floor(c);
+            return std::clamp(f, 0.0f, 0.99999f);
+        }
+        return std::clamp(c, 0.0f, 0.99999f);
+    };
+    const float cu = wrap_coord(u, addr_u);
+    const float cv = wrap_coord(v, addr_v);
 
     auto fetch = [&](uint32_t x, uint32_t y) -> SwVec4 {
         x = std::min(x, w - 1);
@@ -2420,7 +2611,7 @@ bool ExecuteSwSpvModule(const SwSpvModule& mod, SwShaderExecEnv& env) {
                             0, static_cast<int32_t>(level_cnt) - 1);
                         const uint32_t abs_mip = base_mip + static_cast<uint32_t>(rel_mip);
                         c = SwSampleTexture2D(
-                            d_img->texture, uv.f(0), uv.f(1), d_samp->linear_filter, abs_mip);
+                            d_img->texture, uv.f(0), uv.f(1), d_samp->linear_filter, abs_mip, d_samp);
                     }
                     SwSpvVal out{}; out.count = 4;
                     for (uint32_t i = 0; i < 4; ++i) out.set_f(i, c.v[i]);
@@ -2950,6 +3141,10 @@ struct VulkanBackend::Impl {
     bool swapchain_enabled = false;
     bool hdr10_colorspace_enabled = false;
     bool bc_compression_enabled = false;
+    bool depth_bounds_enabled = false;
+    bool custom_border_color_enabled = false;
+    bool custom_border_color_without_format_enabled = false;
+    uint32_t max_custom_border_color_samplers = 0;
     uint32_t max_push_constants_size = 128;
     uint32_t push_constant_budget_override = 0;
     uint32_t subgroup_size = 32;
@@ -3274,6 +3469,110 @@ struct VulkanBackend::Impl {
         rec.bound_tiles.clear();
     }
 
+    Status CreateConfiguredSampler(
+        bool linear_filter,
+        VulkanSamplerAddressMode addr_u,
+        VulkanSamplerAddressMode addr_v,
+        VulkanSamplerAddressMode addr_w,
+        float mip_lod_bias,
+        float min_lod,
+        float max_lod,
+        VulkanBorderColorMode border_mode,
+        const float custom_float[4],
+        const int32_t custom_int[4],
+        VulkanImageFormat border_format,
+        bool specify_format,
+        bool force_standard_fallback,
+        VkSampler& out_sampler,
+        bool& out_used_custom_ext,
+        bool& out_used_fallback,
+        VulkanBorderColorMode& out_effective_mode,
+        float out_effective_float[4],
+        int32_t out_effective_int[4]) {
+        out_sampler = kVkNullHandle;
+        out_used_custom_ext = false;
+        out_used_fallback = false;
+        out_effective_mode = border_mode;
+
+        auto to_vk_addr = [](VulkanSamplerAddressMode m) noexcept -> int32_t {
+            const uint32_t v = static_cast<uint32_t>(m);
+            return (v <= 4u) ? static_cast<int32_t>(v) : kVkSamplerAddressModeClampToEdge;
+        };
+
+        VkSamplerCreateInfo sci{};
+        sci.sType = kVkStypeSamplerCreateInfo;
+        sci.magFilter = linear_filter ? kVkFilterLinear : kVkFilterNearest;
+        sci.minFilter = linear_filter ? kVkFilterLinear : kVkFilterNearest;
+        sci.mipmapMode = linear_filter ? kVkSamplerMipmapModeLinear : kVkSamplerMipmapModeNearest;
+        sci.addressModeU = to_vk_addr(addr_u);
+        sci.addressModeV = to_vk_addr(addr_v);
+        sci.addressModeW = to_vk_addr(addr_w);
+        sci.mipLodBias = mip_lod_bias;
+        sci.minLod = min_lod;
+        sci.maxLod = max_lod;
+
+        const bool is_custom =
+            (border_mode == VulkanBorderColorMode::FloatCustom ||
+             border_mode == VulkanBorderColorMode::IntCustom);
+
+        if (is_custom && !force_standard_fallback && custom_border_color_enabled) {
+            VkSamplerCustomBorderColorCreateInfoEXT cbc{};
+            cbc.sType = kVkStypeSamplerCustomBorderColorCreateInfoExt;
+            cbc.pNext = nullptr;
+            if (border_mode == VulkanBorderColorMode::FloatCustom) {
+                for (int i = 0; i < 4; ++i) {
+                    const float fv = custom_float ? custom_float[i] : 0.0f;
+                    cbc.customBorderColor.float32[i] = fv;
+                    if (out_effective_float) out_effective_float[i] = fv;
+                    if (out_effective_int) out_effective_int[i] = static_cast<int32_t>(fv);
+                }
+                sci.borderColor = kVkBorderColorFloatCustomExt;
+            } else {
+                for (int i = 0; i < 4; ++i) {
+                    const int32_t iv = custom_int ? custom_int[i] : 0;
+                    cbc.customBorderColor.int32[i] = iv;
+                    if (out_effective_int) out_effective_int[i] = iv;
+                    if (out_effective_float) out_effective_float[i] = static_cast<float>(iv);
+                }
+                sci.borderColor = kVkBorderColorIntCustomExt;
+            }
+            // Per VK_EXT_custom_border_color: format must be provided unless customBorderColorWithoutFormat is enabled.
+            cbc.format = (specify_format || !custom_border_color_without_format_enabled)
+                ? static_cast<int32_t>(border_format)
+                : 0;  // VK_FORMAT_UNDEFINED
+            sci.pNext = &cbc;
+
+            if (vkCreateSampler(device, &sci, nullptr, &out_sampler) == kVkSuccess &&
+                out_sampler != kVkNullHandle) {
+                out_used_custom_ext = true;
+                out_used_fallback = false;
+                out_effective_mode = border_mode;
+                return Status::Ok();
+            }
+            // Driver rejected custom border color (e.g., maxCustomBorderColorSamplers exceeded);
+            // gracefully fall back to nearest standard border color below.
+            sci.pNext = nullptr;
+        }
+
+        if (is_custom) {
+            out_effective_mode = ChooseStandardBorderColorFallback(
+                border_mode, custom_float, custom_int, out_effective_float, out_effective_int);
+            sci.borderColor = static_cast<int32_t>(out_effective_mode);
+            out_used_fallback = true;
+        } else {
+            out_effective_mode = ChooseStandardBorderColorFallback(
+                border_mode, custom_float, custom_int, out_effective_float, out_effective_int);
+            sci.borderColor = static_cast<int32_t>(out_effective_mode);
+            out_used_fallback = false;
+        }
+
+        if (vkCreateSampler(device, &sci, nullptr, &out_sampler) != kVkSuccess ||
+            out_sampler == kVkNullHandle) {
+            return Status::Error(StatusCode::DeviceError, "vkCreateSampler failed");
+        }
+        return Status::Ok();
+    }
+
     Status ExecuteGraphicsOrMeshOnIcd(
         bool is_mesh,
         const std::vector<uint32_t>& stage0_spirv, const std::string& stage0_entry,
@@ -3289,7 +3588,9 @@ struct VulkanBackend::Impl {
         const std::vector<uint8_t>& push_constants,
         uint32_t effective_pc_size,
         const std::vector<VulkanDescriptorBinding>& descriptors,
-        FrameBufferRgba8& out_fb, std::vector<uint16_t>& out_fp16) {
+        FrameBufferRgba8& out_fb, std::vector<uint16_t>& out_fp16,
+        uint32_t* out_custom_border_used = nullptr,
+        uint32_t* out_custom_border_fallback = nullptr) {
         if (!has_graphics_queue || !graphics_queue || graphics_command_pool == kVkNullHandle) {
             return Status::Error(StatusCode::DeviceError, "Vulkan graphics queue not initialized");
         }
@@ -3573,21 +3874,41 @@ struct VulkanBackend::Impl {
             }
 
             if (d.kind == VulkanDescriptorKind::CombinedImageSampler || d.kind == VulkanDescriptorKind::Sampler) {
-                VkSamplerCreateInfo sci{};
-                sci.sType = kVkStypeSamplerCreateInfo;
-                sci.magFilter = d.linear_filter ? kVkFilterLinear : kVkFilterNearest;
-                sci.minFilter = d.linear_filter ? kVkFilterLinear : kVkFilterNearest;
-                sci.mipmapMode = d.linear_filter ? kVkSamplerMipmapModeLinear : kVkSamplerMipmapModeNearest;
-                sci.addressModeU = kVkSamplerAddressModeClampToEdge;
-                sci.addressModeV = kVkSamplerAddressModeClampToEdge;
-                sci.addressModeW = kVkSamplerAddressModeClampToEdge;
-                sci.mipLodBias = d.sampler_mip_lod_bias;
-                sci.minLod = d.sampler_min_lod;
-                sci.maxLod = d.sampler_max_lod;
-                if (vkCreateSampler(device, &sci, nullptr, &dg.sampler) != kVkSuccess) {
+                bool used_custom = false;
+                bool used_fb = false;
+                VulkanBorderColorMode eff_mode = d.border_color_mode;
+                float eff_f[4]{};
+                int32_t eff_i[4]{};
+                const VulkanImageFormat border_fmt =
+                    (d.kind == VulkanDescriptorKind::CombinedImageSampler)
+                        ? dg.tex_copy.format
+                        : VulkanImageFormat::Rgba8Unorm;
+                st = CreateConfiguredSampler(
+                    d.linear_filter,
+                    d.address_mode_u,
+                    d.address_mode_v,
+                    d.address_mode_w,
+                    d.sampler_mip_lod_bias,
+                    d.sampler_min_lod,
+                    d.sampler_max_lod,
+                    d.border_color_mode,
+                    d.custom_border_color_float,
+                    d.custom_border_color_int,
+                    border_fmt,
+                    d.custom_border_specify_format,
+                    d.force_standard_border_fallback,
+                    dg.sampler,
+                    used_custom,
+                    used_fb,
+                    eff_mode,
+                    eff_f,
+                    eff_i);
+                if (!st.ok()) {
                     cleanup();
-                    return Status::Error(StatusCode::DeviceError, "vkCreateSampler failed");
+                    return st;
                 }
+                if (used_custom && out_custom_border_used) ++(*out_custom_border_used);
+                if (used_fb && out_custom_border_fallback) ++(*out_custom_border_fallback);
             }
         }
 
@@ -4018,6 +4339,10 @@ struct VulkanBackend::Impl {
         swapchain_enabled = false;
         hdr10_colorspace_enabled = false;
         bc_compression_enabled = false;
+        depth_bounds_enabled = false;
+        custom_border_color_enabled = false;
+        custom_border_color_without_format_enabled = false;
+        max_custom_border_color_samplers = 0;
         max_push_constants_size = 128;
         subgroup_size = 32;
         initialized = false;
@@ -4243,11 +4568,33 @@ Status VulkanBackend::InitializeSoftwareFallback() {
     device_info_.supported_subgroup_stages = kVkShaderStageComputeBit;
     device_info_.supported_subgroup_operations = 0x1u;
     device_info_.supports_bc_texture_compression = true;
+    device_info_.supports_depth_bounds_test = false;
+    device_info_.supports_sample_locations_ext = false;
+    device_info_.supports_custom_border_color = false;
+    device_info_.supports_custom_border_color_without_format = false;
+    device_info_.max_custom_border_color_samplers = 0u;
     device_info_.is_hardware = false;
     device_info_.is_fallback = true;
     impl_->max_push_constants_size = 128u;
     impl_->subgroup_size = 32u;
     impl_->bc_compression_enabled = true;
+    impl_->depth_bounds_enabled = false;
+    impl_->custom_border_color_enabled = false;
+    impl_->custom_border_color_without_format_enabled = false;
+    impl_->max_custom_border_color_samplers = 0u;
+
+    feature_probe_ = VulkanFeatureProbe{};
+    feature_probe_.api_version = kVkApiVersion1_3;
+    feature_probe_.api_major = 1u;
+    feature_probe_.api_minor = 3u;
+    feature_probe_.api_patch = 0u;
+    feature_probe_.probed_from_icd = false;
+    feature_probe_.texture_compression_bc = true;
+    feature_probe_.sparse_binding = true;
+    feature_probe_.sparse_residency_image_2d = true;
+    feature_probe_.sparse_residency_image_3d = true;
+    d3d12_options2_ = MapVulkanToD3D12Options2(feature_probe_);
+    d3d12_options7_ = MapVulkanToD3D12Options7(feature_probe_);
     return Status::Ok();
 }
 
@@ -4515,20 +4862,40 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             impl_->sparse_queue_family = impl_->has_sparse_queue ? best_sparse_qf : 0u;
             impl_->vkGetPhysicalDeviceMemoryProperties(best_dev, &impl_->mem_props);
 
-            // Probe physical device core features for sparse binding / residency & BC compression.
+            // Probe physical device core features (depthBounds, BC compression, sparse, residency).
             VkPhysicalDeviceFeatures supported_feats{};
             if (impl_->vkGetPhysicalDeviceFeatures) {
                 impl_->vkGetPhysicalDeviceFeatures(best_dev, &supported_feats);
             }
-            bool want_bc_compression = (supported_feats.fields[kVkFeatTextureCompressionBC] != 0u);
-            bool want_sparse_binding =
-                impl_->has_sparse_queue && (supported_feats.fields[kVkFeatSparseBinding] != 0u);
-            bool want_sparse_2d =
-                want_sparse_binding && (supported_feats.fields[kVkFeatSparseResidencyImage2D] != 0u);
-            bool want_sparse_3d =
-                want_sparse_binding && (supported_feats.fields[kVkFeatSparseResidencyImage3D] != 0u);
 
-            // Query VkPhysicalDeviceProperties::limits.maxPushConstantsSize and SubgroupProperties.
+            // Probe device extensions (swapchain, mesh shader, sample locations, custom border color, sampler feedback)
+            bool has_dev_swapchain = false;
+            bool has_dev_mesh_shader = false;
+            bool has_dev_sample_locations = false;
+            bool has_dev_custom_border_color = false;
+            bool has_dev_sampler_feedback = false;
+            {
+                uint32_t dext_count = 0;
+                if (impl_->vkEnumerateDeviceExtensionProperties(best_dev, nullptr, &dext_count, nullptr) == kVkSuccess &&
+                    dext_count > 0) {
+                    std::vector<VkExtensionProperties> dexts(dext_count);
+                    if (impl_->vkEnumerateDeviceExtensionProperties(best_dev, nullptr, &dext_count, dexts.data()) == kVkSuccess) {
+                        for (uint32_t i = 0; i < dext_count; ++i) {
+                            if (std::strcmp(dexts[i].extensionName, "VK_KHR_swapchain") == 0) has_dev_swapchain = true;
+                            if (std::strcmp(dexts[i].extensionName, "VK_EXT_mesh_shader") == 0) has_dev_mesh_shader = true;
+                            if (std::strcmp(dexts[i].extensionName, "VK_EXT_sample_locations") == 0) has_dev_sample_locations = true;
+                            if (std::strcmp(dexts[i].extensionName, "VK_EXT_custom_border_color") == 0) has_dev_custom_border_color = true;
+                            if (std::strcmp(dexts[i].extensionName, "VK_EXT_sampler_feedback") == 0 ||
+                                std::strcmp(dexts[i].extensionName, "VK_KHR_sampler_feedback") == 0) {
+                                has_dev_sampler_feedback = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Query VkPhysicalDeviceProperties::limits.maxPushConstantsSize and chained Properties2
+            // (SubgroupProperties, VK_EXT_sample_locations, VK_EXT_custom_border_color).
             uint32_t queried_max_pc = 128u;
             std::memcpy(&queried_max_pc,
                         best_props.limits_and_sparse_storage + kVkLimitsOffsetMaxPushConstantsSize,
@@ -4540,13 +4907,31 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             uint32_t queried_subgroup_size = 32u;
             uint32_t queried_subgroup_stages = 0u;
             uint32_t queried_subgroup_ops = 0u;
+            VkPhysicalDeviceSubgroupProperties sub_props{};
+            sub_props.sType = kVkStypePhysicalDeviceSubgroupProperties;
+            VkPhysicalDeviceSampleLocationsPropertiesEXT sample_loc_props{};
+            sample_loc_props.sType = kVkStypePhysicalDeviceSampleLocationsPropertiesExt;
+            VkPhysicalDeviceCustomBorderColorPropertiesEXT cbc_props{};
+            cbc_props.sType = kVkStypePhysicalDeviceCustomBorderColorPropertiesExt;
+
             if (impl_->vkGetPhysicalDeviceProperties2 && best_props.apiVersion >= kVkApiVersion1_1) {
-                VkPhysicalDeviceSubgroupProperties sub_props{};
-                sub_props.sType = kVkStypePhysicalDeviceSubgroupProperties;
+                void* pnext_head = nullptr;
+                if (has_dev_custom_border_color) {
+                    cbc_props.pNext = pnext_head;
+                    pnext_head = &cbc_props;
+                }
+                if (has_dev_sample_locations) {
+                    sample_loc_props.pNext = pnext_head;
+                    pnext_head = &sample_loc_props;
+                }
+                sub_props.pNext = pnext_head;
+                pnext_head = &sub_props;
+
                 VkPhysicalDeviceProperties2 props2{};
                 props2.sType = kVkStypePhysicalDeviceProperties2;
-                props2.pNext = &sub_props;
+                props2.pNext = pnext_head;
                 impl_->vkGetPhysicalDeviceProperties2(best_dev, &props2);
+
                 if (sub_props.subgroupSize > 0u) {
                     queried_subgroup_size = sub_props.subgroupSize;
                 }
@@ -4554,39 +4939,66 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                 queried_subgroup_ops = sub_props.supportedOperations;
             }
 
-            // Probe device extensions (VK_KHR_swapchain, VK_EXT_mesh_shader)
-            bool has_dev_swapchain = false;
-            bool has_dev_mesh_shader = false;
-            {
-                uint32_t dext_count = 0;
-                if (impl_->vkEnumerateDeviceExtensionProperties(best_dev, nullptr, &dext_count, nullptr) == kVkSuccess &&
-                    dext_count > 0) {
-                    std::vector<VkExtensionProperties> dexts(dext_count);
-                    if (impl_->vkEnumerateDeviceExtensionProperties(best_dev, nullptr, &dext_count, dexts.data()) == kVkSuccess) {
-                        for (uint32_t i = 0; i < dext_count; ++i) {
-                            if (std::strcmp(dexts[i].extensionName, "VK_KHR_swapchain") == 0) has_dev_swapchain = true;
-                            if (std::strcmp(dexts[i].extensionName, "VK_EXT_mesh_shader") == 0) has_dev_mesh_shader = true;
-                        }
-                    }
-                }
-            }
-
-            // Probe VK_EXT_mesh_shader features via vkGetPhysicalDeviceFeatures2
+            // Probe chained VkPhysicalDeviceFeatures2 (core + Vulkan 1.2/1.3 + Mesh Shader + Custom Border Color).
+            VkPhysicalDeviceVulkan12Features queried_v12_feats{};
+            queried_v12_feats.sType = kVkStypePhysicalDeviceVulkan12Features;
+            VkPhysicalDeviceVulkan13Features queried_v13_feats{};
+            queried_v13_feats.sType = kVkStypePhysicalDeviceVulkan13Features;
             VkPhysicalDeviceMeshShaderFeaturesEXT queried_mesh_feats{};
             queried_mesh_feats.sType = kVkStypePhysicalDeviceMeshShaderFeaturesExt;
+            VkPhysicalDeviceCustomBorderColorFeaturesEXT queried_cbc_feats{};
+            queried_cbc_feats.sType = kVkStypePhysicalDeviceCustomBorderColorFeaturesExt;
+            bool probed_v12 = false;
+            bool probed_v13 = false;
+
+            if (impl_->vkGetPhysicalDeviceFeatures2 && best_props.apiVersion >= kVkApiVersion1_1) {
+                void* fnext_head = nullptr;
+                if (has_dev_custom_border_color) {
+                    queried_cbc_feats.pNext = fnext_head;
+                    fnext_head = &queried_cbc_feats;
+                }
+                if (has_dev_mesh_shader && best_props.apiVersion >= kVkApiVersion1_2) {
+                    queried_mesh_feats.pNext = fnext_head;
+                    fnext_head = &queried_mesh_feats;
+                }
+                if (best_props.apiVersion >= kVkApiVersion1_3) {
+                    queried_v13_feats.pNext = fnext_head;
+                    fnext_head = &queried_v13_feats;
+                    probed_v13 = true;
+                }
+                if (best_props.apiVersion >= kVkApiVersion1_2) {
+                    queried_v12_feats.pNext = fnext_head;
+                    fnext_head = &queried_v12_feats;
+                    probed_v12 = true;
+                }
+                VkPhysicalDeviceFeatures2 feats2{};
+                feats2.sType = kVkStypePhysicalDeviceFeatures2;
+                feats2.pNext = fnext_head;
+                impl_->vkGetPhysicalDeviceFeatures2(best_dev, &feats2);
+                supported_feats = feats2.features;
+            }
+
+            bool want_depth_bounds = (supported_feats.fields[kVkFeatDepthBounds] != 0u);
+            bool want_bc_compression = (supported_feats.fields[kVkFeatTextureCompressionBC] != 0u);
+            bool want_sparse_binding =
+                impl_->has_sparse_queue && (supported_feats.fields[kVkFeatSparseBinding] != 0u);
+            bool want_sparse_2d =
+                want_sparse_binding && (supported_feats.fields[kVkFeatSparseResidencyImage2D] != 0u);
+            bool want_sparse_3d =
+                want_sparse_binding && (supported_feats.fields[kVkFeatSparseResidencyImage3D] != 0u);
+
             bool enable_mesh = false;
             bool enable_task = false;
             if (has_dev_mesh_shader && impl_->has_graphics_queue &&
-                best_props.apiVersion >= kVkApiVersion1_2 && impl_->vkGetPhysicalDeviceFeatures2) {
-                VkPhysicalDeviceFeatures2 feats2{};
-                feats2.sType = kVkStypePhysicalDeviceFeatures2;
-                feats2.pNext = &queried_mesh_feats;
-                impl_->vkGetPhysicalDeviceFeatures2(best_dev, &feats2);
-                if (queried_mesh_feats.meshShader != 0u) {
-                    enable_mesh = true;
-                    enable_task = (queried_mesh_feats.taskShader != 0u);
-                }
+                best_props.apiVersion >= kVkApiVersion1_2 && queried_mesh_feats.meshShader != 0u) {
+                enable_mesh = true;
+                enable_task = (queried_mesh_feats.taskShader != 0u);
             }
+
+            bool enable_custom_border_color =
+                has_dev_custom_border_color && (queried_cbc_feats.customBorderColors != 0u);
+            bool enable_custom_border_without_format =
+                enable_custom_border_color && (queried_cbc_feats.customBorderColorWithoutFormat != 0u);
 
             std::vector<const char*> dev_exts;
             if (has_dev_swapchain && impl_->has_graphics_queue && impl_->win32_surface_enabled) {
@@ -4598,6 +5010,14 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                 dev_exts.push_back("VK_EXT_mesh_shader");
                 enable_mesh_feats.meshShader = 1u;
                 enable_mesh_feats.taskShader = enable_task ? 1u : 0u;
+            }
+            VkPhysicalDeviceCustomBorderColorFeaturesEXT enable_cbc_feats{};
+            enable_cbc_feats.sType = kVkStypePhysicalDeviceCustomBorderColorFeaturesExt;
+            if (enable_custom_border_color) {
+                dev_exts.push_back("VK_EXT_custom_border_color");
+                enable_cbc_feats.customBorderColors = 1u;
+                enable_cbc_feats.customBorderColorWithoutFormat =
+                    enable_custom_border_without_format ? 1u : 0u;
             }
 
             const float queue_priority = 1.0f;
@@ -4630,41 +5050,69 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             }
 
             VkPhysicalDeviceFeatures enabled_feats{};
-            if (want_bc_compression) {
-                enabled_feats.fields[kVkFeatTextureCompressionBC] = 1u;
-            }
-            if (want_sparse_binding) {
-                enabled_feats.fields[kVkFeatSparseBinding] = 1u;
-                if (want_sparse_2d) enabled_feats.fields[kVkFeatSparseResidencyImage2D] = 1u;
-                if (want_sparse_3d) enabled_feats.fields[kVkFeatSparseResidencyImage3D] = 1u;
-            }
-            const bool any_core_feats = want_bc_compression || want_sparse_binding;
+            auto sync_enabled_feats = [&]() -> const void* {
+                enabled_feats = VkPhysicalDeviceFeatures{};
+                if (want_depth_bounds) enabled_feats.fields[kVkFeatDepthBounds] = 1u;
+                if (want_bc_compression) enabled_feats.fields[kVkFeatTextureCompressionBC] = 1u;
+                if (want_sparse_binding) {
+                    enabled_feats.fields[kVkFeatSparseBinding] = 1u;
+                    if (want_sparse_2d) enabled_feats.fields[kVkFeatSparseResidencyImage2D] = 1u;
+                    if (want_sparse_3d) enabled_feats.fields[kVkFeatSparseResidencyImage3D] = 1u;
+                }
+                const bool any_core = want_depth_bounds || want_bc_compression || want_sparse_binding;
+                return any_core ? static_cast<const void*>(&enabled_feats) : nullptr;
+            };
+
+            auto rebuild_dev_pnext = [&]() -> const void* {
+                void* head = nullptr;
+                if (enable_custom_border_color) {
+                    enable_cbc_feats.pNext = head;
+                    head = &enable_cbc_feats;
+                }
+                if (enable_mesh) {
+                    enable_mesh_feats.pNext = head;
+                    head = &enable_mesh_feats;
+                }
+                return head;
+            };
 
             VkDeviceCreateInfo dev_ci{};
             dev_ci.sType = kVkStypeDeviceCreateInfo;
-            dev_ci.pNext = enable_mesh ? static_cast<const void*>(&enable_mesh_feats) : nullptr;
+            dev_ci.pNext = rebuild_dev_pnext();
             dev_ci.queueCreateInfoCount = static_cast<uint32_t>(queue_cis.size());
             dev_ci.pQueueCreateInfos = queue_cis.data();
             dev_ci.enabledExtensionCount = static_cast<uint32_t>(dev_exts.size());
             dev_ci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
-            dev_ci.pEnabledFeatures = any_core_feats ? static_cast<const void*>(&enabled_feats) : nullptr;
+            dev_ci.pEnabledFeatures = sync_enabled_feats();
 
             vr = impl_->vkCreateDevice(best_dev, &dev_ci, nullptr, &impl_->device);
+            if ((vr != kVkSuccess || !impl_->device) && enable_custom_border_color) {
+                enable_custom_border_color = false;
+                enable_custom_border_without_format = false;
+                dev_exts.erase(std::remove_if(dev_exts.begin(), dev_exts.end(), [](const char* s) {
+                    return std::strcmp(s, "VK_EXT_custom_border_color") == 0;
+                }), dev_exts.end());
+                dev_ci.pNext = rebuild_dev_pnext();
+                dev_ci.enabledExtensionCount = static_cast<uint32_t>(dev_exts.size());
+                dev_ci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
+                vr = impl_->vkCreateDevice(best_dev, &dev_ci, nullptr, &impl_->device);
+            }
             if ((vr != kVkSuccess || !impl_->device) && want_sparse_binding) {
                 // Retry without sparse features if driver rejected them.
                 want_sparse_binding = false;
                 want_sparse_2d = false;
                 want_sparse_3d = false;
-                enabled_feats.fields[kVkFeatSparseBinding] = 0u;
-                enabled_feats.fields[kVkFeatSparseResidencyImage2D] = 0u;
-                enabled_feats.fields[kVkFeatSparseResidencyImage3D] = 0u;
-                dev_ci.pEnabledFeatures = want_bc_compression ? static_cast<const void*>(&enabled_feats) : nullptr;
+                dev_ci.pEnabledFeatures = sync_enabled_feats();
+                vr = impl_->vkCreateDevice(best_dev, &dev_ci, nullptr, &impl_->device);
+            }
+            if ((vr != kVkSuccess || !impl_->device) && want_depth_bounds) {
+                want_depth_bounds = false;
+                dev_ci.pEnabledFeatures = sync_enabled_feats();
                 vr = impl_->vkCreateDevice(best_dev, &dev_ci, nullptr, &impl_->device);
             }
             if ((vr != kVkSuccess || !impl_->device) && want_bc_compression) {
                 want_bc_compression = false;
-                enabled_feats.fields[kVkFeatTextureCompressionBC] = 0u;
-                dev_ci.pEnabledFeatures = nullptr;
+                dev_ci.pEnabledFeatures = sync_enabled_feats();
                 vr = impl_->vkCreateDevice(best_dev, &dev_ci, nullptr, &impl_->device);
             }
             if ((vr != kVkSuccess || !impl_->device) && enable_mesh) {
@@ -4674,7 +5122,7 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                 dev_exts.erase(std::remove_if(dev_exts.begin(), dev_exts.end(), [](const char* s) {
                     return std::strcmp(s, "VK_EXT_mesh_shader") == 0;
                 }), dev_exts.end());
-                dev_ci.pNext = nullptr;
+                dev_ci.pNext = rebuild_dev_pnext();
                 dev_ci.enabledExtensionCount = static_cast<uint32_t>(dev_exts.size());
                 dev_ci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
                 vr = impl_->vkCreateDevice(best_dev, &dev_ci, nullptr, &impl_->device);
@@ -4838,6 +5286,11 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                 }
             }
 
+            impl_->depth_bounds_enabled = want_depth_bounds;
+            impl_->custom_border_color_enabled = enable_custom_border_color;
+            impl_->custom_border_color_without_format_enabled = enable_custom_border_without_format;
+            impl_->max_custom_border_color_samplers = cbc_props.maxCustomBorderColorSamplers;
+
             best_props.deviceName[sizeof(best_props.deviceName) - 1] = '\0';
             device_info_ = VulkanDeviceInfo{};
             device_info_.device_name = best_props.deviceName;
@@ -4869,10 +5322,80 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             device_info_.supports_bc_texture_compression = want_bc_compression;
             device_info_.selected_device_filter = device_filter;
             device_info_.matched_device_filter = matched_filter;
+            device_info_.supports_depth_bounds_test = impl_->depth_bounds_enabled;
+            device_info_.supports_sample_locations_ext = has_dev_sample_locations;
+            device_info_.supports_custom_border_color = impl_->custom_border_color_enabled;
+            device_info_.supports_custom_border_color_without_format =
+                impl_->custom_border_color_without_format_enabled;
+            device_info_.max_custom_border_color_samplers = impl_->max_custom_border_color_samplers;
             device_info_.is_hardware =
                 (device_info_.device_type == VulkanDeviceType::DiscreteGpu ||
                  device_info_.device_type == VulkanDeviceType::IntegratedGpu);
             device_info_.is_fallback = false;
+
+            // Populate structured live physical-device capability probe & D3D12 OPTIONS2/7 mapping.
+            feature_probe_ = VulkanFeatureProbe{};
+            feature_probe_.api_version = best_props.apiVersion;
+            feature_probe_.api_major = device_info_.api_major;
+            feature_probe_.api_minor = device_info_.api_minor;
+            feature_probe_.api_patch = device_info_.api_patch;
+            feature_probe_.probed_from_icd = true;
+            feature_probe_.depth_bounds = (supported_feats.fields[kVkFeatDepthBounds] != 0u);
+            feature_probe_.texture_compression_bc = (supported_feats.fields[kVkFeatTextureCompressionBC] != 0u);
+            feature_probe_.fragment_stores_and_atomics =
+                (supported_feats.fields[kVkFeatFragmentStoresAndAtomics] != 0u);
+            feature_probe_.shader_resource_residency =
+                (supported_feats.fields[kVkFeatShaderResourceResidency] != 0u);
+            feature_probe_.shader_resource_min_lod =
+                (supported_feats.fields[kVkFeatShaderResourceMinLod] != 0u);
+            feature_probe_.sparse_binding = (supported_feats.fields[kVkFeatSparseBinding] != 0u);
+            feature_probe_.sparse_residency_image_2d =
+                (supported_feats.fields[kVkFeatSparseResidencyImage2D] != 0u);
+            feature_probe_.sparse_residency_image_3d =
+                (supported_feats.fields[kVkFeatSparseResidencyImage3D] != 0u);
+            feature_probe_.vulkan12_probed = probed_v12;
+            if (probed_v12) {
+                feature_probe_.descriptor_indexing =
+                    (queried_v12_feats.fields[kVkFeat12DescriptorIndexing] != 0u);
+                feature_probe_.sampler_filter_minmax =
+                    (queried_v12_feats.fields[kVkFeat12SamplerFilterMinmax] != 0u);
+                feature_probe_.timeline_semaphore =
+                    (queried_v12_feats.fields[kVkFeat12TimelineSemaphore] != 0u);
+                feature_probe_.buffer_device_address =
+                    (queried_v12_feats.fields[kVkFeat12BufferDeviceAddress] != 0u);
+            }
+            feature_probe_.vulkan13_probed = probed_v13;
+            if (probed_v13) {
+                feature_probe_.synchronization2 =
+                    (queried_v13_feats.fields[kVkFeat13Synchronization2] != 0u);
+                feature_probe_.dynamic_rendering =
+                    (queried_v13_feats.fields[kVkFeat13DynamicRendering] != 0u);
+                feature_probe_.maintenance4 =
+                    (queried_v13_feats.fields[kVkFeat13Maintenance4] != 0u);
+            }
+            feature_probe_.has_sample_locations_ext = has_dev_sample_locations;
+            if (has_dev_sample_locations) {
+                feature_probe_.sample_location_sample_counts = sample_loc_props.sampleLocationSampleCounts;
+                feature_probe_.max_sample_location_grid_size_x = sample_loc_props.maxSampleLocationGridSizeWidth;
+                feature_probe_.max_sample_location_grid_size_y = sample_loc_props.maxSampleLocationGridSizeHeight;
+                feature_probe_.sample_location_subpixel_bits = sample_loc_props.sampleLocationSubPixelBits;
+                feature_probe_.variable_sample_locations = (sample_loc_props.variableSampleLocations != 0u);
+            }
+            feature_probe_.has_mesh_shader_ext = has_dev_mesh_shader;
+            feature_probe_.mesh_shader = (queried_mesh_feats.meshShader != 0u);
+            feature_probe_.task_shader = (queried_mesh_feats.taskShader != 0u);
+            feature_probe_.mesh_shader_queries = (queried_mesh_feats.meshShaderQueries != 0u);
+            feature_probe_.has_sampler_feedback_ext = has_dev_sampler_feedback;
+            feature_probe_.sampler_feedback_min_mip = has_dev_sampler_feedback;
+            feature_probe_.sampler_feedback_mip_region_used = has_dev_sampler_feedback;
+            feature_probe_.has_custom_border_color_ext = has_dev_custom_border_color;
+            feature_probe_.custom_border_colors = (queried_cbc_feats.customBorderColors != 0u);
+            feature_probe_.custom_border_color_without_format =
+                (queried_cbc_feats.customBorderColorWithoutFormat != 0u);
+            feature_probe_.max_custom_border_color_samplers = cbc_props.maxCustomBorderColorSamplers;
+
+            d3d12_options2_ = MapVulkanToD3D12Options2(feature_probe_);
+            d3d12_options7_ = MapVulkanToD3D12Options7(feature_probe_);
 
             impl_->max_push_constants_size = queried_max_pc;
             impl_->subgroup_size = queried_subgroup_size;
@@ -4890,6 +5413,9 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                       << " subgroup=" << device_info_.subgroup_size
                       << " max_pc=" << device_info_.max_push_constants_size
                       << " bc=" << (device_info_.supports_bc_texture_compression ? "yes" : "no")
+                      << " depth_bounds=" << (device_info_.supports_depth_bounds_test ? "yes" : "no")
+                      << " sample_pos_tier=" << static_cast<uint32_t>(d3d12_options2_.programmable_sample_positions_tier)
+                      << " custom_border=" << (device_info_.supports_custom_border_color ? "yes" : "no")
                       << " mesh=" << (device_info_.supports_mesh_shader ? (device_info_.supports_task_shader ? "task+mesh" : "mesh") : "no")
                       << " swapchain=" << (device_info_.supports_swapchain ? "yes" : "no")
                       << " hdr10_cs=" << (device_info_.supports_hdr10_colorspace ? "yes" : "no") << "\n";
@@ -4901,6 +5427,9 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
         }
         impl_->Cleanup();
         device_info_ = VulkanDeviceInfo{};
+        feature_probe_ = VulkanFeatureProbe{};
+        d3d12_options2_ = VulkanD3D12Options2{};
+        d3d12_options7_ = VulkanD3D12Options7{};
     }
 #else
     failure_reason = "Dynamic vulkan-1.dll loader requires Windows";
@@ -5366,6 +5895,21 @@ Status VulkanBackend::ExecuteGraphicsDraw(const VulkanGraphicsDrawDesc& desc,
         out_result.device_push_constant_limit = effective_budget;
         out_result.descriptor_collisions_resolved = static_cast<uint32_t>(remaps.size());
         out_result.descriptor_slot_remaps = remaps;
+        for (const auto& d : resolved_descs) {
+            if (d.kind == VulkanDescriptorKind::CombinedImageSampler ||
+                d.kind == VulkanDescriptorKind::Sampler) {
+                const bool is_custom =
+                    (d.border_color_mode == VulkanBorderColorMode::FloatCustom ||
+                     d.border_color_mode == VulkanBorderColorMode::IntCustom);
+                if (is_custom) {
+                    if (d.force_standard_border_fallback) {
+                        ++out_result.custom_border_fallback_samplers_used;
+                    } else {
+                        ++out_result.custom_border_samplers_used;
+                    }
+                }
+            }
+        }
         return sw_st;
     };
 
@@ -5384,7 +5928,9 @@ Status VulkanBackend::ExecuteGraphicsDraw(const VulkanGraphicsDrawDesc& desc,
         desc.vertex_bytes, desc.vertex_stride, desc.vertex_attributes,
         desc.indices, desc.vertex_count, unused_groups,
         desc.push_constants, effective_pc_bytes, resolved_descs,
-        out_result.framebuffer, out_result.raw_fp16_rgba);
+        out_result.framebuffer, out_result.raw_fp16_rgba,
+        &out_result.custom_border_samplers_used,
+        &out_result.custom_border_fallback_samplers_used);
     if (!st.ok()) {
         if (pc_exceeded) {
             // Driver rejected clamped push-constant range smaller than shader block: gracefully fall back.
@@ -5507,7 +6053,9 @@ Status VulkanBackend::ExecuteMeshShaderDraw(const VulkanMeshDrawDesc& desc,
         desc.clear_color, desc.clear_depth,
         no_vb, 0, no_attrs, no_ib, 0, groups,
         desc.push_constants, effective_pc_bytes, resolved_descs,
-        out_result.framebuffer, out_result.raw_fp16_rgba);
+        out_result.framebuffer, out_result.raw_fp16_rgba,
+        &out_result.custom_border_samplers_used,
+        &out_result.custom_border_fallback_samplers_used);
     if (!st.ok()) {
         if (pc_exceeded && desc.allow_fallback_emulation) {
             return run_sw_mesh();
@@ -6921,6 +7469,126 @@ Status VulkanBackend::DestroyReservedImage(uint64_t reserved_handle) {
     }
     impl_->DestroyReservedImageRecord(it->second);
     impl_->reserved_images.erase(it);
+    return Status::Ok();
+}
+
+VulkanD3D12Options2 VulkanBackend::MapVulkanToD3D12Options2(const VulkanFeatureProbe& probe) noexcept {
+    VulkanD3D12Options2 out{};
+    out.depth_bounds_test_supported = probe.depth_bounds;
+
+    // D3D12 Programmable Sample Positions mapping from VK_EXT_sample_locations:
+    // - Requires at least 4 subpixel bits (1/16th pixel precision) and 1x/4x sample counts.
+    // - Tier 1: 1x1 pixel grid (same sample pattern for all pixels).
+    // - Tier 2: >= 2x2 pixel grid with variableSampleLocations support.
+    const bool has_required_counts = (probe.sample_location_sample_counts & 0x5u) == 0x5u;
+    if (probe.has_sample_locations_ext &&
+        has_required_counts &&
+        probe.sample_location_subpixel_bits >= 4u) {
+        if (probe.max_sample_location_grid_size_x >= 2u &&
+            probe.max_sample_location_grid_size_y >= 2u &&
+            probe.variable_sample_locations) {
+            out.programmable_sample_positions_tier =
+                VulkanD3D12ProgrammableSamplePositionsTier::Tier2;
+        } else if (probe.max_sample_location_grid_size_x >= 1u &&
+                   probe.max_sample_location_grid_size_y >= 1u) {
+            out.programmable_sample_positions_tier =
+                VulkanD3D12ProgrammableSamplePositionsTier::Tier1;
+        }
+    }
+    return out;
+}
+
+VulkanD3D12Options7 VulkanBackend::MapVulkanToD3D12Options7(const VulkanFeatureProbe& probe) noexcept {
+    VulkanD3D12Options7 out{};
+
+    // D3D12 Mesh Shader Tier 1 requires both Task (Amplification) and Mesh shader stages.
+    if (probe.has_mesh_shader_ext && probe.mesh_shader && probe.task_shader) {
+        out.mesh_shader_tier = VulkanD3D12MeshShaderTier::Tier1;
+    } else {
+        out.mesh_shader_tier = VulkanD3D12MeshShaderTier::NotSupported;
+    }
+
+    // D3D12 Sampler Feedback Tier mapping from native Vulkan sampler feedback extension capabilities.
+    if (probe.has_sampler_feedback_ext &&
+        probe.sampler_feedback_min_mip &&
+        probe.sampler_feedback_mip_region_used) {
+        out.sampler_feedback_tier = VulkanD3D12SamplerFeedbackTier::Tier1_0;
+    } else if (probe.has_sampler_feedback_ext && probe.sampler_feedback_min_mip) {
+        out.sampler_feedback_tier = VulkanD3D12SamplerFeedbackTier::Tier0_9;
+    } else {
+        out.sampler_feedback_tier = VulkanD3D12SamplerFeedbackTier::NotSupported;
+    }
+    return out;
+}
+
+Status VulkanBackend::QueryD3D12Options2(VulkanD3D12Options2& out_options) const noexcept {
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "VulkanBackend is not initialized");
+    }
+    out_options = d3d12_options2_;
+    return Status::Ok();
+}
+
+Status VulkanBackend::QueryD3D12Options7(VulkanD3D12Options7& out_options) const noexcept {
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "VulkanBackend is not initialized");
+    }
+    out_options = d3d12_options7_;
+    return Status::Ok();
+}
+
+Status VulkanBackend::ProbeCustomBorderColorSampler(
+    const VulkanCustomBorderSamplerDesc& desc,
+    VulkanCustomBorderSamplerResult& out_result) {
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "VulkanBackend is not initialized");
+    }
+    out_result = VulkanCustomBorderSamplerResult{};
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+
+    const bool is_custom =
+        (desc.border_color_mode == VulkanBorderColorMode::FloatCustom ||
+         desc.border_color_mode == VulkanBorderColorMode::IntCustom);
+
+    if (impl_->fallback_mode || !impl_->device || !impl_->vkCreateSampler || !impl_->vkDestroySampler) {
+        out_result.created = true;
+        out_result.executed_on_vulkan_icd = false;
+        out_result.used_custom_border_color_ext = false;
+        out_result.used_standard_border_fallback = is_custom;
+        out_result.effective_border_color_mode = ChooseStandardBorderColorFallback(
+            desc.border_color_mode,
+            desc.custom_border_color_float,
+            desc.custom_border_color_int,
+            out_result.effective_border_color_float,
+            out_result.effective_border_color_int);
+        return Status::Ok();
+    }
+
+    VkSampler sampler = kVkNullHandle;
+    Status st = impl_->CreateConfiguredSampler(
+        desc.linear_filter,
+        desc.address_mode_u,
+        desc.address_mode_v,
+        desc.address_mode_w,
+        0.0f, 0.0f, 16.0f,
+        desc.border_color_mode,
+        desc.custom_border_color_float,
+        desc.custom_border_color_int,
+        desc.border_format,
+        desc.specify_border_format,
+        desc.force_standard_fallback,
+        sampler,
+        out_result.used_custom_border_color_ext,
+        out_result.used_standard_border_fallback,
+        out_result.effective_border_color_mode,
+        out_result.effective_border_color_float,
+        out_result.effective_border_color_int);
+    if (!st.ok()) {
+        return st;
+    }
+    impl_->vkDestroySampler(impl_->device, sampler, nullptr);
+    out_result.created = true;
+    out_result.executed_on_vulkan_icd = true;
     return Status::Ok();
 }
 

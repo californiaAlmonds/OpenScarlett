@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Microsoft XCurl (<XCurl/curl.h>) public C ABI header backed by XCurl.dll.
+// MIT Microsoft XCurl (<XCurl/curl.h>) public C ABI header backed by XCurl.dll.
 
 #include <cstddef>
 #include <cstdint>

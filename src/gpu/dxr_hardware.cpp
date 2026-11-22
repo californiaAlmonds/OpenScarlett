@@ -1,4 +1,5 @@
 #include "openscarlett/gpu/dxr_hardware.h"
+#include "openscarlett/gpu/rdna2_rayquery_bridge.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -1551,6 +1552,334 @@ Status DxrHardwareEngine::DispatchRays(uint64_t tlas_id,
     }
 
     return RecordDxrResult("DispatchRays", final_st);
+}
+
+// ---------------------------------------------------------------------------
+// Automatic DXR Tier 1.1 Hardware vs Compute BVH4 Backend Selection
+// ---------------------------------------------------------------------------
+Rdna2RayQueryBackend SelectRayQueryBackend(
+    const DxrCapabilities& caps,
+    bool force_compute_fallback) noexcept {
+    if (!force_compute_fallback &&
+        caps.using_hardware_path &&
+        caps.supports_inline_rt &&
+        caps.hardware_tier >= static_cast<uint32_t>(DxrTier::Tier1_1)) {
+        return Rdna2RayQueryBackend::HardwareDxr11;
+    }
+    return Rdna2RayQueryBackend::ComputeBvh4Fallback;
+}
+
+Rdna2RayQueryBackend SelectRayQueryBackend(
+    const DxrHardwareEngine& engine,
+    bool force_compute_fallback) noexcept {
+    if (!engine.IsInitialized()) {
+        return Rdna2RayQueryBackend::CpuReference;
+    }
+    return SelectRayQueryBackend(engine.Capabilities(), force_compute_fallback);
+}
+
+// ---------------------------------------------------------------------------
+// Live CreateStateObject / DispatchRays SBT Record Remapper
+// Maps Xbox 32B/64B shader identifiers + local root args -> Host PC DXR SBT
+// and software raygen/miss/closest-hit/callable dispatch records.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::vector<uint8_t> DeriveXboxShaderIdentifier(const std::string& name, uint32_t id_size) {
+    std::vector<uint8_t> id(id_size, 0u);
+    const uint32_t lanes = id_size / 8u;
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+        uint64_t h = 0x58424F5852543131ull ^ (static_cast<uint64_t>(lane) * 0xBF58476D1CE4E5B9ull);
+        for (unsigned char c : name) {
+            h ^= c;
+            h *= 1099511628211ull;
+        }
+        h ^= (static_cast<uint64_t>(id_size) << 40u) | static_cast<uint64_t>(name.size());
+        h *= 1099511628211ull;
+        std::memcpy(id.data() + static_cast<size_t>(lane) * 8u, &h, 8u);
+    }
+    bool all_zero = true;
+    for (uint8_t b : id) {
+        if (b != 0u) {
+            all_zero = false;
+            break;
+        }
+    }
+    if (all_zero && id.size() >= 2u) {
+        id[0] = 0x58u;  // 'X'
+        id[1] = 0x42u;  // 'B'
+    }
+    return id;
+}
+
+std::string MakeByteKey(const uint8_t* data, size_t len) {
+    return std::string(reinterpret_cast<const char*>(data), len);
+}
+
+}  // namespace
+
+struct DxrStateObjectSbtRemapper::Impl {
+    mutable std::mutex mutex;
+    uint64_t next_so_id = 0x50120001ull;
+
+    struct ExportEntry {
+        std::string export_name;
+        DxrStateObjectExportDesc::Kind kind = DxrStateObjectExportDesc::Kind::RayGen;
+        std::vector<uint8_t> xbox_id;
+        std::array<uint8_t, kDxrShaderIdentifierSize> host_id{};
+        uint32_t software_shader_index = 0u;
+    };
+
+    struct StateObjectEntry {
+        uint64_t id = 0ull;
+        uint32_t xbox_identifier_size_bytes = 32u;
+        uint32_t max_payload_size_bytes = 32u;
+        uint32_t max_attribute_size_bytes = 8u;
+        uint32_t max_recursion_depth = 2u;
+        std::unordered_map<std::string, ExportEntry> by_name;
+        std::unordered_map<std::string, std::string> xbox_id_to_name;
+    };
+
+    std::unordered_map<uint64_t, StateObjectEntry> state_objects;
+};
+
+DxrStateObjectSbtRemapper::DxrStateObjectSbtRemapper() : impl_(std::make_unique<Impl>()) {}
+DxrStateObjectSbtRemapper::~DxrStateObjectSbtRemapper() = default;
+
+Status DxrStateObjectSbtRemapper::CreateStateObject(
+    const DxrStateObjectDesc& desc,
+    uint64_t& out_state_object_id) {
+    out_state_object_id = 0ull;
+    if (desc.exports.empty()) {
+        return RecordDxrResult("CreateStateObject",
+                               Status::Error(StatusCode::InvalidArgument,
+                                             "State object requires at least one shader export"));
+    }
+    if (desc.xbox_identifier_size_bytes != 32u && desc.xbox_identifier_size_bytes != 64u) {
+        return RecordDxrResult("CreateStateObject",
+                               Status::Error(StatusCode::InvalidArgument,
+                                             "xbox_identifier_size_bytes must be 32 or 64"));
+    }
+
+    Impl::StateObjectEntry entry{};
+    entry.xbox_identifier_size_bytes = desc.xbox_identifier_size_bytes;
+    entry.max_payload_size_bytes = desc.max_payload_size_bytes;
+    entry.max_attribute_size_bytes = desc.max_attribute_size_bytes;
+    entry.max_recursion_depth = desc.max_recursion_depth;
+
+    uint32_t kind_counters[4] = {0u, 0u, 0u, 0u};
+
+    for (const auto& exp : desc.exports) {
+        if (exp.export_name.empty()) {
+            return RecordDxrResult("CreateStateObject",
+                                   Status::Error(StatusCode::InvalidArgument, "Export name must not be empty"));
+        }
+        if (entry.by_name.find(exp.export_name) != entry.by_name.end()) {
+            return RecordDxrResult("CreateStateObject",
+                                   Status::Error(StatusCode::InvalidArgument,
+                                                 "Duplicate export name in DXR state object: " + exp.export_name));
+        }
+
+        std::vector<uint8_t> xbox_id = exp.xbox_shader_identifier;
+        if (xbox_id.empty()) {
+            xbox_id = DeriveXboxShaderIdentifier(exp.export_name, desc.xbox_identifier_size_bytes);
+        } else if (xbox_id.size() != desc.xbox_identifier_size_bytes) {
+            return RecordDxrResult("CreateStateObject",
+                                   Status::Error(StatusCode::InvalidArgument,
+                                                 "Xbox shader identifier size mismatch for export: " + exp.export_name));
+        }
+
+        const std::string key = MakeByteKey(xbox_id.data(), xbox_id.size());
+        if (entry.xbox_id_to_name.find(key) != entry.xbox_id_to_name.end()) {
+            return RecordDxrResult("CreateStateObject",
+                                   Status::Error(StatusCode::InvalidArgument,
+                                                 "Duplicate Xbox shader identifier in DXR state object"));
+        }
+
+        Impl::ExportEntry rec{};
+        rec.export_name = exp.export_name;
+        rec.kind = exp.kind;
+        rec.xbox_id = std::move(xbox_id);
+        rec.host_id = DeriveShaderIdentifier(exp.export_name);
+        const uint32_t kind_idx = static_cast<uint32_t>(exp.kind) & 3u;
+        rec.software_shader_index = kind_counters[kind_idx]++;
+
+        entry.xbox_id_to_name.emplace(key, exp.export_name);
+        entry.by_name.emplace(exp.export_name, std::move(rec));
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        const uint64_t id = impl_->next_so_id++;
+        entry.id = id;
+        impl_->state_objects.emplace(id, std::move(entry));
+        out_state_object_id = id;
+    }
+
+    return RecordDxrResult("CreateStateObject", Status::Ok());
+}
+
+Status DxrStateObjectSbtRemapper::GetXboxShaderIdentifier(
+    uint64_t state_object_id,
+    const std::string& export_name,
+    std::vector<uint8_t>& out_xbox_id) const {
+    out_xbox_id.clear();
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto it = impl_->state_objects.find(state_object_id);
+    if (it == impl_->state_objects.end()) {
+        return Status::Error(StatusCode::NotFound, "State object ID not found");
+    }
+    auto eit = it->second.by_name.find(export_name);
+    if (eit == it->second.by_name.end()) {
+        return Status::Error(StatusCode::NotFound, "Export name not found in state object");
+    }
+    out_xbox_id = eit->second.xbox_id;
+    return Status::Ok();
+}
+
+Status DxrStateObjectSbtRemapper::GetHostShaderIdentifier(
+    uint64_t state_object_id,
+    const std::string& export_name,
+    std::array<uint8_t, kDxrShaderIdentifierSize>& out_host_id) const {
+    out_host_id.fill(0u);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto it = impl_->state_objects.find(state_object_id);
+    if (it == impl_->state_objects.end()) {
+        return Status::Error(StatusCode::NotFound, "State object ID not found");
+    }
+    auto eit = it->second.by_name.find(export_name);
+    if (eit == it->second.by_name.end()) {
+        return Status::Error(StatusCode::NotFound, "Export name not found in state object");
+    }
+    out_host_id = eit->second.host_id;
+    return Status::Ok();
+}
+
+Status DxrStateObjectSbtRemapper::RemapDispatchRaysSbt(
+    uint64_t state_object_id,
+    DxrHardwareEngine& engine,
+    const XboxDispatchRaysInput& xbox_input,
+    DxrRemappedSbtResult& out_remapped) const {
+    out_remapped = DxrRemappedSbtResult{};
+
+    if (!engine.IsInitialized()) {
+        return RecordDxrResult("RemapDispatchRaysSbt",
+                               Status::Error(StatusCode::DeviceError, "DxrHardwareEngine is not initialized"));
+    }
+
+    DxrShaderTableDesc host_table{};
+    host_table.base_gpu_va = xbox_input.optional_host_base_va;
+    host_table.dispatch_width = std::max<uint32_t>(1u, xbox_input.width);
+    host_table.dispatch_height = std::max<uint32_t>(1u, xbox_input.height);
+    host_table.dispatch_depth = std::max<uint32_t>(1u, xbox_input.depth);
+
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        auto it = impl_->state_objects.find(state_object_id);
+        if (it == impl_->state_objects.end()) {
+            return RecordDxrResult("RemapDispatchRaysSbt",
+                                   Status::Error(StatusCode::NotFound, "State object ID not found"));
+        }
+        const auto& so = it->second;
+        const uint32_t id_sz = so.xbox_identifier_size_bytes;
+        out_remapped.xbox_identifier_size_bytes = id_sz;
+
+        auto remap_one = [&](const XboxSbtRecordInput& src,
+                             DxrStateObjectExportDesc::Kind expected_kind,
+                             DxrShaderRecordDesc& dst_host,
+                             SoftwareDispatchRecord& dst_sw) -> Status {
+            if (src.raw_record_bytes.size() < id_sz) {
+                return Status::Error(StatusCode::InvalidArgument,
+                                     "Xbox SBT record smaller than shader identifier size");
+            }
+            const std::string key = MakeByteKey(src.raw_record_bytes.data(), id_sz);
+            auto nit = so.xbox_id_to_name.find(key);
+            if (nit == so.xbox_id_to_name.end()) {
+                return Status::Error(StatusCode::NotFound,
+                                     "Unknown Xbox shader identifier in SBT record");
+            }
+            const auto& exp = so.by_name.at(nit->second);
+            if (exp.kind != expected_kind) {
+                return Status::Error(StatusCode::InvalidArgument,
+                                     "Xbox SBT record shader kind mismatch for export: " + exp.export_name);
+            }
+
+            dst_host = DxrShaderRecordDesc{};
+            dst_host.export_name = exp.export_name;
+            dst_host.shader_identifier = exp.host_id;
+            if (src.raw_record_bytes.size() > id_sz) {
+                dst_host.local_root_arguments.assign(
+                    src.raw_record_bytes.begin() + static_cast<std::ptrdiff_t>(id_sz),
+                    src.raw_record_bytes.end());
+            }
+
+            dst_sw = SoftwareDispatchRecord{};
+            dst_sw.export_name = exp.export_name;
+            dst_sw.kind = exp.kind;
+            dst_sw.shader_index = exp.software_shader_index;
+            dst_sw.local_root_arguments = dst_host.local_root_arguments;
+            ++out_remapped.remapped_record_count;
+            return Status::Ok();
+        };
+
+        Status st = remap_one(xbox_input.raygen_record,
+                              DxrStateObjectExportDesc::Kind::RayGen,
+                              host_table.raygen,
+                              out_remapped.sw_raygen);
+        if (!st.ok()) {
+            return RecordDxrResult("RemapDispatchRaysSbt", st);
+        }
+
+        host_table.miss_records.resize(xbox_input.miss_records.size());
+        out_remapped.sw_miss.resize(xbox_input.miss_records.size());
+        for (size_t i = 0; i < xbox_input.miss_records.size(); ++i) {
+            st = remap_one(xbox_input.miss_records[i],
+                           DxrStateObjectExportDesc::Kind::Miss,
+                           host_table.miss_records[i],
+                           out_remapped.sw_miss[i]);
+            if (!st.ok()) {
+                return RecordDxrResult("RemapDispatchRaysSbt", st);
+            }
+        }
+
+        host_table.hit_group_records.resize(xbox_input.hit_group_records.size());
+        out_remapped.sw_hit_groups.resize(xbox_input.hit_group_records.size());
+        for (size_t i = 0; i < xbox_input.hit_group_records.size(); ++i) {
+            st = remap_one(xbox_input.hit_group_records[i],
+                           DxrStateObjectExportDesc::Kind::HitGroup,
+                           host_table.hit_group_records[i],
+                           out_remapped.sw_hit_groups[i]);
+            if (!st.ok()) {
+                return RecordDxrResult("RemapDispatchRaysSbt", st);
+            }
+        }
+
+        host_table.callable_records.resize(xbox_input.callable_records.size());
+        out_remapped.sw_callables.resize(xbox_input.callable_records.size());
+        for (size_t i = 0; i < xbox_input.callable_records.size(); ++i) {
+            st = remap_one(xbox_input.callable_records[i],
+                           DxrStateObjectExportDesc::Kind::Callable,
+                           host_table.callable_records[i],
+                           out_remapped.sw_callables[i]);
+            if (!st.ok()) {
+                return RecordDxrResult("RemapDispatchRaysSbt", st);
+            }
+        }
+    }
+
+    Status sbt_st = engine.BuildShaderBindingTable(host_table, out_remapped.host_sbt);
+    return RecordDxrResult("RemapDispatchRaysSbt", sbt_st);
+}
+
+Status DxrStateObjectSbtRemapper::DestroyStateObject(uint64_t state_object_id) {
+    bool erased = false;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        erased = (impl_->state_objects.erase(state_object_id) > 0u);
+    }
+    return RecordDxrResult(
+        "DestroyStateObject",
+        erased ? Status::Ok() : Status::Error(StatusCode::NotFound, "State object ID not found"));
 }
 
 }  // namespace openscarlett

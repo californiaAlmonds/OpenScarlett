@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Standalone Xbox-ABI Guest Sample 3:
+// OpenScarlett MIT Standalone Xbox-ABI Guest Sample 3:
 // Mirrors Microsoft Xbox-GDK-Samples/Samples/IntroGraphics/SimpleCompute (fractal.hlsl Mandelbrot).
 //
 // Deliberately does NOT link openscarlett_core. Runs on BOTH NVIDIA GTX 1650 Ti (HW)
@@ -23,7 +23,6 @@ namespace {
 constexpr uint32_t kWidth = 256u;
 constexpr uint32_t kHeight = 256u;
 constexpr uint32_t kPaletteWidth = 256u;
-constexpr uint32_t D3D12XBOX_RESOURCE_FLAG_ALLOW_DCC = 0x80000000u;
 
 template <typename T>
 class GuestComPtr {
@@ -193,7 +192,6 @@ int main(int argc, char** argv) {
     OpenScarlettD3D12SetPreferWarp(use_warp ? 1 : 0);
     D3D12XBOX_CREATE_DEVICE_PARAMETERS dev_params{};
     dev_params.Version = 1;
-    dev_params.PreferWarp = use_warp ? 1u : 0u;
 
     GuestComPtr<ID3D12DeviceX> device;
     HRESULT hr = D3D12XboxCreateDevice(
@@ -221,7 +219,7 @@ int main(int argc, char** argv) {
     }
 
     D3D12XBOX_FRAME_PIPELINE_TOKEN frame_token = 0;
-    hr = device->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, &frame_token);
+    hr = device->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, 0u, &frame_token);
     if (FAILED(hr) || frame_token == 0) {
         return Fail("WaitFrameEventX", hr);
     }
@@ -517,7 +515,7 @@ int main(int argc, char** argv) {
     D3D12XBOX_PRESENT_PARAMETERS pres_params{};
     pres_params.SyncInterval = 1;
 
-    hr = queue->PresentX(1, &plane, &pres_params, nullptr);
+    hr = queue->PresentX(1, &plane, &pres_params);
     if (FAILED(hr)) {
         return Fail("PresentX(1)", hr);
     }
@@ -615,7 +613,7 @@ int main(int argc, char** argv) {
         return Fail("Write T:\\metrics.txt", ::GetLastError());
     }
 
-    hr = queue->PresentX(0, nullptr, nullptr, nullptr);
+    hr = queue->PresentX(0, nullptr, nullptr);
     if (FAILED(hr)) {
         return Fail("PresentX(0) blank teardown", hr);
     }

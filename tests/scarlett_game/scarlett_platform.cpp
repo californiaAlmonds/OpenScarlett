@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Playable Xbox Series X|S (Scarlett) Platform Implementation.
+// OpenScarlett MIT Playable Xbox Series X|S (Scarlett) Platform Implementation.
 // Pure standalone Xbox-ABI host (does NOT link openscarlett_core):
 //   - d3d12_xs.dll    : D3D12CreateDeviceX + D3D12 textured fullscreen quad shader pass + PresentX
 //   - kernelx.dll     : XMemAlloc / XMemFree + GetConsoleType + TitleMemoryStatus
@@ -1095,7 +1095,7 @@ int ScarlettPlatformPresentFrame(const uint32_t* pixels,
 
     // 3. Acquire Xbox frame pipeline token via WaitFrameEventX.
     D3D12XBOX_FRAME_PIPELINE_TOKEN token = 0;
-    (void)g_plat.device->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, &token);
+    (void)g_plat.device->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, 0u, &token);
 
     // 4. Record D3D12 upload + fullscreen textured quad shader pass.
     if (FAILED(g_plat.alloc->Reset())) return 0;
@@ -1163,7 +1163,7 @@ int ScarlettPlatformPresentFrame(const uint32_t* pixels,
     plane.Token = token;
     plane.ResourceCount = 1u;
     plane.ppResources = plane_res;
-    plane.ColorSpace = D3D12XBOX_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    plane.ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
     plane.ResourceState = D3D12_RESOURCE_STATE_PRESENT;
 
     D3D12XBOX_PRESENT_PARAMETERS pres{};
@@ -1173,7 +1173,7 @@ int ScarlettPlatformPresentFrame(const uint32_t* pixels,
     pres.SyncInterval = (g_plat.cfg.headless || g_plat.cfg.verify_ticks > 0) ? 0u : 1u;
     pres.OutputWindow = g_plat.hwnd;
 
-    if (FAILED(g_plat.queue->PresentX(1u, &plane, &pres, nullptr))) {
+    if (FAILED(g_plat.queue->PresentX(1u, &plane, &pres))) {
         return 0;
     }
 

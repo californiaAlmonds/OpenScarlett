@@ -20,7 +20,8 @@ class CommandQueueX final
       public IOpenScarlettPresentCapture,
       public IOpenScarlettPresentWindow,
       public IOpenScarlettPresentHdr,
-      public IOpenScarlettPresentTiming {
+      public IOpenScarlettPresentTiming,
+      public IOpenScarlettPresentPacing {
 public:
     CommandQueueX(DeviceX* parent_device,
                   ID3D12CommandQueue* host_queue,
@@ -32,6 +33,10 @@ public:
 
     ID3D12CommandQueue* HostQueue() const noexcept { return host_queue_; }
     D3D12_COMMAND_LIST_TYPE QueueType() const noexcept { return queue_type_; }
+
+    // Title-created Win32 console display screen helpers (non-virtual; preserves COM vtable ABI).
+    HWND EffectiveOutputWindow() const noexcept;
+    bool AdoptTitleWindow(HWND hwnd) noexcept;
 
     // Zero-overhead C++ integration hook invoked on command list submission.
     using QueueSubmitHookFn = void (*)(
@@ -95,12 +100,11 @@ public:
     D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override;
 #endif
 
-    // ID3D12CommandQueueX (slots 19..24)
+    // ID3D12CommandQueueX (slots 19..24; slots 19..21 match real GDKX ID3D12CommandQueue)
     HRESULT STDMETHODCALLTYPE PresentX(
         UINT PlaneCount,
         const D3D12XBOX_PRESENT_PLANE_PARAMETERS* pPlaneParameters,
-        const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters,
-        void* pPresentToken) override;
+        const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters) override;
     HRESULT STDMETHODCALLTYPE SuspendX(uint32_t Flags) override;
     HRESULT STDMETHODCALLTYPE ResumeX() override;
     HRESULT STDMETHODCALLTYPE KickoffX() override;
@@ -114,6 +118,10 @@ public:
         uint64_t Value,
         uint64_t Mask,
         D3D12XBOX_WAIT_VALUE_OP Operation) override;
+    HRESULT STDMETHODCALLTYPE Write32BitValueX(
+        D3D12_GPU_VIRTUAL_ADDRESS Address,
+        uint32_t Value,
+        uint32_t Flags) override;
 
     // IOpenScarlettPresentCapture
     HRESULT STDMETHODCALLTYPE SetOutputWindow(HWND hwnd) override;
@@ -152,7 +160,18 @@ public:
     HRESULT STDMETHODCALLTYPE GetPresentTimingStats(
         D3D12XBOX_PRESENT_TIMING_STATS* out_stats) override;
 
+    // IOpenScarlettPresentPacing
+    HRESULT STDMETHODCALLTYPE SetFrameCapFps(
+        uint32_t fps_or_zero_for_uncapped,
+        BOOL override_active) override;
+    HRESULT STDMETHODCALLTYPE GetPresentPacingState(
+        D3D12XBOX_PRESENT_PACING_STATE* out_state) override;
+
 private:
+    uint32_t ResolveEffectiveFrameIntervalUsLocked(
+        bool& out_override_active,
+        uint32_t& out_fcap_fps) const noexcept;
+    void PumpMirrorReadbackCompletionLocked() noexcept;
     void ExecuteVulkanRecordedBatch(const VulkanRecordedBatch& batch);
     HRESULT EnsureVulkanSwapChainLocked(
         HWND hwnd, uint32_t width, uint32_t height, bool prefer_hdr10, bool headless);
@@ -177,6 +196,9 @@ private:
     HRESULT WaitForInternalFenceLocked();
     void AttachWindowSubclassLocked(HWND hwnd);
     void DetachWindowSubclassLocked();
+    HWND ResolveTargetOutputWindowLocked(
+        const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters,
+        bool force_headless);
     void ReleaseSwapChainLocked();
     void ReleasePresentObjectsLocked();
     void PaceFrameLocked(uint32_t frame_interval_us);
@@ -190,9 +212,10 @@ private:
     std::atomic<QueueSubmitHookFn> submit_hook_{nullptr};
     std::atomic<void*> submit_hook_ctx_{nullptr};
 
-    std::mutex present_mutex_;
+    mutable std::mutex present_mutex_;
     HWND attached_hwnd_ = nullptr;
     HWND subclassed_hwnd_ = nullptr;
+    bool explicit_window_detached_ = false;
     std::shared_ptr<WindowCallbackState> window_state_;
     bool readback_capture_enabled_ = true;
 
@@ -235,8 +258,16 @@ private:
     int64_t last_paced_qpc_ = 0;
     int64_t last_present_qpc_ = 0;
     HANDLE pacing_timer_ = nullptr;
+    uint32_t fcap_override_fps_ = 0u;
+    bool fcap_override_active_ = false;
+    uint32_t last_effective_interval_us_ = 0u;
+    uint64_t paced_frame_count_ = 0ull;
+    std::atomic<uint64_t> cached_gpu_ts_freq_{0ull};
 
     uint64_t present_count_ = 0;
+    uint64_t non_blank_present_count_ = 0;
+    bool auto_exit_posted_ = false;
+    bool capture_png_written_ = false;
     uint64_t latency_waits_ = 0;
     double last_frame_ms_ = 0.0;
     uint64_t last_present_hash_ = 0;

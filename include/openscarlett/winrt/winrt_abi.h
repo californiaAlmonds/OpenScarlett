@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room Windows x64 WinRT Activation & HSTRING ABI definitions.
+// Windows x64 WinRT Activation & HSTRING ABI definitions.
 // Deliberately does NOT include <roapi.h> or <winstring.h> to prevent
 // symbol collisions with the Windows SDK when linking winrt_xs.dll.
 
@@ -293,7 +293,7 @@ struct SX_ILanguageFactory {
     const SX_ILanguageFactoryVtbl* lpVtbl;
 };
 
-// Well-known COM / WinRT IIDs (public specifications).
+// Well-known COM / WinRT IIDs.
 constexpr SX_GUID SX_IID_IUnknown = {
     0x00000000u, 0x0000u, 0x0000u, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
 constexpr SX_GUID SX_IID_IInspectable = {

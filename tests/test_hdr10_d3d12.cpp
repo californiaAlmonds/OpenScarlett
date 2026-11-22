@@ -222,8 +222,6 @@ void RunLiveGpuSuite(bool use_warp) {
 
     D3D12XBOX_CREATE_DEVICE_PARAMETERS dev_params{};
     dev_params.Version = 1u;
-    dev_params.OutputWindow = hwnd;
-    dev_params.PreferWarp = use_warp ? 1u : 0u;
 
     TestComPtr<ID3D12DeviceX> dev;
     OS_REQUIRE(SUCCEEDED(D3D12XboxCreateDevice(
@@ -331,13 +329,13 @@ void RunLiveGpuSuite(bool use_warp) {
         D3D12XBOX_PRESENT_PLANE_PARAMETERS plane{};
         plane.ResourceCount = 1u;
         plane.ppResources = plane_res;
-        plane.ColorSpace = D3D12XBOX_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        plane.ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
         plane.ResourceState = D3D12_RESOURCE_STATE_PRESENT;
 
         D3D12XBOX_PRESENT_PARAMETERS pres{};
         pres.Flags = D3D12XBOX_PRESENT_FLAG_IMMEDIATE;
         pres.SyncInterval = 0u;
-        OS_REQUIRE(SUCCEEDED(queue->PresentX(1u, &plane, &pres, nullptr)));
+        OS_REQUIRE(SUCCEEDED(queue->PresentX(1u, &plane, &pres)));
 
         D3D12XBOX_HDR_SWAPCHAIN_STATE hdr_state{};
         OS_REQUIRE(SUCCEEDED(OpenScarlettD3D12GetHdrSwapChainState(queue.Get(), &hdr_state)));
@@ -468,11 +466,11 @@ void RunLiveGpuSuite(bool use_warp) {
         D3D12XBOX_PRESENT_PLANE_PARAMETERS plane{};
         plane.ResourceCount = 1u;
         plane.ppResources = plane_res;
-        plane.ColorSpace = D3D12XBOX_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+        plane.ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
         plane.ResourceState = D3D12_RESOURCE_STATE_PRESENT;
         D3D12XBOX_PRESENT_PARAMETERS pres{};
         pres.Flags = D3D12XBOX_PRESENT_FLAG_IMMEDIATE;
-        OS_REQUIRE(SUCCEEDED(queue->PresentX(1u, &plane, &pres, nullptr)));
+        OS_REQUIRE(SUCCEEDED(queue->PresentX(1u, &plane, &pres)));
 
         // Verify raw FP16 readback preserves exact >1.0 HDR values!
         std::vector<uint8_t> raw_fp16(static_cast<size_t>(kWinW) * kWinH * 8u, 0u);
@@ -507,7 +505,7 @@ void RunLiveGpuSuite(bool use_warp) {
         scrgb_cfg.ToneMapMode = D3D12XBOX_TONEMAP_REINHARD;
         scrgb_cfg.ForceSdrToneMapFallback = 1u;
         OS_REQUIRE(SUCCEEDED(OpenScarlettD3D12SetPresentConfig(queue.Get(), &scrgb_cfg)));
-        OS_REQUIRE(SUCCEEDED(queue->PresentX(1u, &plane, &pres, nullptr)));
+        OS_REQUIRE(SUCCEEDED(queue->PresentX(1u, &plane, &pres)));
 
         D3D12XBOX_HDR_SWAPCHAIN_STATE fb_state{};
         OS_REQUIRE(SUCCEEDED(OpenScarlettD3D12GetHdrSwapChainState(queue.Get(), &fb_state)));

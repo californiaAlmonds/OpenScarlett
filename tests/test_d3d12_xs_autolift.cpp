@@ -75,7 +75,6 @@ struct DeviceXHarness {
         OpenScarlettD3D12SetPreferWarp(use_warp ? 1 : 0);
         D3D12XBOX_CREATE_DEVICE_PARAMETERS params{};
         params.Version = 1;
-        params.PreferWarp = use_warp ? 1u : 0u;
         OS_REQUIRE(SUCCEEDED(D3D12XboxCreateDevice(
             nullptr, &params, IID_ID3D12DeviceX,
             reinterpret_cast<void**>(device.ReleaseAndGetAddressOf()))));

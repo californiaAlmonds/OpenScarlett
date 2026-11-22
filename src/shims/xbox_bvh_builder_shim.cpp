@@ -3,6 +3,7 @@
 #include "openscarlett/core/framebuffer.h"
 #include "openscarlett/core/telemetry.h"
 #include "openscarlett/gpu/dxr_hardware.h"
+#include "openscarlett/gpu/rdna2_rayquery_bridge.h"
 #include "openscarlett/gpu/rt_bvh.h"
 
 #include <cstdio>
@@ -17,6 +18,18 @@ struct XboxBvhBuilderObject {
     openscarlett::DxrHardwareEngine engine;
     std::unordered_map<uint64_t, std::vector<openscarlett::RtTriangle>> blas_triangles;
     std::unordered_map<uint64_t, std::shared_ptr<openscarlett::BvhAccelerationStructure>> bvh_cache;
+    std::unordered_map<uint64_t, openscarlett::XboxBvhConvertedBlas> converted_blas;
+    std::unordered_map<uint64_t, openscarlett::XboxBvhConvertedTlas> converted_tlas;
+    std::unordered_map<uint64_t, std::vector<uint64_t>> tlas_instance_blas_ids;
+    openscarlett::Rdna2Bvh64MultiWindow bvh64_windows;
+    uint64_t next_xbox_va = 0x0000001000000000ull;
+
+    uint64_t AllocXboxVa(uint64_t size_bytes) noexcept {
+        const uint64_t va = next_xbox_va;
+        const uint64_t padded = (size_bytes + 65535ull) & ~65535ull;
+        next_xbox_va += (padded < 65536ull) ? 65536ull : padded;
+        return va;
+    }
 };
 
 namespace {
@@ -136,6 +149,10 @@ void OS_SHIM_CALL XboxBvhDestroyBuilder(XboxBvhBuilderHandle builder) {
     }
     if (removed) {
         std::lock_guard<std::mutex> lk(removed->mutex);
+        removed->bvh64_windows.Clear();
+        removed->converted_tlas.clear();
+        removed->converted_blas.clear();
+        removed->tlas_instance_blas_ids.clear();
         removed->bvh_cache.clear();
         removed->blas_triangles.clear();
         removed->engine.Shutdown();
@@ -238,6 +255,33 @@ int32_t OS_SHIM_CALL XboxBvhBuildBlas(
     if (bvh->Build(tris).ok()) {
         obj->bvh_cache[blas_id] = std::move(bvh);
     }
+
+    // Build Xbox RDNA2 BVH4 representation + register 64-bit multi-window buffer.
+    openscarlett::XboxBvhBlasBuildInput conv_in{};
+    conv_in.build_flags = buildFlags;
+    conv_in.use_box16 = (buildFlags & XBOX_BVH_BUILD_MINIMIZE_MEMORY) != 0u;
+    openscarlett::XboxBvhGeometryDesc gdesc{};
+    gdesc.vertices.reserve(tris.size() * 3u);
+    for (const auto& t : tris) {
+        gdesc.vertices.push_back(t.v0);
+        gdesc.vertices.push_back(t.v1);
+        gdesc.vertices.push_back(t.v2);
+    }
+    if (!tris.empty()) {
+        gdesc.default_color = tris[0].color;
+        gdesc.default_reflectivity = tris[0].reflectivity;
+    }
+    conv_in.geometries.push_back(std::move(gdesc));
+
+    openscarlett::XboxBvhConvertedBlas conv_blas{};
+    const uint64_t xbox_va = obj->AllocXboxVa(
+        static_cast<uint64_t>(tris.size()) * 256ull + 4096ull);
+    if (openscarlett::ConvertXboxBlasToHostAndBvh4(conv_in, xbox_va, conv_blas).ok()) {
+        conv_blas.host_triangles = tris;
+        obj->bvh64_windows.RegisterWindow(xbox_va, conv_blas.xbox_bvh4_buffer);
+        obj->converted_blas[blas_id] = std::move(conv_blas);
+    }
+
     obj->blas_triangles[blas_id] = std::move(tris);
     *outBlasId = blas_id;
     return RecordHr("XboxBvhBuildBlas", OS_SHIM_S_OK);
@@ -267,6 +311,29 @@ int32_t OS_SHIM_CALL XboxBvhUpdateBlas(
     if (bvh->Build(tris).ok()) {
         obj->bvh_cache[blasId] = std::move(bvh);
     }
+
+    auto cit = obj->converted_blas.find(blasId);
+    if (cit != obj->converted_blas.end()) {
+        const uint64_t existing_va = cit->second.xbox_gpu_va;
+        openscarlett::XboxBvhBlasBuildInput conv_in{};
+        conv_in.build_flags = cit->second.host_build_flags;
+        conv_in.use_box16 = (cit->second.host_build_flags & XBOX_BVH_BUILD_MINIMIZE_MEMORY) != 0u;
+        openscarlett::XboxBvhGeometryDesc gdesc{};
+        gdesc.vertices.reserve(tris.size() * 3u);
+        for (const auto& t : tris) {
+            gdesc.vertices.push_back(t.v0);
+            gdesc.vertices.push_back(t.v1);
+            gdesc.vertices.push_back(t.v2);
+        }
+        conv_in.geometries.push_back(std::move(gdesc));
+        openscarlett::XboxBvhConvertedBlas rebuilt{};
+        if (openscarlett::ConvertXboxBlasToHostAndBvh4(conv_in, existing_va, rebuilt).ok()) {
+            rebuilt.host_triangles = tris;
+            obj->bvh64_windows.RegisterWindow(existing_va, rebuilt.xbox_bvh4_buffer);
+            cit->second = std::move(rebuilt);
+        }
+    }
+
     obj->blas_triangles[blasId] = std::move(tris);
     return RecordHr("XboxBvhUpdateBlas", OS_SHIM_S_OK);
 }
@@ -306,9 +373,30 @@ int32_t OS_SHIM_CALL XboxBvhBuildTlas(
         return RecordHr("XboxBvhBuildTlas", StatusToHr(st));
     }
 
-    // Build flattened world-space BVH so XboxBvhTraceRay can query the TLAS directly.
+    // Build flattened world-space BVH mirror AND real 64-bit multi-window RDNA2 BVH4 TLAS.
     std::vector<openscarlett::RtTriangle> world_tris;
+    std::vector<openscarlett::XboxBvhTlasInstanceInput> bvh4_insts;
+    std::vector<openscarlett::XboxBvhConvertedBlas> blas_snapshot;
+    std::vector<uint64_t> instance_blas_ids;
+    bvh4_insts.reserve(dxr_insts.size());
+    instance_blas_ids.reserve(dxr_insts.size());
+
     for (const auto& inst : dxr_insts) {
+        auto bit = obj->converted_blas.find(inst.blas_id);
+        if (bit != obj->converted_blas.end()) {
+            openscarlett::XboxBvhTlasInstanceInput ti{};
+            ti.blas_xbox_va = bit->second.xbox_gpu_va;
+            ti.host_blas_id = inst.blas_id;
+            std::memcpy(ti.object_to_world, inst.transform, sizeof(ti.object_to_world));
+            ti.instance_id = inst.instance_id;
+            ti.instance_mask = inst.instance_mask;
+            ti.hit_group_contribution = inst.instance_contribution_to_hit_group_index;
+            ti.instance_flags = inst.flags;
+            bvh4_insts.push_back(ti);
+            blas_snapshot.push_back(bit->second);
+            instance_blas_ids.push_back(inst.blas_id);
+        }
+
         if (inst.instance_mask == 0u) continue;
         auto it = obj->blas_triangles.find(inst.blas_id);
         if (it == obj->blas_triangles.end()) continue;
@@ -316,6 +404,20 @@ int32_t OS_SHIM_CALL XboxBvhBuildTlas(
             world_tris.push_back(openscarlett::TransformTriangle3x4(inst.transform, tri));
         }
     }
+
+    if (!bvh4_insts.empty()) {
+        openscarlett::XboxBvhConvertedTlas conv_tlas{};
+        const uint64_t tlas_va = obj->AllocXboxVa(
+            static_cast<uint64_t>(bvh4_insts.size()) * 256ull + 4096ull);
+        const bool use_box16 = (buildFlags & XBOX_BVH_BUILD_MINIMIZE_MEMORY) != 0u;
+        if (openscarlett::ConvertXboxTlasToHostAndBvh4(
+                bvh4_insts, blas_snapshot, tlas_va, buildFlags, use_box16, conv_tlas).ok()) {
+            obj->bvh64_windows.RegisterWindow(tlas_va, conv_tlas.xbox_bvh4_buffer);
+            obj->converted_tlas[tlas_id] = std::move(conv_tlas);
+            obj->tlas_instance_blas_ids[tlas_id] = std::move(instance_blas_ids);
+        }
+    }
+
     if (!world_tris.empty()) {
         auto bvh = std::make_shared<openscarlett::BvhAccelerationStructure>();
         if (bvh->Build(world_tris).ok()) {
@@ -358,20 +460,101 @@ int32_t OS_SHIM_CALL XboxBvhTraceRay(
     r.t_min = ray->tMin > 0.0f ? ray->tMin : 0.001f;
     r.t_max = ray->tMax > r.t_min ? ray->tMax : 1e30f;
 
-    openscarlett::RtHit h{};
-    if (bvh->TraceRay(r, h, nullptr) && h.hit) {
-        outHit->hit = 1u;
-        outHit->t = h.t;
-        outHit->u = h.u;
-        outHit->v = h.v;
-        outHit->triangleIndex = h.triangle_index;
-        outHit->normal[0] = h.normal.x;
-        outHit->normal[1] = h.normal.y;
-        outHit->normal[2] = h.normal.z;
-        outHit->color[0] = h.color.x;
-        outHit->color[1] = h.color.y;
-        outHit->color[2] = h.color.z;
-        outHit->reflectivity = h.reflectivity;
+    // Prefer real 64-bit multi-window BVH4 traversal when the AS has a converted BVH4 window,
+    // verifying exact parity and enriching shading metadata from the hit BLAS triangles.
+    bool traced_via_bvh64 = false;
+    {
+        std::lock_guard<std::mutex> lk(obj->mutex);
+        uint64_t root_va = 0ull;
+        bool is_tlas = false;
+        if (auto tit = obj->converted_tlas.find(asId); tit != obj->converted_tlas.end()) {
+            root_va = tit->second.xbox_gpu_va;
+            is_tlas = true;
+        } else if (auto bit = obj->converted_blas.find(asId); bit != obj->converted_blas.end()) {
+            root_va = bit->second.xbox_gpu_va;
+        }
+
+        if (root_va != 0ull) {
+            openscarlett::Rdna2RayQueryInput rq{};
+            rq.origin = r.origin;
+            rq.t_min = r.t_min;
+            rq.direction = r.direction;
+            rq.t_max = r.t_max;
+            rq.ray_flags = openscarlett::kRdna2RayFlagNone;
+            rq.instance_mask = 0xFFu;
+
+            openscarlett::Rdna2RayQueryHit rq_hit{};
+            if (obj->bvh64_windows.TraceRay64(root_va, rq, rq_hit).ok()) {
+                traced_via_bvh64 = true;
+                if (rq_hit.committed_status == openscarlett::kRdna2CommittedTriangleHit) {
+                    outHit->hit = 1u;
+                    outHit->t = rq_hit.t;
+                    outHit->u = rq_hit.bary_u;
+                    outHit->v = rq_hit.bary_v;
+                    outHit->triangleIndex = rq_hit.primitive_index;
+
+                    const openscarlett::RtTriangle* hit_tri = nullptr;
+                    if (is_tlas) {
+                        auto ib_it = obj->tlas_instance_blas_ids.find(asId);
+                        if (ib_it != obj->tlas_instance_blas_ids.end() &&
+                            rq_hit.instance_index < ib_it->second.size()) {
+                            const uint64_t hit_blas_id = ib_it->second[rq_hit.instance_index];
+                            auto bt_it = obj->blas_triangles.find(hit_blas_id);
+                            if (bt_it != obj->blas_triangles.end() &&
+                                rq_hit.primitive_index < bt_it->second.size()) {
+                                hit_tri = &bt_it->second[rq_hit.primitive_index];
+                            }
+                        }
+                    } else {
+                        auto bt_it = obj->blas_triangles.find(asId);
+                        if (bt_it != obj->blas_triangles.end() &&
+                            rq_hit.primitive_index < bt_it->second.size()) {
+                            hit_tri = &bt_it->second[rq_hit.primitive_index];
+                        }
+                    }
+
+                    if (hit_tri) {
+                        outHit->color[0] = hit_tri->color.x;
+                        outHit->color[1] = hit_tri->color.y;
+                        outHit->color[2] = hit_tri->color.z;
+                        outHit->reflectivity = hit_tri->reflectivity;
+                        float tmp_t = 0.0f, tmp_u = 0.0f, tmp_v = 0.0f;
+                        openscarlett::Vec3 n{};
+                        if (!is_tlas && openscarlett::IntersectRayTriangle(
+                                *hit_tri, r, r.t_max, tmp_t, tmp_u, tmp_v, n)) {
+                            outHit->normal[0] = n.x;
+                            outHit->normal[1] = n.y;
+                            outHit->normal[2] = n.z;
+                        } else if (bvh) {
+                            openscarlett::RtHit h_meta{};
+                            if (bvh->TraceRay(r, h_meta, nullptr) && h_meta.hit) {
+                                outHit->normal[0] = h_meta.normal.x;
+                                outHit->normal[1] = h_meta.normal.y;
+                                outHit->normal[2] = h_meta.normal.z;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (!traced_via_bvh64 && bvh) {
+        openscarlett::RtHit h{};
+        if (bvh->TraceRay(r, h, nullptr) && h.hit) {
+            outHit->hit = 1u;
+            outHit->t = h.t;
+            outHit->u = h.u;
+            outHit->v = h.v;
+            outHit->triangleIndex = h.triangle_index;
+            outHit->normal[0] = h.normal.x;
+            outHit->normal[1] = h.normal.y;
+            outHit->normal[2] = h.normal.z;
+            outHit->color[0] = h.color.x;
+            outHit->color[1] = h.color.y;
+            outHit->color[2] = h.color.z;
+            outHit->reflectivity = h.reflectivity;
+        }
     }
 
     return RecordHr("XboxBvhTraceRay", OS_SHIM_S_OK);

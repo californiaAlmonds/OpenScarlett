@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Playable Scarlett Game Live End-to-End Verification Harness.
+// OpenScarlett MIT Playable Scarlett Game Live End-to-End Verification Harness.
 //
 // Launches standalone ZERO-DLL Xbox Series X|S GDK game packages via `openscarlett.exe run`:
 //   1. ScarlettArena (100% MIT 3D raycaster — ALWAYS runs on CI and local hosts, HW + WARP)

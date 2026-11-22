@@ -83,8 +83,24 @@ void EmitSpvVec(std::vector<uint32_t>& out, uint16_t op, const std::vector<uint3
     out.insert(out.end(), ops.begin(), ops.end());
 }
 
-// SPIR-V 1.3 opcodes used by HS/DS/GS and Wave64-on-Wave32 emitters.
+void AppendSpvExtString(std::vector<uint32_t>& out, const char* str) {
+    const size_t len = std::strlen(str) + 1u;
+    const size_t words = (len + 3u) / 4u;
+    for (size_t w = 0u; w < words; ++w) {
+        uint32_t word = 0u;
+        for (size_t b = 0u; b < 4u; ++b) {
+            const size_t idx = w * 4u + b;
+            if (idx < len) {
+                word |= static_cast<uint32_t>(static_cast<uint8_t>(str[idx])) << (b * 8u);
+            }
+        }
+        out.push_back(word);
+    }
+}
+
+// SPIR-V 1.3 / 1.6 opcodes used by HS/DS/GS, VS/GS/MS cull-distance, and Wave64-on-Wave32 emitters.
 enum SpvExtOp : uint16_t {
+    SpvOpExtension = 10,
     SpvOpMemoryModel = 14,
     SpvOpEntryPoint = 15,
     SpvOpExecutionMode = 16,
@@ -111,11 +127,15 @@ enum SpvExtOp : uint16_t {
     SpvOpMemberDecorate = 72,
     SpvOpCompositeConstruct = 80,
     SpvOpCompositeExtract = 81,
+    SpvOpConvertUToF = 112,
+    SpvOpBitcast = 124,
     SpvOpIAdd = 128,
     SpvOpFAdd = 129,
     SpvOpISub = 130,
+    SpvOpFSub = 131,
     SpvOpIMul = 132,
     SpvOpFMul = 133,
+    SpvOpUMod = 137,
     SpvOpVectorTimesScalar = 142,
     SpvOpSelect = 169,
     SpvOpIEqual = 170,
@@ -131,12 +151,14 @@ enum SpvExtOp : uint16_t {
     SpvOpEmitVertex = 218,
     SpvOpEndPrimitive = 219,
     SpvOpControlBarrier = 224,
+    SpvOpAtomicAnd = 240,
     SpvOpAtomicOr = 241,
     SpvOpSelectionMerge = 247,
     SpvOpLabel = 248,
     SpvOpBranch = 249,
     SpvOpBranchConditional = 250,
     SpvOpReturn = 253,
+    SpvOpSetMeshOutputsEXT = 5295,
 };
 
 #if defined(_WIN32)
@@ -613,18 +635,21 @@ std::vector<uint32_t> BuildDomainSpirv13(const Rdna2DomainStageContract& c, floa
     return spv;
 }
 
-// Emits SPIR-V 1.3 Geometry (GS) module with real OpEmitVertex & OpEndPrimitive.
+// Emits SPIR-V 1.3 Geometry (GS) module with real OpEmitVertex & OpEndPrimitive
+// and optional BuiltIn CullDistance preservation across input/output gl_PerVertex.
 std::vector<uint32_t> BuildGeometrySpirv13(
     const Rdna2GeometryStageContract& c,
     uint32_t emit_count,
     uint32_t cut_count,
-    float bias) {
+    float bias,
+    uint32_t cull_dist_count = 0u) {
     uint32_t id = 1u;
     auto nid = [&]() { return id++; };
 
     const uint32_t in_verts = GsInputVertexCount(c.input_primitive);
     const uint32_t out_max = std::max(1u, c.max_vertex_count);
     const uint32_t eff_emits = std::min(out_max, std::max(1u, emit_count));
+    const uint32_t eff_cull = (cull_dist_count > 0u) ? std::min(8u, cull_dist_count) : 0u;
 
     const uint32_t ty_void = nid(), ty_u32 = nid(), ty_f32 = nid(), ty_v4f = nid(), ty_perv = nid();
     const uint32_t c_inv = nid(), c_0 = nid();
@@ -644,7 +669,37 @@ std::vector<uint32_t> BuildGeometrySpirv13(
     EmitSpv(types, SpvOpTypeInt, {ty_u32, 32u, 0u});
     EmitSpv(types, SpvOpTypeFloat, {ty_f32, 32u});
     EmitSpv(types, SpvOpTypeVector, {ty_v4f, ty_f32, 4u});
-    EmitSpv(types, SpvOpTypeStruct, {ty_perv, ty_v4f});
+
+    uint32_t ty_ptr_in_f32 = 0u, ty_ptr_out_f32 = 0u, c_1_mem = 0u;
+    std::vector<uint32_t> cull_idx_consts;
+    if (eff_cull > 0u) {
+        const uint32_t c_cull_len = nid();
+        const uint32_t ty_arr_cull = nid();
+        c_1_mem = nid();
+        ty_ptr_in_f32 = nid();
+        ty_ptr_out_f32 = nid();
+        EmitSpv(types, SpvOpConstant, {ty_u32, c_cull_len, eff_cull});
+        EmitSpv(types, SpvOpConstant, {ty_u32, c_1_mem, 1u});
+        EmitSpv(types, SpvOpTypeArray, {ty_arr_cull, ty_f32, c_cull_len});
+        EmitSpv(types, SpvOpTypeStruct, {ty_perv, ty_v4f, ty_arr_cull});
+        EmitSpv(decs, SpvOpMemberDecorate, {ty_perv, 1u, 11u, 4u});  // BuiltIn CullDistance
+        EmitSpv(types, SpvOpTypePointer, {ty_ptr_in_f32, 1u, ty_f32});
+        EmitSpv(types, SpvOpTypePointer, {ty_ptr_out_f32, 3u, ty_f32});
+        cull_idx_consts.resize(eff_cull);
+        for (uint32_t k = 0u; k < eff_cull; ++k) {
+            if (k == 0u) {
+                cull_idx_consts[k] = c_0;
+            } else if (k == 1u) {
+                cull_idx_consts[k] = c_1_mem;
+            } else {
+                cull_idx_consts[k] = nid();
+                EmitSpv(types, SpvOpConstant, {ty_u32, cull_idx_consts[k], k});
+            }
+        }
+    } else {
+        EmitSpv(types, SpvOpTypeStruct, {ty_perv, ty_v4f});
+    }
+
     EmitSpv(types, SpvOpConstant, {ty_u32, c_inv, in_verts});
     EmitSpv(types, SpvOpConstant, {ty_u32, c_0, 0u});
     EmitSpv(types, SpvOpConstant, {ty_f32, c_bias, FloatToBits(bias)});
@@ -679,6 +734,14 @@ std::vector<uint32_t> BuildGeometrySpirv13(
         EmitSpv(body, SpvOpFAdd, {ty_v4f, vo, vi, c_bias_v4});
         EmitSpv(body, SpvOpAccessChain, {ty_ptr_out_v4f, po, var_out, c_0});
         EmitSpv(body, SpvOpStore, {po, vo});
+        for (uint32_t k = 0u; k < eff_cull; ++k) {
+            const uint32_t pc_in = nid(), vc = nid(), pc_out = nid();
+            EmitSpv(body, SpvOpAccessChain,
+                    {ty_ptr_in_f32, pc_in, var_in, idx_consts[e % in_verts], c_1_mem, cull_idx_consts[k]});
+            EmitSpv(body, SpvOpLoad, {ty_f32, vc, pc_in});
+            EmitSpv(body, SpvOpAccessChain, {ty_ptr_out_f32, pc_out, var_out, c_1_mem, cull_idx_consts[k]});
+            EmitSpv(body, SpvOpStore, {pc_out, vc});
+        }
         EmitSpv(body, SpvOpStore, {var_col, c_col_v4});
         EmitSpv(body, SpvOpEmitVertex, {});
     }
@@ -709,6 +772,9 @@ std::vector<uint32_t> BuildGeometrySpirv13(
     std::vector<uint32_t> spv = {0x07230203u, 0x00010300u, 0x4F533200u, id, 0u};
     EmitSpv(spv, SpvOpCapability, {1u});  // Shader
     EmitSpv(spv, SpvOpCapability, {2u});  // Geometry
+    if (eff_cull > 0u) {
+        EmitSpv(spv, SpvOpCapability, {45u});  // CullDistance
+    }
     EmitSpv(spv, SpvOpMemoryModel, {0u, 1u});
     EmitSpv(spv, SpvOpEntryPoint, {3u, fn_main, 0x6E69616Du, 0u, var_in, var_out, var_col});
     EmitSpv(spv, SpvOpExecutionMode, {fn_main, in_mode});
@@ -946,6 +1012,20 @@ Status LiftRdna2GeometryShader(
         }
     }
 
+    // Detect vertex cull-distance exports (EXP Pos2 -> 4 floats, EXP Pos3 -> 8 floats)
+    uint32_t cull_dist_count = 0u;
+    for (const auto& inst : out_result.instructions) {
+        if (inst.opcode == Rdna2Opcode::EXP) {
+            if (inst.exp_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos3)) {
+                cull_dist_count = 8u;
+                break;
+            }
+            if (inst.exp_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos2)) {
+                cull_dist_count = 4u;
+            }
+        }
+    }
+
     const auto alu = SummarizeAndLiftRdna2Alu(out_result.instructions, "v.pos");
     out_result.lifted_alu_ops = alu.alu_count;
     out_result.hlsl_target = options.target_profile_override.empty() ? "gs_6_5" : options.target_profile_override;
@@ -956,8 +1036,16 @@ Status LiftRdna2GeometryShader(
     if (options.emit_hlsl) {
         std::ostringstream hlsl;
         hlsl << "// Lifted OpenScarlett RDNA2 Geometry Shader (GS -> " << out_result.hlsl_target << ")\n";
-        hlsl << "struct GsInput  { float4 pos : SV_Position; float4 col : COLOR0; };\n";
-        hlsl << "struct GsOutput { float4 pos : SV_Position; float4 col : COLOR0; };\n\n";
+        if (cull_dist_count > 4u) {
+            hlsl << "struct GsInput  { float4 pos : SV_Position; float4 col : COLOR0; float4 cull_dist0 : SV_CullDistance0; float4 cull_dist1 : SV_CullDistance1; };\n";
+            hlsl << "struct GsOutput { float4 pos : SV_Position; float4 col : COLOR0; float4 cull_dist0 : SV_CullDistance0; float4 cull_dist1 : SV_CullDistance1; };\n\n";
+        } else if (cull_dist_count > 0u) {
+            hlsl << "struct GsInput  { float4 pos : SV_Position; float4 col : COLOR0; float4 cull_dist0 : SV_CullDistance0; };\n";
+            hlsl << "struct GsOutput { float4 pos : SV_Position; float4 col : COLOR0; float4 cull_dist0 : SV_CullDistance0; };\n\n";
+        } else {
+            hlsl << "struct GsInput  { float4 pos : SV_Position; float4 col : COLOR0; };\n";
+            hlsl << "struct GsOutput { float4 pos : SV_Position; float4 col : COLOR0; };\n\n";
+        }
         if (contract.instance_count > 1u) {
             hlsl << "[instance(" << contract.instance_count << ")]\n";
         }
@@ -969,10 +1057,17 @@ Status LiftRdna2GeometryShader(
             uint32_t emitted = 0u;
             for (const auto& ev : gs_events) {
                 if (ev.emit && emitted < max_verts) {
+                    const uint32_t src_v = emitted % in_verts;
                     hlsl << "    {\n";
                     hlsl << "        GsOutput v;\n";
-                    hlsl << "        v.pos = verts[" << (emitted % in_verts) << "].pos;\n";
-                    hlsl << "        v.col = verts[" << (emitted % in_verts) << "].col;\n";
+                    hlsl << "        v.pos = verts[" << src_v << "].pos;\n";
+                    hlsl << "        v.col = verts[" << src_v << "].col;\n";
+                    if (cull_dist_count > 0u) {
+                        hlsl << "        v.cull_dist0 = verts[" << src_v << "].cull_dist0;\n";
+                    }
+                    if (cull_dist_count > 4u) {
+                        hlsl << "        v.cull_dist1 = verts[" << src_v << "].cull_dist1;\n";
+                    }
                     hlsl << alu.hlsl_body;
                     hlsl << "        out_stream.Append(v);\n";
                     hlsl << "    }\n";
@@ -989,6 +1084,12 @@ Status LiftRdna2GeometryShader(
                 hlsl << "        GsOutput v;\n";
                 hlsl << "        v.pos = verts[" << i << "].pos;\n";
                 hlsl << "        v.col = verts[" << i << "].col;\n";
+                if (cull_dist_count > 0u) {
+                    hlsl << "        v.cull_dist0 = verts[" << i << "].cull_dist0;\n";
+                }
+                if (cull_dist_count > 4u) {
+                    hlsl << "        v.cull_dist1 = verts[" << i << "].cull_dist1;\n";
+                }
                 hlsl << alu.hlsl_body;
                 hlsl << "        out_stream.Append(v);\n";
                 hlsl << "    }\n";
@@ -1002,7 +1103,8 @@ Status LiftRdna2GeometryShader(
     if (options.emit_spirv) {
         const uint32_t spv_emits = (out_result.gs_emit_count > 0u) ? out_result.gs_emit_count
                                                                     : std::min(in_verts, max_verts);
-        out_result.spirv_words = BuildGeometrySpirv13(contract, spv_emits, out_result.gs_cut_count, alu.bias_offset);
+        out_result.spirv_words = BuildGeometrySpirv13(
+            contract, spv_emits, out_result.gs_cut_count, alu.bias_offset, cull_dist_count);
     }
 
     return FinalizeExtendedStageLift(options, out_result);
@@ -1391,17 +1493,18 @@ uint W64_ReadLane(uint group_idx, uint src0, uint target_lane) {
 uint2 W64_Ballot64(uint group_idx, bool pred) {
     uint gw = group_idx >> 6u;
     uint lane = group_idx & 63u;
-    if (lane == 0u) {
-        g_w64_ballot[gw * 2u + 0u] = 0u;
-        g_w64_ballot[gw * 2u + 1u] = 0u;
-    }
+    uint b0 = gw * 2u + 0u;
+    uint b1 = gw * 2u + 1u;
+    GroupMemoryBarrierWithGroupSync();
+    InterlockedAnd(g_w64_ballot[b0], 0u);
+    InterlockedAnd(g_w64_ballot[b1], 0u);
     GroupMemoryBarrierWithGroupSync();
     if (pred) {
         uint half_i = lane >> 5u;
         InterlockedOr(g_w64_ballot[gw * 2u + half_i], 1u << (lane & 31u));
     }
     GroupMemoryBarrierWithGroupSync();
-    uint2 b = uint2(g_w64_ballot[gw * 2u + 0u], g_w64_ballot[gw * 2u + 1u]);
+    uint2 b = uint2(g_w64_ballot[b0], g_w64_ballot[b1]);
     GroupMemoryBarrierWithGroupSync();
     return b;
 }
@@ -1426,6 +1529,64 @@ uint W64_MbcntHi(uint group_idx, uint mask_hi, uint acc) {
     uint lane = group_idx & 63u;
     uint hi_mask = (lane >= 32u) ? ((1u << (lane - 32u)) - 1u) : 0u;
     return acc + countbits(mask_hi & hi_mask);
+}
+
+uint W64_ActiveCountBits64(uint2 ballot_mask) {
+    return countbits(ballot_mask.x) + countbits(ballot_mask.y);
+}
+
+uint W64_Mbcnt64(uint group_idx, uint2 ballot_mask, uint acc) {
+    return W64_MbcntHi(group_idx, ballot_mask.y, W64_MbcntLo(group_idx, ballot_mask.x, acc));
+}
+
+uint W64_ReadFirstLane(uint group_idx, uint src0) {
+    uint2 active = W64_Ballot64(group_idx, true);
+    uint first_lane = (active.x != 0u) ? firstbitlow(active.x)
+                                       : ((active.y != 0u) ? (32u + firstbitlow(active.y)) : 0u);
+    return W64_ReadLane(group_idx, src0, first_lane);
+}
+
+uint W64_CrossHalfExchange(uint group_idx, uint src0) {
+    uint gw = group_idx >> 6u;
+    uint lane = group_idx & 63u;
+    uint base = gw * 64u;
+    g_w64_lds[base + lane] = src0;
+    GroupMemoryBarrierWithGroupSync();
+    uint res = g_w64_lds[base + (lane ^ 32u)];
+    GroupMemoryBarrierWithGroupSync();
+    return res;
+}
+
+uint W64_CrossHalfShuffle(uint group_idx, uint src0, uint xor_mask) {
+    uint gw = group_idx >> 6u;
+    uint lane = group_idx & 63u;
+    uint base = gw * 64u;
+    g_w64_lds[base + lane] = src0;
+    GroupMemoryBarrierWithGroupSync();
+    uint res = g_w64_lds[base + ((lane ^ xor_mask) & 63u)];
+    GroupMemoryBarrierWithGroupSync();
+    return res;
+}
+
+// Canonical LDS-backed Wave64-on-Wave32 helper aliases
+uint2 ballot64(uint group_idx, bool pred) {
+    return W64_Ballot64(group_idx, pred);
+}
+
+uint mbcnt64_lo(uint group_idx, uint mask_lo, uint acc) {
+    return W64_MbcntLo(group_idx, mask_lo, acc);
+}
+
+uint mbcnt64_hi(uint group_idx, uint mask_hi, uint acc) {
+    return W64_MbcntHi(group_idx, mask_hi, acc);
+}
+
+uint readlane64(uint group_idx, uint src0, uint target_lane) {
+    return W64_ReadLane(group_idx, src0, target_lane);
+}
+
+uint cross_half_exchange64(uint group_idx, uint src0) {
+    return W64_CrossHalfExchange(group_idx, src0);
 }
 )HLSL";
     return oss.str();
@@ -2296,6 +2457,750 @@ AsyncPsoPoolStats AsyncPsoCompilePool::Stats() const noexcept {
     s.worker_count = static_cast<uint32_t>(impl_->workers.size());
     s.pending_queue_depth = static_cast<uint32_t>(impl_->pq.size());
     return s;
+}
+
+// ===========================================================================
+// 5. Standalone Wave64-on-Wave32 LDS Emulation & Paired Barycentric/CullDistance Lowering
+// ===========================================================================
+
+std::string EmitWave64On32LdsHlslLibrary(const Wave64LdsEmulationConfig& config) {
+    const uint32_t tg_rounded = std::max(64u, ((std::max(1u, config.threadgroup_size) + 63u) / 64u) * 64u);
+    const uint32_t waves = std::max(std::max(1u, config.max_guest_waves), tg_rounded / 64u);
+    return Wave64On32Emulator::EmitHlslHelperLibrary(waves);
+}
+
+Status EmitWave64On32LdsSpirv(
+    const Wave64LdsEmulationConfig& config,
+    std::vector<uint32_t>& out_spirv) {
+    out_spirv.clear();
+
+    const uint32_t tg_size = std::clamp(((std::max(1u, config.threadgroup_size) + 63u) / 64u) * 64u, 64u, 1024u);
+    const uint32_t guest_waves = std::max(std::max(1u, config.max_guest_waves), tg_size / 64u);
+    const uint32_t lds_dwords = guest_waves * 64u;
+    const uint32_t ballot_dwords = guest_waves * 2u;
+
+    uint32_t id = 1u;
+    auto nid = [&]() { return id++; };
+
+    std::vector<uint32_t> decs, types, body;
+    std::unordered_map<uint32_t, uint32_t> uconsts;
+
+    const uint32_t ty_void = nid(), ty_bool = nid(), ty_u32 = nid();
+    const uint32_t ty_rt_u32 = nid(), ty_buf = nid();
+    const uint32_t ty_ptr_sb_buf = nid(), ty_ptr_sb_u32 = nid();
+    const uint32_t ty_ptr_in_u32 = nid(), ty_ptr_wg_u32 = nid(), ty_fn = nid();
+
+    EmitSpv(types, SpvOpTypeVoid, {ty_void});
+    EmitSpv(types, SpvOpTypeBool, {ty_bool});
+    EmitSpv(types, SpvOpTypeInt, {ty_u32, 32u, 0u});
+    EmitSpv(types, SpvOpTypeRuntimeArray, {ty_rt_u32, ty_u32});
+    EmitSpv(types, SpvOpTypeStruct, {ty_buf, ty_rt_u32});
+    EmitSpv(types, SpvOpTypePointer, {ty_ptr_sb_buf, 12u, ty_buf});
+    EmitSpv(types, SpvOpTypePointer, {ty_ptr_sb_u32, 12u, ty_u32});
+    EmitSpv(types, SpvOpTypePointer, {ty_ptr_in_u32, 1u, ty_u32});
+    EmitSpv(types, SpvOpTypePointer, {ty_ptr_wg_u32, 4u, ty_u32});
+    EmitSpv(types, SpvOpTypeFunction, {ty_fn, ty_void});
+
+    auto cu = [&](uint32_t v) -> uint32_t {
+        auto it = uconsts.find(v);
+        if (it != uconsts.end()) return it->second;
+        const uint32_t cid = nid();
+        EmitSpv(types, SpvOpConstant, {ty_u32, cid, v});
+        uconsts[v] = cid;
+        return cid;
+    };
+
+    const uint32_t ty_arr_lds = nid(), ty_arr_bal = nid();
+    const uint32_t ty_ptr_wg_lds = nid(), ty_ptr_wg_bal = nid();
+    EmitSpv(types, SpvOpTypeArray, {ty_arr_lds, ty_u32, cu(lds_dwords)});
+    EmitSpv(types, SpvOpTypeArray, {ty_arr_bal, ty_u32, cu(ballot_dwords)});
+    EmitSpv(types, SpvOpTypePointer, {ty_ptr_wg_lds, 4u, ty_arr_lds});
+    EmitSpv(types, SpvOpTypePointer, {ty_ptr_wg_bal, 4u, ty_arr_bal});
+
+    const uint32_t var_in = nid(), var_out = nid(), var_lid = nid();
+    const uint32_t var_lds = nid(), var_bal = nid();
+    EmitSpv(types, SpvOpVariable, {ty_ptr_sb_buf, var_in, 12u});
+    EmitSpv(types, SpvOpVariable, {ty_ptr_sb_buf, var_out, 12u});
+    EmitSpv(types, SpvOpVariable, {ty_ptr_in_u32, var_lid, 1u});
+    EmitSpv(types, SpvOpVariable, {ty_ptr_wg_lds, var_lds, 4u});
+    EmitSpv(types, SpvOpVariable, {ty_ptr_wg_bal, var_bal, 4u});
+
+    EmitSpv(decs, SpvOpDecorate, {ty_rt_u32, 6u, 4u});
+    EmitSpv(decs, SpvOpDecorate, {ty_buf, 2u});
+    EmitSpv(decs, SpvOpMemberDecorate, {ty_buf, 0u, 35u, 0u});
+    EmitSpv(decs, SpvOpDecorate, {var_in, 34u, 0u});
+    EmitSpv(decs, SpvOpDecorate, {var_in, 33u, 0u});
+    EmitSpv(decs, SpvOpDecorate, {var_in, 24u});
+    EmitSpv(decs, SpvOpDecorate, {var_out, 34u, 0u});
+    EmitSpv(decs, SpvOpDecorate, {var_out, 33u, 1u});
+    EmitSpv(decs, SpvOpDecorate, {var_lid, 11u, 29u});  // BuiltIn LocalInvocationIndex
+
+    auto bin = [&](uint16_t op, uint32_t ty, uint32_t a, uint32_t b) {
+        const uint32_t r = nid();
+        EmitSpv(body, op, {ty, r, a, b});
+        return r;
+    };
+    auto sel = [&](uint32_t c, uint32_t t, uint32_t f) {
+        const uint32_t r = nid();
+        EmitSpv(body, SpvOpSelect, {ty_u32, r, c, t, f});
+        return r;
+    };
+    auto load_in = [&](uint32_t idx) {
+        const uint32_t p = nid(), v = nid();
+        EmitSpv(body, SpvOpAccessChain, {ty_ptr_sb_u32, p, var_in, cu(0u), idx});
+        EmitSpv(body, SpvOpLoad, {ty_u32, v, p});
+        return v;
+    };
+    auto store_out = [&](uint32_t idx, uint32_t val) {
+        const uint32_t p = nid();
+        EmitSpv(body, SpvOpAccessChain, {ty_ptr_sb_u32, p, var_out, cu(0u), idx});
+        EmitSpv(body, SpvOpStore, {p, val});
+    };
+    auto wg_barrier = [&]() {
+        EmitSpv(body, SpvOpControlBarrier, {cu(2u), cu(2u), cu(0x108u)});
+    };
+
+    const uint32_t fn_main = nid(), lbl = nid();
+    EmitSpv(body, SpvOpFunction, {ty_void, fn_main, 0u, ty_fn});
+    EmitSpv(body, SpvOpLabel, {lbl});
+
+    const uint32_t lid = nid();
+    EmitSpv(body, SpvOpLoad, {ty_u32, lid, var_lid});
+    const uint32_t gw = bin(SpvOpShiftRightLogical, ty_u32, lid, cu(6u));
+    const uint32_t lane = bin(SpvOpBitwiseAnd, ty_u32, lid, cu(63u));
+    const uint32_t wave_base = bin(SpvOpShiftLeftLogical, ty_u32, gw, cu(6u));
+    const uint32_t bal_base = bin(SpvOpShiftLeftLogical, ty_u32, gw, cu(1u));
+
+    const uint32_t val = load_in(lid);
+    const uint32_t rl_tgt = bin(SpvOpBitwiseAnd, ty_u32, load_in(bin(SpvOpIAdd, ty_u32, lid, cu(tg_size))), cu(63u));
+
+    // Store all 64 lanes per guest wave into isolated LDS slice + barrier
+    const uint32_t self_idx = bin(SpvOpIAdd, ty_u32, wave_base, lane);
+    const uint32_t p_lds_self = nid();
+    EmitSpv(body, SpvOpAccessChain, {ty_ptr_wg_u32, p_lds_self, var_lds, self_idx});
+    EmitSpv(body, SpvOpStore, {p_lds_self, val});
+    wg_barrier();
+
+    uint32_t res_xchg = val;
+    if (config.emit_cross_half_exchange) {
+        const uint32_t xchg_lane = bin(SpvOpBitwiseXor, ty_u32, lane, cu(32u));
+        const uint32_t xchg_idx = bin(SpvOpIAdd, ty_u32, wave_base, xchg_lane);
+        const uint32_t p_xchg = nid();
+        res_xchg = nid();
+        EmitSpv(body, SpvOpAccessChain, {ty_ptr_wg_u32, p_xchg, var_lds, xchg_idx});
+        EmitSpv(body, SpvOpLoad, {ty_u32, res_xchg, p_xchg});
+    }
+
+    uint32_t res_rl = val;
+    if (config.emit_readlane64) {
+        const uint32_t rl_idx = bin(SpvOpIAdd, ty_u32, wave_base, rl_tgt);
+        const uint32_t p_rl = nid();
+        res_rl = nid();
+        EmitSpv(body, SpvOpAccessChain, {ty_ptr_wg_u32, p_rl, var_lds, rl_idx});
+        EmitSpv(body, SpvOpLoad, {ty_u32, res_rl, p_rl});
+    }
+
+    uint32_t bal_lo = cu(0u);
+    uint32_t bal_hi = cu(0u);
+    if (config.emit_ballot64 || config.emit_mbcnt64) {
+        const uint32_t b1_idx = bin(SpvOpIAdd, ty_u32, bal_base, cu(1u));
+        const uint32_t p_b0 = nid(), p_b1 = nid(), clr0 = nid(), clr1 = nid();
+        EmitSpv(body, SpvOpAccessChain, {ty_ptr_wg_u32, p_b0, var_bal, bal_base});
+        EmitSpv(body, SpvOpAccessChain, {ty_ptr_wg_u32, p_b1, var_bal, b1_idx});
+
+        wg_barrier();
+        EmitSpv(body, SpvOpAtomicAnd, {ty_u32, clr0, p_b0, cu(2u), cu(0u), cu(0u)});
+        EmitSpv(body, SpvOpAtomicAnd, {ty_u32, clr1, p_b1, cu(2u), cu(0u), cu(0u)});
+        wg_barrier();
+
+        const uint32_t pred = bin(SpvOpINotEqual, ty_bool, bin(SpvOpBitwiseAnd, ty_u32, val, cu(1u)), cu(0u));
+        const uint32_t half_i = bin(SpvOpShiftRightLogical, ty_u32, lane, cu(5u));
+        const uint32_t sub_lane = bin(SpvOpBitwiseAnd, ty_u32, lane, cu(31u));
+        const uint32_t bit = bin(SpvOpShiftLeftLogical, ty_u32, cu(1u), sub_lane);
+        const uint32_t contrib = sel(pred, bit, cu(0u));
+        const uint32_t slot = bin(SpvOpIAdd, ty_u32, bal_base, half_i);
+        const uint32_t p_bw = nid(), old_or = nid();
+        EmitSpv(body, SpvOpAccessChain, {ty_ptr_wg_u32, p_bw, var_bal, slot});
+        EmitSpv(body, SpvOpAtomicOr, {ty_u32, old_or, p_bw, cu(2u), cu(0u), contrib});
+        wg_barrier();
+
+        bal_lo = nid();
+        bal_hi = nid();
+        EmitSpv(body, SpvOpLoad, {ty_u32, bal_lo, p_b0});
+        EmitSpv(body, SpvOpLoad, {ty_u32, bal_hi, p_b1});
+    }
+
+    uint32_t mb_lo = cu(0u);
+    uint32_t mb_hi = cu(0u);
+    if (config.emit_mbcnt64) {
+        const uint32_t lt32 = bin(SpvOpULessThan, ty_bool, lane, cu(32u));
+        const uint32_t sub_lane = bin(SpvOpBitwiseAnd, ty_u32, lane, cu(31u));
+        const uint32_t sub_mask = bin(SpvOpISub, ty_u32, bin(SpvOpShiftLeftLogical, ty_u32, cu(1u), sub_lane), cu(1u));
+        const uint32_t lo_mask = sel(lt32, sub_mask, cu(0xFFFFFFFFu));
+        const uint32_t hi_mask = sel(lt32, cu(0u), sub_mask);
+        mb_lo = nid();
+        const uint32_t mb_hi_part = nid();
+        EmitSpv(body, SpvOpBitCount, {ty_u32, mb_lo, bin(SpvOpBitwiseAnd, ty_u32, bal_lo, lo_mask)});
+        EmitSpv(body, SpvOpBitCount, {ty_u32, mb_hi_part, bin(SpvOpBitwiseAnd, ty_u32, bal_hi, hi_mask)});
+        mb_hi = bin(SpvOpIAdd, ty_u32, mb_lo, mb_hi_part);
+    }
+
+    store_out(lid, res_xchg);
+    store_out(bin(SpvOpIAdd, ty_u32, lid, cu(tg_size)), res_rl);
+    store_out(bin(SpvOpIAdd, ty_u32, lid, cu(tg_size * 2u)), bal_lo);
+    store_out(bin(SpvOpIAdd, ty_u32, lid, cu(tg_size * 3u)), bal_hi);
+    store_out(bin(SpvOpIAdd, ty_u32, lid, cu(tg_size * 4u)), mb_lo);
+    store_out(bin(SpvOpIAdd, ty_u32, lid, cu(tg_size * 5u)), mb_hi);
+
+    EmitSpv(body, SpvOpReturn, {});
+    EmitSpv(body, SpvOpFunctionEnd, {});
+
+    out_spirv = {0x07230203u, 0x00010300u, 0x4F533200u, id, 0u};
+    EmitSpv(out_spirv, SpvOpCapability, {1u});  // Shader
+    EmitSpv(out_spirv, SpvOpMemoryModel, {0u, 1u});
+    EmitSpv(out_spirv, SpvOpEntryPoint, {5u, fn_main, 0x6E69616Du, 0u, var_lid});
+    EmitSpv(out_spirv, SpvOpExecutionMode, {fn_main, 17u, tg_size, 1u, 1u});
+    out_spirv.insert(out_spirv.end(), decs.begin(), decs.end());
+    out_spirv.insert(out_spirv.end(), types.begin(), types.end());
+    out_spirv.insert(out_spirv.end(), body.begin(), body.end());
+    return ValidateSpirvBinary(out_spirv);
+}
+
+Status LowerRdna2StageWithBarycentricAndCullDistance(
+    const Xs2ShaderContainer& xs2,
+    const Rdna2BarycentricCullStageDesc& desc,
+    Rdna2BarycentricCullLiftResult& out_result) {
+    out_result = Rdna2BarycentricCullLiftResult{};
+    if (desc.stage != ShaderStage::Vertex && desc.stage != ShaderStage::Geometry &&
+        desc.stage != ShaderStage::Mesh) {
+        return Status::Error(
+            StatusCode::InvalidArgument,
+            "LowerRdna2StageWithBarycentricAndCullDistance supports Vertex, Geometry, and Mesh stages");
+    }
+
+    std::vector<Rdna2Instruction> insns;
+    if (!xs2.code_words.empty()) {
+        Status dst = DisassembleRdna2(xs2.code_words, insns);
+        if (!dst.ok()) return dst;
+    }
+
+    const uint32_t cull_n = desc.preserve_cull_distance
+                                ? std::clamp(desc.cull_distance_count, 1u, 8u)
+                                : 0u;
+    const bool keep_bary = desc.preserve_paired_barycentrics;
+    const uint32_t max_v = std::max(3u, desc.max_vertices);
+    const uint32_t max_p = std::max(1u, desc.max_primitives);
+    const uint32_t tg_x = std::max(1u, desc.threadgroup_x);
+    const auto alu = SummarizeAndLiftRdna2Alu(insns, (desc.stage == ShaderStage::Vertex) ? "o.pos" : "v.pos");
+
+    out_result.stage = desc.stage;
+    out_result.preserved_cull_distances = cull_n;
+    out_result.has_paired_barycentrics = keep_bary;
+
+    // Helper for DXIL-compliant packed SV_CullDistance0/1 vector fields (max 2 float4 rows = 8 floats)
+    auto emit_hlsl_cull_decls = [&](std::ostringstream& os) {
+        if (cull_n == 0u) return;
+        const uint32_t n0 = std::min(4u, cull_n);
+        const char* ty0 = (n0 == 1u) ? "float" : ((n0 == 2u) ? "float2" : ((n0 == 3u) ? "float3" : "float4"));
+        os << "    " << ty0 << " cull_dist0 : SV_CullDistance0;\n";
+        if (cull_n > 4u) {
+            const uint32_t n1 = cull_n - 4u;
+            const char* ty1 = (n1 == 1u) ? "float" : ((n1 == 2u) ? "float2" : ((n1 == 3u) ? "float3" : "float4"));
+            os << "    " << ty1 << " cull_dist1 : SV_CullDistance1;\n";
+        }
+    };
+    auto emit_hlsl_cull_init = [&](std::ostringstream& os, const char* indent, const char* var) {
+        if (cull_n == 0u) return;
+        const uint32_t n0 = std::min(4u, cull_n);
+        if (n0 == 1u) {
+            os << indent << var << ".cull_dist0 = 1.0f;\n";
+        } else {
+            os << indent << var << ".cull_dist0 = float" << n0 << "(";
+            for (uint32_t k = 0u; k < n0; ++k) {
+                if (k > 0u) os << ", ";
+                os << "1.0f - (" << k << ".0f * 0.0625f)";
+            }
+            os << ");\n";
+        }
+        if (cull_n > 4u) {
+            const uint32_t n1 = cull_n - 4u;
+            if (n1 == 1u) {
+                os << indent << var << ".cull_dist1 = 1.0f - (4.0f * 0.0625f);\n";
+            } else {
+                os << indent << var << ".cull_dist1 = float" << n1 << "(";
+                for (uint32_t k = 0u; k < n1; ++k) {
+                    if (k > 0u) os << ", ";
+                    os << "1.0f - (" << (k + 4u) << ".0f * 0.0625f)";
+                }
+                os << ");\n";
+            }
+        }
+    };
+
+    // 1. Emit SM 6.5 HLSL preserving paired barycentrics + SV_CullDistance
+    if (desc.stage == ShaderStage::Vertex) {
+        out_result.hlsl_target = "vs_6_5";
+        std::ostringstream hlsl;
+        hlsl << "// OpenScarlett VS with Paired Barycentrics & SV_CullDistance Preservation\n";
+        hlsl << "struct VsOut {\n";
+        hlsl << "    float4 pos : SV_Position;\n";
+        hlsl << "    float4 col : TEXCOORD0;\n";
+        if (keep_bary) {
+            hlsl << "    float2 bary_pair : TEXCOORD1;\n";
+            hlsl << "    float3 bary_tri  : TEXCOORD2;\n";
+        }
+        emit_hlsl_cull_decls(hlsl);
+        hlsl << "};\n\n";
+        hlsl << "VsOut main(uint vid : SV_VertexID) {\n";
+        hlsl << "    VsOut o;\n";
+        hlsl << "    uint corner = vid % 3u;\n";
+        hlsl << "    float u = (corner == 0u) ? 1.0f : 0.0f;\n";
+        hlsl << "    float v = (corner == 1u) ? 1.0f : 0.0f;\n";
+        hlsl << "    o.pos = float4(u * 2.0f - 1.0f, v * 2.0f - 1.0f, 0.0f, 1.0f);\n";
+        hlsl << "    o.col = float4(u, v, 1.0f - u - v, 1.0f);\n";
+        if (keep_bary) {
+            hlsl << "    o.bary_pair = float2(u, v);\n";
+            hlsl << "    o.bary_tri  = float3(1.0f - u - v, u, v);\n";
+        }
+        emit_hlsl_cull_init(hlsl, "    ", "o");
+        hlsl << alu.hlsl_body;
+        hlsl << "    return o;\n}\n";
+        out_result.hlsl_source = hlsl.str();
+    } else if (desc.stage == ShaderStage::Geometry) {
+        out_result.hlsl_target = "gs_6_5";
+        std::ostringstream hlsl;
+        hlsl << "// OpenScarlett GS with Paired Barycentrics & SV_CullDistance Preservation\n";
+        hlsl << "struct GsVert {\n";
+        hlsl << "    float4 pos : SV_Position;\n";
+        hlsl << "    float4 col : TEXCOORD0;\n";
+        if (keep_bary) {
+            hlsl << "    float2 bary_pair : TEXCOORD1;\n";
+            hlsl << "    float3 bary_tri  : TEXCOORD2;\n";
+        }
+        emit_hlsl_cull_decls(hlsl);
+        hlsl << "};\n\n";
+        hlsl << "[maxvertexcount(" << max_v << ")]\n";
+        hlsl << "void main(triangle GsVert verts[3], inout TriangleStream<GsVert> out_stream) {\n";
+        hlsl << "    [unroll]\n";
+        hlsl << "    for (uint i = 0u; i < 3u; ++i) {\n";
+        hlsl << "        GsVert v = verts[i];\n";
+        hlsl << alu.hlsl_body;
+        hlsl << "        out_stream.Append(v);\n";
+        hlsl << "    }\n";
+        hlsl << "    out_stream.RestartStrip();\n";
+        hlsl << "}\n";
+        out_result.hlsl_source = hlsl.str();
+    } else {
+        out_result.hlsl_target = "ms_6_5";
+        std::ostringstream hlsl;
+        hlsl << "// OpenScarlett MS with Paired Barycentrics & SV_CullDistance Preservation\n";
+        hlsl << "struct MeshVert {\n";
+        hlsl << "    float4 pos : SV_Position;\n";
+        hlsl << "    float4 col : TEXCOORD0;\n";
+        if (keep_bary) {
+            hlsl << "    float2 bary_pair : TEXCOORD1;\n";
+            hlsl << "    float3 bary_tri  : TEXCOORD2;\n";
+        }
+        emit_hlsl_cull_decls(hlsl);
+        hlsl << "};\n\n";
+        hlsl << "[outputtopology(\"triangle\")]\n";
+        hlsl << "[numthreads(" << tg_x << ", 1, 1)]\n";
+        hlsl << "void main(uint gtid : SV_GroupIndex, out vertices MeshVert verts[" << max_v
+             << "], out indices uint3 prims[" << max_p << "]) {\n";
+        hlsl << "    SetMeshOutputCounts(" << max_v << "u, " << max_p << "u);\n";
+        hlsl << "    for (uint vi = gtid; vi < " << max_v << "u; vi += " << tg_x << "u) {\n";
+        hlsl << "        uint corner = vi % 3u;\n";
+        hlsl << "        float u = (corner == 0u) ? 1.0f : 0.0f;\n";
+        hlsl << "        float v_coord = (corner == 1u) ? 1.0f : 0.0f;\n";
+        hlsl << "        MeshVert v;\n";
+        hlsl << "        v.pos = float4(u * 2.0f - 1.0f, v_coord * 2.0f - 1.0f, 0.0f, 1.0f);\n";
+        hlsl << "        v.col = float4(u, v_coord, 1.0f - u - v_coord, 1.0f);\n";
+        if (keep_bary) {
+            hlsl << "        v.bary_pair = float2(u, v_coord);\n";
+            hlsl << "        v.bary_tri  = float3(1.0f - u - v_coord, u, v_coord);\n";
+        }
+        emit_hlsl_cull_init(hlsl, "        ", "v");
+        hlsl << alu.hlsl_body;
+        hlsl << "        verts[vi] = v;\n";
+        hlsl << "    }\n";
+        hlsl << "    for (uint pi = gtid; pi < " << max_p << "u; pi += " << tg_x << "u) {\n";
+        hlsl << "        prims[pi] = uint3(0u, 1u, 2u);\n";
+        hlsl << "    }\n";
+        hlsl << "}\n";
+        out_result.hlsl_source = hlsl.str();
+    }
+
+    // 2. Emit strictly valid SPIR-V (1.3 for VS/GS, 1.6 SPV_EXT_mesh_shader for MS)
+    uint32_t id = 1u;
+    auto nid = [&]() { return id++; };
+    std::vector<uint32_t> decs, types, body;
+    std::unordered_map<uint32_t, uint32_t> uconsts;
+    std::unordered_map<uint32_t, uint32_t> fconsts;
+
+    const uint32_t ty_void = nid(), ty_bool = nid(), ty_u32 = nid(), ty_i32 = nid();
+    const uint32_t ty_f32 = nid(), ty_v2f = nid(), ty_v3f = nid(), ty_v4f = nid(), ty_v3u = nid();
+    const uint32_t ty_fn = nid();
+    EmitSpv(types, SpvOpTypeVoid, {ty_void});
+    EmitSpv(types, SpvOpTypeBool, {ty_bool});
+    EmitSpv(types, SpvOpTypeInt, {ty_u32, 32u, 0u});
+    EmitSpv(types, SpvOpTypeInt, {ty_i32, 32u, 1u});
+    EmitSpv(types, SpvOpTypeFloat, {ty_f32, 32u});
+    EmitSpv(types, SpvOpTypeVector, {ty_v2f, ty_f32, 2u});
+    EmitSpv(types, SpvOpTypeVector, {ty_v3f, ty_f32, 3u});
+    EmitSpv(types, SpvOpTypeVector, {ty_v4f, ty_f32, 4u});
+    EmitSpv(types, SpvOpTypeVector, {ty_v3u, ty_u32, 3u});
+    EmitSpv(types, SpvOpTypeFunction, {ty_fn, ty_void});
+
+    auto cu = [&](uint32_t v) -> uint32_t {
+        auto it = uconsts.find(v);
+        if (it != uconsts.end()) return it->second;
+        const uint32_t cid = nid();
+        EmitSpv(types, SpvOpConstant, {ty_u32, cid, v});
+        uconsts[v] = cid;
+        return cid;
+    };
+    auto cf = [&](float f) -> uint32_t {
+        const uint32_t bits = FloatToBits(f);
+        auto it = fconsts.find(bits);
+        if (it != fconsts.end()) return it->second;
+        const uint32_t cid = nid();
+        EmitSpv(types, SpvOpConstant, {ty_f32, cid, bits});
+        fconsts[bits] = cid;
+        return cid;
+    };
+
+    const uint32_t ty_perv = nid();
+    EmitSpv(decs, SpvOpDecorate, {ty_perv, 2u});                  // Block
+    EmitSpv(decs, SpvOpMemberDecorate, {ty_perv, 0u, 11u, 0u});   // BuiltIn Position
+    uint32_t ty_ptr_in_f32 = 0u, ty_ptr_out_f32 = 0u;
+    if (cull_n > 0u) {
+        const uint32_t ty_arr_cull = nid();
+        EmitSpv(types, SpvOpTypeArray, {ty_arr_cull, ty_f32, cu(cull_n)});
+        EmitSpv(types, SpvOpTypeStruct, {ty_perv, ty_v4f, ty_arr_cull});
+        EmitSpv(decs, SpvOpMemberDecorate, {ty_perv, 1u, 11u, 4u});  // BuiltIn CullDistance
+        ty_ptr_in_f32 = nid();
+        ty_ptr_out_f32 = nid();
+        EmitSpv(types, SpvOpTypePointer, {ty_ptr_in_f32, 1u, ty_f32});
+        EmitSpv(types, SpvOpTypePointer, {ty_ptr_out_f32, 3u, ty_f32});
+    } else {
+        EmitSpv(types, SpvOpTypeStruct, {ty_perv, ty_v4f});
+    }
+
+    const uint32_t ty_ptr_out_v4f = nid();
+    const uint32_t ty_ptr_out_v2f = nid();
+    const uint32_t ty_ptr_out_v3f = nid();
+    EmitSpv(types, SpvOpTypePointer, {ty_ptr_out_v4f, 3u, ty_v4f});
+    EmitSpv(types, SpvOpTypePointer, {ty_ptr_out_v2f, 3u, ty_v2f});
+    EmitSpv(types, SpvOpTypePointer, {ty_ptr_out_v3f, 3u, ty_v3f});
+
+    const uint32_t fn_main = nid(), lbl = nid();
+    std::vector<uint32_t> iface;
+
+    if (desc.stage == ShaderStage::Vertex) {
+        const uint32_t ty_ptr_in_i32 = nid(), ty_ptr_out_pv = nid();
+        EmitSpv(types, SpvOpTypePointer, {ty_ptr_in_i32, 1u, ty_i32});
+        EmitSpv(types, SpvOpTypePointer, {ty_ptr_out_pv, 3u, ty_perv});
+
+        const uint32_t var_vid = nid(), var_out = nid(), var_col = nid();
+        EmitSpv(types, SpvOpVariable, {ty_ptr_in_i32, var_vid, 1u});
+        EmitSpv(types, SpvOpVariable, {ty_ptr_out_pv, var_out, 3u});
+        EmitSpv(types, SpvOpVariable, {ty_ptr_out_v4f, var_col, 3u});
+        EmitSpv(decs, SpvOpDecorate, {var_vid, 11u, 42u});  // BuiltIn VertexIndex
+        EmitSpv(decs, SpvOpDecorate, {var_col, 30u, 0u});   // Location 0
+        iface = {var_vid, var_out, var_col};
+
+        uint32_t var_bary2 = 0u, var_bary3 = 0u;
+        if (keep_bary) {
+            var_bary2 = nid();
+            var_bary3 = nid();
+            EmitSpv(types, SpvOpVariable, {ty_ptr_out_v2f, var_bary2, 3u});
+            EmitSpv(types, SpvOpVariable, {ty_ptr_out_v3f, var_bary3, 3u});
+            EmitSpv(decs, SpvOpDecorate, {var_bary2, 30u, 1u});  // Location 1
+            EmitSpv(decs, SpvOpDecorate, {var_bary3, 30u, 2u});  // Location 2
+            iface.push_back(var_bary2);
+            iface.push_back(var_bary3);
+        }
+
+        EmitSpv(body, SpvOpFunction, {ty_void, fn_main, 0u, ty_fn});
+        EmitSpv(body, SpvOpLabel, {lbl});
+        const uint32_t vid_i = nid(), vid_u = nid(), corner = nid();
+        const uint32_t is0 = nid(), is1 = nid(), u = nid(), v = nid();
+        const uint32_t uv_sum = nid(), w = nid();
+        const uint32_t px = nid(), py = nid(), pos_x = nid(), pos_y = nid(), pos = nid(), col = nid();
+        EmitSpv(body, SpvOpLoad, {ty_i32, vid_i, var_vid});
+        EmitSpv(body, SpvOpBitcast, {ty_u32, vid_u, vid_i});
+        EmitSpv(body, SpvOpUMod, {ty_u32, corner, vid_u, cu(3u)});
+        EmitSpv(body, SpvOpIEqual, {ty_bool, is0, corner, cu(0u)});
+        EmitSpv(body, SpvOpIEqual, {ty_bool, is1, corner, cu(1u)});
+        EmitSpv(body, SpvOpSelect, {ty_f32, u, is0, cf(1.0f), cf(0.0f)});
+        EmitSpv(body, SpvOpSelect, {ty_f32, v, is1, cf(1.0f), cf(0.0f)});
+        EmitSpv(body, SpvOpFAdd, {ty_f32, uv_sum, u, v});
+        EmitSpv(body, SpvOpFSub, {ty_f32, w, cf(1.0f), uv_sum});
+        EmitSpv(body, SpvOpFMul, {ty_f32, px, u, cf(2.0f)});
+        EmitSpv(body, SpvOpFMul, {ty_f32, py, v, cf(2.0f)});
+        EmitSpv(body, SpvOpFSub, {ty_f32, pos_x, px, cf(1.0f)});
+        EmitSpv(body, SpvOpFSub, {ty_f32, pos_y, py, cf(1.0f)});
+        EmitSpv(body, SpvOpCompositeConstruct, {ty_v4f, pos, pos_x, pos_y, cf(0.0f), cf(1.0f)});
+        EmitSpv(body, SpvOpCompositeConstruct, {ty_v4f, col, u, v, w, cf(1.0f)});
+
+        const uint32_t p_pos = nid();
+        EmitSpv(body, SpvOpAccessChain, {ty_ptr_out_v4f, p_pos, var_out, cu(0u)});
+        EmitSpv(body, SpvOpStore, {p_pos, pos});
+        EmitSpv(body, SpvOpStore, {var_col, col});
+        if (keep_bary) {
+            const uint32_t b2 = nid(), b3 = nid();
+            EmitSpv(body, SpvOpCompositeConstruct, {ty_v2f, b2, u, v});
+            EmitSpv(body, SpvOpCompositeConstruct, {ty_v3f, b3, w, u, v});
+            EmitSpv(body, SpvOpStore, {var_bary2, b2});
+            EmitSpv(body, SpvOpStore, {var_bary3, b3});
+        }
+        for (uint32_t k = 0u; k < cull_n; ++k) {
+            const uint32_t p_cd = nid();
+            EmitSpv(body, SpvOpAccessChain, {ty_ptr_out_f32, p_cd, var_out, cu(1u), cu(k)});
+            EmitSpv(body, SpvOpStore, {p_cd, cf(1.0f - static_cast<float>(k) * 0.0625f)});
+        }
+        EmitSpv(body, SpvOpReturn, {});
+        EmitSpv(body, SpvOpFunctionEnd, {});
+
+        out_result.spirv_words = {0x07230203u, 0x00010300u, 0x4F533200u, id, 0u};
+        EmitSpv(out_result.spirv_words, SpvOpCapability, {1u});  // Shader
+        if (cull_n > 0u) EmitSpv(out_result.spirv_words, SpvOpCapability, {45u});  // CullDistance
+        EmitSpv(out_result.spirv_words, SpvOpMemoryModel, {0u, 1u});
+        std::vector<uint32_t> ep = {0u, fn_main, 0x6E69616Du, 0u};
+        ep.insert(ep.end(), iface.begin(), iface.end());
+        EmitSpvVec(out_result.spirv_words, SpvOpEntryPoint, ep);
+    } else if (desc.stage == ShaderStage::Geometry) {
+        const uint32_t ty_arr_pv = nid(), ty_arr_v4 = nid();
+        const uint32_t ty_ptr_in_pv = nid(), ty_ptr_in_v4 = nid(), ty_ptr_in_arr_v4 = nid();
+        const uint32_t ty_ptr_out_pv = nid();
+        EmitSpv(types, SpvOpTypeArray, {ty_arr_pv, ty_perv, cu(3u)});
+        EmitSpv(types, SpvOpTypeArray, {ty_arr_v4, ty_v4f, cu(3u)});
+        EmitSpv(types, SpvOpTypePointer, {ty_ptr_in_pv, 1u, ty_arr_pv});
+        EmitSpv(types, SpvOpTypePointer, {ty_ptr_in_v4, 1u, ty_v4f});
+        EmitSpv(types, SpvOpTypePointer, {ty_ptr_in_arr_v4, 1u, ty_arr_v4});
+        EmitSpv(types, SpvOpTypePointer, {ty_ptr_out_pv, 3u, ty_perv});
+
+        const uint32_t var_in = nid(), var_out = nid(), var_col_in = nid(), var_col_out = nid();
+        EmitSpv(types, SpvOpVariable, {ty_ptr_in_pv, var_in, 1u});
+        EmitSpv(types, SpvOpVariable, {ty_ptr_out_pv, var_out, 3u});
+        EmitSpv(types, SpvOpVariable, {ty_ptr_in_arr_v4, var_col_in, 1u});
+        EmitSpv(types, SpvOpVariable, {ty_ptr_out_v4f, var_col_out, 3u});
+        EmitSpv(decs, SpvOpDecorate, {var_col_in, 30u, 0u});
+        EmitSpv(decs, SpvOpDecorate, {var_col_out, 30u, 0u});
+        iface = {var_in, var_out, var_col_in, var_col_out};
+
+        uint32_t ty_ptr_in_v2 = 0u, ty_ptr_in_v3 = 0u;
+        uint32_t var_b2_in = 0u, var_b2_out = 0u, var_b3_in = 0u, var_b3_out = 0u;
+        if (keep_bary) {
+            const uint32_t ty_arr_v2 = nid(), ty_arr_v3 = nid();
+            const uint32_t ty_ptr_in_a2 = nid(), ty_ptr_in_a3 = nid();
+            ty_ptr_in_v2 = nid();
+            ty_ptr_in_v3 = nid();
+            EmitSpv(types, SpvOpTypeArray, {ty_arr_v2, ty_v2f, cu(3u)});
+            EmitSpv(types, SpvOpTypeArray, {ty_arr_v3, ty_v3f, cu(3u)});
+            EmitSpv(types, SpvOpTypePointer, {ty_ptr_in_a2, 1u, ty_arr_v2});
+            EmitSpv(types, SpvOpTypePointer, {ty_ptr_in_a3, 1u, ty_arr_v3});
+            EmitSpv(types, SpvOpTypePointer, {ty_ptr_in_v2, 1u, ty_v2f});
+            EmitSpv(types, SpvOpTypePointer, {ty_ptr_in_v3, 1u, ty_v3f});
+            var_b2_in = nid();
+            var_b2_out = nid();
+            var_b3_in = nid();
+            var_b3_out = nid();
+            EmitSpv(types, SpvOpVariable, {ty_ptr_in_a2, var_b2_in, 1u});
+            EmitSpv(types, SpvOpVariable, {ty_ptr_out_v2f, var_b2_out, 3u});
+            EmitSpv(types, SpvOpVariable, {ty_ptr_in_a3, var_b3_in, 1u});
+            EmitSpv(types, SpvOpVariable, {ty_ptr_out_v3f, var_b3_out, 3u});
+            EmitSpv(decs, SpvOpDecorate, {var_b2_in, 30u, 1u});
+            EmitSpv(decs, SpvOpDecorate, {var_b2_out, 30u, 1u});
+            EmitSpv(decs, SpvOpDecorate, {var_b3_in, 30u, 2u});
+            EmitSpv(decs, SpvOpDecorate, {var_b3_out, 30u, 2u});
+            iface.push_back(var_b2_in);
+            iface.push_back(var_b2_out);
+            iface.push_back(var_b3_in);
+            iface.push_back(var_b3_out);
+        }
+
+        EmitSpv(body, SpvOpFunction, {ty_void, fn_main, 0u, ty_fn});
+        EmitSpv(body, SpvOpLabel, {lbl});
+        for (uint32_t e = 0u; e < 3u; ++e) {
+            const uint32_t pi = nid(), vi = nid(), po = nid();
+            EmitSpv(body, SpvOpAccessChain, {ty_ptr_in_v4, pi, var_in, cu(e), cu(0u)});
+            EmitSpv(body, SpvOpLoad, {ty_v4f, vi, pi});
+            EmitSpv(body, SpvOpAccessChain, {ty_ptr_out_v4f, po, var_out, cu(0u)});
+            EmitSpv(body, SpvOpStore, {po, vi});
+
+            const uint32_t pci = nid(), vci = nid();
+            EmitSpv(body, SpvOpAccessChain, {ty_ptr_in_v4, pci, var_col_in, cu(e)});
+            EmitSpv(body, SpvOpLoad, {ty_v4f, vci, pci});
+            EmitSpv(body, SpvOpStore, {var_col_out, vci});
+
+            if (keep_bary) {
+                const uint32_t pb2 = nid(), vb2 = nid(), pb3 = nid(), vb3 = nid();
+                EmitSpv(body, SpvOpAccessChain, {ty_ptr_in_v2, pb2, var_b2_in, cu(e)});
+                EmitSpv(body, SpvOpLoad, {ty_v2f, vb2, pb2});
+                EmitSpv(body, SpvOpStore, {var_b2_out, vb2});
+                EmitSpv(body, SpvOpAccessChain, {ty_ptr_in_v3, pb3, var_b3_in, cu(e)});
+                EmitSpv(body, SpvOpLoad, {ty_v3f, vb3, pb3});
+                EmitSpv(body, SpvOpStore, {var_b3_out, vb3});
+            }
+            for (uint32_t k = 0u; k < cull_n; ++k) {
+                const uint32_t pcd_i = nid(), vcd = nid(), pcd_o = nid();
+                EmitSpv(body, SpvOpAccessChain, {ty_ptr_in_f32, pcd_i, var_in, cu(e), cu(1u), cu(k)});
+                EmitSpv(body, SpvOpLoad, {ty_f32, vcd, pcd_i});
+                EmitSpv(body, SpvOpAccessChain, {ty_ptr_out_f32, pcd_o, var_out, cu(1u), cu(k)});
+                EmitSpv(body, SpvOpStore, {pcd_o, vcd});
+            }
+            EmitSpv(body, SpvOpEmitVertex, {});
+        }
+        EmitSpv(body, SpvOpEndPrimitive, {});
+        EmitSpv(body, SpvOpReturn, {});
+        EmitSpv(body, SpvOpFunctionEnd, {});
+
+        out_result.spirv_words = {0x07230203u, 0x00010300u, 0x4F533200u, id, 0u};
+        EmitSpv(out_result.spirv_words, SpvOpCapability, {1u});  // Shader
+        EmitSpv(out_result.spirv_words, SpvOpCapability, {2u});  // Geometry
+        if (cull_n > 0u) EmitSpv(out_result.spirv_words, SpvOpCapability, {45u});  // CullDistance
+        EmitSpv(out_result.spirv_words, SpvOpMemoryModel, {0u, 1u});
+        std::vector<uint32_t> ep = {3u, fn_main, 0x6E69616Du, 0u};
+        ep.insert(ep.end(), iface.begin(), iface.end());
+        EmitSpvVec(out_result.spirv_words, SpvOpEntryPoint, ep);
+        EmitSpv(out_result.spirv_words, SpvOpExecutionMode, {fn_main, 22u});  // Triangles
+        EmitSpv(out_result.spirv_words, SpvOpExecutionMode, {fn_main, 0u, 1u});
+        EmitSpv(out_result.spirv_words, SpvOpExecutionMode, {fn_main, 29u});  // OutputTriangleStrip
+        EmitSpv(out_result.spirv_words, SpvOpExecutionMode, {fn_main, 26u, max_v});
+    } else {
+        // MeshEXT SPIR-V 1.6 (SPV_EXT_mesh_shader) preserving paired barycentrics + BuiltIn CullDistance
+        const uint32_t ty_ptr_in_u32 = nid();
+        const uint32_t ty_arr_pv = nid(), ty_ptr_out_pv_arr = nid();
+        const uint32_t ty_arr_col = nid(), ty_ptr_out_col_arr = nid();
+        const uint32_t ty_arr_prims = nid(), ty_ptr_out_prims = nid(), ty_ptr_out_v3u = nid();
+        EmitSpv(types, SpvOpTypePointer, {ty_ptr_in_u32, 1u, ty_u32});
+        EmitSpv(types, SpvOpTypeArray, {ty_arr_pv, ty_perv, cu(max_v)});
+        EmitSpv(types, SpvOpTypePointer, {ty_ptr_out_pv_arr, 3u, ty_arr_pv});
+        EmitSpv(types, SpvOpTypeArray, {ty_arr_col, ty_v4f, cu(max_v)});
+        EmitSpv(types, SpvOpTypePointer, {ty_ptr_out_col_arr, 3u, ty_arr_col});
+        EmitSpv(types, SpvOpTypeArray, {ty_arr_prims, ty_v3u, cu(max_p)});
+        EmitSpv(types, SpvOpTypePointer, {ty_ptr_out_prims, 3u, ty_arr_prims});
+        EmitSpv(types, SpvOpTypePointer, {ty_ptr_out_v3u, 3u, ty_v3u});
+
+        const uint32_t var_lid = nid(), var_out = nid(), var_col = nid(), var_prims = nid();
+        EmitSpv(types, SpvOpVariable, {ty_ptr_in_u32, var_lid, 1u});
+        EmitSpv(types, SpvOpVariable, {ty_ptr_out_pv_arr, var_out, 3u});
+        EmitSpv(types, SpvOpVariable, {ty_ptr_out_col_arr, var_col, 3u});
+        EmitSpv(types, SpvOpVariable, {ty_ptr_out_prims, var_prims, 3u});
+        EmitSpv(decs, SpvOpDecorate, {var_lid, 11u, 29u});      // BuiltIn LocalInvocationIndex
+        EmitSpv(decs, SpvOpDecorate, {var_col, 30u, 0u});       // Location 0
+        EmitSpv(decs, SpvOpDecorate, {var_prims, 11u, 5294u});  // BuiltIn PrimitiveTriangleIndicesEXT
+        iface = {var_lid, var_out, var_col, var_prims};
+
+        uint32_t var_b2 = 0u, var_b3 = 0u;
+        if (keep_bary) {
+            const uint32_t ty_arr_b2 = nid(), ty_arr_b3 = nid();
+            const uint32_t ty_ptr_out_a2 = nid(), ty_ptr_out_a3 = nid();
+            EmitSpv(types, SpvOpTypeArray, {ty_arr_b2, ty_v2f, cu(max_v)});
+            EmitSpv(types, SpvOpTypeArray, {ty_arr_b3, ty_v3f, cu(max_v)});
+            EmitSpv(types, SpvOpTypePointer, {ty_ptr_out_a2, 3u, ty_arr_b2});
+            EmitSpv(types, SpvOpTypePointer, {ty_ptr_out_a3, 3u, ty_arr_b3});
+            var_b2 = nid();
+            var_b3 = nid();
+            EmitSpv(types, SpvOpVariable, {ty_ptr_out_a2, var_b2, 3u});
+            EmitSpv(types, SpvOpVariable, {ty_ptr_out_a3, var_b3, 3u});
+            EmitSpv(decs, SpvOpDecorate, {var_b2, 30u, 1u});
+            EmitSpv(decs, SpvOpDecorate, {var_b3, 30u, 2u});
+            iface.push_back(var_b2);
+            iface.push_back(var_b3);
+        }
+
+        EmitSpv(body, SpvOpFunction, {ty_void, fn_main, 0u, ty_fn});
+        EmitSpv(body, SpvOpLabel, {lbl});
+        EmitSpv(body, SpvOpSetMeshOutputsEXT, {cu(max_v), cu(max_p)});
+
+        const uint32_t lid = nid(), v_lt = nid(), l_vbody = nid(), l_vmerge = nid();
+        EmitSpv(body, SpvOpLoad, {ty_u32, lid, var_lid});
+        EmitSpv(body, SpvOpULessThan, {ty_bool, v_lt, lid, cu(max_v)});
+        EmitSpv(body, SpvOpSelectionMerge, {l_vmerge, 0u});
+        EmitSpv(body, SpvOpBranchConditional, {v_lt, l_vbody, l_vmerge});
+
+        EmitSpv(body, SpvOpLabel, {l_vbody});
+        {
+            const uint32_t corner = nid(), is0 = nid(), is1 = nid(), u = nid(), v = nid();
+            const uint32_t uv_sum = nid(), w = nid();
+            const uint32_t px = nid(), py = nid(), pos_x = nid(), pos_y = nid();
+            const uint32_t pos = nid(), col = nid(), p_pos = nid(), p_col = nid();
+            EmitSpv(body, SpvOpUMod, {ty_u32, corner, lid, cu(3u)});
+            EmitSpv(body, SpvOpIEqual, {ty_bool, is0, corner, cu(0u)});
+            EmitSpv(body, SpvOpIEqual, {ty_bool, is1, corner, cu(1u)});
+            EmitSpv(body, SpvOpSelect, {ty_f32, u, is0, cf(1.0f), cf(0.0f)});
+            EmitSpv(body, SpvOpSelect, {ty_f32, v, is1, cf(1.0f), cf(0.0f)});
+            EmitSpv(body, SpvOpFAdd, {ty_f32, uv_sum, u, v});
+            EmitSpv(body, SpvOpFSub, {ty_f32, w, cf(1.0f), uv_sum});
+            EmitSpv(body, SpvOpFMul, {ty_f32, px, u, cf(2.0f)});
+            EmitSpv(body, SpvOpFMul, {ty_f32, py, v, cf(2.0f)});
+            EmitSpv(body, SpvOpFSub, {ty_f32, pos_x, px, cf(1.0f)});
+            EmitSpv(body, SpvOpFSub, {ty_f32, pos_y, py, cf(1.0f)});
+            EmitSpv(body, SpvOpCompositeConstruct, {ty_v4f, pos, pos_x, pos_y, cf(0.0f), cf(1.0f)});
+            EmitSpv(body, SpvOpCompositeConstruct, {ty_v4f, col, u, v, w, cf(1.0f)});
+            EmitSpv(body, SpvOpAccessChain, {ty_ptr_out_v4f, p_pos, var_out, lid, cu(0u)});
+            EmitSpv(body, SpvOpStore, {p_pos, pos});
+            EmitSpv(body, SpvOpAccessChain, {ty_ptr_out_v4f, p_col, var_col, lid});
+            EmitSpv(body, SpvOpStore, {p_col, col});
+            if (keep_bary) {
+                const uint32_t b2 = nid(), b3 = nid(), pb2 = nid(), pb3 = nid();
+                EmitSpv(body, SpvOpCompositeConstruct, {ty_v2f, b2, u, v});
+                EmitSpv(body, SpvOpCompositeConstruct, {ty_v3f, b3, w, u, v});
+                EmitSpv(body, SpvOpAccessChain, {ty_ptr_out_v2f, pb2, var_b2, lid});
+                EmitSpv(body, SpvOpStore, {pb2, b2});
+                EmitSpv(body, SpvOpAccessChain, {ty_ptr_out_v3f, pb3, var_b3, lid});
+                EmitSpv(body, SpvOpStore, {pb3, b3});
+            }
+            for (uint32_t k = 0u; k < cull_n; ++k) {
+                const uint32_t p_cd = nid();
+                EmitSpv(body, SpvOpAccessChain, {ty_ptr_out_f32, p_cd, var_out, lid, cu(1u), cu(k)});
+                EmitSpv(body, SpvOpStore, {p_cd, cf(1.0f - static_cast<float>(k) * 0.0625f)});
+            }
+        }
+        EmitSpv(body, SpvOpBranch, {l_vmerge});
+
+        EmitSpv(body, SpvOpLabel, {l_vmerge});
+        const uint32_t p_lt = nid(), l_pbody = nid(), l_pmerge = nid();
+        EmitSpv(body, SpvOpULessThan, {ty_bool, p_lt, lid, cu(max_p)});
+        EmitSpv(body, SpvOpSelectionMerge, {l_pmerge, 0u});
+        EmitSpv(body, SpvOpBranchConditional, {p_lt, l_pbody, l_pmerge});
+
+        EmitSpv(body, SpvOpLabel, {l_pbody});
+        {
+            const uint32_t tri = nid(), p_pr = nid();
+            EmitSpv(body, SpvOpCompositeConstruct, {ty_v3u, tri, cu(0u), cu(1u), cu(2u)});
+            EmitSpv(body, SpvOpAccessChain, {ty_ptr_out_v3u, p_pr, var_prims, lid});
+            EmitSpv(body, SpvOpStore, {p_pr, tri});
+        }
+        EmitSpv(body, SpvOpBranch, {l_pmerge});
+
+        EmitSpv(body, SpvOpLabel, {l_pmerge});
+        EmitSpv(body, SpvOpReturn, {});
+        EmitSpv(body, SpvOpFunctionEnd, {});
+
+        out_result.spirv_words = {0x07230203u, 0x00010600u, 0x4F533200u, id, 0u};
+        EmitSpv(out_result.spirv_words, SpvOpCapability, {1u});     // Shader
+        EmitSpv(out_result.spirv_words, SpvOpCapability, {5283u});  // MeshShadingEXT
+        if (cull_n > 0u) EmitSpv(out_result.spirv_words, SpvOpCapability, {45u});  // CullDistance
+        std::vector<uint32_t> ext_ops;
+        AppendSpvExtString(ext_ops, "SPV_EXT_mesh_shader");
+        EmitSpvVec(out_result.spirv_words, SpvOpExtension, ext_ops);
+        EmitSpv(out_result.spirv_words, SpvOpMemoryModel, {0u, 1u});
+        std::vector<uint32_t> ep = {5365u, fn_main, 0x6E69616Du, 0u};  // MeshEXT
+        ep.insert(ep.end(), iface.begin(), iface.end());
+        EmitSpvVec(out_result.spirv_words, SpvOpEntryPoint, ep);
+        EmitSpv(out_result.spirv_words, SpvOpExecutionMode, {fn_main, 17u, tg_x, 1u, 1u});
+        EmitSpv(out_result.spirv_words, SpvOpExecutionMode, {fn_main, 26u, max_v});
+        EmitSpv(out_result.spirv_words, SpvOpExecutionMode, {fn_main, 5270u, max_p});
+        EmitSpv(out_result.spirv_words, SpvOpExecutionMode, {fn_main, 5298u});
+    }
+
+    out_result.spirv_words.insert(out_result.spirv_words.end(), decs.begin(), decs.end());
+    out_result.spirv_words.insert(out_result.spirv_words.end(), types.begin(), types.end());
+    out_result.spirv_words.insert(out_result.spirv_words.end(), body.begin(), body.end());
+    return ValidateSpirvBinary(out_result.spirv_words);
 }
 
 }  // namespace openscarlett

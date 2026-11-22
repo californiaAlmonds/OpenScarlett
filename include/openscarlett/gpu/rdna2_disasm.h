@@ -10,7 +10,7 @@
 namespace openscarlett {
 
 // ---------------------------------------------------------------------------
-// Clean-room Scarlett RDNA2 / GFX10.3 ('XS2\0') Shader Container
+// Scarlett RDNA2 / GFX10.3 ('XS2\0') Shader Container
 // ---------------------------------------------------------------------------
 constexpr uint32_t kXs2ContainerVersion = 1u;
 constexpr uint32_t kXs2ContainerVersionV2 = 2u;
@@ -154,7 +154,7 @@ struct XboxDxbcBuildDesc {
 // Selects guest Wave32 vs Wave64 mode from parsed PSV0 wave lane bounds.
 uint32_t SelectGuestWaveSizeFromPsv0(const XboxPsv0Info& psv0, uint32_t default_wave_size = 32u) noexcept;
 
-// Clean-room DXBC / DXIL container MD5 hash computation, verification, and in-place re-signing.
+// DXBC / DXIL container MD5 hash computation, verification, and in-place re-signing.
 void ComputeDxbcContainerHash(const uint8_t* dxbc_bytes, size_t size, uint8_t out_hash[16]) noexcept;
 bool VerifyDxbcContainerHash(const uint8_t* dxbc_bytes, size_t size) noexcept;
 Status ResignDxilContainer(std::vector<uint8_t>& dxbc_bytes);
@@ -167,7 +167,7 @@ bool IsXboxShaderBytecode(const void* data, size_t size) noexcept;
 Status ParseXboxShaderContainer(const void* data, size_t size, XboxDxbcContainer& out_container);
 Status ParseXboxShaderContainer(const std::vector<uint8_t>& bytes, XboxDxbcContainer& out_container);
 
-// Clean-room builder for Xbox-wrapped DXBC containers (for testing and tooling).
+// Builder for Xbox-wrapped DXBC containers (for testing and tooling).
 std::vector<uint8_t> BuildXboxDxbcContainer(const XboxDxbcBuildDesc& desc);
 
 // ---------------------------------------------------------------------------
@@ -668,7 +668,7 @@ Status DisassembleRdna2(
     std::vector<Rdna2Instruction>& out_instructions);
 
 // ---------------------------------------------------------------------------
-// Clean-room RDNA2 / GFX10.3 Binary Instruction Assembler
+// RDNA2 / GFX10.3 Binary Instruction Assembler
 // ---------------------------------------------------------------------------
 class Rdna2Assembler {
 public:

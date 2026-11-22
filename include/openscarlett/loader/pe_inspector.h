@@ -281,7 +281,7 @@ bool LookupMappedPeExportForwarder(const void* module_base,
 bool ReadMappedPeTlsCallbackRvas(const void* module_base,
                                  std::vector<uint32_t>& out_callback_rvas);
 
-// Clean-room helper to invoke all IMAGE_DIRECTORY_ENTRY_TLS callbacks on a mapped PE32+ image.
+// Helper to invoke all IMAGE_DIRECTORY_ENTRY_TLS callbacks on a mapped PE32+ image.
 // Returns the number of callbacks invoked.
 uint32_t InvokePeTlsCallbacks(void* module_base, uint32_t reason, void* reserved = nullptr);
 

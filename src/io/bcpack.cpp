@@ -1,4 +1,5 @@
 #include "openscarlett/io/bcpack.h"
+#include "openscarlett/kernel/vram_residency_manager.h"
 
 #include <algorithm>
 #include <array>
@@ -863,7 +864,7 @@ Status HuffmanDecompress(const uint8_t* src, size_t src_size, size_t expected_si
 }
 
 // ---------------------------------------------------------------------------
-// Clean-Room Endpoint Ring-Buffer Sliding-Window Codec (BC1..BC7 Endpoints)
+// Endpoint Ring-Buffer Sliding-Window Codec (BC1..BC7 Endpoints)
 // ---------------------------------------------------------------------------
 // Fixed 64-entry history ring buffer of element_bytes (1..8):
 //   0x00..0x3F : Single history back-ref at age_idx = tag (0 = most recent, < populated)
@@ -1150,7 +1151,7 @@ Status EndpointRingWindowDecompress(
 }
 
 // ---------------------------------------------------------------------------
-// Clean-Room Selector Index-Table & Sliding-Window Codec (BC1..BC7 Selectors)
+// Selector Index-Table & Sliding-Window Codec (BC1..BC7 Selectors)
 // ---------------------------------------------------------------------------
 // Header:
 //   uint16 LE table_size (0..256)
@@ -1612,6 +1613,34 @@ Status BcPackParseHeader(const uint8_t* src, size_t src_size, BcPackHeader& out_
         }
         if (d.compressed_size == 0) {
             return Status::Error(StatusCode::ParseError, "BCPack plane compressed_size is zero");
+        }
+        // Strict codec-specific minimum payload & element geometry checks before decompression.
+        switch (d.codec) {
+            case BcPlaneCodec::Raw:
+                if (d.compressed_size != d.raw_size) {
+                    return Status::Error(StatusCode::ParseError, "BCPack raw plane compressed_size != raw_size");
+                }
+                break;
+            case BcPlaneCodec::CanonicalHuffman:
+            case BcPlaneCodec::LzRleHuffman:
+                if (d.compressed_size < 5u) {
+                    return Status::Error(StatusCode::ParseError, "BCPack Huffman plane payload truncated");
+                }
+                break;
+            case BcPlaneCodec::EndpointRingWindow:
+                if (d.element_bytes == 0u || d.element_bytes > 8u || (d.raw_size % d.element_bytes) != 0u) {
+                    return Status::Error(StatusCode::ParseError, "BCPack EndpointRingWindow geometry invalid");
+                }
+                break;
+            case BcPlaneCodec::SelectorIndexTable:
+                if (d.element_bytes == 0u || d.element_bytes > 8u ||
+                    (d.raw_size % d.element_bytes) != 0u || d.compressed_size < 2u) {
+                    return Status::Error(StatusCode::ParseError, "BCPack SelectorIndexTable geometry/header invalid");
+                }
+                break;
+            case BcPlaneCodec::LzRle:
+            default:
+                break;
         }
         if (d.data_offset < table_end ||
             static_cast<uint64_t>(d.data_offset) + static_cast<uint64_t>(d.compressed_size) > src_size) {
@@ -2221,7 +2250,287 @@ Status BcPackDecompressMipChain(
 }
 
 // ---------------------------------------------------------------------------
-// Clean-Room Synthetic BC1..BC7 Surface Generator (for Round-Trip Verification)
+// Texture-Array + Multi-Mip BCPack Container ('BCPA') & Stream Validation
+// ---------------------------------------------------------------------------
+namespace {
+constexpr size_t kTextureArrayHeaderFixedBytes = 28u;
+constexpr size_t kTextureArrayEntryBytes = 8u;
+}  // namespace
+
+Status BcPackValidateStream(const uint8_t* src, size_t src_size) noexcept {
+    if (!src || src_size < 4u) {
+        return Status::Error(StatusCode::ParseError, "BCPack stream null or smaller than magic");
+    }
+    const uint32_t magic = ReadLe32(src);
+    if (magic == kBcPackMagic) {
+        BcPackHeader hdr{};
+        return BcPackParseHeader(src, src_size, hdr);
+    }
+    if (magic == kBcPackMipChainMagic) {
+        BcPackMipChainHeader mhdr{};
+        return BcPackParseMipChainHeader(src, src_size, mhdr);
+    }
+    if (magic == kBcPackTextureArrayMagic) {
+        BcPackTextureArrayHeader ahdr{};
+        return BcPackParseTextureArrayHeader(src, src_size, ahdr);
+    }
+    return Status::Error(StatusCode::ParseError, "Unknown BCPack container magic");
+}
+
+Status BcPackCompressTextureArray(
+    BcFormat format,
+    uint32_t base_width,
+    uint32_t base_height,
+    uint32_t mip_count,
+    uint32_t array_size,
+    const std::vector<std::vector<uint8_t>>& subresources,
+    std::vector<uint8_t>& out_compressed) {
+    out_compressed.clear();
+
+    const uint32_t max_mips = BcCalculateMaxMipLevels(base_width, base_height);
+    if (BcFormatBlockBytes(format) == 0u || max_mips == 0u) {
+        return Status::Error(StatusCode::InvalidArgument, "Invalid BC format or base dimensions for texture array");
+    }
+    if (mip_count == 0u || mip_count > max_mips || mip_count > kBcPackMaxMipLevels) {
+        return Status::Error(StatusCode::InvalidArgument, "Invalid mip_count for texture array");
+    }
+    if (array_size == 0u || array_size > kBcPackMaxArraySlices) {
+        return Status::Error(StatusCode::InvalidArgument, "Invalid array_size for texture array");
+    }
+    const uint64_t total_subresources = static_cast<uint64_t>(array_size) * static_cast<uint64_t>(mip_count);
+    if (total_subresources == 0ull || subresources.size() != total_subresources) {
+        return Status::Error(StatusCode::InvalidArgument,
+                             "Texture array subresource vector size must equal array_size * mip_count");
+    }
+
+    std::vector<std::vector<uint8_t>> packed(static_cast<size_t>(total_subresources));
+    for (uint32_t slice = 0u; slice < array_size; ++slice) {
+        for (uint32_t mip = 0u; mip < mip_count; ++mip) {
+            BcPackMipLevelInfo info{};
+            if (!BcCalculateMipLevelInfo(format, base_width, base_height, mip, info)) {
+                return Status::Error(StatusCode::InvalidArgument, "Failed calculating texture array mip geometry");
+            }
+            const size_t sub_idx = static_cast<size_t>(slice) * mip_count + mip;
+            if (subresources[sub_idx].size() != info.byte_size) {
+                return Status::Error(StatusCode::InvalidArgument, "Texture array subresource byte size mismatch");
+            }
+            Status st = BcPackCompress(
+                format,
+                info.width,
+                info.height,
+                subresources[sub_idx].data(),
+                subresources[sub_idx].size(),
+                packed[sub_idx]);
+            if (!st.ok()) {
+                return st;
+            }
+        }
+    }
+
+    const uint64_t table_end =
+        static_cast<uint64_t>(kTextureArrayHeaderFixedBytes) +
+        total_subresources * static_cast<uint64_t>(kTextureArrayEntryBytes);
+    uint64_t cur_offset = table_end;
+    std::vector<uint32_t> offsets(static_cast<size_t>(total_subresources));
+    std::vector<uint32_t> sizes(static_cast<size_t>(total_subresources));
+    for (size_t i = 0u; i < packed.size(); ++i) {
+        if (cur_offset > std::numeric_limits<uint32_t>::max() ||
+            packed[i].size() > std::numeric_limits<uint32_t>::max()) {
+            return Status::Error(StatusCode::OutOfMemory, "BCPack texture array exceeds 4 GiB");
+        }
+        offsets[i] = static_cast<uint32_t>(cur_offset);
+        sizes[i] = static_cast<uint32_t>(packed[i].size());
+        cur_offset += packed[i].size();
+    }
+    if (cur_offset > std::numeric_limits<uint32_t>::max()) {
+        return Status::Error(StatusCode::OutOfMemory, "BCPack texture array total size exceeds 4 GiB");
+    }
+
+    out_compressed.reserve(static_cast<size_t>(cur_offset));
+    AppendLe32(out_compressed, kBcPackTextureArrayMagic);
+    AppendLe16(out_compressed, kBcPackVersion);
+    AppendLe16(out_compressed, 0u);
+    AppendLe32(out_compressed, static_cast<uint32_t>(format));
+    AppendLe32(out_compressed, base_width);
+    AppendLe32(out_compressed, base_height);
+    AppendLe32(out_compressed, mip_count);
+    AppendLe32(out_compressed, array_size);
+
+    for (size_t i = 0u; i < packed.size(); ++i) {
+        AppendLe32(out_compressed, offsets[i]);
+        AppendLe32(out_compressed, sizes[i]);
+    }
+    for (size_t i = 0u; i < packed.size(); ++i) {
+        out_compressed.insert(out_compressed.end(), packed[i].begin(), packed[i].end());
+    }
+    return Status::Ok();
+}
+
+Status BcPackParseTextureArrayHeader(
+    const uint8_t* src,
+    size_t src_size,
+    BcPackTextureArrayHeader& out_header) {
+    out_header = BcPackTextureArrayHeader{};
+    if (!src || src_size < kTextureArrayHeaderFixedBytes) {
+        return Status::Error(StatusCode::ParseError, "BCPack texture-array stream too small");
+    }
+    out_header.magic = ReadLe32(src + 0u);
+    if (out_header.magic != kBcPackTextureArrayMagic) {
+        return Status::Error(StatusCode::ParseError, "Invalid BCPack texture-array magic");
+    }
+    out_header.version = ReadLe16(src + 4u);
+    if (out_header.version != kBcPackVersion) {
+        return Status::Error(StatusCode::UnsupportedFormat, "Unsupported BCPack texture-array version");
+    }
+    out_header.flags = ReadLe16(src + 6u);
+    if (out_header.flags != 0u) {
+        return Status::Error(StatusCode::UnsupportedFormat, "Unsupported non-zero texture-array flags");
+    }
+    out_header.format = static_cast<BcFormat>(ReadLe32(src + 8u));
+    out_header.base_width = ReadLe32(src + 12u);
+    out_header.base_height = ReadLe32(src + 16u);
+    out_header.mip_count = ReadLe32(src + 20u);
+    out_header.array_size = ReadLe32(src + 24u);
+
+    const uint32_t max_mips = BcCalculateMaxMipLevels(out_header.base_width, out_header.base_height);
+    if (BcFormatBlockBytes(out_header.format) == 0u || max_mips == 0u) {
+        return Status::Error(StatusCode::ParseError, "Invalid format or base dimensions in texture array");
+    }
+    if (out_header.mip_count == 0u || out_header.mip_count > max_mips ||
+        out_header.mip_count > kBcPackMaxMipLevels) {
+        return Status::Error(StatusCode::ParseError, "Invalid mip_count in texture-array header");
+    }
+    if (out_header.array_size == 0u || out_header.array_size > kBcPackMaxArraySlices) {
+        return Status::Error(StatusCode::ParseError, "Invalid array_size in texture-array header");
+    }
+
+    const uint64_t total_subresources =
+        static_cast<uint64_t>(out_header.array_size) * static_cast<uint64_t>(out_header.mip_count);
+    const uint64_t table_end =
+        static_cast<uint64_t>(kTextureArrayHeaderFixedBytes) +
+        total_subresources * static_cast<uint64_t>(kTextureArrayEntryBytes);
+    if (table_end > static_cast<uint64_t>(src_size)) {
+        return Status::Error(StatusCode::ParseError, "Texture-array offset table truncated");
+    }
+
+    const size_t count = static_cast<size_t>(total_subresources);
+    out_header.subresource_offsets.resize(count);
+    out_header.subresource_compressed_sizes.resize(count);
+    std::vector<std::pair<uint64_t, uint64_t>> intervals;
+    intervals.reserve(count);
+
+    for (size_t i = 0u; i < count; ++i) {
+        const uint8_t* e = src + kTextureArrayHeaderFixedBytes + i * kTextureArrayEntryBytes;
+        const uint32_t off = ReadLe32(e + 0u);
+        const uint32_t sz = ReadLe32(e + 4u);
+        if (sz == 0u || static_cast<uint64_t>(off) < table_end ||
+            static_cast<uint64_t>(off) + static_cast<uint64_t>(sz) > static_cast<uint64_t>(src_size)) {
+            return Status::Error(StatusCode::ParseError, "Texture-array subresource range out of bounds");
+        }
+        out_header.subresource_offsets[i] = off;
+        out_header.subresource_compressed_sizes[i] = sz;
+        intervals.push_back({static_cast<uint64_t>(off), static_cast<uint64_t>(off) + static_cast<uint64_t>(sz)});
+    }
+
+    // O(N log N) overlap check to prevent aliasing/zip-bomb streams even for large arrays.
+    std::sort(intervals.begin(), intervals.end());
+    for (size_t i = 1u; i < intervals.size(); ++i) {
+        if (intervals[i].first < intervals[i - 1u].second) {
+            return Status::Error(StatusCode::ParseError, "Texture-array subresource ranges overlap");
+        }
+    }
+
+    return Status::Ok();
+}
+
+Status BcPackDecompressTextureArray(
+    const uint8_t* src,
+    size_t src_size,
+    std::vector<std::vector<uint8_t>>& out_subresources,
+    BcPackTextureArrayHeader* out_header) {
+    out_subresources.clear();
+    BcPackTextureArrayHeader hdr{};
+    Status st = BcPackParseTextureArrayHeader(src, src_size, hdr);
+    if (!st.ok()) {
+        return st;
+    }
+
+    const size_t count = static_cast<size_t>(hdr.array_size) * static_cast<size_t>(hdr.mip_count);
+    out_subresources.resize(count);
+    for (uint32_t slice = 0u; slice < hdr.array_size; ++slice) {
+        for (uint32_t mip = 0u; mip < hdr.mip_count; ++mip) {
+            BcPackMipLevelInfo expected{};
+            if (!BcCalculateMipLevelInfo(hdr.format, hdr.base_width, hdr.base_height, mip, expected)) {
+                out_subresources.clear();
+                return Status::Error(StatusCode::ParseError, "Invalid mip geometry during texture-array decode");
+            }
+            const size_t idx = static_cast<size_t>(slice) * hdr.mip_count + mip;
+            BcPackHeader sub_hdr{};
+            st = BcPackDecompress(
+                src + hdr.subresource_offsets[idx],
+                hdr.subresource_compressed_sizes[idx],
+                out_subresources[idx],
+                &sub_hdr);
+            if (!st.ok()) {
+                out_subresources.clear();
+                return st;
+            }
+            if (sub_hdr.format != hdr.format ||
+                sub_hdr.width != expected.width ||
+                sub_hdr.height != expected.height) {
+                out_subresources.clear();
+                return Status::Error(StatusCode::ParseError, "Texture-array subresource format/dimensions mismatch");
+            }
+        }
+    }
+
+    if (out_header) {
+        *out_header = std::move(hdr);
+    }
+    return Status::Ok();
+}
+
+Status BcPackDecompressTextureArraySubresource(
+    const uint8_t* src,
+    size_t src_size,
+    uint32_t array_slice,
+    uint32_t mip_level,
+    std::vector<uint8_t>& out_blocks) {
+    out_blocks.clear();
+    BcPackTextureArrayHeader hdr{};
+    Status st = BcPackParseTextureArrayHeader(src, src_size, hdr);
+    if (!st.ok()) {
+        return st;
+    }
+    if (array_slice >= hdr.array_size || mip_level >= hdr.mip_count) {
+        return Status::Error(StatusCode::InvalidArgument, "Texture-array slice or mip out of bounds");
+    }
+    BcPackMipLevelInfo expected{};
+    if (!BcCalculateMipLevelInfo(hdr.format, hdr.base_width, hdr.base_height, mip_level, expected)) {
+        return Status::Error(StatusCode::ParseError, "Invalid mip geometry for subresource decode");
+    }
+    const size_t idx = static_cast<size_t>(array_slice) * hdr.mip_count + mip_level;
+    BcPackHeader sub_hdr{};
+    st = BcPackDecompress(
+        src + hdr.subresource_offsets[idx],
+        hdr.subresource_compressed_sizes[idx],
+        out_blocks,
+        &sub_hdr);
+    if (!st.ok()) {
+        out_blocks.clear();
+        return st;
+    }
+    if (sub_hdr.format != hdr.format ||
+        sub_hdr.width != expected.width ||
+        sub_hdr.height != expected.height) {
+        out_blocks.clear();
+        return Status::Error(StatusCode::ParseError, "Texture-array subresource format/dimensions mismatch");
+    }
+    return Status::Ok();
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic BC1..BC7 Surface Generator (for Round-Trip Verification)
 // ---------------------------------------------------------------------------
 Status BcGenerateSyntheticSurface(
     BcFormat format,

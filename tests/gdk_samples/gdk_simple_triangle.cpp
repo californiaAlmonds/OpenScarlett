@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Standalone Xbox-ABI Guest Sample 1:
+// OpenScarlett MIT Standalone Xbox-ABI Guest Sample 1:
 // Mirrors Microsoft Xbox-GDK-Samples/Samples/IntroGraphics/SimpleTriangle.
 //
 // Deliberately does NOT link openscarlett_core. Runs inside an isolated package
@@ -21,7 +21,6 @@ namespace {
 
 constexpr uint32_t kWidth = 256u;
 constexpr uint32_t kHeight = 256u;
-constexpr uint32_t D3D12XBOX_RESOURCE_FLAG_ALLOW_DCC = 0x80000000u;
 
 constexpr uint8_t kBgR = 0x14u;
 constexpr uint8_t kBgG = 0x18u;
@@ -178,7 +177,6 @@ int main(int argc, char** argv) {
     dev_params.Version = 1;
     dev_params.DisableGeometryShaderAllocations = 1;
     dev_params.DisableTessellationShaderAllocations = 1;
-    dev_params.PreferWarp = use_warp ? 1u : 0u;
 
     GuestComPtr<ID3D12DeviceX> device;
     HRESULT hr = D3D12XboxCreateDevice(
@@ -218,7 +216,7 @@ int main(int argc, char** argv) {
         return Fail("SetFrameIntervalX", hr);
     }
     D3D12XBOX_FRAME_PIPELINE_TOKEN frame_token = 0;
-    hr = device->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, &frame_token);
+    hr = device->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, 0u, &frame_token);
     if (FAILED(hr) || frame_token == 0) {
         return Fail("WaitFrameEventX", hr);
     }
@@ -443,7 +441,7 @@ int main(int argc, char** argv) {
     D3D12XBOX_PRESENT_PARAMETERS pres_params{};
     pres_params.SyncInterval = 1;
 
-    hr = queue->PresentX(1, &plane, &pres_params, nullptr);
+    hr = queue->PresentX(1, &plane, &pres_params);
     if (FAILED(hr)) {
         return Fail("PresentX(1)", hr);
     }
@@ -550,8 +548,8 @@ int main(int argc, char** argv) {
         return Fail("Write T:\\metrics.txt", ::GetLastError());
     }
 
-    // 11. Blank teardown PresentX(0, nullptr, nullptr, nullptr) — exact Microsoft DeviceResources pattern!
-    hr = queue->PresentX(0, nullptr, nullptr, nullptr);
+    // 11. Blank teardown PresentX(0, nullptr, nullptr) — exact Microsoft DeviceResources pattern!
+    hr = queue->PresentX(0, nullptr, nullptr);
     if (FAILED(hr)) {
         return Fail("PresentX(0) blank teardown", hr);
     }
