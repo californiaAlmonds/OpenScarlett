@@ -720,15 +720,14 @@ struct RuntimeState {
 
     // XSystem handle registry (XSystemHandleTrack / XSystemIsHandleValid)
     std::mutex handle_mutex;
-    uint64_t next_handle_token = 1;
     struct TrackedHandle {
-        XSystemHandleType type = XSystemHandleType_Unknown;
-        XSystemHandleInvalidatedCallback callback = nullptr;
-        void* context = nullptr;
+        XSystemHandleType type = XSystemHandleType_User;
         bool closed = false;
     };
     std::unordered_map<void*, TrackedHandle> tracked_handles;
-    std::unordered_map<uint64_t, void*> tracked_handle_tokens;
+    // Process-wide lifecycle observer (2-arg XSystemHandleTrack ABI).
+    XSystemHandleCallback handle_callback = nullptr;
+    void* handle_callback_context = nullptr;
 
     // XStore handles
     std::mutex store_mutex;
@@ -779,33 +778,49 @@ RuntimeState& GetRuntime() {
     return *s;
 }
 
-/// Registers `handle` in the XSystem handle registry if it is not tracked yet.
-/// GDK handle creation paths call this so the handle can be validated later.
+/// Registers `handle` in the XSystem handle registry if it is not tracked yet
+/// and fires the process-wide observer with `Created` (outside the registry
+/// lock). GDK handle creation paths call this so the handle can be validated
+/// later.
 void RegisterHandleIfNeeded(void* handle, XSystemHandleType type) {
     if (!handle) return;
     auto& rt = GetRuntime();
-    std::lock_guard<std::mutex> lk(rt.handle_mutex);
-    auto it = rt.tracked_handles.find(handle);
-    if (it != rt.tracked_handles.end() && !it->second.closed) return;
-    rt.tracked_handles[handle] = RuntimeState::TrackedHandle{type, nullptr, nullptr, false};
+    XSystemHandleCallback cb = nullptr;
+    void* ctx = nullptr;
+    bool created = false;
+    {
+        std::lock_guard<std::mutex> lk(rt.handle_mutex);
+        auto it = rt.tracked_handles.find(handle);
+        if (it == rt.tracked_handles.end() || it->second.closed) {
+            rt.tracked_handles[handle] = RuntimeState::TrackedHandle{type, false};
+            created = true;
+        } else {
+            it->second.type = type;
+        }
+        cb = rt.handle_callback;
+        ctx = rt.handle_callback_context;
+    }
+    if (created && cb) cb(handle, type, XSystemHandleCallbackReason_Created, ctx);
 }
 
-/// Marks a tracked handle closed and fires its invalidation callback (outside
-/// the registry lock). Called from GDK handle close paths.
+/// Marks a tracked handle closed and fires the process-wide observer with
+/// `Destroyed` (outside the registry lock). Called from GDK handle close paths.
 void MarkHandleClosed(void* handle) {
     if (!handle) return;
-    XSystemHandleInvalidatedCallback callback = nullptr;
-    void* context = nullptr;
+    XSystemHandleCallback cb = nullptr;
+    void* ctx = nullptr;
+    XSystemHandleType type = XSystemHandleType_User;
     {
         auto& rt = GetRuntime();
         std::lock_guard<std::mutex> lk(rt.handle_mutex);
         auto it = rt.tracked_handles.find(handle);
         if (it == rt.tracked_handles.end() || it->second.closed) return;
         it->second.closed = true;
-        callback = it->second.callback;
-        context = it->second.context;
+        type = it->second.type;
+        cb = rt.handle_callback;
+        ctx = rt.handle_callback_context;
     }
-    if (callback) callback(context, handle);
+    if (cb) cb(handle, type, XSystemHandleCallbackReason_Destroyed, ctx);
 }
 
 std::shared_ptr<XTaskQueueObject> LookupQueue(XTaskQueueHandle handle) {
@@ -1074,9 +1089,11 @@ XGameResult OPENSCARLETT_GDK_CALL UserAddProvider(
                 auto& rt = GetRuntime();
                 std::lock_guard<std::mutex> lk(rt.user_mutex);
                 rt.live_users[raw] = std::move(u);
-    RegisterHandleIfNeeded(raw, XSystemHandleType_User);
-                RegisterHandleIfNeeded(raw, XSystemHandleType_User);
             }
+            // Outside user_mutex: RegisterHandleIfNeeded takes handle_mutex,
+            // which must never be nested under user_mutex, and the Created
+            // callback fires outside all locks.
+            RegisterHandleIfNeeded(raw, XSystemHandleType_User);
             ctx->user = raw;
             XAsyncComplete(data->async, XGR_S_OK, sizeof(XUserHandle));
             return XGR_E_PENDING;
@@ -4715,50 +4732,16 @@ bool OPENSCARLETT_GDK_CALL XSystemIsHandleValid(void* handle) {
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XSystemHandleTrack(
-    void* handle,
-    XSystemHandleType type,
-    XSystemHandleInvalidatedCallback callback,
-    void* context,
-    uint64_t* token) {
-    if (!handle || handle == reinterpret_cast<void*>(static_cast<intptr_t>(-1)) || !token) {
-        return RecordHr("XSystemHandleTrack", XGR_E_INVALIDARG);
-    }
-    *token = 0;
+    XSystemHandleCallback callback,
+    void* context) {
+    // 2-argument Microsoft GDK ABI: registers the process-wide handle
+    // lifecycle observer; passing nullptr clears/disables it. There is no
+    // XSystemHandleUntrack export.
     auto& rt = GetRuntime();
     std::lock_guard<std::mutex> lk(rt.handle_mutex);
-    auto it = rt.tracked_handles.find(handle);
-    if (it != rt.tracked_handles.end() && it->second.closed) {
-        // A closed handle cannot be tracked again until it is reopened.
-        return RecordHr("XSystemHandleTrack", XGR_E_HANDLE);
-    }
-    const uint64_t new_token = rt.next_handle_token++;
-    // Re-tracking a live handle (e.g. one auto-registered by a create path)
-    // attaches the callback and type and issues a fresh token.
-    rt.tracked_handles[handle] = RuntimeState::TrackedHandle{type, callback, context, false};
-    rt.tracked_handle_tokens[new_token] = handle;
-    *token = new_token;
+    rt.handle_callback = callback;
+    rt.handle_callback_context = context;
     return RecordHr("XSystemHandleTrack", XGR_S_OK);
-}
-
-XGameResult OPENSCARLETT_GDK_CALL XSystemHandleUntrack(uint64_t token) {
-    if (token == 0) {
-        return RecordHr("XSystemHandleUntrack", XGR_E_INVALIDARG);
-    }
-    auto& rt = GetRuntime();
-    std::lock_guard<std::mutex> lk(rt.handle_mutex);
-    auto it = rt.tracked_handle_tokens.find(token);
-    if (it == rt.tracked_handle_tokens.end()) {
-        return RecordHr("XSystemHandleUntrack", XGR_E_HANDLE);
-    }
-    void* handle = it->second;
-    rt.tracked_handle_tokens.erase(it);
-    auto hit = rt.tracked_handles.find(handle);
-    if (hit != rt.tracked_handles.end() && !hit->second.closed) {
-        // Untracked but still open: drop the registry entry entirely so the
-        // handle falls back to the legacy "any non-null handle is valid".
-        rt.tracked_handles.erase(hit);
-    }
-    return RecordHr("XSystemHandleUntrack", XGR_S_OK);
 }
 
 // ===========================================================================
@@ -8933,10 +8916,10 @@ const IXgrSystemApiVtable g_system_vtable = {
     &XSystemGetAnalyticsInfo,
     &XSystemGetRuntimeInfo,
     &XSystemIsHandleValid,
-    &XSystemHandleTrack,
-    &XSystemHandleUntrack,
     &XGameRuntimeIsFeatureAvailable,
     &XSystemGetAppSpecificDeviceId,
+    // Appended last so existing slot indices stay ABI-stable.
+    &XSystemHandleTrack,
 };
 
 const IXgrMemApiVtable g_mem_vtable = {

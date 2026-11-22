@@ -182,63 +182,66 @@ void TestXGameRuntime() {
     OS_REQUIRE(!XSystemIsHandleValid(nullptr));
     OS_REQUIRE(XSystemIsHandleValid(cid));
 
-    // XSystem handle registry (XSystemHandleTrack / XSystemIsHandleValid)
+    // XSystem handle registry (2-arg XSystemHandleTrack ABI / XSystemIsHandleValid)
     {
-        static std::atomic<int> invalidated_calls{0};
-        static void* invalidated_handle = nullptr;
-        auto on_invalidated = [](void* /*ctx*/, void* h) {
-            invalidated_handle = h;
-            invalidated_calls.fetch_add(1);
+        struct CbState {
+            std::atomic<int> created{0};
+            std::atomic<int> destroyed{0};
+            void* last_handle = nullptr;
+            XSystemHandleType last_type = XSystemHandleType_User;
+            XSystemHandleCallbackReason last_reason = XSystemHandleCallbackReason_Created;
         };
-        int dummy = 0;
-        void* h = &dummy;
-        uint64_t token = 0;
-        OS_REQUIRE(XSystemHandleTrack(h, XSystemHandleType_Generic, on_invalidated, nullptr, &token) == XGR_S_OK);
-        OS_REQUIRE(token != 0);
-        OS_REQUIRE(XSystemIsHandleValid(h));
-        // Re-tracking a live handle attaches the callback and issues a fresh
-        // token; bad arguments fail.
-        uint64_t token2 = 0;
-        OS_REQUIRE(XSystemHandleTrack(h, XSystemHandleType_Generic, on_invalidated, nullptr, &token2) == XGR_S_OK);
-        OS_REQUIRE(token2 != 0 && token2 != token);
-        OS_REQUIRE(XSystemHandleUntrack(token2) == XGR_S_OK);
-        OS_REQUIRE(XSystemHandleTrack(nullptr, XSystemHandleType_Generic, nullptr, nullptr, &token2) == XGR_E_INVALIDARG);
-        OS_REQUIRE(XSystemHandleTrack(h, XSystemHandleType_Generic, nullptr, nullptr, nullptr) == XGR_E_INVALIDARG);
+        static CbState cb_state;
+        auto on_handle_event = [](XSystemHandle h, XSystemHandleType t,
+                                  XSystemHandleCallbackReason r, void* ctx) {
+            auto* st = static_cast<CbState*>(ctx);
+            st->last_handle = h;
+            st->last_type = t;
+            st->last_reason = r;
+            if (r == XSystemHandleCallbackReason_Created) st->created.fetch_add(1);
+            else st->destroyed.fetch_add(1);
+        };
         OS_REQUIRE(!XSystemIsHandleValid(nullptr));
         OS_REQUIRE(!XSystemIsHandleValid(reinterpret_cast<void*>(static_cast<intptr_t>(-1))));
-        // Untracking makes the handle fall back to legacy "valid" again.
-        OS_REQUIRE(XSystemHandleUntrack(token) == XGR_S_OK);
-        OS_REQUIRE(XSystemIsHandleValid(h));
-        OS_REQUIRE(XSystemHandleUntrack(token) == XGR_E_HANDLE);
-        // Re-track, then close through a real GDK handle path (task queue).
-        OS_REQUIRE(XSystemHandleTrack(h, XSystemHandleType_User, on_invalidated, nullptr, &token) == XGR_S_OK);
+        // Untracked arbitrary pointers stay valid (legacy behaviour).
+        OS_REQUIRE(XSystemIsHandleValid(reinterpret_cast<void*>(0x1234u)));
+        // Register the process-wide observer (2-arg ABI).
+        OS_REQUIRE(XSystemHandleTrack(on_handle_event, &cb_state) == XGR_S_OK);
+        // Creating a task queue auto-registers the handle and fires Created.
         XTaskQueueHandle q = nullptr;
         OS_REQUIRE(XTaskQueueCreate(XTaskQueueDispatchMode_Manual, XTaskQueueDispatchMode_Manual, &q) == XGR_S_OK);
         OS_REQUIRE(q != nullptr);
         OS_REQUIRE(XSystemIsHandleValid(q));  // auto-registered on create
-        uint64_t qtoken = 0;
-        OS_REQUIRE(XSystemHandleTrack(q, XSystemHandleType_TaskQueue, on_invalidated, nullptr, &qtoken) == XGR_S_OK);
-        OS_REQUIRE(qtoken != 0);
+        OS_REQUIRE(cb_state.created.load() == 1);
+        OS_REQUIRE(cb_state.last_handle == q);
+        OS_REQUIRE(cb_state.last_type == XSystemHandleType_TaskQueue);
+        OS_REQUIRE(cb_state.last_reason == XSystemHandleCallbackReason_Created);
+        // Closing the handle fires Destroyed and invalidates it.
         XTaskQueueCloseHandle(q);
         OS_REQUIRE(!XSystemIsHandleValid(q));  // closed handles are invalid
-        OS_REQUIRE(invalidated_calls.load() == 1);
-        OS_REQUIRE(invalidated_handle == q);
-        // Untracked arbitrary pointers stay valid (legacy behaviour).
-        OS_REQUIRE(XSystemIsHandleValid(reinterpret_cast<void*>(0x1234u)));
-        OS_REQUIRE(XSystemHandleUntrack(token) == XGR_S_OK);
-        // Concurrent track/validate/untrack from several threads.
+        OS_REQUIRE(cb_state.destroyed.load() == 1);
+        OS_REQUIRE(cb_state.last_handle == q);
+        OS_REQUIRE(cb_state.last_reason == XSystemHandleCallbackReason_Destroyed);
+        // Passing nullptr clears the observer: no more events fire.
+        OS_REQUIRE(XSystemHandleTrack(nullptr, nullptr) == XGR_S_OK);
+        XTaskQueueHandle q2 = nullptr;
+        OS_REQUIRE(XTaskQueueCreate(XTaskQueueDispatchMode_Manual, XTaskQueueDispatchMode_Manual, &q2) == XGR_S_OK);
+        OS_REQUIRE(cb_state.created.load() == 1);
+        XTaskQueueCloseHandle(q2);
+        OS_REQUIRE(cb_state.destroyed.load() == 1);
+        OS_REQUIRE(!XSystemIsHandleValid(q2));
+        // Concurrent track/validate from several threads.
         {
             std::vector<std::thread> threads;
             std::atomic<int> ok{0};
             for (int t = 0; t < 8; ++t) {
                 threads.emplace_back([&ok, t] {
                     void* local = reinterpret_cast<void*>(static_cast<intptr_t>(0x10000u + t));
-                    uint64_t tok = 0;
-                    if (XSystemHandleTrack(local, XSystemHandleType_Generic, nullptr, nullptr, &tok) == XGR_S_OK && tok != 0) {
+                    if (XSystemHandleTrack(nullptr, nullptr) == XGR_S_OK) {
                         for (int i = 0; i < 1000; ++i) {
                             if (XSystemIsHandleValid(local)) ok.fetch_add(1);
                         }
-                        if (XSystemHandleUntrack(tok) == XGR_S_OK) ok.fetch_add(1);
+                        ok.fetch_add(1);
                     }
                 });
             }
