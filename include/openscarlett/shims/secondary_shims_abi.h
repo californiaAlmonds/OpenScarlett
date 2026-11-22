@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Secondary Console / GDK Shim ABI definitions for OpenScarlett:
+// Secondary Console / GDK Shim ABI definitions for OpenScarlett:
 //   1. pixevt.dll
 //   2. xmem.dll (forwards to kernelx.dll)
 //   3. xcrdapi.dll

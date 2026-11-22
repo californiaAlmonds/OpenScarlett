@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Microsoft GameInput (GameInput.dll) COM ABI definitions for OpenScarlett.
+// Microsoft GameInput (GameInput.dll) COM ABI definitions for OpenScarlett.
 // Self-contained (does not include <windows.h> or <GameInput.h>).
 
 #include <cstddef>

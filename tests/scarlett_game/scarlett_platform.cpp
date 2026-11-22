@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Playable Xbox Series X|S (Scarlett) Platform Implementation.
+// OpenScarlett MIT Playable Xbox Series X|S (Scarlett) Platform Implementation.
 // Pure standalone Xbox-ABI host (does NOT link openscarlett_core):
 //   - d3d12_xs.dll    : D3D12CreateDeviceX + D3D12 textured fullscreen quad shader pass + PresentX
 //   - kernelx.dll     : XMemAlloc / XMemFree + GetConsoleType + TitleMemoryStatus

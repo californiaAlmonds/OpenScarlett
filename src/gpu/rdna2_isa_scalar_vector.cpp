@@ -307,7 +307,7 @@ inline uint32_t ComputeDpp8SrcLane(uint32_t lane, const std::array<uint8_t, 8>& 
 }
 
 // ---------------------------------------------------------------------------
-// Complete Clean-Room GFX10.3 Scalar + Vector Opcode Table
+// Complete GFX10.3 Scalar + Vector Opcode Table
 // ---------------------------------------------------------------------------
 using Enc = Rdna2Encoding;
 using DK = Rdna2DataKind;

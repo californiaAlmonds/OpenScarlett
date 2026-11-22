@@ -2,7 +2,6 @@
 
 // OpenScarlett Sprint 12 — Streaming, BCPack/Metadata Coherency, Physical Page Aliasing,
 // and LRU VRAM Residency Management Public Interfaces.
-// Clean-room MIT implementation.
 
 #include <array>
 #include <cstddef>

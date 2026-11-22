@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Live Verification Suite:
+// OpenScarlett Live Verification Suite:
 // Commercial GDK Thunks (292/292 xgameruntime.dll + 16/16 XCurl.dll) & Full GDK Lifecycle.
 //
 // Always runs (CI & local):
@@ -44,7 +44,7 @@ namespace fs = std::filesystem;
 namespace {
 
 // Full 292-entry public GDK thunk export table matching shipping XGamingRuntimeThunks.dll.
-// Clean-room list of documented public Microsoft GDK C API symbol names (sorted alphabetically).
+// List of documented public Microsoft GDK C API symbol names (sorted alphabetically).
 constexpr std::array<const char*, 292> kRequiredXgameruntimeExports = {{
     "QueryApiImpl",
     "XAppBroadcastGetStatus",

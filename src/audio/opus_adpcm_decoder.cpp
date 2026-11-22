@@ -135,7 +135,7 @@ uint32_t OpusConfigFrameSamples48k(uint8_t config) noexcept {
     return kCeltDur[config & 3u];
 }
 
-// Clean-room minimal RFC 6716 Section 4.1 range encoder for building valid
+// Minimal RFC 6716 Section 4.1 range encoder for building valid
 // CELT fullband test packets without external encoder libraries.
 class CleanOpusRangeEncoder {
 public:
@@ -560,7 +560,7 @@ Status ImaAdpcmDecoder::DecodeBlocks(
 }
 
 // ===========================================================================
-// 2. Opus RFC 6716 TOC Parsing, Stream Framing & Clean-Room Packet Builder
+// 2. Opus RFC 6716 TOC Parsing, Stream Framing & Packet Builder
 // ===========================================================================
 
 bool ParseOpusToc(const uint8_t* packet, size_t packet_bytes, OpusTocInfo& out_info) noexcept {
@@ -690,7 +690,7 @@ bool ExtractOpusPackets(
     return TryParseLengthPrefixed(stream_data, stream_bytes, 2u, 1u, out_packets);
 }
 
-std::vector<uint8_t> BuildCleanRoomOpusTestPacket(
+std::vector<uint8_t> BuildOpusTestPacket(
     uint16_t channels,
     uint32_t frame_index,
     size_t payload_bytes) {

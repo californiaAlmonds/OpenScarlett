@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT End-to-End Isolated Dual-API Launch Test for `gdk_3d_scene.exe`.
+// OpenScarlett End-to-End Isolated Dual-API Launch Test for `gdk_3d_scene.exe`.
 //
 // Stages ONLY `gdk_3d_scene.exe` and `MicrosoftGame.Config` into an isolated zero-DLL temp
 // package directory (strictly on E:\OpenScarlett\.tmp\... when running from E:\, never C:\),

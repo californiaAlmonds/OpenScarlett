@@ -24,8 +24,8 @@
 namespace openscarlett {
 
 // ---------------------------------------------------------------------------
-// Clean-room AMD RDNA2 / GFX10.3 Hardware Descriptor Models (V# / T# / S#)
-// Based on the public AMD RDNA2 Instruction Set Architecture Reference Guide.
+// AMD RDNA2 / GFX10.3 Hardware Descriptor Models (V# / T# / S#)
+// Based on the AMD RDNA2 Instruction Set Architecture Reference Guide.
 // ---------------------------------------------------------------------------
 
 // GFX10.3 channel destination selector (3 bits: DST_SEL_X/Y/Z/W)
@@ -82,7 +82,7 @@ enum class Rdna2SwizzleMode : uint8_t {
     Sw64KB_Z_X = 24,
 };
 
-// GFX10.3 9-bit unified image formats (clean-room subset matching common Xbox DXGI formats)
+// GFX10.3 9-bit unified image formats (subset matching common Xbox DXGI formats)
 enum class Rdna2ImageFormat : uint16_t {
     Invalid = 0,
     R8_UNORM = 1,

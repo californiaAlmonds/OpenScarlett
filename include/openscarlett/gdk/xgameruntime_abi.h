@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Microsoft GDK xgameruntime.dll ABI definitions for OpenScarlett.
+// Microsoft GDK xgameruntime.dll ABI definitions for OpenScarlett.
 // Self-contained (does not include <windows.h>) to avoid Windows SDK collisions.
 
 #include <cstddef>
@@ -739,7 +739,7 @@ OPENSCARLETT_GDK_API XSystemRuntimeInfo OPENSCARLETT_GDK_CALL XSystemGetRuntimeI
 OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XSystemIsHandleValid(void* handle);
 
 // ---------------------------------------------------------------------------
-// XGameStreaming (clean-room local-PC compatibility surface)
+// XGameStreaming (local-PC compatibility surface)
 // ---------------------------------------------------------------------------
 typedef uint64_t XGameStreamingClientId;
 constexpr XGameStreamingClientId XGameStreamingAllClients = 0ull;

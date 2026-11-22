@@ -1,5 +1,5 @@
 #pragma once
-// Clean-room MIT DirectXTK12 GamePad subset for untouched Xbox-GDK-Samples.
+// MIT DirectXTK12 GamePad subset for untouched Xbox-GDK-Samples.
 
 namespace DirectX {
 
@@ -19,6 +19,8 @@ public:
         bool IsConnected() const noexcept { return false; }
         bool IsViewPressed() const noexcept { return false; }
         bool IsLeftStickPressed() const noexcept { return false; }
+        bool IsLeftTriggerPressed() const noexcept { return false; }
+        bool IsRightTriggerPressed() const noexcept { return false; }
     };
 
     class ButtonStateTracker {
@@ -38,6 +40,8 @@ public:
         ButtonState rightStick = UP;
         ButtonState leftShoulder = UP;
         ButtonState rightShoulder = UP;
+        ButtonState leftTrigger = UP;
+        ButtonState rightTrigger = UP;
         ButtonState back = UP;
         ButtonState view = UP;
         ButtonState start = UP;
@@ -45,7 +49,8 @@ public:
 
         void Update(const State&) noexcept {}
         void Reset() noexcept {
-            a = b = x = y = leftStick = rightStick = leftShoulder = rightShoulder = back = view = start = menu = UP;
+            a = b = x = y = leftStick = rightStick = leftShoulder = rightShoulder =
+                leftTrigger = rightTrigger = back = view = start = menu = UP;
         }
     };
 

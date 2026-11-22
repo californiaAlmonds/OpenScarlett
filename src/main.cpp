@@ -649,9 +649,6 @@ int RunProbe(int argc, char** argv) {
         return 1;
     }
 
-    constexpr const char* kDrmPolicyNote =
-        "Retail XVD/XVC DRM decryption and Microsoft key extraction are strictly out of scope and never implemented.";
-
     // Case 1: Direct .xvd / .xvc container file (12 KiB header geometry inspection).
     if (std::filesystem::is_regular_file(input_p, ec) && HasXvdExtensionOrMagic(input_p)) {
         openscarlett::XvdInspectionReport xvd{};
@@ -665,7 +662,6 @@ int RunProbe(int argc, char** argv) {
             oss << "{\n"
                 << "  \"probe_kind\": \"xvd\",\n"
                 << "  \"target\": \"" << EscapeJsonMain(target_path) << "\",\n"
-                << "  \"drm_policy\": \"" << EscapeJsonMain(kDrmPolicyNote) << "\",\n"
                 << "  \"ready_to_launch\": " << (xvd.can_inspect_filesystem_directly ? "true" : "false") << ",\n"
                 << "  \"xvd\": " << openscarlett::FormatXvdInspectionJson(xvd) << "\n"
                 << "}\n";
@@ -673,9 +669,6 @@ int RunProbe(int argc, char** argv) {
         } else {
             std::printf("=== OpenScarlett Preflight Compatibility Probe (XVD/XVC) ===\n");
             std::fputs(openscarlett::FormatXvdInspectionText(xvd).c_str(), stdout);
-            if (xvd.is_encrypted) {
-                std::printf("DRM Policy   : %s\n", kDrmPolicyNote);
-            }
         }
         return 0;
     }
@@ -719,7 +712,6 @@ int RunProbe(int argc, char** argv) {
                 oss << "{\n"
                     << "  \"probe_kind\": \"xvd\",\n"
                     << "  \"target\": \"" << EscapeJsonMain(found_xvds.front().string()) << "\",\n"
-                    << "  \"drm_policy\": \"" << EscapeJsonMain(kDrmPolicyNote) << "\",\n"
                     << "  \"ready_to_launch\": " << (xvd.can_inspect_filesystem_directly ? "true" : "false") << ",\n"
                     << "  \"xvd\": " << openscarlett::FormatXvdInspectionJson(xvd) << "\n"
                     << "}\n";
@@ -727,9 +719,6 @@ int RunProbe(int argc, char** argv) {
             } else {
                 std::printf("=== OpenScarlett Preflight Compatibility Probe (XVD/XVC) ===\n");
                 std::fputs(openscarlett::FormatXvdInspectionText(xvd).c_str(), stdout);
-                if (xvd.is_encrypted) {
-                    std::printf("DRM Policy   : %s\n", kDrmPolicyNote);
-                }
             }
             return 0;
         }
@@ -857,9 +846,6 @@ int RunProbe(int argc, char** argv) {
             std::printf("XVD Containers Found: %zu\n", dir_xvds.size());
             for (const auto& xvd : dir_xvds) {
                 std::fputs(openscarlett::FormatXvdInspectionText(xvd).c_str(), stdout);
-                if (xvd.is_encrypted) {
-                    std::printf("DRM Policy   : %s\n", kDrmPolicyNote);
-                }
             }
         }
     }
@@ -868,7 +854,7 @@ int RunProbe(int argc, char** argv) {
 
 void PrintUsage() {
     std::printf(
-        "OpenScarlett - Clean-room Xbox Series X|S (Scarlett) translation layer for Windows x64\n"
+        "OpenScarlett - Xbox Series X|S (Scarlett) translation layer for Windows x64\n"
         "Usage:\n"
         "  openscarlett probe-gpu               Probe host D3D12, Vulkan, and DXC capabilities\n"
         "  openscarlett probe <exe|dir|xvd> [--json]\n"

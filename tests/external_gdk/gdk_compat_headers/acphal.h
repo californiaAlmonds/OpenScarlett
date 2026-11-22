@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Xbox Audio Co-Processor HAL (<acphal.h>) public ABI header.
+// MIT Xbox Audio Co-Processor HAL (<acphal.h>) public ABI header.
 
 #include <cstdint>
 #include <unknwn.h>

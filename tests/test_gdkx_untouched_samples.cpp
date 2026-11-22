@@ -5,6 +5,8 @@
 //   2. SimpleLighting_GDKX.exe   (GDKX ID3D12Device + D32_FLOAT depth + 2 PSOs + CBVs + 3D lit cube)
 //   3. SimpleTexture_GDKX.exe    (WIC JPEG decode + UpdateSubresources + SRV table + static sampler)
 //   4. SimpleInstancing_GDKX.exe (5,000 instanced 3D cubes + 3 vertex streams + 25 lights + Fence ring)
+//   5. SimpleBezier_GDKX.exe     (4K UHD hardware HS/DS tessellation + 6 PSOs + 16-CP Bezier Mobius strip)
+//   6. SimpleCompute_GDKX.exe    (CS 6.0 Mandelbrot fractal + Async Compute Queue + UAV/SRV + Fence sync)
 //
 // Each sample is staged into an isolated ZERO-DLL directory (proving real suspended-process
 // APC hook injection), launched via `openscarlett.exe run` on BOTH default host GPU and WARP,
@@ -161,7 +163,7 @@ TelemetrySummary ParseTelemetryJson(const fs::path& json_path) {
     return sum;
 }
 
-// Clean-room stored-DEFLATE RGBA8 PNG decoder (matches FrameBufferRgba8::WritePng output).
+// Stored-DEFLATE RGBA8 PNG decoder (matches FrameBufferRgba8::WritePng output).
 struct DecodedPng {
     uint32_t width = 0;
     uint32_t height = 0;
@@ -358,7 +360,8 @@ void VerifyPeImports(const fs::path& exe_path, const std::string& label) {
 void VerifyCommonTelemetry(
     const TelemetrySummary& tel,
     const std::string& tag,
-    uint64_t min_pso_count) {
+    uint64_t min_pso_count,
+    bool expects_device_type_query) {
     EXPECT_MSG(tel.total_calls > 0u, tag + ": telemetry recorded calls");
     EXPECT_MSG(tel.total_stubs == 0u, tag + ": telemetry stubs == 0 (got " + std::to_string(tel.total_stubs) + ")");
     EXPECT_MSG(tel.total_not_impl == 0u, tag + ": telemetry not_impl == 0 (got " + std::to_string(tel.total_not_impl) + ")");
@@ -389,7 +392,9 @@ void VerifyCommonTelemetry(
     EXPECT_MSG(tel.OkCount("kernelx.dll", "RegisterAppConstrainedChangeNotification") >= 1u, tag + ": RegisterAppConstrainedChangeNotification");
     EXPECT_MSG(tel.OkCount("kernelx.dll", "UnregisterAppConstrainedChangeNotification") >= 1u, tag + ": UnregisterAppConstrainedChangeNotification");
     EXPECT_MSG(tel.OkCount("xgameruntime.dll", "XGameRuntimeInitialize") >= 1u, tag + ": XGameRuntimeInitialize");
-    EXPECT_MSG(tel.OkCount("xgameruntime.dll", "XSystemGetDeviceType") >= 1u, tag + ": XSystemGetDeviceType");
+    if (expects_device_type_query) {
+        EXPECT_MSG(tel.OkCount("xgameruntime.dll", "XSystemGetDeviceType") >= 1u, tag + ": XSystemGetDeviceType");
+    }
     EXPECT_MSG(tel.OkCount("xgameruntime.dll", "XGameRuntimeUninitialize") >= 1u, tag + ": XGameRuntimeUninitialize");
     EXPECT_MSG(tel.OkCount("pixevt.dll", "PIXBeginEventOnCpu") >= 12u, tag + ": PIXBeginEventOnCpu >= 12");
     EXPECT_MSG(tel.OkCount("pixevt.dll", "PIXEndEventOnCpu") >= 12u, tag + ": PIXEndEventOnCpu >= 12");
@@ -501,8 +506,8 @@ void VerifySimpleLightingPixels(const DecodedPng& img, const std::string& tag) {
               << " color_buckets=" << distinct_quantized_colors.size() << "\n";
 }
 
-// Clean-room procedural sunset JPEG generator via host Windows WIC so SimpleTexture_GDKX
-// runs with zero external copyrighted asset dependencies (works identically in portable bundles).
+// Procedural sunset JPEG generator via host Windows WIC so SimpleTexture_GDKX
+// runs self-contained with zero external asset dependencies (works identically in portable bundles).
 bool WriteProceduralSunsetJpeg(const fs::path& dst_path, std::string& err) {
     using Microsoft::WRL::ComPtr;
     constexpr UINT kW = 256u;
@@ -766,11 +771,144 @@ void VerifySimpleInstancingPixels(const DecodedPng& img, const std::string& tag)
               << " color_buckets=" << distinct_quantized_colors.size() << "\n";
 }
 
+void VerifySimpleBezierPixels(const DecodedPng& img, const std::string& tag) {
+    EXPECT_MSG(img.width == 3840u && img.height == 2160u,
+               tag + ": 4K UHD Scarlett framebuffer (" + std::to_string(img.width) + "x" +
+                   std::to_string(img.height) + ")");
+    if (img.width < 64u || img.height < 64u) return;
+
+    uint8_t bg_r = 0, bg_g = 0, bg_b = 0, bg_a = 0;
+    img.SamplePixel(16, 16, bg_r, bg_g, bg_b, bg_a);
+    EXPECT_MSG(IsAtgBackground(bg_r, bg_g, bg_b),
+               tag + ": corner(16,16) is ATG #414141 background (got " + std::to_string(bg_r) + "," +
+                   std::to_string(bg_g) + "," + std::to_string(bg_b) + ")");
+
+    uint8_t r2 = 0, g2 = 0, b2 = 0, a2 = 0;
+    img.SamplePixel(img.width - 16, 16, r2, g2, b2, a2);
+    EXPECT_MSG(IsAtgBackground(r2, g2, b2),
+               tag + ": corner(w-16,16) is ATG #414141 background");
+
+    // Sample a dense 160x90 grid across the 4K frame to verify the N.L red-lit tessellated Mobius strip.
+    uint32_t non_bg_samples = 0;
+    uint32_t red_shaded_samples = 0;
+    uint32_t bright_red_samples = 0;
+    std::set<uint32_t> distinct_red_buckets;
+
+    for (uint32_t gy = 0; gy < 90; ++gy) {
+        const uint32_t y = gy * img.height / 90 + img.height / 180;
+        for (uint32_t gx = 0; gx < 160; ++gx) {
+            const uint32_t x = gx * img.width / 160 + img.width / 320;
+            uint8_t r = 0, g = 0, b = 0, a = 0;
+            img.SamplePixel(x, y, r, g, b, a);
+            if (!IsAtgBackground(r, g, b)) {
+                ++non_bg_samples;
+                if (r > 50u && r > g + 45u && r > b + 45u && g < 16u && b < 16u) {
+                    ++red_shaded_samples;
+                    if (r > 170u) ++bright_red_samples;
+                    distinct_red_buckets.insert(r >> 4);
+                }
+            }
+        }
+    }
+
+    EXPECT_MSG(non_bg_samples >= 500u,
+               tag + ": tessellated Bezier Mobius strip pixels present (non_bg=" +
+                   std::to_string(non_bg_samples) + "/14400)");
+    EXPECT_MSG(red_shaded_samples >= 400u,
+               tag + ": N.L red-lit tessellated surface pixels present (red_shaded=" +
+                   std::to_string(red_shaded_samples) + ")");
+    EXPECT_MSG(bright_red_samples >= 80u,
+               tag + ": brightly lit Bezier facets present (bright_red=" +
+                   std::to_string(bright_red_samples) + ")");
+    EXPECT_MSG(distinct_red_buckets.size() >= 4u,
+               tag + ": smooth N.L shading gradient across curved patches (red_buckets=" +
+                   std::to_string(distinct_red_buckets.size()) + ")");
+
+    std::cout << "  [" << tag << "] SimpleBezier PNG verified: " << img.width << "x" << img.height
+              << " non_bg=" << non_bg_samples << " red_shaded=" << red_shaded_samples
+              << " bright_red=" << bright_red_samples
+              << " red_buckets=" << distinct_red_buckets.size() << "\n";
+}
+
+void VerifySimpleComputePixels(const DecodedPng& img, const std::string& tag) {
+    EXPECT_MSG(img.width == 1920u && img.height == 1080u,
+               tag + ": 1080p SimpleCompute framebuffer (" + std::to_string(img.width) + "x" +
+                   std::to_string(img.height) + ")");
+    if (img.width < 64u || img.height < 64u) return;
+
+    // Far exterior corner (16, 16) escapes in iter=1 -> frac(1/300)=0.0033 -> GradientTexels[0] = (64,0,0).
+    uint8_t fr = 0, fg = 0, fb = 0, fa = 0;
+    img.SamplePixel(16, 16, fr, fg, fb, fa);
+    EXPECT_MSG(!IsAtgBackground(fr, fg, fb) && fr >= 50u && fr <= 80u && fg < 12u && fb < 12u,
+               tag + ": corner(16,16) far exterior is GradientTexels[0] deep crimson (got " +
+                   std::to_string(fr) + "," + std::to_string(fg) + "," + std::to_string(fb) + ")");
+
+    // Center pixel maps to complex coord (-0.65, 0.0), inside the main Mandelbrot cardioid:
+    // iter == maxiter == 1200 -> frac(1200.0 / 300.0) is either 0.0 (exact IEEE div -> GradientTexels[0]
+    // deep crimson (64,0,0)) or 1.0-eps (GPU fast rcp -> GradientTexels[7] bright yellow (255,255,0)).
+    uint8_t cr = 0, cg = 0, cb = 0, ca = 0;
+    img.SamplePixel(img.width / 2, img.height / 2, cr, cg, cb, ca);
+    const bool center_is_lut0 = (cr >= 50u && cr <= 80u && cg < 12u && cb < 12u);
+    const bool center_is_lut7 = (cr >= 240u && cg >= 240u && cb < 12u);
+    EXPECT_MSG(!IsAtgBackground(cr, cg, cb) && (center_is_lut0 || center_is_lut7),
+               tag + ": center inside Mandelbrot cardioid is exact LUT endpoint (got " +
+                   std::to_string(cr) + "," + std::to_string(cg) + "," + std::to_string(cb) + ")");
+
+    // Dense 320x180 grid across the 1080p frame (57,600 samples) to verify the CS 6.0 fractal
+    // and its multi-band red/orange/yellow gradient around the Mandelbrot boundary.
+    uint32_t non_atg_bg_samples = 0;
+    uint32_t dark_crimson_samples = 0;
+    uint32_t bright_red_samples = 0;
+    uint32_t warm_orange_yellow_samples = 0;
+    std::set<uint32_t> distinct_quantized_colors;
+
+    for (uint32_t gy = 0; gy < 180; ++gy) {
+        const uint32_t y = gy * img.height / 180 + img.height / 360;
+        for (uint32_t gx = 0; gx < 320; ++gx) {
+            const uint32_t x = gx * img.width / 320 + img.width / 640;
+            uint8_t r = 0, g = 0, b = 0, a = 0;
+            img.SamplePixel(x, y, r, g, b, a);
+            if (!IsAtgBackground(r, g, b) && r >= 45u && b < 20u) {
+                ++non_atg_bg_samples;
+                if (r >= 50u && r <= 80u && g < 16u) ++dark_crimson_samples;
+                if (r >= 115u && b < 20u) ++bright_red_samples;
+                if (r >= 200u && g >= 40u && b < 20u) ++warm_orange_yellow_samples;
+                const uint32_t q = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+                distinct_quantized_colors.insert(q);
+            }
+        }
+    }
+
+    EXPECT_MSG(non_atg_bg_samples >= 50000u,
+               tag + ": CS 6.0 fractal fills viewport (non_atg=" +
+                   std::to_string(non_atg_bg_samples) + "/57600)");
+    EXPECT_MSG(dark_crimson_samples >= 10000u,
+               tag + ": Mandelbrot exterior gradient band rendered (dark_crimson=" +
+                   std::to_string(dark_crimson_samples) + ")");
+    EXPECT_MSG(bright_red_samples >= 200u,
+               tag + ": fractal escape-time red bands present (bright_red=" +
+                   std::to_string(bright_red_samples) + ")");
+    EXPECT_MSG(warm_orange_yellow_samples >= 40u,
+               tag + ": high-iteration orange/yellow fractal boundary present (warm=" +
+                   std::to_string(warm_orange_yellow_samples) + ")");
+    EXPECT_MSG(distinct_quantized_colors.size() >= 6u,
+               tag + ": multi-band gradient LUT colors present (buckets=" +
+                   std::to_string(distinct_quantized_colors.size()) + ")");
+
+    std::cout << "  [" << tag << "] SimpleCompute PNG verified: " << img.width << "x" << img.height
+              << " center=(" << int(cr) << "," << int(cg) << "," << int(cb) << ")"
+              << " non_atg=" << non_atg_bg_samples << " bright_red=" << bright_red_samples
+              << " warm=" << warm_orange_yellow_samples
+              << " color_buckets=" << distinct_quantized_colors.size() << "\n";
+}
+
 enum class SampleKind {
     Triangle,
     Lighting,
     Texture,
     Instancing,
+    Bezier,
+    Compute,
 };
 
 struct SampleSpec {
@@ -831,7 +969,7 @@ void RunSampleEndToEnd(const fs::path& bin_dir, const SampleSpec& spec, bool pre
     if (spec.needs_sunset_jpg) {
         std::string jpg_err;
         EXPECT_MSG(WriteProceduralSunsetJpeg(pkg_dir / L"sunset.jpg", jpg_err),
-                   tag + ": generate clean-room sunset.jpg (" + jpg_err + ")");
+                   tag + ": generate sunset.jpg (" + jpg_err + ")");
     }
 
     // Minimal MicrosoftGame.Config pointing to the untouched *_GDKX.exe
@@ -876,7 +1014,8 @@ void RunSampleEndToEnd(const fs::path& bin_dir, const SampleSpec& spec, bool pre
             std::cerr << "  [" << tag << "] telemetry.json dump (rc=" << rc << "):\n" << raw << "\n";
         }
         const TelemetrySummary tel = ParseTelemetryJson(telemetry_json);
-        VerifyCommonTelemetry(tel, tag, spec.min_pso_count);
+        const bool expects_device_type = (spec.kind != SampleKind::Compute);
+        VerifyCommonTelemetry(tel, tag, spec.min_pso_count, expects_device_type);
         if (spec.kind == SampleKind::Texture) {
             EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12DeviceX::CreateShaderResourceView") >= 1u,
                        tag + ": DeviceX::CreateShaderResourceView >= 1");
@@ -885,6 +1024,26 @@ void RunSampleEndToEnd(const fs::path& bin_dir, const SampleSpec& spec, bool pre
         } else if (spec.kind == SampleKind::Instancing) {
             EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12DeviceX::CreateFence") >= 2u,
                        tag + ": DeviceX::CreateFence >= 2");
+        } else if (spec.kind == SampleKind::Bezier) {
+            EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12DeviceX::CreateConstantBufferView") >= 1u,
+                       tag + ": DeviceX::CreateConstantBufferView >= 1");
+            EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12GraphicsCommandListX::IASetPrimitiveTopology") >= 12u,
+                       tag + ": CommandListX::IASetPrimitiveTopology >= 12");
+        } else if (spec.kind == SampleKind::Compute) {
+            EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12DeviceX::CreateComputePipelineState") >= 1u,
+                       tag + ": DeviceX::CreateComputePipelineState >= 1");
+            EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12DeviceX::CreateCommandQueue") >= 2u,
+                       tag + ": DeviceX::CreateCommandQueue >= 2 (Direct + Compute)");
+            EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12DeviceX::CreateUnorderedAccessView") >= 2u,
+                       tag + ": DeviceX::CreateUnorderedAccessView >= 2");
+            EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12DeviceX::CreateShaderResourceView") >= 4u,
+                       tag + ": DeviceX::CreateShaderResourceView >= 4");
+            EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12DeviceX::CreateSampler") >= 1u,
+                       tag + ": DeviceX::CreateSampler >= 1");
+            EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12DeviceX::CreateFence") >= 3u,
+                       tag + ": DeviceX::CreateFence >= 3");
+            EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12GraphicsCommandListX::Dispatch") >= 12u,
+                       tag + ": CommandListX::Dispatch >= 12");
         }
     }
 
@@ -908,6 +1067,12 @@ void RunSampleEndToEnd(const fs::path& bin_dir, const SampleSpec& spec, bool pre
                 case SampleKind::Instancing:
                     VerifySimpleInstancingPixels(img, tag);
                     break;
+                case SampleKind::Bezier:
+                    VerifySimpleBezierPixels(img, tag);
+                    break;
+                case SampleKind::Compute:
+                    VerifySimpleComputePixels(img, tag);
+                    break;
             }
         }
     }
@@ -923,6 +1088,11 @@ int main() {
         {"SimpleLighting", "SimpleLighting_GDKX.exe", {"TriangleVS.cso", "LambertPS.cso", "SolidColorPS.cso"}, 2u, SampleKind::Lighting, false},
         {"SimpleTexture", "SimpleTexture_GDKX.exe", {"VertexShader.cso", "PixelShader.cso"}, 1u, SampleKind::Texture, true},
         {"SimpleInstancing", "SimpleInstancing_GDKX.exe", {"VertexShader.cso", "PixelShader.cso"}, 1u, SampleKind::Instancing, false},
+        {"SimpleBezier", "SimpleBezier_GDKX.exe",
+         {"BezierVS.cso", "BezierHS_int.cso", "BezierHS_fracEven.cso", "BezierHS_fracOdd.cso",
+          "BezierDS.cso", "BezierPS.cso", "SolidColorPS.cso"},
+         6u, SampleKind::Bezier, false},
+        {"SimpleCompute", "SimpleCompute_GDKX.exe", {"Fractal.cso"}, 1u, SampleKind::Compute, false},
     };
 
     for (const auto& s : samples) {

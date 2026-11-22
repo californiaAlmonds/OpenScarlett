@@ -1062,7 +1062,7 @@ void Test1_ComputeAluBranchConstFold(openscarlett::VulkanBackend& vk,
     d3d_warp.RunComputeBuffers(CompileForDevice(d3d_warp, res.hlsl_source, res.pc_dxil), input, d3d_warp_out, 1);
     verify_golden(d3d_warp_out, "D3D12-WARP");
 
-    // Verify exact parity with Clean-Room CPU RDNA2 Reference Interpreter
+    // Verify exact parity with CPU RDNA2 Reference Interpreter
     Rdna2CpuExecState cpu{};
     cpu.uav0 = input;
     cpu.uav1.assign(kCount, 0u);

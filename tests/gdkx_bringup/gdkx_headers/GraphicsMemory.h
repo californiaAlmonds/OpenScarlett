@@ -1,14 +1,17 @@
 #pragma once
 #include <d3d12_xs.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <new>
 #include <stdexcept>
+#include <thread>
 
-// Clean-room MIT DirectXTK12 GraphicsMemory subset for untouched Xbox-GDK-Samples.
-// Lazily allocates a 256-byte-aligned GPU upload ring on first AllocateConstant<T>() call.
+// MIT DirectXTK12 GraphicsMemory subset for untouched Xbox-GDK-Samples.
+// Lazily allocates a 256-byte-aligned GPU upload ring on first Allocate/AllocateConstant call.
 
 namespace DirectX {
 
@@ -28,8 +31,44 @@ private:
     size_t m_size;
 };
 
+class SharedGraphicsResource {
+public:
+    SharedGraphicsResource() noexcept : m_gpuAddress(0u), m_memory(nullptr), m_size(0u) {}
+    SharedGraphicsResource(const GraphicsResource& r) noexcept
+        : m_gpuAddress(r.GpuAddress()), m_memory(r.Memory()), m_size(r.Size()) {}
+    SharedGraphicsResource(GraphicsResource&& r) noexcept
+        : m_gpuAddress(r.GpuAddress()), m_memory(r.Memory()), m_size(r.Size()) {}
+
+    SharedGraphicsResource& operator=(const GraphicsResource& r) noexcept {
+        m_gpuAddress = r.GpuAddress();
+        m_memory = r.Memory();
+        m_size = r.Size();
+        return *this;
+    }
+    SharedGraphicsResource& operator=(GraphicsResource&& r) noexcept {
+        m_gpuAddress = r.GpuAddress();
+        m_memory = r.Memory();
+        m_size = r.Size();
+        return *this;
+    }
+
+    D3D12_GPU_VIRTUAL_ADDRESS GpuAddress() const noexcept { return m_gpuAddress; }
+    void* Memory() const noexcept { return m_memory; }
+    size_t Size() const noexcept { return m_size; }
+
+private:
+    D3D12_GPU_VIRTUAL_ADDRESS m_gpuAddress;
+    void* m_memory;
+    size_t m_size;
+};
+
 class GraphicsMemory {
 public:
+    enum MemoryTag : uint32_t {
+        TAG_GRAPHICS = 0u,
+        TAG_COMPUTE = 1u,
+    };
+
     explicit GraphicsMemory(ID3D12Device* device) noexcept
         : m_device(device),
           m_uploadBuffer(nullptr),
@@ -39,9 +78,13 @@ public:
         if (m_device) {
             m_device->AddRef();
         }
+        s_instance = this;
     }
 
     ~GraphicsMemory() noexcept {
+        if (s_instance == this) {
+            s_instance = nullptr;
+        }
         if (m_uploadBuffer) {
             if (m_mapped) {
                 m_uploadBuffer->Unmap(0u, nullptr);
@@ -59,27 +102,46 @@ public:
     GraphicsMemory(const GraphicsMemory&) = delete;
     GraphicsMemory& operator=(const GraphicsMemory&) = delete;
 
-    template <typename T>
-    GraphicsResource AllocateConstant(const T& data) {
+    static GraphicsMemory& Get(ID3D12Device* = nullptr) {
+        if (!s_instance) {
+            throw std::logic_error("GraphicsMemory singleton not initialized");
+        }
+        return *s_instance;
+    }
+
+    GraphicsResource Allocate(size_t size, size_t alignment = 16u, uint32_t = TAG_GRAPHICS) {
+        std::lock_guard<std::mutex> lock(m_mutex);
         EnsureRing();
-        const size_t aligned = (sizeof(T) + 255u) & ~size_t(255u);
-        if (aligned > kRingCapacityBytes) {
+        // Desktop D3D12 root CBVs require 256-byte alignment (strictly satisfies <=256 alignment).
+        const size_t effAlign = std::max<size_t>(alignment, 256u);
+        const size_t mask = effAlign - 1u;
+        size_t alignedOffset = (m_offset + mask) & ~mask;
+        const size_t alignedSize = (size + 255u) & ~size_t(255u);
+        if (alignedSize > kRingCapacityBytes) {
             throw std::bad_alloc();
         }
-        if (m_offset + aligned > kRingCapacityBytes) {
-            m_offset = 0u;
+        if (alignedOffset + alignedSize > kRingCapacityBytes) {
+            alignedOffset = 0u;
         }
-        uint8_t* dst = m_mapped + m_offset;
-        std::memcpy(dst, &data, sizeof(T));
-        const D3D12_GPU_VIRTUAL_ADDRESS gpuAddr = m_gpuBase + static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(m_offset);
-        m_offset += aligned;
-        return GraphicsResource(gpuAddr, dst, sizeof(T));
+        uint8_t* dst = m_mapped + alignedOffset;
+        const D3D12_GPU_VIRTUAL_ADDRESS gpuAddr =
+            m_gpuBase + static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(alignedOffset);
+        m_offset = alignedOffset + alignedSize;
+        return GraphicsResource(gpuAddr, dst, size);
+    }
+
+    template <typename T>
+    GraphicsResource AllocateConstant(const T& data) {
+        GraphicsResource res = Allocate(sizeof(T), 256u, TAG_GRAPHICS);
+        std::memcpy(res.Memory(), &data, sizeof(T));
+        return res;
     }
 
     void Commit(ID3D12CommandQueue*) noexcept {}
 
 private:
     static constexpr size_t kRingCapacityBytes = 2u * 1024u * 1024u;
+    inline static GraphicsMemory* s_instance = nullptr;
 
     void EnsureRing() {
         if (m_uploadBuffer) return;
@@ -127,6 +189,7 @@ private:
         m_offset = 0u;
     }
 
+    std::mutex m_mutex;
     ID3D12Device* m_device;
     ID3D12Resource* m_uploadBuffer;
     uint8_t* m_mapped;

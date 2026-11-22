@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Standalone Xbox-ABI Guest Sample — DXRTriangle (Wave 2)
+// OpenScarlett MIT Standalone Xbox-ABI Guest Sample — DXRTriangle (Wave 2)
 //
 // End-to-end ID3D12Device5 BLAS/TLAS/SBT + DispatchRays workload running as a pure
 // standalone Xbox-ABI executable launched via `openscarlett run <package_dir>` from

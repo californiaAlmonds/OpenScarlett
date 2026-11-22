@@ -829,7 +829,7 @@ void TestMinecraftGdkSurface() {
 }
 
 // ===========================================================================
-// Test 8: 6 New Clean-Room Fixed-Return Stub DLLs + 30-DLL Routing
+// Test 8: 6 New Fixed-Return Stub DLLs + 30-DLL Routing
 // ===========================================================================
 void TestSixNewFixedReturnStubDlls(const fs::path& bin_dir) {
     using namespace openscarlett;
@@ -1008,7 +1008,7 @@ void TestSixNewFixedReturnStubDlls(const fs::path& bin_dir) {
         ::FreeLibrary(m);
     }
 
-    std::printf("[PASS] Test 8: 6 new clean-room fixed-return stub DLLs + 30-DLL routing (not_impl=0)\n");
+    std::printf("[PASS] Test 8: 6 new fixed-return stub DLLs + 30-DLL routing (not_impl=0)\n");
 }
 
 // ===========================================================================

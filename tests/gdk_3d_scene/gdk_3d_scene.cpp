@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Standalone 3D Multi-Mesh Xbox-ABI GDK Title (`gdk_3d_scene.exe`).
+// OpenScarlett MIT Standalone 3D Multi-Mesh Xbox-ABI GDK Title (`gdk_3d_scene.exe`).
 //
 // Pure Xbox Series X|S guest binary (NEVER links openscarlett_core):
 //   - d3d12_xs.dll    : D3D12XboxCreateDevice, two-pass shadow map (D32_FLOAT) + Blinn-Phong PBR,
@@ -50,7 +50,7 @@ constexpr uint32_t kMaxDrawObjects = 16u;
 constexpr uint32_t kMaxBones = 8u;
 constexpr uint32_t kAudioSampleRate = 48000u;
 
-// Clean-room HLSL SM 5.0 shaders compiled at runtime via D3DCompile.
+// HLSL SM 5.0 shaders compiled at runtime via D3DCompile.
 // Supports both Pass 1 (directional light depth-only shadow pass) and Pass 2
 // (main lit PBR/Blinn-Phong pass with 3x3 PCF shadow sampling, BC1/BC3 textures,
 // rim/fill lighting, ambient occlusion gradient, and 3-bone linear-blend skinning).

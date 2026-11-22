@@ -153,8 +153,8 @@ $TestDescriptions = @{
     'test_media_video_gameinput.exe'   = 'MFMediaEngine video decode, 64-voice XAudio2 effects, Bink2 streaming & GameInput hot-plug'
     'test_probe_veh_capture.exe'       = 'First-Boot Probe E_NOTIMPL trampolines, Win32 VEH crash dumper & per-draw PNG/JSON capture'
     'test_gdkx_abi.exe'                = 'GDKX COM zero-escape (Device..Device12), IDXGIDevice1 virtual output, 5-arg WaitFrameEventX, 3-arg PresentX & appnotify PLM'
-    'test_gdkx_untouched_samples.exe'  = 'Untouched Microsoft _GAMING_XBOX_SCARLETT SimpleTriangle, SimpleLighting, SimpleTexture & SimpleInstancing APC boot + 4K PNG check'
-    'test_rdna2_gpu_accuracy.exe'      = 'GFX10.3 HW accuracy rules (v_sin/cos turns, s_bfe, fused fp16 FMA, D16/snorm) & 615/779 real-GPU opcode audit'
+    'test_gdkx_untouched_samples.exe'  = '6 untouched Microsoft _GAMING_XBOX_SCARLETT samples (Triangle/Lighting/Texture/Instancing/Bezier/Compute) APC boot + 4K PNG check'
+    'test_rdna2_gpu_accuracy.exe'      = 'GFX10.3 HW accuracy rules (v_sin/cos turns, s_bfe, fused fp16 FMA, D16/snorm) & 764/779 real-GPU opcode audit'
     'test_rdna2_as_task_spirv.exe'     = 'Amplification/Task SPIR-V 1.6 TaskEXT (130/130 spirv-val), Wave64-on-32 LDS & VS/GS/MS CullDistance'
     'test_d3d12_feedback_queries.exe'  = 'Console Sampler Feedback readback/clear, QueryAccumulatorX, predicated byte copies & GPU-QPC clock calibration'
     'test_xvd_loader_lsa.exe'          = '12 KiB XVD header geometry inspector, mixed-case PE forwarders/API-sets & Console LSA/PFN policy state'
@@ -163,6 +163,10 @@ $TestDescriptions = @{
     'test_s12_rayquery_live.exe'       = 'Sprint 12 RDNA2 image_bvh*_intersect_ray -> DXR 1.1 RayQuery / SPV_KHR_ray_query, 64-bit multi-window BVH4 & SBT remapping'
     'test_s12_streaming_vram.exe'      = 'Sprint 12 DirectStorage priority/auto-submit/cancel/BCPack->untile, BC1-BC7 fuzz, HTILE/CMASK/DCC, page aliasing & LRU VRAM eviction'
     'test_s12_os_loader_gameinput.exe' = 'Sprint 12 live PeForwarder/LSA/probe CLI, TLS slot 0, NtCreateFile nested VFS, GameInput user-before-connect & 128-voice XAudio2'
+    'test_s13_live_xbox_shader_e2e.exe' = 'Sprint 13 live Xbox DXBC/PM4/SGPR + RayQuery E2E through DeviceX (VS/PS/CS/Mesh no-RTS0), unified texture sync & title HWND PresentX'
+    'test_s13_vk_xg_tiled.exe'         = 'Sprint 13 Vulkan OPTIONS2/7 & VK_EXT_custom_border_color, placed tiled textures in CommandListX/XG untiler & stencil/HTILE parity'
+    'test_s13_shader_cfg_safety.exe'   = 'Sprint 13 RDNA2 MIMG R128/TFE/LWE refusal, poisoned mutex recovery, CFG canonicalization, V# slot-0/LDS & 764/779 GPU opcodes'
+    'test_s13_gdk_offline_ntdll.exe'   = 'Sprint 13 offline-first XSTS default (OPENSCARLETT_MOCK_XSTS=1 opt-in), XTaskQueue waiter re-arm/drain, dialog/XError & UMS/wldp shims'
 }
 
 Write-Host ''

@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Standalone Xbox-ABI Guest Sample 2:
+// OpenScarlett MIT Standalone Xbox-ABI Guest Sample 2:
 // Mirrors Microsoft Xbox-GDK-Samples/Samples/IntroGraphics/SimpleMeshShader.
 //
 // Deliberately does NOT link openscarlett_core. Runs live on hardware Mesh Shaders

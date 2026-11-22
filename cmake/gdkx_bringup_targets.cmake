@@ -1,6 +1,6 @@
 # OpenScarlett Real Untouched _GAMING_XBOX_SCARLETT (GDKX) Bring-Up & ABI Suite
 # Compiles 100% untouched MIT Microsoft Xbox-GDK-Samples
-# (SimpleTriangle + SimpleLighting + SimpleTexture + SimpleInstancing)
+# (SimpleTriangle + SimpleLighting + SimpleTexture + SimpleInstancing + SimpleBezier + SimpleCompute)
 # under /D_GAMING_XBOX_SCARLETT linking ONLY OpenScarlett's shims, and verifies
 # zero raw-host escape + real rendered PNG pixels via openscarlett.exe APC injection.
 
@@ -15,7 +15,7 @@ if(WIN32)
     target_link_libraries(test_gdkx_abi PRIVATE dxguid)
 endif()
 
-# 2. Untouched Microsoft _GAMING_XBOX_SCARLETT samples (MSVC + dxc.exe)
+# 2. Untouched Microsoft _GAMING_XBOX_SCARLETT samples (MSVC / Clang-CL + dxc.exe)
 if(WIN32 AND MSVC)
     set(_os_dxc_hints "")
     if(DEFINED ENV{WindowsSdkVerBinPath} AND NOT "$ENV{WindowsSdkVerBinPath}" STREQUAL "")
@@ -37,19 +37,46 @@ if(WIN32 AND MSVC)
         set(_os_gdkx_headers "${CMAKE_CURRENT_SOURCE_DIR}/tests/gdkx_bringup/gdkx_headers")
         set(_os_gdkx_manifest "${CMAKE_CURRENT_SOURCE_DIR}/tests/gdkx_bringup/utf8.manifest")
         set(_os_gdkx_cso_root "${CMAKE_BINARY_DIR}/gdkx_shaders")
+        set(_os_gdkx_gen_root "${CMAKE_BINARY_DIR}/gdkx_generated")
 
-        function(openscarlett_compile_hlsl out_var hlsl_path cso_path profile include_dir)
+        # Clean-room MIT SpriteBatch::Draw() blit shader headers generated at build time via dxc.exe
+        set(_sb_vs_inc "${_os_gdkx_gen_root}/SpriteBatchBlitVS.inc.h")
+        set(_sb_ps_inc "${_os_gdkx_gen_root}/SpriteBatchBlitPS.inc.h")
+        add_custom_command(
+            OUTPUT "${_sb_vs_inc}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${_os_gdkx_gen_root}"
+            COMMAND "${OPENSCARLETT_DXC_EXE}" -nologo -T vs_6_0 -E main -Vn g_SpriteBatchBlitVS -Fh "${_sb_vs_inc}" "${_os_gdkx_headers}/SpriteBatchBlitVS.hlsl"
+            DEPENDS "${_os_gdkx_headers}/SpriteBatchBlitVS.hlsl"
+            COMMENT "DXC generating clean-room SpriteBatchBlitVS header"
+            VERBATIM
+        )
+        add_custom_command(
+            OUTPUT "${_sb_ps_inc}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${_os_gdkx_gen_root}"
+            COMMAND "${OPENSCARLETT_DXC_EXE}" -nologo -T ps_6_0 -E main -Vn g_SpriteBatchBlitPS -Fh "${_sb_ps_inc}" "${_os_gdkx_headers}/SpriteBatchBlitPS.hlsl"
+            DEPENDS "${_os_gdkx_headers}/SpriteBatchBlitPS.hlsl"
+            COMMENT "DXC generating clean-room SpriteBatchBlitPS header"
+            VERBATIM
+        )
+        add_custom_target(openscarlett_gdkx_spritebatch_shaders ALL DEPENDS "${_sb_vs_inc}" "${_sb_ps_inc}")
+
+        function(openscarlett_compile_hlsl_entry out_var hlsl_path cso_path profile entry_point include_dir)
             get_filename_component(_cso_dir "${cso_path}" DIRECTORY)
             set(_extra_deps ${ARGN})
             add_custom_command(
                 OUTPUT "${cso_path}"
                 COMMAND ${CMAKE_COMMAND} -E make_directory "${_cso_dir}"
-                COMMAND "${OPENSCARLETT_DXC_EXE}" -nologo -T ${profile} -E main -I "${include_dir}" -Fo "${cso_path}" "${hlsl_path}"
+                COMMAND "${OPENSCARLETT_DXC_EXE}" -nologo -T ${profile} -E ${entry_point} -I "${include_dir}" -Fo "${cso_path}" "${hlsl_path}"
                 DEPENDS "${hlsl_path}" ${_extra_deps}
-                COMMENT "DXC compiling untouched GDKX shader ${hlsl_path} (${profile})"
+                COMMENT "DXC compiling untouched GDKX shader ${hlsl_path} (${profile}, entry ${entry_point})"
                 VERBATIM
             )
             set(${out_var} "${cso_path}" PARENT_SCOPE)
+        endfunction()
+
+        function(openscarlett_compile_hlsl out_var hlsl_path cso_path profile include_dir)
+            openscarlett_compile_hlsl_entry(_out "${hlsl_path}" "${cso_path}" "${profile}" main "${include_dir}" ${ARGN})
+            set(${out_var} "${_out}" PARENT_SCOPE)
         endfunction()
 
         # Helper to build an untouched MIT Microsoft _GAMING_XBOX_SCARLETT sample
@@ -63,16 +90,18 @@ if(WIN32 AND MSVC)
                 ${_sample_abs_srcs}
                 "${_os_gdkx_manifest}"
             )
+            add_dependencies(${target_name} openscarlett_gdkx_spritebatch_shaders)
             # Microsoft's untouched Main.cpp uses C++17 u8"..." literals as LPCSTR
             set_target_properties(${target_name} PROPERTIES
                 CXX_STANDARD 17
                 CXX_STANDARD_REQUIRED ON
                 CXX_EXTENSIONS OFF
             )
-            # Strictly ONLY clean-room GDKX headers + the untouched sample directory
+            # Strictly ONLY GDKX headers + generated SpriteBatch shaders + untouched sample dir
             # (NO OpenScarlett internal include/ headers!)
             target_include_directories(${target_name} PRIVATE
                 "${_os_gdkx_headers}"
+                "${_os_gdkx_gen_root}"
                 "${sample_dir}"
             )
             # NOTE: Do NOT define UNICODE / _UNICODE here! Microsoft's untouched GDKX Main.cpp
@@ -83,6 +112,7 @@ if(WIN32 AND MSVC)
             target_compile_definitions(${target_name} PRIVATE
                 _GAMING_XBOX_SCARLETT=1
                 _GAMING_XBOX=1
+                OPENSCARLETT_SPRITEBATCH_BLIT=1
             )
             # Link ONLY OpenScarlett's GDKX shim libs + standard Win32 OS libs
             # (kernelx precedes xgameruntime so appnotify.h resolves to kernelx.dll, matching GDKX)
@@ -102,7 +132,7 @@ if(WIN32 AND MSVC)
                 )
             else()
                 set_source_files_properties(${_sample_abs_srcs} PROPERTIES
-                    COMPILE_OPTIONS "/W3;/wd4061;/wd4062;/wd4100;/wd4191;/wd4244;/wd4263;/wd4264;/wd4265;/wd4266;/wd4365;/wd4746;/wd4826;/wd4986;/wd4987;/wd5029;/wd5038;/wd5042"
+                    COMPILE_OPTIONS "/W3;/wd4061;/wd4062;/wd4100;/wd4189;/wd4191;/wd4244;/wd4263;/wd4264;/wd4265;/wd4266;/wd4365;/wd4746;/wd4826;/wd4986;/wd4987;/wd5029;/wd5038;/wd5042"
                 )
             endif()
         endfunction()
@@ -149,6 +179,34 @@ if(WIN32 AND MSVC)
         add_custom_target(SimpleInstancing_GDKX_shaders ALL DEPENDS "${_inst_vs_cso}" "${_inst_ps_cso}")
         add_dependencies(SimpleInstancing_GDKX SimpleInstancing_GDKX_shaders)
 
+        # --- Sample 5: Untouched MIT SimpleBezier (Hardware HS/DS Tessellation, 6 PSOs) ---
+        set(_bez_dir "${CMAKE_CURRENT_SOURCE_DIR}/tests/gdkx_bringup/samples/SimpleBezier")
+        set(_bez_assets "${_bez_dir}/Assets")
+        openscarlett_add_untouched_gdkx_sample(SimpleBezier_GDKX "${_bez_dir}"
+            "pch.cpp;DeviceResources.cpp;SimpleBezier.cpp;Main.cpp"
+        )
+        openscarlett_compile_hlsl(_bez_vs_cso "${_bez_assets}/BezierVS.hlsl" "${_os_gdkx_cso_root}/SimpleBezier/BezierVS.cso" vs_6_0 "${_bez_assets}" "${_bez_assets}/SimpleBezier.hlsli")
+        openscarlett_compile_hlsl_entry(_bez_hs_int_cso "${_bez_assets}/BezierHS_int.hlsl" "${_os_gdkx_cso_root}/SimpleBezier/BezierHS_int.cso" hs_6_0 BezierHS "${_bez_assets}" "${_bez_assets}/SimpleBezier.hlsli")
+        openscarlett_compile_hlsl_entry(_bez_hs_even_cso "${_bez_assets}/BezierHS_fracEven.hlsl" "${_os_gdkx_cso_root}/SimpleBezier/BezierHS_fracEven.cso" hs_6_0 BezierHS "${_bez_assets}" "${_bez_assets}/SimpleBezier.hlsli")
+        openscarlett_compile_hlsl_entry(_bez_hs_odd_cso "${_bez_assets}/BezierHS_fracOdd.hlsl" "${_os_gdkx_cso_root}/SimpleBezier/BezierHS_fracOdd.cso" hs_6_0 BezierHS "${_bez_assets}" "${_bez_assets}/SimpleBezier.hlsli")
+        openscarlett_compile_hlsl(_bez_ds_cso "${_bez_assets}/BezierDS.hlsl" "${_os_gdkx_cso_root}/SimpleBezier/BezierDS.cso" ds_6_0 "${_bez_assets}" "${_bez_assets}/SimpleBezier.hlsli")
+        openscarlett_compile_hlsl(_bez_ps_cso "${_bez_assets}/BezierPS.hlsl" "${_os_gdkx_cso_root}/SimpleBezier/BezierPS.cso" ps_6_0 "${_bez_assets}" "${_bez_assets}/SimpleBezier.hlsli")
+        openscarlett_compile_hlsl(_bez_solid_cso "${_bez_assets}/SolidColorPS.hlsl" "${_os_gdkx_cso_root}/SimpleBezier/SolidColorPS.cso" ps_6_0 "${_bez_assets}" "${_bez_assets}/SimpleBezier.hlsli")
+        add_custom_target(SimpleBezier_GDKX_shaders ALL DEPENDS
+            "${_bez_vs_cso}" "${_bez_hs_int_cso}" "${_bez_hs_even_cso}" "${_bez_hs_odd_cso}"
+            "${_bez_ds_cso}" "${_bez_ps_cso}" "${_bez_solid_cso}"
+        )
+        add_dependencies(SimpleBezier_GDKX SimpleBezier_GDKX_shaders)
+
+        # --- Sample 6: Untouched MIT SimpleCompute (CS 6.0 Mandelbrot + Async Compute Queue + UAV/SRV) ---
+        set(_cmp_dir "${CMAKE_CURRENT_SOURCE_DIR}/tests/gdkx_bringup/samples/SimpleCompute")
+        openscarlett_add_untouched_gdkx_sample(SimpleCompute_GDKX "${_cmp_dir}"
+            "pch.cpp;DeviceResources.cpp;SimpleCompute.cpp;Main.cpp"
+        )
+        openscarlett_compile_hlsl(_cmp_cs_cso "${_cmp_dir}/fractal.hlsl" "${_os_gdkx_cso_root}/SimpleCompute/Fractal.cso" cs_6_0 "${_cmp_dir}")
+        add_custom_target(SimpleCompute_GDKX_shaders ALL DEPENDS "${_cmp_cs_cso}")
+        add_dependencies(SimpleCompute_GDKX SimpleCompute_GDKX_shaders)
+
         # --- End-to-End CTest Harness (Isolated Zero-DLL APC Run + Telemetry + PNG Pixel Check) ---
         openscarlett_add_test(test_gdkx_untouched_samples tests/test_gdkx_untouched_samples.cpp)
         target_link_libraries(test_gdkx_untouched_samples PRIVATE ole32 windowscodecs)
@@ -167,9 +225,13 @@ if(WIN32 AND MSVC)
             SimpleTexture_GDKX_shaders
             SimpleInstancing_GDKX
             SimpleInstancing_GDKX_shaders
+            SimpleBezier_GDKX
+            SimpleBezier_GDKX_shaders
+            SimpleCompute_GDKX
+            SimpleCompute_GDKX_shaders
         )
         set_tests_properties(test_gdkx_untouched_samples PROPERTIES
-            TIMEOUT 480
+            TIMEOUT 600
         )
     else()
         message(STATUS "OpenScarlett GDKX bring-up: dxc.exe not found; skipping untouched HLSL sample builds")

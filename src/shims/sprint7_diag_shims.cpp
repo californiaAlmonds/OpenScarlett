@@ -1,4 +1,4 @@
-// Clean-room MIT Sprint 7 Fixed-Return Diagnostic & Media Compatibility Shims for OpenScarlett.
+// MIT Sprint 7 Fixed-Return Diagnostic & Media Compatibility Shims for OpenScarlett.
 // Compiled into 6 standalone DLL targets via preprocessor target macros:
 //   1. OPENSCARLETT_S7_TARGET_MFLNMHELP        -> mflnmhelp.dll
 //   2. OPENSCARLETT_S7_TARGET_MFHEVCDEC        -> mfhevcdec.dll

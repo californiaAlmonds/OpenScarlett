@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <stdexcept>
 
-// Clean-room MIT DirectXTK12 DescriptorHeap subset for untouched Xbox-GDK-Samples.
+// MIT DirectXTK12 DescriptorHeap subset for untouched Xbox-GDK-Samples.
 // Creates a real D3D12 descriptor heap so SetDescriptorHeaps routes through DescriptorHeapX.
 
 namespace DirectX {

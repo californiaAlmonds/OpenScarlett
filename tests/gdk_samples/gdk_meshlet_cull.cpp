@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Wave 2 Standalone Xbox-ABI Guest Sample:
+// OpenScarlett MIT Wave 2 Standalone Xbox-ABI Guest Sample:
 // MeshletCull — Amplification Shader (as_6_5) + Mesh Shader (ms_6_5) + Pixel Shader (ps_6_5)
 // GPU 6-plane frustum & normal-cone culling pipeline via ID3D12GraphicsCommandListX::DispatchMesh,
 // with graceful Compute (cs_6_2) + Graphics (vs_6_2/ps_6_2) fallback for WARP / non-MeshTier GPUs.

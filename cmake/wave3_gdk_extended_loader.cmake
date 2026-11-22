@@ -1,11 +1,11 @@
-# OpenScarlett Clean-Room MIT Wave 3 — Extended GDK (XDisplay/UI/Invite/Accessibility/Speech),
+# OpenScarlett MIT Wave 3 — Extended GDK (XDisplay/UI/Invite/Accessibility/Speech),
 # X3DAudio/XAudio2FX, and Topological DLL Dependency Initialization Ordering.
 # Owned by wave1/gdk-display-audio-loader worktree.
 
 set(_os_dep_gen_dir "${CMAKE_CURRENT_BINARY_DIR}/wave3_dep_dlls")
 file(MAKE_DIRECTORY "${_os_dep_gen_dir}")
 
-# Generate 3 tiny clean-room helper DLLs (strictly inside build dir on E:\)
+# Generate 3 tiny helper DLLs (strictly inside build dir on E:\)
 # that append their DLL name to %OPENSCARLETT_DEP_INIT_LOG% inside DllMain(DLL_PROCESS_ATTACH).
 file(WRITE "${_os_dep_gen_dir}/test_dep_base.cpp" [=[
 #define WIN32_LEAN_AND_MEAN

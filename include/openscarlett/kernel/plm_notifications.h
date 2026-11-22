@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room thread-safe Xbox Game Core (appnotify.h) Process Lifecycle Management (PLM)
+// Thread-safe Xbox Game Core (appnotify.h) Process Lifecycle Management (PLM)
 // notification registry. Used by kernelx.dll and xgameruntime.dll to export
 // RegisterAppStateChangeNotification / UnregisterAppStateChangeNotification /
 // RegisterAppConstrainedChangeNotification / UnregisterAppConstrainedChangeNotification.

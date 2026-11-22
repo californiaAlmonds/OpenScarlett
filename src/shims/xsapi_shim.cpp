@@ -23,6 +23,16 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#endif
+
 namespace fs = std::filesystem;
 
 // ---------------------------------------------------------------------------
@@ -156,20 +166,59 @@ inline void RecordOk(const char* sym) {
         kModName, sym, openscarlett::CallOutcome::Ok, 0, -1);
 }
 
+// Canonical GDK / Xbox Live offline auth / no-token HRESULT codes.
+constexpr XGameResult kHrGameUserSignedOut = static_cast<XGameResult>(0x89245101u);
+constexpr XGameResult kHrGameUserResolveUserIssueRequired = static_cast<XGameResult>(0x89245102u);
+constexpr XGameResult kHrGameUserDeferralNotAvailable = static_cast<XGameResult>(0x89245103u);
+constexpr XGameResult kHrGameUserNoTokenRequired = static_cast<XGameResult>(0x89245105u);
+constexpr XGameResult kHrXblAuthNoToken = static_cast<XGameResult>(0x89235200u);
+
 std::string GetEnvString(const char* name) {
-#if defined(_MSC_VER)
-    char* buf = nullptr;
-    size_t len = 0;
-    if (_dupenv_s(&buf, &len, name) != 0 || !buf) {
+#if defined(_WIN32)
+    if (!name || !*name) {
         return {};
     }
-    std::string out(buf);
-    std::free(buf);
+    const DWORD needed = GetEnvironmentVariableA(name, nullptr, 0);
+    if (needed == 0) {
+        return {};
+    }
+    std::string out(static_cast<size_t>(needed), '\0');
+    const DWORD written = GetEnvironmentVariableA(name, out.data(), needed);
+    if (written == 0 || written >= needed) {
+        return {};
+    }
+    out.resize(static_cast<size_t>(written));
     return out;
 #else
     const char* v = std::getenv(name);
     return v ? std::string(v) : std::string{};
 #endif
+}
+
+bool IsMockXstsEnabled() {
+    std::string v = GetEnvString("OPENSCARLETT_MOCK_XSTS");
+    if (v.empty()) {
+        return false;
+    }
+    std::transform(v.begin(), v.end(), v.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return v == "1" || v == "true" || v == "yes" || v == "on";
+}
+
+bool IsXboxLiveAuthEndpointUrl(const std::string& url) {
+    if (url.empty()) {
+        return false;
+    }
+    std::string lo = url;
+    std::transform(lo.begin(), lo.end(), lo.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return lo.find("xsts.auth.xboxlive.com") != std::string::npos ||
+           lo.find("user.auth.xboxlive.com") != std::string::npos ||
+           lo.find("device.auth.xboxlive.com") != std::string::npos ||
+           lo.find("title.auth.xboxlive.com") != std::string::npos ||
+           lo.find("sisu.xboxlive.com") != std::string::npos ||
+           lo.find("/xsts/authorize") != std::string::npos ||
+           lo.find("/user/authenticate") != std::string::npos;
 }
 
 // ---------------------------------------------------------------------------
@@ -2388,7 +2437,12 @@ XblErrorCondition OPENSCARLETT_XSAPI_CALL XblGetErrorCondition(XGameResult hr) {
     if (hr == XGR_E_INVALIDARG || hr == XGR_E_NOT_SUFFICIENT_BUFFER) {
         return XblErrorCondition_GenericOutOfRange;
     }
-    if (hr == XGR_E_ACCESSDENIED) {
+    if (hr == XGR_E_ACCESSDENIED ||
+        hr == kHrGameUserSignedOut ||
+        hr == kHrGameUserResolveUserIssueRequired ||
+        hr == kHrGameUserDeferralNotAvailable ||
+        hr == kHrGameUserNoTokenRequired ||
+        hr == kHrXblAuthNoToken) {
         return XblErrorCondition_Auth;
     }
     return XblErrorCondition_GenericError;
@@ -2928,7 +2982,7 @@ XGameResult OPENSCARLETT_XSAPI_CALL XblProfileGetUserProfilesForSocialGroupResul
 }
 
 // ===========================================================================
-// Title Storage (Clean-Room Local + Persistent Blob Store)
+// Title Storage (Local + Persistent Blob Store)
 // ===========================================================================
 XGameResult OPENSCARLETT_XSAPI_CALL XblTitleStorageGetQuotaAsync(
     XblContextHandle xboxLiveContext,
@@ -4450,16 +4504,106 @@ XGameResult OPENSCARLETT_XSAPI_CALL XblHttpCallPerformAsync(
         std::string method_copy;
         std::string url_copy;
         std::string body_str;
+        std::string auth_token;
+        std::string auth_sig;
         uint64_t xuid_copy = 0;
+        {
+            XsapiState& s = GetState();
+            std::lock_guard<std::mutex> lk(s.mutex);
+            if (!s.initialized) return XBL_E_NOT_INITIALIZED;
+            method_copy = obj->method;
+            url_copy = obj->url;
+            xuid_copy = obj->xuid;
+            for (const auto& [tok, cb] : s.call_routed_handlers) {
+                (void)tok;
+                routed_handlers.push_back(cb);
+            }
+        }
+
+        const bool is_auth_endpoint = IsXboxLiveAuthEndpointUrl(url_copy);
+        if (is_auth_endpoint && !IsMockXstsEnabled()) {
+            // Offline-first policy: fail Xbox Live auth/XSTS token endpoints immediately with
+            // canonical E_GAMEUSER_NO_TOKEN_REQUIRED so real titles take their offline codepath
+            // without stalling or hanging on live authentication handshakes.
+            {
+                XsapiState& s = GetState();
+                std::lock_guard<std::mutex> lk(s.mutex);
+                obj->status_code = 0u;
+                obj->network_error_code = kHrGameUserNoTokenRequired;
+                obj->platform_network_error_code = static_cast<uint32_t>(kHrGameUserNoTokenRequired);
+                obj->platform_network_error_message =
+                    "Offline mode: XSTS auth token disabled (set OPENSCARLETT_MOCK_XSTS=1 to opt in)";
+                obj->response_headers.clear();
+                obj->response_body.clear();
+                obj->response_string.clear();
+            }
+            if (!routed_handlers.empty()) {
+                const int64_t now = NowUnixSeconds();
+                XblServiceCallRoutedArgs args{};
+                args.xboxUserId = xuid_copy;
+                args.httpMethod = method_copy.c_str();
+                args.uri = url_copy.c_str();
+                args.requestHeaders = "";
+                args.requestBody = "";
+                args.responseCount = 0u;
+                args.responseHeaders = "";
+                args.responseBody = "";
+                args.etag = "";
+                args.token = "";
+                args.signature = "";
+                args.httpStatus = 0u;
+                args.fullResponseFormatted = "";
+                args.requestTime = now;
+                args.responseTime = now;
+                args.elapsedCallTime = 0;
+                for (const auto& [fn, user_ctx] : routed_handlers) {
+                    if (fn) fn(args, user_ctx);
+                }
+            }
+            return kHrGameUserNoTokenRequired;
+        }
+
+        if (is_auth_endpoint) {
+            // Opt-in OPENSCARLETT_MOCK_XSTS=1: request synthetic XBL3.0 token from xgameruntime.
+            XUserHandle u = nullptr;
+            if (XUserFindUserById(xuid_copy, &u) == XGR_S_OK && u != nullptr) {
+                XAsyncBlock tab{};
+                if (XUserGetTokenAndSignatureAsync(
+                        u, XUserGetTokenAndSignatureOptions_None,
+                        method_copy.c_str(), url_copy.c_str(),
+                        0, nullptr, 0, nullptr, &tab) == XGR_S_OK) {
+                    size_t tsz = 0;
+                    if (XUserGetTokenAndSignatureResultSize(&tab, &tsz) == XGR_S_OK &&
+                        tsz >= sizeof(XUserGetTokenAndSignatureData)) {
+                        std::vector<uint8_t> tbuf(tsz, 0);
+                        XUserGetTokenAndSignatureData* tdata = nullptr;
+                        size_t tused = 0;
+                        if (XUserGetTokenAndSignatureResult(
+                                &tab, tbuf.size(), tbuf.data(), &tdata, &tused) == XGR_S_OK &&
+                            tdata != nullptr) {
+                            if (tdata->token) auth_token = tdata->token;
+                            if (tdata->signature) auth_sig = tdata->signature;
+                        }
+                    }
+                }
+                XUserCloseHandle(u);
+            }
+        }
+
         {
             XsapiState& s = GetState();
             std::lock_guard<std::mutex> lk(s.mutex);
             if (!s.initialized) return XBL_E_NOT_INITIALIZED;
 
             std::ostringstream oss;
-            oss << "{\"service\":\"openscarlett-xsapi-http\",\"status\":200,\"method\":"
-                << JsonEscape(obj->method) << ",\"url\":" << JsonEscape(obj->url)
-                << ",\"requestBytes\":" << obj->request_body.size() << "}";
+            if (is_auth_endpoint) {
+                oss << "{\"service\":\"openscarlett-xsapi-http\",\"status\":200,\"Token\":"
+                    << JsonEscape(auth_token) << ",\"DisplayClaims\":{\"xui\":[{\"uhs\":\"0000000000000001\"}]}}";
+            } else {
+                oss << "{\"service\":\"openscarlett-xsapi-http\",\"status\":200,\"method\":"
+                    << JsonEscape(obj->method) << ",\"url\":" << JsonEscape(obj->url)
+                    << ",\"requestBytes\":" << obj->request_body.size() << "}";
+            }
             body_str = oss.str();
 
             obj->status_code = 200u;
@@ -4473,14 +4617,6 @@ XGameResult OPENSCARLETT_XSAPI_CALL XblHttpCallPerformAsync(
                 {"Server", "OpenScarlett-XSAPI/1.0"},
                 {"Content-Length", std::to_string(body_str.size())},
             };
-
-            method_copy = obj->method;
-            url_copy = obj->url;
-            xuid_copy = obj->xuid;
-            for (const auto& [tok, cb] : s.call_routed_handlers) {
-                (void)tok;
-                routed_handlers.push_back(cb);
-            }
         }
 
         if (!routed_handlers.empty()) {
@@ -4495,8 +4631,8 @@ XGameResult OPENSCARLETT_XSAPI_CALL XblHttpCallPerformAsync(
             args.responseHeaders = "Content-Type: application/json\r\n";
             args.responseBody = body_str.c_str();
             args.etag = "";
-            args.token = "";
-            args.signature = "";
+            args.token = auth_token.c_str();
+            args.signature = auth_sig.c_str();
             args.httpStatus = 200u;
             args.fullResponseFormatted = body_str.c_str();
             args.requestTime = now;

@@ -1362,7 +1362,7 @@ std::vector<BundledDemoEntry> DiscoverBundledDemos(const std::filesystem::path& 
             "scarlett_arena",
             "ScarlettArena.exe",
             "ScarlettArena (MIT 3D Raycaster)",
-            "Clean-room MIT 3D raycaster running natively through OpenScarlett shims",
+            "MIT 3D raycaster running natively through OpenScarlett shims",
             "ScarlettArena_MicrosoftGame.Config",
         },
         {

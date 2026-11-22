@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Microsoft libHttpClient (<httpClient/httpClient.h>) public C ABI header
+// MIT Microsoft libHttpClient (<httpClient/httpClient.h>) public C ABI header
 // backed by libHttpClient.GDK.dll.
 
 #include "../XAsync.h"

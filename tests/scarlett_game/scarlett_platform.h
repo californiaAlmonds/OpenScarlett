@@ -1,6 +1,6 @@
 #pragma once
 
-// OpenScarlett Clean-Room MIT Playable Xbox Series X|S (Scarlett) Game Platform Host.
+// OpenScarlett MIT Playable Xbox Series X|S (Scarlett) Game Platform Host.
 // Pure standalone Scarlett ABI integration:
 //   - d3d12_xs.dll    : D3D12CreateDeviceX + GPU upload/SRV/RTV textured fullscreen quad + PresentX
 //   - kernelx.dll     : XMemAlloc / XMemFree unified staging framebuffer + GetConsoleType + TitleMemoryStatus

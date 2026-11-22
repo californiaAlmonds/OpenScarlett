@@ -1,5 +1,5 @@
 // OpenScarlett Launcher — Modern Dark Native Win32 + Direct2D + DirectWrite GUI
-// Clean-room MIT C++20 implementation. Zero third-party GUI or network libraries.
+// MIT C++20 implementation. Zero third-party GUI or network libraries.
 
 #ifndef WIN32_LEAN_AND_MEAN
 #  define WIN32_LEAN_AND_MEAN
@@ -1551,7 +1551,7 @@ private:
         // 3. Active Tab Surface Cards & Custom Telemetry Widgets
         if (active_tab_ == kTabPlay) {
             DrawCardD2D(play_card1_, L"Target & Runtime Configuration");
-            DrawCardD2D(play_card2_, L"1-Click Quick-Launch Bundled Clean-Room Demos");
+            DrawCardD2D(play_card2_, L"1-Click Quick-Launch Bundled Demos");
             DrawPlayTelemetryStripD2D();
             DrawCardD2D(play_card3_, L"Live Execution Output");
         } else if (active_tab_ == kTabHwTest) {

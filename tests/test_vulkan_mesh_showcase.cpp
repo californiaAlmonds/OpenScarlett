@@ -1,5 +1,5 @@
 // OpenScarlett Wave 4 — Portable End-to-End Live Test Harness for VulkanMeshShowcase:
-//   - Constructs clean-room RDNA2 XS2\0 shaders (AS + MS + PS with 3D LUT IMAGE_LOAD_MIP +
+//   - Constructs RDNA2 XS2\0 shaders (AS + MS + PS with 3D LUT IMAGE_LOAD_MIP +
 //     Fallback VS) and a 32x32x32 warm-to-cool cinematic 3D LUT volume texture.
 //   - Stages a zero-DLL Xbox package directory under %TEMP%\openscarlett_wave4_vulkan_mesh_showcase\
 //     with MicrosoftGame.Config (TitleId = 0x5CA01005), standalone gdk_vulkan_mesh_showcase.exe,
@@ -80,7 +80,7 @@ constexpr const char* kMicrosoftGameConfigXml =
     "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
     "<Game configVersion=\"1\">\n"
     "  <Identity Name=\"OpenScarlett.Wave4.VulkanMeshShowcase\"\n"
-    "            Publisher=\"CN=OpenScarlett Clean-Room MIT\"\n"
+    "            Publisher=\"CN=OpenScarlett\"\n"
     "            Version=\"1.0.0.0\" />\n"
     "  <TitleId>0x5CA01005</TitleId>\n"
     "  <ShellVisuals DefaultDisplayName=\"OpenScarlett VulkanMeshShowcase (XS2 AS+MS+PS + 3D LUT)\" />\n"
@@ -163,7 +163,7 @@ std::array<uint8_t, 4> Lookup3DLutNearest(
 }
 
 // ---------------------------------------------------------------------------
-// Clean-Room RDNA2 XS2\0 Shader Builders (AS, MS, PS+3D-LUT, Fallback VS)
+// RDNA2 XS2\0 Shader Builders (AS, MS, PS+3D-LUT, Fallback VS)
 // ---------------------------------------------------------------------------
 std::vector<uint8_t> BuildShowcaseAsXs2() {
     using namespace openscarlett;
@@ -996,7 +996,7 @@ int main() {
     ::SetEnvironmentVariableW(L"OPENSCARLETT_SHADER_CACHE", cache_dir.c_str());
 
     // -----------------------------------------------------------------------
-    // 0. Build Clean-Room RDNA2 XS2\0 Shaders & 32x32x32 3D Color-Grading LUT
+    // 0. Build RDNA2 XS2\0 Shaders & 32x32x32 3D Color-Grading LUT
     // -----------------------------------------------------------------------
     const auto as_xs2 = BuildShowcaseAsXs2();
     const auto ms_xs2 = BuildShowcaseMsXs2();

@@ -36,7 +36,7 @@ flowchart LR
 
 Source: [`include/openscarlett/io/dstorage_abi.h`](https://github.com/californiaAlmonds/OpenScarlett/blob/main/include/openscarlett/io/dstorage_abi.h), `src/shims/dstorage_shim.cpp`, `src/shims/xcrdapi_shim.cpp`
 
-OpenScarlett's clean-room DirectStorage implementation passes the untouched Microsoft MIT **`SimpleDirectStorageCombo`** sample (`SimpleLoad`, `StatusBatch`, `CompletionEvent`, `MultipleQueues` — byte-identical hash `0x6824D2954256492C` across 769 live calls) and adds full Sprint 12 AAA streaming capabilities:
+OpenScarlett's DirectStorage implementation passes the untouched Microsoft MIT **`SimpleDirectStorageCombo`** sample (`SimpleLoad`, `StatusBatch`, `CompletionEvent`, `MultipleQueues` — byte-identical hash `0x6824D2954256492C` across 769 live calls) and adds full Sprint 12 AAA streaming capabilities:
 
 - **Strict Priority Scheduling:** Dispatches queues in strict priority order (`REALTIME` > `HIGH` > `NORMAL` > `LOW`) with telemetry counters (`OpenScarlettDStorageGetPriorityStats`).
 - **Request Cancellation & Physical-Page Targets:** Supports in-flight cancellation tags and direct decompression into physical-page-aliased memory targets.
@@ -51,8 +51,8 @@ Source: `src/io/gdeflate.cpp`, `src/io/bcpack.cpp`
 
 | Codec | Format & Capabilities | Verification |
 | :--- | :--- | :--- |
-| **GDeflate v1** | Clean-room tile-parallel RFC 1951/Deflate stream decompression matching Xbox/DirectStorage GDeflate v1 tile headers | `test_codecs`, `test_xg_dstorage`, `test_external_gdk_bringup` |
-| **BCPack (BC1–BC7)** | Clean-room block-compressed texture decompression for **BC1, BC2, BC3, BC4, BC5, BC6H, and BC7**, plus Sprint 12 **texture-array (`BCPA` magic, up to 2,048 slices) & multi-mip** streaming validation | `test_bcpack_bvh4`, `test_s12_streaming_vram` |
+| **GDeflate v1** | Tile-parallel RFC 1951/Deflate stream decompression matching Xbox/DirectStorage GDeflate v1 tile headers | `test_codecs`, `test_xg_dstorage`, `test_external_gdk_bringup` |
+| **BCPack (BC1–BC7)** | Block-compressed texture decompression for **BC1, BC2, BC3, BC4, BC5, BC6H, and BC7**, plus Sprint 12 **texture-array (`BCPA` magic, up to 2,048 slices) & multi-mip** streaming validation | `test_bcpack_bvh4`, `test_s12_streaming_vram` |
 
 ---
 

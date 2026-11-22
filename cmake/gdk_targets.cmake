@@ -1,4 +1,4 @@
-# OpenScarlett Clean-Room MIT Core GDK Runtime Shims
+# OpenScarlett MIT Core GDK Runtime Shims
 # Owned by sprint1-gdk worktree.
 
 # 1. xgameruntime.dll

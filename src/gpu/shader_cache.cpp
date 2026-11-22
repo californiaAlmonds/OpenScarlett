@@ -3,10 +3,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <sstream>
 
 #include "openscarlett/core/telemetry.h"
@@ -121,6 +124,108 @@ bool EndsWith50(const std::string& target) noexcept {
     return target.size() >= 4 && target.compare(target.size() - 4, 4, "_5_0") == 0;
 }
 
+// ---------------------------------------------------------------------------
+// Poison-Aware Shader-Translator Mutex with RAII Unwind Tracking & Recovery
+// ---------------------------------------------------------------------------
+// If a shader translation attempt throws an exception or unwinds without
+// committing under the translator mutex, the mutex is unlocked cleanly (never
+// deadlocking) while recording poison state + reason. The next caller detects
+// the poison bit, logs telemetry & diagnostics, clears the poison state, and
+// proceeds cleanly.
+class PoisonAwareTranslatorMutex {
+public:
+    static PoisonAwareTranslatorMutex& Global() {
+        static PoisonAwareTranslatorMutex g_instance;
+        return g_instance;
+    }
+
+    class RecoverableLock {
+    public:
+        explicit RecoverableLock(
+            PoisonAwareTranslatorMutex& owner,
+            bool* out_recovered = nullptr,
+            std::string* out_recovery_diag = nullptr)
+            : owner_(owner), lock_(owner.mu_) {
+            if (owner_.poisoned_.load(std::memory_order_acquire)) {
+                owner_.poisoned_.store(false, std::memory_order_release);
+                const uint64_t rec_n =
+                    owner_.recovery_count_.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+                recovered_ = true;
+                if (out_recovered) {
+                    *out_recovered = true;
+                }
+                if (out_recovery_diag) {
+                    std::string diag =
+                        "Recovered shader-translator mutex from poisoned state (recovery #" +
+                        std::to_string(rec_n) + ")";
+                    if (!owner_.last_poison_reason_.empty()) {
+                        diag += "; prior fault: " + owner_.last_poison_reason_;
+                    }
+                    *out_recovery_diag = std::move(diag);
+                }
+                owner_.last_poison_reason_.clear();
+                CallTelemetry::Global().Record(
+                    kCacheTelemetryModule, "TranslatorMutexRecoveredFromPoison", CallOutcome::Ok,
+                    static_cast<int32_t>(rec_n));
+            } else if (out_recovered) {
+                *out_recovered = false;
+            }
+        }
+
+        RecoverableLock(const RecoverableLock&) = delete;
+        RecoverableLock& operator=(const RecoverableLock&) = delete;
+
+        void Commit() noexcept { committed_ = true; }
+        void MarkPoisonReason(std::string reason) { poison_reason_ = std::move(reason); }
+        bool RecoveredFromPoison() const noexcept { return recovered_; }
+
+        ~RecoverableLock() {
+            if (!committed_) {
+                owner_.poisoned_.store(true, std::memory_order_release);
+                const uint64_t pn =
+                    owner_.poison_count_.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+                owner_.last_poison_reason_ =
+                    poison_reason_.empty()
+                        ? "uncommitted unwind / exception during shader translation"
+                        : poison_reason_;
+                CallTelemetry::Global().Record(
+                    kCacheTelemetryModule, "TranslatorMutexPoisoned", CallOutcome::Error,
+                    static_cast<int32_t>(pn));
+            }
+        }
+
+    private:
+        PoisonAwareTranslatorMutex& owner_;
+        std::unique_lock<std::mutex> lock_;
+        bool committed_ = false;
+        bool recovered_ = false;
+        std::string poison_reason_;
+    };
+
+    bool IsPoisoned() const noexcept {
+        return poisoned_.load(std::memory_order_acquire);
+    }
+
+    uint64_t RecoveryCount() const noexcept {
+        return recovery_count_.load(std::memory_order_acquire);
+    }
+
+    void ResetForTest() noexcept {
+        std::lock_guard<std::mutex> g(mu_);
+        poisoned_.store(false, std::memory_order_release);
+        poison_count_.store(0u, std::memory_order_release);
+        recovery_count_.store(0u, std::memory_order_release);
+        last_poison_reason_.clear();
+    }
+
+private:
+    std::mutex mu_;
+    std::atomic<bool> poisoned_{false};
+    std::atomic<uint64_t> poison_count_{0u};
+    std::atomic<uint64_t> recovery_count_{0u};
+    std::string last_poison_reason_;
+};
+
 #if defined(_WIN32)
 // ---------------------------------------------------------------------------
 // Self-contained minimal COM definitions for dxcompiler.dll (zero <dxcapi.h> dependency,
@@ -209,11 +314,30 @@ public:
     }
 
     PfnDxcCreateInstance Resolve(const std::string& hint_dxc_path) {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::unique_lock<std::mutex> lock(mu_);
+        if (poisoned_) {
+            poisoned_ = false;
+            attempted_default_ = false;
+            CallTelemetry::Global().Record(
+                kCacheTelemetryModule, "DxcLoaderMutexRecoveredFromPoison", CallOutcome::Ok, 1);
+        }
+        bool committed = false;
+        struct UnwindPoisonGuard {
+            bool& poisoned_ref;
+            bool& committed_ref;
+            ~UnwindPoisonGuard() {
+                if (!committed_ref) {
+                    poisoned_ref = true;
+                }
+            }
+        } poison_guard{poisoned_, committed};
+
         if (create_instance_ != nullptr) {
+            committed = true;
             return create_instance_;
         }
         if (attempted_default_ && hint_dxc_path.empty()) {
+            committed = true;
             return nullptr;
         }
         if (hint_dxc_path.empty()) {
@@ -277,6 +401,7 @@ public:
             if (fn != nullptr) {
                 module_ = mod;
                 create_instance_ = fn;
+                committed = true;
                 return create_instance_;
             }
             FreeLibrary(mod);
@@ -288,11 +413,13 @@ public:
             if (fn != nullptr) {
                 module_ = mod;
                 create_instance_ = fn;
+                committed = true;
                 return create_instance_;
             }
             FreeLibrary(mod);
         }
 
+        committed = true;
         return nullptr;
     }
 
@@ -301,6 +428,7 @@ private:
     HMODULE module_ = nullptr;
     PfnDxcCreateInstance create_instance_ = nullptr;
     bool attempted_default_ = false;
+    bool poisoned_ = false;
 };
 
 Status CompileHlslWithFxc50(
@@ -904,6 +1032,63 @@ Status ShaderCache::CompileStandInShader(
     return Status::Ok();
 }
 
+Status ExecuteGuardedShaderTranslation(
+    const std::function<Status()>& work,
+    std::string* out_diagnostics,
+    bool* out_recovered_from_poison) {
+    if (!work) {
+        if (out_recovered_from_poison) *out_recovered_from_poison = false;
+        return Status::Error(StatusCode::InvalidArgument, "Null shader translation callback");
+    }
+
+    bool recovered = false;
+    std::string recovery_diag;
+    PoisonAwareTranslatorMutex::RecoverableLock guard(
+        PoisonAwareTranslatorMutex::Global(), &recovered, &recovery_diag);
+    if (out_recovered_from_poison) {
+        *out_recovered_from_poison = recovered;
+    }
+
+    try {
+        Status st = work();
+        guard.Commit();
+        if (out_diagnostics && !recovery_diag.empty()) {
+            if (out_diagnostics->empty()) {
+                *out_diagnostics = recovery_diag;
+            } else {
+                *out_diagnostics = recovery_diag + " | " + *out_diagnostics;
+            }
+        }
+        return st;
+    } catch (const std::exception& ex) {
+        const std::string reason = std::string("Shader translation threw std::exception: ") + ex.what();
+        guard.MarkPoisonReason(reason);
+        if (out_diagnostics) {
+            *out_diagnostics = recovery_diag.empty() ? reason : (recovery_diag + " | " + reason);
+        }
+        return Status::Error(StatusCode::ShaderError, reason);
+    } catch (...) {
+        const std::string reason = "Shader translation threw unknown exception (translator mutex poisoned)";
+        guard.MarkPoisonReason(reason);
+        if (out_diagnostics) {
+            *out_diagnostics = recovery_diag.empty() ? reason : (recovery_diag + " | " + reason);
+        }
+        return Status::Error(StatusCode::ShaderError, reason);
+    }
+}
+
+bool IsShaderTranslatorMutexPoisoned() noexcept {
+    return PoisonAwareTranslatorMutex::Global().IsPoisoned();
+}
+
+uint64_t GetShaderTranslatorMutexRecoveryCount() noexcept {
+    return PoisonAwareTranslatorMutex::Global().RecoveryCount();
+}
+
+void ResetShaderTranslatorMutexForTest() noexcept {
+    PoisonAwareTranslatorMutex::Global().ResetForTest();
+}
+
 Status ShaderCache::CompileRealXboxShaderSync(
     const std::vector<uint8_t>& blob_bytes,
     ShaderStage stage,
@@ -927,38 +1112,57 @@ Status ShaderCache::CompileRealXboxShaderSync(
     opts.dxc_path = request.dxc_path;
 
     Rdna2LiftResult lifted{};
-    Status st = LiftRdna2Xs2Shader(blob_bytes, lifted, opts);
+    std::string guard_diag;
+    bool recovered_from_poison = false;
+    Status st = ExecuteGuardedShaderTranslation(
+        [&]() -> Status { return LiftRdna2Xs2Shader(blob_bytes, lifted, opts); },
+        &guard_diag,
+        &recovered_from_poison);
     if (!st.ok()) {
         if (out_diagnostics) {
-            *out_diagnostics = lifted.dxc_diagnostics.empty() ? st.message : lifted.dxc_diagnostics;
+            std::string detail = lifted.dxc_diagnostics.empty() ? st.message : lifted.dxc_diagnostics;
+            *out_diagnostics = guard_diag.empty() ? detail : (guard_diag + " | " + detail);
         }
         return st;
     }
 
-    if (use_fxc_50) {
+    try {
+        if (use_fxc_50) {
 #if defined(_WIN32)
-        std::string fxc_diag;
-        st = CompileHlslWithFxc50(lifted.hlsl_source, target_profile, "main", out_dxil, &fxc_diag);
-        if (!st.ok()) {
-            if (out_diagnostics) *out_diagnostics = fxc_diag.empty() ? st.message : fxc_diag;
-            return st;
-        }
+            std::string fxc_diag;
+            st = CompileHlslWithFxc50(lifted.hlsl_source, target_profile, "main", out_dxil, &fxc_diag);
+            if (!st.ok()) {
+                if (out_diagnostics) *out_diagnostics = fxc_diag.empty() ? st.message : fxc_diag;
+                return st;
+            }
 #else
-        (void)stage;
-        return Status::Error(StatusCode::NotImplemented, "SM 5.0 fallback requires Windows");
+            (void)stage;
+            return Status::Error(StatusCode::NotImplemented, "SM 5.0 fallback requires Windows");
 #endif
-    } else if (can_use_inproc_dxc) {
-        std::string dxc_diag;
-        st = CompileHlslPreferInProcessDxc(
-            lifted.hlsl_source, target_profile, "main", out_dxil, dxc_diag, request.dxc_path);
-        if (!st.ok()) {
-            if (out_diagnostics) *out_diagnostics = dxc_diag.empty() ? st.message : dxc_diag;
-            return st;
+        } else if (can_use_inproc_dxc) {
+            std::string dxc_diag;
+            st = CompileHlslPreferInProcessDxc(
+                lifted.hlsl_source, target_profile, "main", out_dxil, dxc_diag, request.dxc_path);
+            if (!st.ok()) {
+                if (out_diagnostics) *out_diagnostics = dxc_diag.empty() ? st.message : dxc_diag;
+                return st;
+            }
+        } else {
+            out_dxil = std::move(lifted.pc_dxil);
         }
-    } else {
-        out_dxil = std::move(lifted.pc_dxil);
+    } catch (const std::exception& ex) {
+        const std::string err = std::string("Backend DXIL/FXC compilation threw exception: ") + ex.what();
+        if (out_diagnostics) *out_diagnostics = err;
+        return Status::Error(StatusCode::ShaderError, err);
+    } catch (...) {
+        const std::string err = "Backend DXIL/FXC compilation threw unknown exception";
+        if (out_diagnostics) *out_diagnostics = err;
+        return Status::Error(StatusCode::ShaderError, err);
     }
 
+    if (out_diagnostics && recovered_from_poison && !guard_diag.empty()) {
+        *out_diagnostics = guard_diag;
+    }
     (void)stage;
     return Status::Ok();
 }

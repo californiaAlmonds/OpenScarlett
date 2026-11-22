@@ -17,7 +17,7 @@ Lists every D3D12 adapter (Hardware & WARP), VRAM, Wave lane range, Shader Model
 openscarlett.exe probe <exe|dir|xvd> [--json]
 ```
 - **For an EXE or unpacked package folder:** Parses `MicrosoftGame.Config` / `.mgc`, computes `ConsoleLsaPolicy` identity (TitleId, PFN, SandboxId), resolves every PE import & forwarder chain via `PeForwarderResolver`, counts shimmed/Windows/API-set/native/missing imports, and outputs `ready_to_launch`.
-- **For `.xvd` / `.xvc` files:** Performs read-only 12 KiB header geometry inspection and reports whether the volume is encrypted (with explicit no-DRM-decryption policy notice).
+- **For `.xvd` / `.xvc` files:** Performs read-only 12 KiB header geometry inspection and reports disk type, layout geometry, and encryption status (`ready_to_launch: false` when encrypted).
 
 ### `inspect` — PE32+ x64 Binary Inspector
 ```powershell

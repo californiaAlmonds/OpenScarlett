@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Bink2 for Scarlett (<bink2.h>) public C ABI header
+// MIT Bink2 for Scarlett (<bink2.h>) public C ABI header
 // backed by Bink2Scarlett.dll.
 
 #include <cstddef>

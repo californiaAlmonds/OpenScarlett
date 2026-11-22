@@ -54,7 +54,7 @@ if(WIN32)
     _openscarlett_configure_s7_target(test_rdna2_lockstep_isa)
 
     # -------------------------------------------------------------------------
-    # Worker 3: 6 New Clean-Room Fixed-Return Stub DLLs + PE/GDK Runtime Parity
+    # Worker 3: 6 New Fixed-Return Stub DLLs + PE/GDK Runtime Parity
     # -------------------------------------------------------------------------
     foreach(_s7_dll_spec
         "mflnmhelp|OPENSCARLETT_S7_TARGET_MFLNMHELP|"
@@ -107,7 +107,7 @@ if(WIN32)
     _openscarlett_configure_s7_target(test_s7_pe_gdk_runtime)
 
     # -------------------------------------------------------------------------
-    # Worker 4: Clean-Room 3D Shadowed/Skinned/BC1+BC3 GDK Scene + Dual-API Test
+    # Worker 4: 3D Shadowed/Skinned/BC1+BC3 GDK Scene + Dual-API Test
     # -------------------------------------------------------------------------
     add_executable(gdk_3d_scene tests/gdk_3d_scene/gdk_3d_scene.cpp)
     target_include_directories(gdk_3d_scene PRIVATE

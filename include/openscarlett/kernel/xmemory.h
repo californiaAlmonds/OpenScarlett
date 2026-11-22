@@ -81,7 +81,7 @@ struct UnifiedMemoryAlias {
     bool from_placeholder = false;
 };
 
-// Clean-room Scarlett unified CPU/GPU virtual & physical memory manager.
+// Scarlett unified CPU/GPU virtual & physical memory manager.
 // Uses Windows 10/11 VirtualAlloc2 / MapViewOfFile3 / UnmapViewOfFile2 placeholder
 // splitting & coalescing backed by pagefile sections (CreateFileMappingW) to provide
 // hardware-coherent multi-VA physical aliasing at 64 KiB and 4 MiB page granules.

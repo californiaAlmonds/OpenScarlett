@@ -1,4 +1,4 @@
-# OpenScarlett Clean-Room MIT Wave 1 Audio (Opus/IMA-ADPCM/WASAPI),
+# OpenScarlett MIT Wave 1 Audio (Opus/IMA-ADPCM/WASAPI),
 # Full GFX10 Texture Tiling (xg_xs), and DirectStorage Hardening Targets.
 # Owned by wave1/audio-textures-dstorage worktree.
 

@@ -1,8 +1,38 @@
 #define OPENSCARLETT_BUILDING_KERNELX 1
 
 #if defined(_WIN32)
-#include <malloc.h>
-#include <windows.h>
+// Temporarily rename Win32 UMS prototypes before including <windows.h> so we can
+// cleanly export our user-space cooperative UMS shims from kernelx.dll without
+// dllimport/dllexport conflicts across MSVC, Clang-CL, and MinGW-w64 (Win11 removed
+// kernel UMS support).
+#  define CreateUmsCompletionList _os_win_CreateUmsCompletionList
+#  define DeleteUmsCompletionList _os_win_DeleteUmsCompletionList
+#  define DequeueUmsCompletionListItems _os_win_DequeueUmsCompletionListItems
+#  define GetUmsCompletionListEvent _os_win_GetUmsCompletionListEvent
+#  define CreateUmsThreadContext _os_win_CreateUmsThreadContext
+#  define DeleteUmsThreadContext _os_win_DeleteUmsThreadContext
+#  define EnterUmsSchedulingMode _os_win_EnterUmsSchedulingMode
+#  define ExecuteUmsThread _os_win_ExecuteUmsThread
+#  define UmsThreadYield _os_win_UmsThreadYield
+#  define QueryUmsThreadInformation _os_win_QueryUmsThreadInformation
+#  define SetUmsThreadInformation _os_win_SetUmsThreadInformation
+#  define GetCurrentUmsThread _os_win_GetCurrentUmsThread
+#  define GetNextUmsListItem _os_win_GetNextUmsListItem
+#  include <malloc.h>
+#  include <windows.h>
+#  undef CreateUmsCompletionList
+#  undef DeleteUmsCompletionList
+#  undef DequeueUmsCompletionListItems
+#  undef GetUmsCompletionListEvent
+#  undef CreateUmsThreadContext
+#  undef DeleteUmsThreadContext
+#  undef EnterUmsSchedulingMode
+#  undef ExecuteUmsThread
+#  undef UmsThreadYield
+#  undef QueryUmsThreadInformation
+#  undef SetUmsThreadInformation
+#  undef GetCurrentUmsThread
+#  undef GetNextUmsListItem
 #endif
 
 #include "openscarlett/kernel/kernelx_abi.h"
@@ -10,11 +40,16 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "openscarlett/core/telemetry.h"
@@ -2652,6 +2687,663 @@ int32_t OPENSCARLETT_KERNELX_CALL KernelXWriteTelemetryJson(const char* filePath
         return 0;
     }
     return CallTelemetry::Global().WriteJsonReport(filePath).ok() ? 1 : 0;
+}
+
+}  // extern "C"
+
+// ===========================================================================
+// Clean-Room User-Mode Scheduling (UMS) Cooperative / Fiber-Backed Shims
+// (Compatible with Win10 & Win11 where Microsoft removed kernel UMS support.)
+// ===========================================================================
+namespace {
+
+constexpr uint32_t kOsUmsVersion = 0x0100u;
+constexpr uint32_t kOsUmsSchedulerStartup = 0u;
+constexpr uint32_t kOsUmsSchedulerThreadYield = 2u;
+
+constexpr uint32_t kOsUmsInfoUserContext = 1u;
+constexpr uint32_t kOsUmsInfoPriority = 2u;
+constexpr uint32_t kOsUmsInfoAffinity = 3u;
+constexpr uint32_t kOsUmsInfoTeb = 4u;
+constexpr uint32_t kOsUmsInfoIsSuspended = 5u;
+constexpr uint32_t kOsUmsInfoIsTerminated = 6u;
+
+using PfnOsUmsSchedulerEntry = void(OPENSCARLETT_KERNELX_CALL*)(
+    uint32_t Reason,
+    uintptr_t ActivationPayload,
+    void* SchedulerParam);
+
+using PfnOsUmsWorkerEntry = void(OPENSCARLETT_KERNELX_CALL*)(void* Param);
+
+struct OsUmsSchedulerStartupInfo {
+    uint32_t UmsVersion;
+    void* CompletionList;
+    PfnOsUmsSchedulerEntry SchedulerProc;
+    void* SchedulerParam;
+};
+
+struct UmsThreadContextObj;
+
+struct UmsCompletionListObj {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<UmsThreadContextObj*> items;
+#if defined(_WIN32)
+    HANDLE event = nullptr;
+#endif
+};
+
+struct UmsThreadContextObj {
+    void* user_context = nullptr;
+    int32_t priority = 0;
+    uintptr_t affinity = 1u;
+    uint64_t synthetic_teb[16]{};
+    void* teb = nullptr;
+    bool is_suspended = false;
+    bool is_terminated = false;
+    bool running = false;
+    bool has_yielded = false;
+    void* yield_param = nullptr;
+    UmsThreadContextObj* next_list_item = nullptr;
+    PfnOsUmsWorkerEntry worker_entry = nullptr;
+    void* worker_param = nullptr;
+#if defined(_WIN32)
+    void* worker_fiber = nullptr;
+    void* scheduler_fiber = nullptr;
+#endif
+};
+
+struct UmsSchedulerTls {
+    bool in_scheduler = false;
+    UmsCompletionListObj* completion_list = nullptr;
+    PfnOsUmsSchedulerEntry scheduler_proc = nullptr;
+    void* scheduler_param = nullptr;
+    void* scheduler_fiber = nullptr;
+    UmsThreadContextObj* current_worker = nullptr;
+};
+
+thread_local UmsSchedulerTls g_ums_tls;
+
+struct UmsRuntime {
+    std::mutex mutex;
+    std::unordered_map<void*, std::unique_ptr<UmsCompletionListObj>> lists;
+    std::unordered_map<void*, std::unique_ptr<UmsThreadContextObj>> contexts;
+
+    bool IsValidList(void* p) {
+        std::lock_guard<std::mutex> lk(mutex);
+        return lists.find(p) != lists.end();
+    }
+
+    bool IsValidContext(void* p) {
+        std::lock_guard<std::mutex> lk(mutex);
+        return contexts.find(p) != contexts.end();
+    }
+};
+
+UmsRuntime& GetUmsRuntime() {
+    static UmsRuntime* rt = new UmsRuntime();
+    return *rt;
+}
+
+void EnqueueUmsListItem(UmsCompletionListObj* list, UmsThreadContextObj* ctx) {
+    if (!list || !ctx) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(list->mutex);
+        list->items.push_back(ctx);
+#if defined(_WIN32)
+        if (list->event) {
+            ::SetEvent(list->event);
+        }
+#endif
+    }
+    list->cv.notify_all();
+}
+
+#if defined(_WIN32)
+void WINAPI UmsWorkerFiberTrampoline(PVOID param) {
+    auto* ctx = static_cast<UmsThreadContextObj*>(param);
+    if (ctx && ctx->worker_entry) {
+        ctx->worker_entry(ctx->worker_param);
+    }
+    if (ctx) {
+        ctx->is_terminated = true;
+        ctx->has_yielded = false;
+        if (ctx->scheduler_fiber) {
+            ::SwitchToFiber(ctx->scheduler_fiber);
+        }
+    }
+}
+#endif
+
+}  // namespace
+
+extern "C" {
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL CreateUmsCompletionList(
+    void** UmsCompletionList) {
+    if (!UmsCompletionList) {
+        SetHostLastError(87u);
+        RecordTelemetry("CreateUmsCompletionList", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+    *UmsCompletionList = nullptr;
+    auto list = std::make_unique<UmsCompletionListObj>();
+#if defined(_WIN32)
+    list->event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!list->event) {
+        SetHostLastError(8u);
+        RecordTelemetry("CreateUmsCompletionList", CallOutcome::Error, kHrFail);
+        return 0;
+    }
+#endif
+    void* raw = list.get();
+    {
+        auto& rt = GetUmsRuntime();
+        std::lock_guard<std::mutex> lk(rt.mutex);
+        rt.lists.emplace(raw, std::move(list));
+    }
+    *UmsCompletionList = raw;
+    SetHostLastError(0u);
+    RecordTelemetry("CreateUmsCompletionList", CallOutcome::Ok, kHrOk);
+    return 1;
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL DeleteUmsCompletionList(
+    void* UmsCompletionList) {
+    if (!UmsCompletionList) {
+        SetHostLastError(87u);
+        RecordTelemetry("DeleteUmsCompletionList", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+    std::unique_ptr<UmsCompletionListObj> owned;
+    {
+        auto& rt = GetUmsRuntime();
+        std::lock_guard<std::mutex> lk(rt.mutex);
+        auto it = rt.lists.find(UmsCompletionList);
+        if (it == rt.lists.end()) {
+            SetHostLastError(87u);
+            RecordTelemetry("DeleteUmsCompletionList", CallOutcome::Error, kHrInvalidArg);
+            return 0;
+        }
+        {
+            std::lock_guard<std::mutex> llk(it->second->mutex);
+            if (!it->second->items.empty()) {
+                SetHostLastError(87u);
+                RecordTelemetry("DeleteUmsCompletionList", CallOutcome::Error, kHrInvalidArg);
+                return 0;
+            }
+        }
+        owned = std::move(it->second);
+        rt.lists.erase(it);
+    }
+#if defined(_WIN32)
+    if (owned && owned->event) {
+        ::CloseHandle(owned->event);
+        owned->event = nullptr;
+    }
+#endif
+    SetHostLastError(0u);
+    RecordTelemetry("DeleteUmsCompletionList", CallOutcome::Ok, kHrOk);
+    return 1;
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL GetUmsCompletionListEvent(
+    void* UmsCompletionList,
+    void** UmsCompletionEvent) {
+    if (!UmsCompletionList || !UmsCompletionEvent) {
+        SetHostLastError(87u);
+        RecordTelemetry("GetUmsCompletionListEvent", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+    *UmsCompletionEvent = nullptr;
+    auto& rt = GetUmsRuntime();
+    std::lock_guard<std::mutex> lk(rt.mutex);
+    auto it = rt.lists.find(UmsCompletionList);
+    if (it == rt.lists.end()) {
+        SetHostLastError(87u);
+        RecordTelemetry("GetUmsCompletionListEvent", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+#if defined(_WIN32)
+    *UmsCompletionEvent = static_cast<void*>(it->second->event);
+#else
+    *UmsCompletionEvent = it->second.get();
+#endif
+    SetHostLastError(0u);
+    RecordTelemetry("GetUmsCompletionListEvent", CallOutcome::Ok, kHrOk);
+    return 1;
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL DequeueUmsCompletionListItems(
+    void* UmsCompletionList,
+    uint32_t WaitTimeOut,
+    void** UmsThreadList) {
+    if (!UmsCompletionList || !UmsThreadList) {
+        SetHostLastError(87u);
+        RecordTelemetry("DequeueUmsCompletionListItems", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+    *UmsThreadList = nullptr;
+    UmsCompletionListObj* list = nullptr;
+    {
+        auto& rt = GetUmsRuntime();
+        std::lock_guard<std::mutex> lk(rt.mutex);
+        auto it = rt.lists.find(UmsCompletionList);
+        if (it == rt.lists.end()) {
+            SetHostLastError(87u);
+            RecordTelemetry("DequeueUmsCompletionListItems", CallOutcome::Error, kHrInvalidArg);
+            return 0;
+        }
+        list = it->second.get();
+    }
+
+    std::vector<UmsThreadContextObj*> drained;
+    {
+        std::unique_lock<std::mutex> llk(list->mutex);
+        if (list->items.empty() && WaitTimeOut != 0u) {
+            if (WaitTimeOut == 0xFFFFFFFFu) {
+                list->cv.wait(llk, [&]() { return !list->items.empty(); });
+            } else {
+                (void)list->cv.wait_for(
+                    llk, std::chrono::milliseconds(WaitTimeOut),
+                    [&]() { return !list->items.empty(); });
+            }
+        }
+        if (list->items.empty()) {
+            if (WaitTimeOut == 0u) {
+                SetHostLastError(0u);
+                RecordTelemetry("DequeueUmsCompletionListItems", CallOutcome::Ok, kHrOk);
+                return 1;
+            }
+            SetHostLastError(1460u);  // ERROR_TIMEOUT
+            RecordTelemetry("DequeueUmsCompletionListItems", CallOutcome::Error, kHrFail);
+            return 0;
+        }
+        while (!list->items.empty()) {
+            drained.push_back(list->items.front());
+            list->items.pop_front();
+        }
+#if defined(_WIN32)
+        if (list->event) {
+            ::ResetEvent(list->event);
+        }
+#endif
+    }
+
+    for (size_t i = 0; i < drained.size(); ++i) {
+        drained[i]->next_list_item = (i + 1u < drained.size()) ? drained[i + 1u] : nullptr;
+    }
+    *UmsThreadList = drained.front();
+    SetHostLastError(0u);
+    RecordTelemetry("DequeueUmsCompletionListItems", CallOutcome::Ok, kHrOk);
+    return 1;
+}
+
+OPENSCARLETT_KERNELX_API void* OPENSCARLETT_KERNELX_CALL GetNextUmsListItem(void* UmsContext) {
+    if (!UmsContext || !GetUmsRuntime().IsValidContext(UmsContext)) {
+        SetHostLastError(87u);
+        RecordTelemetry("GetNextUmsListItem", CallOutcome::Error, kHrInvalidArg);
+        return nullptr;
+    }
+    auto* ctx = static_cast<UmsThreadContextObj*>(UmsContext);
+    SetHostLastError(0u);
+    RecordTelemetry("GetNextUmsListItem", CallOutcome::Ok, kHrOk);
+    return ctx->next_list_item;
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL CreateUmsThreadContext(
+    void** lpUmsThread) {
+    if (!lpUmsThread) {
+        SetHostLastError(87u);
+        RecordTelemetry("CreateUmsThreadContext", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+    *lpUmsThread = nullptr;
+    auto ctx = std::make_unique<UmsThreadContextObj>();
+    ctx->teb = ctx->synthetic_teb;
+    void* raw = ctx.get();
+    {
+        auto& rt = GetUmsRuntime();
+        std::lock_guard<std::mutex> lk(rt.mutex);
+        rt.contexts.emplace(raw, std::move(ctx));
+    }
+    *lpUmsThread = raw;
+    SetHostLastError(0u);
+    RecordTelemetry("CreateUmsThreadContext", CallOutcome::Ok, kHrOk);
+    return 1;
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL DeleteUmsThreadContext(
+    void* UmsThread) {
+    if (!UmsThread) {
+        SetHostLastError(87u);
+        RecordTelemetry("DeleteUmsThreadContext", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+    std::unique_ptr<UmsThreadContextObj> owned;
+    {
+        auto& rt = GetUmsRuntime();
+        std::lock_guard<std::mutex> lk(rt.mutex);
+        auto it = rt.contexts.find(UmsThread);
+        if (it == rt.contexts.end() || it->second->running) {
+            SetHostLastError(87u);
+            RecordTelemetry("DeleteUmsThreadContext", CallOutcome::Error, kHrInvalidArg);
+            return 0;
+        }
+        owned = std::move(it->second);
+        rt.contexts.erase(it);
+    }
+#if defined(_WIN32)
+    if (owned && owned->worker_fiber) {
+        ::DeleteFiber(owned->worker_fiber);
+        owned->worker_fiber = nullptr;
+    }
+#endif
+    SetHostLastError(0u);
+    RecordTelemetry("DeleteUmsThreadContext", CallOutcome::Ok, kHrOk);
+    return 1;
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL QueryUmsThreadInformation(
+    void* UmsThread,
+    uint32_t UmsThreadInfoClass,
+    void* UmsThreadInformation,
+    uint32_t UmsThreadInformationLength,
+    uint32_t* ReturnLength) {
+    if (ReturnLength) {
+        *ReturnLength = 0u;
+    }
+    if (!UmsThread || !GetUmsRuntime().IsValidContext(UmsThread)) {
+        SetHostLastError(87u);
+        RecordTelemetry("QueryUmsThreadInformation", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+    auto* ctx = static_cast<UmsThreadContextObj*>(UmsThread);
+
+    auto write_val = [&](const void* src, uint32_t needed) -> int32_t {
+        if (ReturnLength) {
+            *ReturnLength = needed;
+        }
+        if (!UmsThreadInformation || UmsThreadInformationLength < needed) {
+            SetHostLastError(122u);  // ERROR_INSUFFICIENT_BUFFER
+            RecordTelemetry("QueryUmsThreadInformation", CallOutcome::Error, kHrInsufficientBuffer);
+            return 0;
+        }
+        std::memcpy(UmsThreadInformation, src, needed);
+        SetHostLastError(0u);
+        RecordTelemetry("QueryUmsThreadInformation", CallOutcome::Ok, kHrOk);
+        return 1;
+    };
+
+    switch (UmsThreadInfoClass) {
+        case kOsUmsInfoUserContext:
+            return write_val(&ctx->user_context, static_cast<uint32_t>(sizeof(void*)));
+        case kOsUmsInfoPriority:
+            return write_val(&ctx->priority, static_cast<uint32_t>(sizeof(int32_t)));
+        case kOsUmsInfoAffinity:
+            return write_val(&ctx->affinity, static_cast<uint32_t>(sizeof(uintptr_t)));
+        case kOsUmsInfoTeb:
+            return write_val(&ctx->teb, static_cast<uint32_t>(sizeof(void*)));
+        case kOsUmsInfoIsSuspended: {
+            if (UmsThreadInformationLength == 1u && UmsThreadInformation) {
+                const uint8_t b = ctx->is_suspended ? 1u : 0u;
+                return write_val(&b, 1u);
+            }
+            const uint32_t v = ctx->is_suspended ? 1u : 0u;
+            return write_val(&v, static_cast<uint32_t>(sizeof(uint32_t)));
+        }
+        case kOsUmsInfoIsTerminated: {
+            if (UmsThreadInformationLength == 1u && UmsThreadInformation) {
+                const uint8_t b = ctx->is_terminated ? 1u : 0u;
+                return write_val(&b, 1u);
+            }
+            const uint32_t v = ctx->is_terminated ? 1u : 0u;
+            return write_val(&v, static_cast<uint32_t>(sizeof(uint32_t)));
+        }
+        default:
+            SetHostLastError(87u);
+            RecordTelemetry("QueryUmsThreadInformation", CallOutcome::Error, kHrInvalidArg);
+            return 0;
+    }
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL SetUmsThreadInformation(
+    void* UmsThread,
+    uint32_t UmsThreadInfoClass,
+    void* UmsThreadInformation,
+    uint32_t UmsThreadInformationLength) {
+    if (!UmsThread || !UmsThreadInformation || !GetUmsRuntime().IsValidContext(UmsThread)) {
+        SetHostLastError(87u);
+        RecordTelemetry("SetUmsThreadInformation", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+    auto* ctx = static_cast<UmsThreadContextObj*>(UmsThread);
+    switch (UmsThreadInfoClass) {
+        case kOsUmsInfoUserContext:
+            if (UmsThreadInformationLength != sizeof(void*)) {
+                SetHostLastError(87u);
+                RecordTelemetry("SetUmsThreadInformation", CallOutcome::Error, kHrInvalidArg);
+                return 0;
+            }
+            std::memcpy(&ctx->user_context, UmsThreadInformation, sizeof(void*));
+            break;
+        case kOsUmsInfoPriority:
+            if (UmsThreadInformationLength != sizeof(int32_t)) {
+                SetHostLastError(87u);
+                RecordTelemetry("SetUmsThreadInformation", CallOutcome::Error, kHrInvalidArg);
+                return 0;
+            }
+            std::memcpy(&ctx->priority, UmsThreadInformation, sizeof(int32_t));
+            break;
+        case kOsUmsInfoAffinity:
+            if (UmsThreadInformationLength != sizeof(uintptr_t)) {
+                SetHostLastError(87u);
+                RecordTelemetry("SetUmsThreadInformation", CallOutcome::Error, kHrInvalidArg);
+                return 0;
+            }
+            std::memcpy(&ctx->affinity, UmsThreadInformation, sizeof(uintptr_t));
+            break;
+        default:
+            SetHostLastError(87u);
+            RecordTelemetry("SetUmsThreadInformation", CallOutcome::Error, kHrInvalidArg);
+            return 0;
+    }
+    SetHostLastError(0u);
+    RecordTelemetry("SetUmsThreadInformation", CallOutcome::Ok, kHrOk);
+    return 1;
+}
+
+OPENSCARLETT_KERNELX_API void* OPENSCARLETT_KERNELX_CALL GetCurrentUmsThread(void) {
+    RecordTelemetry("GetCurrentUmsThread", CallOutcome::Ok, kHrOk);
+    return g_ums_tls.current_worker;
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL EnterUmsSchedulingMode(
+    const void* SchedulerStartupInfo) {
+    if (!SchedulerStartupInfo || g_ums_tls.in_scheduler) {
+        SetHostLastError(87u);
+        RecordTelemetry("EnterUmsSchedulingMode", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+    const auto* info = static_cast<const OsUmsSchedulerStartupInfo*>(SchedulerStartupInfo);
+    if (info->UmsVersion != kOsUmsVersion ||
+        !info->CompletionList ||
+        !info->SchedulerProc ||
+        !GetUmsRuntime().IsValidList(info->CompletionList)) {
+        SetHostLastError(87u);
+        RecordTelemetry("EnterUmsSchedulingMode", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+
+#if defined(_WIN32)
+    const bool was_fiber = (::IsThreadAFiber() != FALSE);
+    void* sched_fiber = was_fiber ? ::GetCurrentFiber() : ::ConvertThreadToFiber(nullptr);
+    if (!sched_fiber) {
+        SetHostLastError(8u);
+        RecordTelemetry("EnterUmsSchedulingMode", CallOutcome::Error, kHrFail);
+        return 0;
+    }
+#else
+    void* sched_fiber = nullptr;
+#endif
+
+    g_ums_tls.in_scheduler = true;
+    g_ums_tls.completion_list = static_cast<UmsCompletionListObj*>(info->CompletionList);
+    g_ums_tls.scheduler_proc = info->SchedulerProc;
+    g_ums_tls.scheduler_param = info->SchedulerParam;
+    g_ums_tls.scheduler_fiber = sched_fiber;
+    g_ums_tls.current_worker = nullptr;
+
+    RecordTelemetry("EnterUmsSchedulingMode", CallOutcome::Ok, kHrOk);
+    info->SchedulerProc(kOsUmsSchedulerStartup, 0u, info->SchedulerParam);
+
+    g_ums_tls.in_scheduler = false;
+    g_ums_tls.completion_list = nullptr;
+    g_ums_tls.scheduler_proc = nullptr;
+    g_ums_tls.scheduler_param = nullptr;
+    g_ums_tls.scheduler_fiber = nullptr;
+    g_ums_tls.current_worker = nullptr;
+
+#if defined(_WIN32)
+    if (!was_fiber) {
+        (void)::ConvertFiberToThread();
+    }
+#endif
+    SetHostLastError(0u);
+    return 1;
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL ExecuteUmsThread(void* UmsThread) {
+    if (!UmsThread || !g_ums_tls.in_scheduler || !GetUmsRuntime().IsValidContext(UmsThread)) {
+        SetHostLastError(87u);
+        RecordTelemetry("ExecuteUmsThread", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+    auto* ctx = static_cast<UmsThreadContextObj*>(UmsThread);
+    if (ctx->is_terminated || ctx->running) {
+        SetHostLastError(87u);
+        RecordTelemetry("ExecuteUmsThread", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+
+    RecordTelemetry("ExecuteUmsThread", CallOutcome::Ok, kHrOk);
+
+    if (!ctx->worker_entry) {
+        ctx->is_terminated = true;
+        EnqueueUmsListItem(g_ums_tls.completion_list, ctx);
+        SetHostLastError(0u);
+        return 1;
+    }
+
+#if defined(_WIN32)
+    if (!ctx->worker_fiber) {
+        ctx->worker_fiber = ::CreateFiber(0u, &UmsWorkerFiberTrampoline, ctx);
+        if (!ctx->worker_fiber) {
+            SetHostLastError(8u);
+            return 0;
+        }
+    }
+    ctx->scheduler_fiber = g_ums_tls.scheduler_fiber;
+    ctx->running = true;
+    ctx->has_yielded = false;
+    ctx->yield_param = nullptr;
+    UmsThreadContextObj* prev_worker = g_ums_tls.current_worker;
+    g_ums_tls.current_worker = ctx;
+
+    ::SwitchToFiber(ctx->worker_fiber);
+
+    g_ums_tls.current_worker = prev_worker;
+    ctx->running = false;
+
+    if (ctx->has_yielded) {
+        EnqueueUmsListItem(g_ums_tls.completion_list, ctx);
+        if (g_ums_tls.scheduler_proc) {
+            g_ums_tls.scheduler_proc(
+                kOsUmsSchedulerThreadYield,
+                reinterpret_cast<uintptr_t>(ctx),
+                ctx->yield_param);
+        }
+    } else if (ctx->is_terminated) {
+        if (ctx->worker_fiber) {
+            ::DeleteFiber(ctx->worker_fiber);
+            ctx->worker_fiber = nullptr;
+        }
+        EnqueueUmsListItem(g_ums_tls.completion_list, ctx);
+    }
+#else
+    ctx->running = true;
+    UmsThreadContextObj* prev_worker = g_ums_tls.current_worker;
+    g_ums_tls.current_worker = ctx;
+    ctx->worker_entry(ctx->worker_param);
+    g_ums_tls.current_worker = prev_worker;
+    ctx->running = false;
+    ctx->is_terminated = true;
+    EnqueueUmsListItem(g_ums_tls.completion_list, ctx);
+#endif
+    SetHostLastError(0u);
+    return 1;
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL UmsThreadYield(void* SchedulerParam) {
+    UmsThreadContextObj* ctx = g_ums_tls.current_worker;
+    if (!ctx) {
+        SetHostLastError(1u);  // ERROR_INVALID_FUNCTION
+        RecordTelemetry("UmsThreadYield", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+    RecordTelemetry("UmsThreadYield", CallOutcome::Ok, kHrOk);
+#if defined(_WIN32)
+    if (!ctx->scheduler_fiber) {
+        SetHostLastError(1u);
+        return 0;
+    }
+    ctx->has_yielded = true;
+    ctx->yield_param = SchedulerParam;
+    ::SwitchToFiber(ctx->scheduler_fiber);
+    SetHostLastError(0u);
+    return 1;
+#else
+    (void)SchedulerParam;
+    SetHostLastError(0u);
+    return 1;
+#endif
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL OpenScarlettUmsBindWorkerProc(
+    void* UmsThread,
+    void* EntryProc,
+    void* EntryParam) {
+    if (!UmsThread || !EntryProc || !GetUmsRuntime().IsValidContext(UmsThread)) {
+        SetHostLastError(87u);
+        return 0;
+    }
+    auto* ctx = static_cast<UmsThreadContextObj*>(UmsThread);
+    if (ctx->running || ctx->is_terminated) {
+        SetHostLastError(87u);
+        return 0;
+    }
+    ctx->worker_entry = reinterpret_cast<PfnOsUmsWorkerEntry>(EntryProc);
+    ctx->worker_param = EntryParam;
+    SetHostLastError(0u);
+    return 1;
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL OpenScarlettUmsEnqueueCompletionItem(
+    void* UmsCompletionList,
+    void* UmsThread) {
+    if (!UmsCompletionList || !UmsThread ||
+        !GetUmsRuntime().IsValidList(UmsCompletionList) ||
+        !GetUmsRuntime().IsValidContext(UmsThread)) {
+        SetHostLastError(87u);
+        return 0;
+    }
+    EnqueueUmsListItem(
+        static_cast<UmsCompletionListObj*>(UmsCompletionList),
+        static_cast<UmsThreadContextObj*>(UmsThread));
+    SetHostLastError(0u);
+    return 1;
 }
 
 }  // extern "C"

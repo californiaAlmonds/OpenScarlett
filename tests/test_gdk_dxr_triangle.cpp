@@ -39,7 +39,7 @@ constexpr uint32_t kWidth = 256u;
 constexpr uint32_t kHeight = 256u;
 constexpr uint32_t kExpectedHitPixels = 10112u;
 
-// Clean-room MIT DXR 1.0 shader library (compiled live with dxc.exe -T lib_6_3).
+// DXR 1.0 shader library (compiled live with dxc.exe -T lib_6_3).
 // Matches Path B's exact camera, two-triangle geometry, barycentric RGB shading & miss color.
 constexpr const char* kDxrTriangleLibHlsl = R"HLSL(
 RaytracingAccelerationStructure g_Scene : register(t0, space0);

@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Microsoft Xbox Services GDK C (<xsapi-c/services_c.h>) public ABI header
+// MIT Microsoft Xbox Services GDK C (<xsapi-c/services_c.h>) public ABI header
 // backed by Microsoft.Xbox.Services.GDK.C.dll.
 
 #include "../XAsync.h"

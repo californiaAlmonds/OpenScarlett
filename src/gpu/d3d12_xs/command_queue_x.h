@@ -34,6 +34,10 @@ public:
     ID3D12CommandQueue* HostQueue() const noexcept { return host_queue_; }
     D3D12_COMMAND_LIST_TYPE QueueType() const noexcept { return queue_type_; }
 
+    // Title-created Win32 console display screen helpers (non-virtual; preserves COM vtable ABI).
+    HWND EffectiveOutputWindow() const noexcept;
+    bool AdoptTitleWindow(HWND hwnd) noexcept;
+
     // Zero-overhead C++ integration hook invoked on command list submission.
     using QueueSubmitHookFn = void (*)(
         ID3D12CommandQueue* host_queue,
@@ -192,6 +196,9 @@ private:
     HRESULT WaitForInternalFenceLocked();
     void AttachWindowSubclassLocked(HWND hwnd);
     void DetachWindowSubclassLocked();
+    HWND ResolveTargetOutputWindowLocked(
+        const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters,
+        bool force_headless);
     void ReleaseSwapChainLocked();
     void ReleasePresentObjectsLocked();
     void PaceFrameLocked(uint32_t frame_interval_us);
@@ -205,9 +212,10 @@ private:
     std::atomic<QueueSubmitHookFn> submit_hook_{nullptr};
     std::atomic<void*> submit_hook_ctx_{nullptr};
 
-    std::mutex present_mutex_;
+    mutable std::mutex present_mutex_;
     HWND attached_hwnd_ = nullptr;
     HWND subclassed_hwnd_ = nullptr;
+    bool explicit_window_detached_ = false;
     std::shared_ptr<WindowCallbackState> window_state_;
     bool readback_capture_enabled_ = true;
 

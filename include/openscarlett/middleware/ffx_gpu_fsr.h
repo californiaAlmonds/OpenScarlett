@@ -34,7 +34,7 @@ struct Fsr1DispatchStats {
     std::string adapter_description;
 };
 
-// Clean-room GPU FidelityFX Super Resolution 1.0 (EASU + RCAS) D3D12 Compute Pipeline.
+// GPU FidelityFX Super Resolution 1.0 (EASU + RCAS) D3D12 Compute Pipeline.
 // Compiles HLSL cs_5_0 shaders live via D3DCompile:
 //   Pass 1 (EASU): 12-tap directional edge-adaptive Lanczos2 spatial upsampling with anti-ringing.
 //   Pass 2 (RCAS): 5-tap local contrast-adaptive sharpening with non-clipping lobe limits.

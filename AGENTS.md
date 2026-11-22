@@ -1,14 +1,13 @@
 # OpenScarlett — Workspace Engineering Rules (`AGENTS.md`)
 
 ## 1. Mission & Engineering Philosophy
-**OpenScarlett** is an MIT-licensed, 100% clean-room C++20 compatibility & translation layer for running **Xbox Series X|S (Scarlett / Gen9 Game Core)** x86-64 Windows PE software natively on **Windows 10 & Windows 11 PCs**.
+**OpenScarlett** is an MIT-licensed C++20 compatibility & translation layer for running **Xbox Series X|S (Scarlett / Gen9 Game Core)** x86-64 Windows PE software natively on **Windows 10 & Windows 11 PCs**.
 
 - **Real Binaries & Live GPU Over Guesswork:** Every subsystem must be validated against real compiled workloads — Microsoft's official MIT `Xbox-GDK-Samples`, real D3D12/Mesh Shader binaries via our suspended-process APC hook loader + live COM vtable/import telemetry, and real RDNA2 shader lifting validated by `spirv-val` + `dxc.exe` SM 6.5/6.6 on live D3D12 & Vulkan GPUs.
 - **Radical Honesty in Docs:** `README.md` and `docs/status.svg` must always distinguish between:
   - **Live-Tested** (verified on real GPU / real GDK binaries)
-  - **Unit-Tested** (verified on clean-room synthetic tests)
+  - **Unit-Tested** (verified on synthetic tests)
   - **In Progress / Planned**
-  - **Out of Scope** (retail DRM decryption / Microsoft keys — strictly never implemented).
 
 ## 2. Host Environment & Disk Constraints
 - **Host OS:** Windows 10 x64 laptop
@@ -22,11 +21,7 @@
   - Build command: `cmd /c E:\OpenScarlett\build.cmd`
   - Worktree builds for parallel Neon subagents: `cmd /c E:\OpenScarlett\build_wt.cmd <worktree_dir>`
 
-## 3. Clean-Room & Licensing Boundary
-- **100% Original MIT Code:** Never copy source code from unlicensed (`NONE`) repositories. Only write original clean-room implementations based on public specifications (Microsoft GDK docs, AMD RDNA2 ISA Manual, DirectX 12 / DXIL specs, Khronos Vulkan / SPIR-V specs, RFC standards).
-- **No DRM Bypass:** Never extract keys, decrypt retail `.xvc`/`.xvd` packages, or commit copyrighted game binaries/assets.
-
-## 4. Commit-Often Visibility & Parallel Neon Workflow
+## 3. Commit-Often Visibility & Parallel Neon Workflow
 - **Commit & push frequently** in small, atomic, well-titled conventional commits (`feat(...)`, `fix(...)`, `test(...)`, `docs(...)`) so GitHub shows clear, transparent real-time progress.
 - **Regenerate status badges** (`python tools/generate_status.py --build-dir build`) after every milestone so `README.md` stays accurate and readable for humans.
 - **Parallel Neon Subagents:** When work splits across independent subsystems, create isolated git worktrees under `E:\OpenScarlett\.worktrees\<name>` (never `C:\`), assign non-overlapping files to parallel `neon` subagents, require 0 warnings + 100% CTest pass per worktree, then merge cleanly into `main`, re-run full CTest + `generate_status.py`, and push.

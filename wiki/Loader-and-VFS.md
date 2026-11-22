@@ -60,14 +60,14 @@ When pointed at a package directory or `.mgc` / `MicrosoftGame.Config` XML file,
 
 ---
 
-## 4. Clean-Room 12 KiB XVD / XVC Header Inspector
+## 4. 12 KiB XVD / XVC Header Inspector
 
 Source: [`include/openscarlett/loader/xvd_inspector.h`](https://github.com/californiaAlmonds/OpenScarlett/blob/main/include/openscarlett/loader/xvd_inspector.h), [`src/loader/xvd_inspector.cpp`](https://github.com/californiaAlmonds/OpenScarlett/blob/main/src/loader/xvd_inspector.cpp)
 
 `openscarlett probe <file.xvd|file.xvc>` performs **strictly read-only metadata inspection** of the public 12 KiB (`0x3000` byte) Xbox Virtual Disk header (`msft-xvd` magic at offset `0x200`):
 - Reports disk type (`Fixed`/`Dynamic`), content type (`Title`, `Data`, `Application`, etc.), drive size, page/block geometry (`4 KiB` pages, `680 KiB` default block), format version, sandbox ID, product ID, package version, and XVC region descriptors.
 - Detects whether encryption flags / ODK keyslots are active (`is_encrypted`).
-- **DRM Policy:** OpenScarlett **never** attempts to decrypt encrypted `.xvd`/`.xvc` volumes or extract keys. Encrypted containers report `ready_to_launch: false` with an explicit policy notice.
+- Encrypted containers report `ready_to_launch: false` during preflight.
 
 ---
 

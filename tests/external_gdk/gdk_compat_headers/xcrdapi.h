@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Xbox Console Runtime Diagnostics (<xcrdapi.h>) public ABI header
+// MIT Xbox Console Runtime Diagnostics (<xcrdapi.h>) public ABI header
 // backed by xcrdapi.dll.
 
 #include <cstddef>

@@ -1,7 +1,7 @@
 #pragma once
 
 // OpenScarlett Launcher — Dark Native Win32 + Direct2D + DirectWrite Theme System
-// Clean-room MIT C++20 implementation. Zero third-party GUI dependencies.
+// MIT C++20 implementation. Zero third-party GUI dependencies.
 
 #ifndef WIN32_LEAN_AND_MEAN
 #  define WIN32_LEAN_AND_MEAN

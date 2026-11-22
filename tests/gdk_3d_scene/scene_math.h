@@ -1,6 +1,6 @@
 #pragma once
 
-// OpenScarlett Clean-Room MIT 3D Scene Math Utilities (C++20).
+// OpenScarlett MIT 3D Scene Math Utilities (C++20).
 // Row-major 4x4 matrices with row-vector convention (v' = v * M) matching HLSL row_major float4x4.
 
 #include <cmath>

@@ -589,7 +589,7 @@ constexpr const char* kMicrosoftGameConfigXml =
     "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
     "<Game configVersion=\"1\">\n"
     "  <Identity Name=\"OpenScarlett.Wave2.MeshletCull\"\n"
-    "            Publisher=\"CN=OpenScarlett Clean-Room MIT\"\n"
+    "            Publisher=\"CN=OpenScarlett\"\n"
     "            Version=\"1.0.0.0\" />\n"
     "  <TitleId>0x5CA01002</TitleId>\n"
     "  <ShellVisuals DefaultDisplayName=\"OpenScarlett MeshletCull (AS+MS+PS)\" />\n"

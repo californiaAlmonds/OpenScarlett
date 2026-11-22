@@ -7,7 +7,7 @@ function(openscarlett_add_external_gdk_exe name src)
     add_executable(${name} ${src})
     # Pure standalone external Xbox-ABI Win32 x64 guest executable:
     # Deliberately does NOT link openscarlett_core AND does NOT include ${CMAKE_CURRENT_SOURCE_DIR}/include!
-    # Compiles strictly against clean-room MIT Microsoft-GDK-compatible headers!
+    # Compiles strictly against MIT Microsoft-GDK-compatible headers!
     target_include_directories(${name} PRIVATE
         ${_os_gdk_compat_inc}
     )

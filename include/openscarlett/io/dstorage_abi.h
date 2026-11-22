@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Microsoft DirectStorage for Xbox (dstorage_xs.dll) COM ABI definitions.
+// Microsoft DirectStorage for Xbox (dstorage_xs.dll) COM ABI definitions.
 // Self-contained (does not include <windows.h> or <dstorage.h>).
 
 #include <cstddef>

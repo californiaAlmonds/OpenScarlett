@@ -1093,7 +1093,7 @@ std::vector<uint8_t> BuildPsv0Chunk(const XboxPsv0Info& psv) {
     return out;
 }
 
-// Clean-room RFC 1321 MD5 compression function used for DXBC / DXIL container digest.
+// RFC 1321 MD5 compression function used for DXBC / DXIL container digest.
 void DxbcMd5Compress(uint32_t state[4], const uint8_t block[64]) noexcept {
     static constexpr uint32_t kSinTable[64] = {
         0xD76AA478u, 0xE8C7B756u, 0x242070DBu, 0xC1BDCEEEu,
@@ -1165,7 +1165,7 @@ bool TryExtractXs2FromXboxChunk(const std::vector<uint8_t>& chunk_data, Xs2Shade
     if (chunk_data.size() >= kXs2HeaderSizeBytes && std::memcmp(chunk_data.data(), "XS2\0", 4) == 0) {
         return ParseXs2Container(chunk_data, out_xs2).ok();
     }
-    // Also handle wrapped Xbox shader chunks with a clean-room metadata prefix before "XS2\0"
+    // Also handle wrapped Xbox shader chunks with a metadata prefix before "XS2\0"
     for (size_t off = 4; off + kXs2HeaderSizeBytes <= chunk_data.size(); off += 4) {
         if (std::memcmp(chunk_data.data() + off, "XS2\0", 4) == 0) {
             std::vector<uint8_t> slice(chunk_data.begin() + static_cast<std::ptrdiff_t>(off), chunk_data.end());
@@ -2864,7 +2864,7 @@ Status DisassembleRdna2(
 }
 
 // ---------------------------------------------------------------------------
-// Clean-room RDNA2 / GFX10.3 Binary Assembler
+// RDNA2 / GFX10.3 Binary Assembler
 // ---------------------------------------------------------------------------
 void Rdna2Assembler::EmitSop2(
     Rdna2Opcode op,

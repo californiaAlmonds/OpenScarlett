@@ -1,6 +1,6 @@
 # Graphics: DirectX 12 (`d3d12_xs`) & Vulkan 1.4
 
-Xbox Series X|S graphics software links against `d3d12_xs.dll` (Xbox-specific Direct3D 12 COM ABI) and `xg_xs.dll` (GFX10 texture addressing/tiling). OpenScarlett implements a full clean-room **`d3d12_xs.dll`** proxy layer that translates console D3D12 calls onto either native PC **DirectX 12** (default) or **Vulkan 1.4** (`--backend=vulkan`).
+Xbox Series X|S graphics software links against `d3d12_xs.dll` (Xbox-specific Direct3D 12 COM ABI) and `xg_xs.dll` (GFX10 texture addressing/tiling). OpenScarlett implements a full **`d3d12_xs.dll`** proxy layer that translates console D3D12 calls onto either native PC **DirectX 12** (default) or **Vulkan 1.4** (`--backend=vulkan`).
 
 ---
 
@@ -40,7 +40,7 @@ Source: `src/gpu/d3d12_xs/sampler_feedback_x.cpp`, `src/gpu/d3d12_xs/query_accum
   - `SetSamplePositions`
   - Predicated byte-level copies & fast-clear metadata updates
   - `GetCopyableFootprints` parity with Xbox layout rules
-- **Console Sampler Feedback (`SamplerFeedbackX`):** Clean-room mip-region residency tracking, readback decode (`MinMip` / `MipRegionUsed`), and fast clear (`test_d3d12_feedback_queries`).
+- **Console Sampler Feedback (`SamplerFeedbackX`):** Mip-region residency tracking, readback decode (`MinMip` / `MipRegionUsed`), and fast clear (`test_d3d12_feedback_queries`).
 - **`QueryAccumulatorX` & GPU-QPC Clock Calibration:** Deterministic occlusion, binary occlusion, pipeline statistics, and calibrated GPU-to-Win32 `QueryPerformanceCounter` timestamp correlation (`test_d3d12_feedback_queries`).
 - **Untouched `_GAMING_XBOX_SCARLETT` ABI Parity:** Verified against 4 untouched Microsoft MIT `Xbox-GDK-Samples` (`SimpleTriangle`, `SimpleLighting`, `SimpleTexture`, `SimpleInstancing`) compiled directly against Scarlett headers (`test_gdkx_abi`, `test_gdkx_untouched_samples`).
 

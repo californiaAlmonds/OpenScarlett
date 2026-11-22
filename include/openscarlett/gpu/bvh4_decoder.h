@@ -10,7 +10,7 @@
 
 namespace openscarlett {
 
-// Clean-room AMD RDNA2 (GFX10.3) BVH4 architecture constants.
+// AMD RDNA2 (GFX10.3) BVH4 architecture constants.
 // Nodes are 64-byte or 128-byte aligned; 32-bit node pointers tag the low 3 bits
 // with the node type while bits [31:3] encode the 64-byte-shifted node byte offset:
 //   byte_offset = uint64_t(ptr & ~0x7u) << 3   (== (ptr >> 3) * 64)

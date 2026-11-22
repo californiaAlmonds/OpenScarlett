@@ -7,6 +7,40 @@ namespace openscarlett::xg {
 
 namespace {
 
+// Xbox Scarlett / GDK extended 16-bit depth-stencil DXGI format ordinals (public GDK docs).
+constexpr uint32_t kXboxDxgiFormatD16UnormS8Uint = 118u;
+constexpr uint32_t kXboxDxgiFormatR16UnormX8Typeless = 119u;
+constexpr uint32_t kXboxDxgiFormatX16TypelessG8Uint = 120u;
+
+// D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL bit (0x2) does not overlap XG_BIND_FLAGS bits
+// (0x8, 0x20, 0x40, 0x80, 0x100, 0x200), allowing callers to pass either flag cleanly.
+constexpr uint32_t kD3D12AllowDepthStencilBit = 0x2u;
+
+constexpr bool HasDepthStencilBindFlag(uint32_t bind_flags) noexcept {
+    return (bind_flags & (XG_BIND_DEPTH_STENCIL | kD3D12AllowDepthStencilBit)) != 0u;
+}
+
+// Maps stencil-only DXGI / Xbox view formats onto their full 2-plane parent depth-stencil format.
+// Preserves standalone 1-plane SRV view for DXGI_FORMAT_X32_TYPELESS_G8X24_UINT (22) when
+// BindFlags == XG_BIND_SHADER_RESOURCE explicitly, while promoting full planar depth-stencil
+// layout for 22 (with depth-stencil or default bind), 47 (X24_TYPELESS_G8_UINT), and 120
+// (Xbox X16_TYPELESS_G8_UINT).
+uint32_t ResolvePlanarSurfaceFormat(uint32_t dxgi_format, uint32_t bind_flags) noexcept {
+    switch (dxgi_format) {
+        case static_cast<uint32_t>(DXGI_FORMAT_X24_TYPELESS_G8_UINT):  // 47
+            return static_cast<uint32_t>(DXGI_FORMAT_D24_UNORM_S8_UINT);
+        case kXboxDxgiFormatX16TypelessG8Uint:  // 120
+            return kXboxDxgiFormatD16UnormS8Uint;
+        case static_cast<uint32_t>(DXGI_FORMAT_X32_TYPELESS_G8X24_UINT):  // 22
+            if (bind_flags == XG_BIND_SHADER_RESOURCE) {
+                return dxgi_format;
+            }
+            return static_cast<uint32_t>(DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
+        default:
+            return dxgi_format;
+    }
+}
+
 constexpr uint32_t AlignUpU32(uint32_t value, uint32_t alignment) noexcept {
     return (alignment <= 1u) ? value : ((value + alignment - 1u) & ~(alignment - 1u));
 }
@@ -581,11 +615,14 @@ bool IsTileMode3D(XG_TILE_MODE mode) noexcept {
 }
 
 uint32_t GetFormatPlaneCount(uint32_t dxgi_format) noexcept {
-    switch (static_cast<DXGI_FORMAT>(dxgi_format)) {
-        case DXGI_FORMAT_R24G8_TYPELESS:
-        case DXGI_FORMAT_D24_UNORM_S8_UINT:
-        case DXGI_FORMAT_R32G8X24_TYPELESS:
-        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+    switch (dxgi_format) {
+        case static_cast<uint32_t>(DXGI_FORMAT_R24G8_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_D24_UNORM_S8_UINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_X24_TYPELESS_G8_UINT):  // 47 -> full D24S8 2-plane surface
+        case static_cast<uint32_t>(DXGI_FORMAT_R32G8X24_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_D32_FLOAT_S8X24_UINT):
+        case kXboxDxgiFormatD16UnormS8Uint:    // 118 -> Xbox D16S8 2-plane surface
+        case kXboxDxgiFormatX16TypelessG8Uint: // 120 -> Xbox stencil-only view of D16S8 2-plane surface
             return 2u;
         default:
             return 1u;
@@ -596,76 +633,79 @@ bool GetFormatBlockInfo(uint32_t dxgi_format, XG_FORMAT_BLOCK_INFO& out_info) no
     out_info = XG_FORMAT_BLOCK_INFO{};
     out_info.dxgi_format = dxgi_format;
 
-    switch (static_cast<DXGI_FORMAT>(dxgi_format)) {
-        // 8 bpp (1 byte) + stencil-view formats
-        case DXGI_FORMAT_R8_TYPELESS:
-        case DXGI_FORMAT_R8_UNORM:
-        case DXGI_FORMAT_R8_UINT:
-        case DXGI_FORMAT_R8_SNORM:
-        case DXGI_FORMAT_R8_SINT:
-        case DXGI_FORMAT_A8_UNORM:
-        case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
-        case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+    switch (dxgi_format) {
+        // 8 bpp (1 byte) + standalone X32_TYPELESS_G8X24_UINT block query
+        case static_cast<uint32_t>(DXGI_FORMAT_R8_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_R8_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_R8_UINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R8_SNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_R8_SINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_A8_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_X32_TYPELESS_G8X24_UINT):
             out_info.block_width = 1u;
             out_info.block_height = 1u;
             out_info.bytes_per_block = 1u;
             out_info.is_compressed = 0u;
             return true;
 
-        // 16 bpp (2 bytes)
-        case DXGI_FORMAT_R8G8_TYPELESS:
-        case DXGI_FORMAT_R8G8_UNORM:
-        case DXGI_FORMAT_R8G8_UINT:
-        case DXGI_FORMAT_R8G8_SNORM:
-        case DXGI_FORMAT_R8G8_SINT:
-        case DXGI_FORMAT_R16_TYPELESS:
-        case DXGI_FORMAT_R16_FLOAT:
-        case DXGI_FORMAT_D16_UNORM:
-        case DXGI_FORMAT_R16_UNORM:
-        case DXGI_FORMAT_R16_UINT:
-        case DXGI_FORMAT_R16_SNORM:
-        case DXGI_FORMAT_R16_SINT:
-        case DXGI_FORMAT_B5G6R5_UNORM:
-        case DXGI_FORMAT_B5G5R5A1_UNORM:
+        // 16 bpp (2 bytes), including Xbox D16_UNORM_S8_UINT / R16_X8 / X16_G8 Plane 0
+        case static_cast<uint32_t>(DXGI_FORMAT_R8G8_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_R8G8_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_R8G8_UINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R8G8_SNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_R8G8_SINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R16_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_R16_FLOAT):
+        case static_cast<uint32_t>(DXGI_FORMAT_D16_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_R16_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_R16_UINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R16_SNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_R16_SINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_B5G6R5_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_B5G5R5A1_UNORM):
+        case kXboxDxgiFormatD16UnormS8Uint:
+        case kXboxDxgiFormatR16UnormX8Typeless:
+        case kXboxDxgiFormatX16TypelessG8Uint:
             out_info.block_width = 1u;
             out_info.block_height = 1u;
             out_info.bytes_per_block = 2u;
             out_info.is_compressed = 0u;
             return true;
 
-        // 32 bpp (4 bytes): RGBA8, BGRA8, RGB10A2, RG11B10, RGB9E5, D32F, D24S8/D32FS8X24 Plane 0
-        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-        case DXGI_FORMAT_R8G8B8A8_UNORM:
-        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-        case DXGI_FORMAT_R8G8B8A8_UINT:
-        case DXGI_FORMAT_R8G8B8A8_SNORM:
-        case DXGI_FORMAT_R8G8B8A8_SINT:
-        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-        case DXGI_FORMAT_B8G8R8A8_UNORM:
-        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-        case DXGI_FORMAT_B8G8R8X8_UNORM:
-        case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-        case DXGI_FORMAT_R10G10B10A2_UNORM:
-        case DXGI_FORMAT_R10G10B10A2_UINT:
-        case DXGI_FORMAT_R11G11B10_FLOAT:
-        case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
-        case DXGI_FORMAT_R16G16_TYPELESS:
-        case DXGI_FORMAT_R16G16_FLOAT:
-        case DXGI_FORMAT_R16G16_UNORM:
-        case DXGI_FORMAT_R16G16_UINT:
-        case DXGI_FORMAT_R16G16_SNORM:
-        case DXGI_FORMAT_R16G16_SINT:
-        case DXGI_FORMAT_R32_TYPELESS:
-        case DXGI_FORMAT_D32_FLOAT:
-        case DXGI_FORMAT_R32_FLOAT:
-        case DXGI_FORMAT_R32_UINT:
-        case DXGI_FORMAT_R32_SINT:
-        case DXGI_FORMAT_R24G8_TYPELESS:
-        case DXGI_FORMAT_D24_UNORM_S8_UINT:
-        case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
-        case DXGI_FORMAT_R32G8X24_TYPELESS:
-        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-        case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+        // 32 bpp (4 bytes): RGBA8, BGRA8, RGB10A2, RG11B10, RGB9E5, D32F, D24S8/X24G8/D32FS8X24 Plane 0
+        case static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB):
+        case static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_SNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_SINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB):
+        case static_cast<uint32_t>(DXGI_FORMAT_B8G8R8X8_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_R10G10B10A2_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_R10G10B10A2_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_R10G10B10A2_UINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R11G11B10_FLOAT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R9G9B9E5_SHAREDEXP):
+        case static_cast<uint32_t>(DXGI_FORMAT_R16G16_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_R16G16_FLOAT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R16G16_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_R16G16_UINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R16G16_SNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_R16G16_SINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R32_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_D32_FLOAT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R32_FLOAT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R32_UINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R32_SINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R24G8_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_D24_UNORM_S8_UINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R24_UNORM_X8_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_X24_TYPELESS_G8_UINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R32G8X24_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_D32_FLOAT_S8X24_UINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS):
             out_info.block_width = 1u;
             out_info.block_height = 1u;
             out_info.bytes_per_block = 4u;
@@ -673,16 +713,16 @@ bool GetFormatBlockInfo(uint32_t dxgi_format, XG_FORMAT_BLOCK_INFO& out_info) no
             return true;
 
         // 64 bpp (8 bytes)
-        case DXGI_FORMAT_R16G16B16A16_TYPELESS:
-        case DXGI_FORMAT_R16G16B16A16_FLOAT:
-        case DXGI_FORMAT_R16G16B16A16_UNORM:
-        case DXGI_FORMAT_R16G16B16A16_UINT:
-        case DXGI_FORMAT_R16G16B16A16_SNORM:
-        case DXGI_FORMAT_R16G16B16A16_SINT:
-        case DXGI_FORMAT_R32G32_TYPELESS:
-        case DXGI_FORMAT_R32G32_FLOAT:
-        case DXGI_FORMAT_R32G32_UINT:
-        case DXGI_FORMAT_R32G32_SINT:
+        case static_cast<uint32_t>(DXGI_FORMAT_R16G16B16A16_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_R16G16B16A16_FLOAT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R16G16B16A16_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_R16G16B16A16_UINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R16G16B16A16_SNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_R16G16B16A16_SINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R32G32_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_R32G32_FLOAT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R32G32_UINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R32G32_SINT):
             out_info.block_width = 1u;
             out_info.block_height = 1u;
             out_info.bytes_per_block = 8u;
@@ -690,10 +730,10 @@ bool GetFormatBlockInfo(uint32_t dxgi_format, XG_FORMAT_BLOCK_INFO& out_info) no
             return true;
 
         // 128 bpp (16 bytes)
-        case DXGI_FORMAT_R32G32B32A32_TYPELESS:
-        case DXGI_FORMAT_R32G32B32A32_FLOAT:
-        case DXGI_FORMAT_R32G32B32A32_UINT:
-        case DXGI_FORMAT_R32G32B32A32_SINT:
+        case static_cast<uint32_t>(DXGI_FORMAT_R32G32B32A32_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_R32G32B32A32_FLOAT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R32G32B32A32_UINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R32G32B32A32_SINT):
             out_info.block_width = 1u;
             out_info.block_height = 1u;
             out_info.bytes_per_block = 16u;
@@ -701,12 +741,12 @@ bool GetFormatBlockInfo(uint32_t dxgi_format, XG_FORMAT_BLOCK_INFO& out_info) no
             return true;
 
         // 4x4 Block-Compressed 8-byte blocks (BC1, BC4)
-        case DXGI_FORMAT_BC1_TYPELESS:
-        case DXGI_FORMAT_BC1_UNORM:
-        case DXGI_FORMAT_BC1_UNORM_SRGB:
-        case DXGI_FORMAT_BC4_TYPELESS:
-        case DXGI_FORMAT_BC4_UNORM:
-        case DXGI_FORMAT_BC4_SNORM:
+        case static_cast<uint32_t>(DXGI_FORMAT_BC1_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC1_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC1_UNORM_SRGB):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC4_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC4_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC4_SNORM):
             out_info.block_width = 4u;
             out_info.block_height = 4u;
             out_info.bytes_per_block = 8u;
@@ -714,21 +754,21 @@ bool GetFormatBlockInfo(uint32_t dxgi_format, XG_FORMAT_BLOCK_INFO& out_info) no
             return true;
 
         // 4x4 Block-Compressed 16-byte blocks (BC2, BC3, BC5, BC6H, BC7)
-        case DXGI_FORMAT_BC2_TYPELESS:
-        case DXGI_FORMAT_BC2_UNORM:
-        case DXGI_FORMAT_BC2_UNORM_SRGB:
-        case DXGI_FORMAT_BC3_TYPELESS:
-        case DXGI_FORMAT_BC3_UNORM:
-        case DXGI_FORMAT_BC3_UNORM_SRGB:
-        case DXGI_FORMAT_BC5_TYPELESS:
-        case DXGI_FORMAT_BC5_UNORM:
-        case DXGI_FORMAT_BC5_SNORM:
-        case DXGI_FORMAT_BC6H_TYPELESS:
-        case DXGI_FORMAT_BC6H_UF16:
-        case DXGI_FORMAT_BC6H_SF16:
-        case DXGI_FORMAT_BC7_TYPELESS:
-        case DXGI_FORMAT_BC7_UNORM:
-        case DXGI_FORMAT_BC7_UNORM_SRGB:
+        case static_cast<uint32_t>(DXGI_FORMAT_BC2_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC2_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC2_UNORM_SRGB):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC3_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC3_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC3_UNORM_SRGB):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC5_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC5_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC5_SNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC6H_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC6H_UF16):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC6H_SF16):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC7_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC7_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_BC7_UNORM_SRGB):
             out_info.block_width = 4u;
             out_info.block_height = 4u;
             out_info.bytes_per_block = 16u;
@@ -751,7 +791,7 @@ bool GetFormatPlaneBlockInfo(
     if (plane == 0u) {
         return GetFormatBlockInfo(dxgi_format, out_info);
     }
-    // Plane 1 for planar depth/stencil formats (D24S8 / R24G8 / D32FS8X24 / R32G8X24): 8-bit stencil.
+    // Plane 1 for planar depth/stencil formats (D24S8/X24G8, D32FS8X24, Xbox D16S8/X16G8): 8-bit stencil.
     out_info = XG_FORMAT_BLOCK_INFO{};
     out_info.dxgi_format = static_cast<uint32_t>(DXGI_FORMAT_R8_UINT);
     out_info.block_width = 1u;
@@ -773,7 +813,10 @@ XG_TILE_MODE ComputeOptimalTileMode(
     if ((bind_flags & XG_BIND_DISPLAYABLE) != 0u) {
         return XG_TILE_MODE_2D_THIN_64KB_D;
     }
-    if ((bind_flags & (XG_BIND_RENDER_TARGET | XG_BIND_DEPTH_STENCIL)) != 0u) {
+    if (HasDepthStencilBindFlag(bind_flags)) {
+        return XG_TILE_MODE_2D_THIN_64KB_Z_X;
+    }
+    if ((bind_flags & XG_BIND_RENDER_TARGET) != 0u) {
         return XG_TILE_MODE_2D_THIN_64KB_R_X;
     }
     const uint64_t elems_x = (width + info.block_width - 1u) / info.block_width;
@@ -816,10 +859,15 @@ bool ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT& o
         return false;
     }
 
+    // Stencil-only view formats (22, 47, 120) map to their full 2-plane parent depth-stencil
+    // surface geometry so Plane 0 (depth) and Plane 1 (stencil) match console memory layout.
+    const uint32_t planar_format = ResolvePlanarSurfaceFormat(desc.Format, desc.BindFlags);
+
     XG_FORMAT_BLOCK_INFO fmt0{};
-    if (!GetFormatPlaneBlockInfo(desc.Format, 0u, fmt0)) {
+    if (!GetFormatPlaneBlockInfo(planar_format, 0u, fmt0)) {
         return false;
     }
+    fmt0.dxgi_format = desc.Format;
 
     TileGeometry geom0{};
     if (!GetTileGeometry(desc.TileMode, fmt0.bytes_per_block, geom0) || geom0.is_3d) {
@@ -828,7 +876,7 @@ bool ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT& o
 
     const uint32_t max_mips = ComputeMaxMips2D(desc.Width, desc.Height);
     const uint32_t mip_levels = (desc.MipLevels == 0u) ? max_mips : std::min(desc.MipLevels, max_mips);
-    const uint32_t plane_count = GetFormatPlaneCount(desc.Format);
+    const uint32_t plane_count = GetFormatPlaneCount(planar_format);
 
     out_layout.Dimension = XG_RESOURCE_DIMENSION_TEXTURE2D;
     out_layout.Depth = 1u;
@@ -857,7 +905,7 @@ bool ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT& o
 
     if (plane_count == 2u) {
         XG_FORMAT_BLOCK_INFO fmt1{};
-        if (!GetFormatPlaneBlockInfo(desc.Format, 1u, fmt1)) {
+        if (!GetFormatPlaneBlockInfo(planar_format, 1u, fmt1)) {
             return false;
         }
         out_layout.PlaneFormatInfo[1] = fmt1;
@@ -1446,15 +1494,20 @@ bool UntileSurface3D(
 namespace {
 
 bool IsDepthFormat(uint32_t dxgi_format) noexcept {
-    switch (static_cast<DXGI_FORMAT>(dxgi_format)) {
-        case DXGI_FORMAT_D16_UNORM:
-        case DXGI_FORMAT_D24_UNORM_S8_UINT:
-        case DXGI_FORMAT_D32_FLOAT:
-        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-        case DXGI_FORMAT_R24G8_TYPELESS:
-        case DXGI_FORMAT_R32G8X24_TYPELESS:
-        case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
-        case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+    switch (dxgi_format) {
+        case static_cast<uint32_t>(DXGI_FORMAT_D16_UNORM):
+        case static_cast<uint32_t>(DXGI_FORMAT_D24_UNORM_S8_UINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_D32_FLOAT):
+        case static_cast<uint32_t>(DXGI_FORMAT_D32_FLOAT_S8X24_UINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R24G8_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_R32G8X24_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_R24_UNORM_X8_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_X24_TYPELESS_G8_UINT):
+        case static_cast<uint32_t>(DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_X32_TYPELESS_G8X24_UINT):
+        case kXboxDxgiFormatD16UnormS8Uint:
+        case kXboxDxgiFormatR16UnormX8Typeless:
+        case kXboxDxgiFormatX16TypelessG8Uint:
             return true;
         default:
             return false;
@@ -1462,13 +1515,18 @@ bool IsDepthFormat(uint32_t dxgi_format) noexcept {
 }
 
 bool IsDepthCapableTypeless(uint32_t dxgi_format) noexcept {
-    switch (static_cast<DXGI_FORMAT>(dxgi_format)) {
-        case DXGI_FORMAT_R16_TYPELESS:
-        case DXGI_FORMAT_R32_TYPELESS:
+    switch (dxgi_format) {
+        case static_cast<uint32_t>(DXGI_FORMAT_R16_TYPELESS):
+        case static_cast<uint32_t>(DXGI_FORMAT_R32_TYPELESS):
             return true;
         default:
             return IsDepthFormat(dxgi_format);
     }
+}
+
+bool HasStencilPlaneFormat(uint32_t dxgi_format, uint32_t bind_flags) noexcept {
+    const uint32_t planar = ResolvePlanarSurfaceFormat(dxgi_format, bind_flags);
+    return GetFormatPlaneCount(planar) >= 2u;
 }
 
 }  // namespace
@@ -1542,27 +1600,56 @@ bool ComputeTexture2DMetadataLayout(
     uint64_t cursor = base_layout.SizeBytes;
 
     // 1. HTILE metadata plane (GFX10 hierarchical Z/stencil: 4 bytes per 8x8 pixel block).
+    // Supports both XG_BIND_DEPTH_STENCIL and D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, and
+    // ensures single-mip (and NPOT) depth-bind surfaces cover their full tile-padded 8x8 grid
+    // aligned to pipe-interleave * NumPipes and tile alignment without under-allocation.
+    const bool depth_bind = HasDepthStencilBindFlag(desc.BindFlags);
     const bool is_depth =
-        ((desc.BindFlags & XG_BIND_DEPTH_STENCIL) != 0u && IsDepthCapableTypeless(desc.Format)) ||
+        (depth_bind && IsDepthCapableTypeless(desc.Format)) ||
         IsDepthFormat(desc.Format);
     if (is_tiled && is_depth) {
-        const uint64_t htile_align = std::max<uint64_t>(
-            pipe_align,
-            (base_layout.BaseAlignmentBytes >= 65536ull) ? 65536ull : 4096ull);
+        const uint64_t tile_htile_align =
+            (base_layout.BaseAlignmentBytes >= 65536ull) ? 65536ull :
+            ((base_layout.BaseAlignmentBytes >= 4096ull) ? 4096ull : 256ull);
+        const uint64_t htile_align = std::max<uint64_t>(pipe_align, tile_htile_align);
         const uint32_t meta_block_w = 8u * pipe_cfg.NumPipes;
         const uint32_t meta_block_h = 8u * pipe_cfg.NumBanks;
 
         uint64_t htile_slice_bytes = 0ull;
-        for (uint32_t m = 0u; m < base_layout.MipLevels; ++m) {
-            const uint32_t mw = std::max(1u, desc.Width >> m);
-            const uint32_t mh = std::max(1u, desc.Height >> m);
-            const uint32_t blocks_x = (mw + 7u) / 8u;
-            const uint32_t blocks_y = (mh + 7u) / 8u;
-            const uint64_t mip_bytes =
+        if (base_layout.MipLevels == 1u) {
+            const XG_MIPLEVEL_LAYOUT& ml0 = base_layout.Mips[0];
+            const uint32_t padded_w = std::max(
+                desc.Width,
+                ml0.PaddedWidthElements * std::max(1u, base_layout.FormatInfo.block_width));
+            const uint32_t padded_h = std::max(
+                desc.Height,
+                ml0.PaddedHeightElements * std::max(1u, base_layout.FormatInfo.block_height));
+            const uint32_t cov_w = AlignUpU32(padded_w, 8u);
+            const uint32_t cov_h = AlignUpU32(padded_h, 8u);
+            const uint32_t blocks_x = cov_w / 8u;
+            const uint32_t blocks_y = cov_h / 8u;
+            const uint64_t raw_htile_bytes =
                 static_cast<uint64_t>(blocks_x) * static_cast<uint64_t>(blocks_y) * 4ull;
-            htile_slice_bytes += AlignUpU64(mip_bytes, pipe_align);
+            htile_slice_bytes = AlignUpU64(std::max<uint64_t>(raw_htile_bytes, pipe_align), htile_align);
+        } else {
+            for (uint32_t m = 0u; m < base_layout.MipLevels; ++m) {
+                const uint32_t mw = std::max(1u, desc.Width >> m);
+                const uint32_t mh = std::max(1u, desc.Height >> m);
+                const XG_MIPLEVEL_LAYOUT& ml = base_layout.Mips[m];
+                const uint32_t padded_w = (m == 0u)
+                    ? std::max(mw, ml.PaddedWidthElements * std::max(1u, base_layout.FormatInfo.block_width))
+                    : mw;
+                const uint32_t padded_h = (m == 0u)
+                    ? std::max(mh, ml.PaddedHeightElements * std::max(1u, base_layout.FormatInfo.block_height))
+                    : mh;
+                const uint32_t blocks_x = (padded_w + 7u) / 8u;
+                const uint32_t blocks_y = (padded_h + 7u) / 8u;
+                const uint64_t mip_bytes =
+                    static_cast<uint64_t>(blocks_x) * static_cast<uint64_t>(blocks_y) * 4ull;
+                htile_slice_bytes += AlignUpU64(mip_bytes, pipe_align);
+            }
+            htile_slice_bytes = AlignUpU64(std::max<uint64_t>(htile_slice_bytes, pipe_align), htile_align);
         }
-        htile_slice_bytes = AlignUpU64(std::max<uint64_t>(htile_slice_bytes, pipe_align), htile_align);
 
         cursor = AlignUpU64(cursor, htile_align);
         out_meta.Htile.Enabled = 1u;
@@ -1630,6 +1717,97 @@ bool ComputeTexture2DMetadataLayout(
     }
 
     out_meta.TotalSizeWithMetadataBytes = AlignUpU64(cursor, out_meta.BaseAlignmentBytes);
+    return true;
+}
+
+// Clean-room plane usage bitmask & single-mip depth HTILE summary (xbox-emulator #124).
+// Plane usage flag bits:
+//   bit 0 (0x01): Color data plane
+//   bit 1 (0x02): Depth data plane
+//   bit 2 (0x04): Stencil data plane
+//   bit 3 (0x08): HTILE metadata plane
+//   bit 4 (0x10): DCC metadata plane
+//   bit 5 (0x20): CMASK metadata plane
+//   bit 6 (0x40): Single-mip depth-bind HTILE active
+struct XgPlaneUsageMetadataSummary {
+    uint32_t plane_usage_flags = 0u;
+    uint32_t data_plane_count = 0u;
+    uint32_t htile_blocks_x = 0u;
+    uint32_t htile_blocks_y = 0u;
+    uint32_t htile_padded_width = 0u;
+    uint32_t htile_padded_height = 0u;
+    uint64_t htile_raw_bytes = 0ull;
+    uint64_t htile_pipe_align_bytes = 0ull;
+    uint64_t htile_offset_bytes = 0ull;
+    uint64_t htile_size_bytes = 0ull;
+    uint64_t htile_slice_pitch_bytes = 0ull;
+    uint64_t total_size_bytes = 0ull;
+};
+
+bool ComputeTexture2DPlaneUsageSummary(
+    const XG_TEXTURE2D_DESC& desc,
+    XG_CONSOLE_TYPE console_type,
+    XgPlaneUsageMetadataSummary& out_summary) noexcept {
+    out_summary = XgPlaneUsageMetadataSummary{};
+    XG_RESOURCE_LAYOUT layout{};
+    XG_RESOURCE_METADATA_LAYOUT meta{};
+    if (!ComputeTexture2DLayout(desc, layout) ||
+        !ComputeTexture2DMetadataLayout(desc, console_type, meta)) {
+        return false;
+    }
+
+    const bool depth_bind = HasDepthStencilBindFlag(desc.BindFlags);
+    const bool is_depth =
+        (depth_bind && IsDepthCapableTypeless(desc.Format)) ||
+        IsDepthFormat(desc.Format);
+
+    uint32_t flags = 0u;
+    if (is_depth) {
+        flags |= 0x02u;  // Depth plane
+        if (HasStencilPlaneFormat(desc.Format, desc.BindFlags) || layout.PlaneCount >= 2u) {
+            flags |= 0x04u;  // Stencil plane
+        }
+    } else {
+        flags |= 0x01u;  // Color plane
+    }
+    if (meta.Htile.Enabled != 0u) {
+        flags |= 0x08u;  // HTILE plane
+        if (layout.MipLevels == 1u) {
+            flags |= 0x40u;  // Single-mip HTILE flag
+        }
+        const XG_MIPLEVEL_LAYOUT& ml0 = layout.Mips[0];
+        const uint32_t padded_w = std::max(
+            desc.Width,
+            ml0.PaddedWidthElements * std::max(1u, layout.FormatInfo.block_width));
+        const uint32_t padded_h = std::max(
+            desc.Height,
+            ml0.PaddedHeightElements * std::max(1u, layout.FormatInfo.block_height));
+        const uint32_t cov_w = AlignUpU32(padded_w, 8u);
+        const uint32_t cov_h = AlignUpU32(padded_h, 8u);
+        out_summary.htile_padded_width = cov_w;
+        out_summary.htile_padded_height = cov_h;
+        out_summary.htile_blocks_x = cov_w / 8u;
+        out_summary.htile_blocks_y = cov_h / 8u;
+        out_summary.htile_raw_bytes =
+            static_cast<uint64_t>(out_summary.htile_blocks_x) *
+            static_cast<uint64_t>(out_summary.htile_blocks_y) * 4ull;
+        out_summary.htile_pipe_align_bytes =
+            static_cast<uint64_t>(meta.PipeConfig.NumPipes) *
+            static_cast<uint64_t>(meta.PipeConfig.PipeInterleaveBytes);
+        out_summary.htile_offset_bytes = meta.Htile.OffsetBytes;
+        out_summary.htile_size_bytes = meta.Htile.SizeBytes;
+        out_summary.htile_slice_pitch_bytes = meta.Htile.SlicePitchBytes;
+    }
+    if (meta.Dcc.Enabled != 0u) {
+        flags |= 0x10u;  // DCC plane
+    }
+    if (meta.Cmask.Enabled != 0u) {
+        flags |= 0x20u;  // CMASK plane
+    }
+
+    out_summary.plane_usage_flags = flags;
+    out_summary.data_plane_count = layout.PlaneCount;
+    out_summary.total_size_bytes = meta.TotalSizeWithMetadataBytes;
     return true;
 }
 

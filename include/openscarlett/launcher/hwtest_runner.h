@@ -163,7 +163,7 @@ std::string GetHardwareTestDescription(const std::string& exe_name);
 // Probes host GPUs (via openscarlett.exe probe-gpu) and parses structured telemetry.
 GpuTelemetrySnapshot ProbeHostGpuTelemetry(const std::filesystem::path& bundle_dir);
 
-// Discovers bundled clean-room playable demos beside the launcher (ScarlettDoom, ScarlettArena, gdk_3d_scene).
+// Discovers bundled playable demos beside the launcher (ScarlettDoom, ScarlettArena, gdk_3d_scene).
 std::vector<BundledDemoEntry> DiscoverBundledDemos(const std::filesystem::path& bundle_dir);
 
 // Runs openscarlett.exe probe-gpu + all portable test_*.exe binaries asynchronously (blocking caller thread;

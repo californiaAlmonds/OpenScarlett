@@ -100,7 +100,7 @@
 #define KERNELX_TILE_POOL_LARGE_PAGES 0x00000002u
 #define KERNELX_TILE_POOL_WRITE_COMBINED 0x00000004u
 
-// Clean-room Xbox XALLOC_ATTRIBUTES alignment codes (bits 24..27).
+// Xbox XALLOC_ATTRIBUTES alignment codes (bits 24..27).
 #define XALLOC_ALIGNMENT_DEFAULT 0x0u
 #define XALLOC_ALIGNMENT_4       0x1u
 #define XALLOC_ALIGNMENT_8       0x2u
@@ -118,20 +118,20 @@
 #define XALLOC_ALIGNMENT_32K     0xEu
 #define XALLOC_ALIGNMENT_64K     0xFu
 
-// Clean-room Xbox XALLOC_ATTRIBUTES memory type codes (bits 28..31).
+// Xbox XALLOC_ATTRIBUTES memory type codes (bits 28..31).
 #define XALLOC_MEMTYPE_HEAP                               0x0u
 #define XALLOC_MEMTYPE_GRAPHICS_WRITECOMBINE              0x1u
 #define XALLOC_MEMTYPE_GRAPHICS_WRITECOMBINE_GPU_READONLY 0x2u
 #define XALLOC_MEMTYPE_GRAPHICS_CACHEABLE                 0x3u
 #define XALLOC_MEMTYPE_PHYSICAL                           0x4u
 
-// Clean-room Xbox XALLOC_ATTRIBUTES page size preference (bits 32..33).
+// Xbox XALLOC_ATTRIBUTES page size preference (bits 32..33).
 #define XALLOC_PAGESIZE_DEFAULT 0x0u
 #define XALLOC_PAGESIZE_4KB     0x1u
 #define XALLOC_PAGESIZE_64KB    0x2u
 #define XALLOC_PAGESIZE_4MB     0x3u
 
-// Clean-room Xbox XALLOC_ATTRIBUTES zero-initialize & 2 MiB page-hint bits (bits 34..35).
+// Xbox XALLOC_ATTRIBUTES zero-initialize & 2 MiB page-hint bits (bits 34..35).
 #define XALLOC_FLAG_ZERO_INIT (1ull << 34)
 #define XALLOC_FLAG_2MB_PAGES (1ull << 35)
 
@@ -209,7 +209,7 @@ typedef struct KERNELX_OS_VERSION {
     uint16_t Revision;
 } KERNELX_OS_VERSION;
 
-// ABI-identical clean-room layout matching Win32 MEMORY_BASIC_INFORMATION (48 bytes on x64).
+// ABI-identical layout matching Win32 MEMORY_BASIC_INFORMATION (48 bytes on x64).
 typedef struct XMEM_MEMORY_BASIC_INFORMATION {
     void* BaseAddress;
     void* AllocationBase;

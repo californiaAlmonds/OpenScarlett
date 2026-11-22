@@ -1,4 +1,4 @@
-# OpenScarlett Worker 6 — Clean-room BCPack BC1-BC7 Hardening & RDNA2 BVH4 Decoder
+# OpenScarlett Worker 6 — BCPack BC1-BC7 Hardening & RDNA2 BVH4 Decoder
 
 target_sources(openscarlett_core PRIVATE
     src/gpu/bvh4_decoder.cpp

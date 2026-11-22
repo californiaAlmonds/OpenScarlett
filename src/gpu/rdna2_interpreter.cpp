@@ -680,7 +680,7 @@ uint32_t Rdna2CpuTexture::AtomicCmpSwapR32u(
 }
 
 // ---------------------------------------------------------------------------
-// Clean-Room CPU RDNA2 Wave32 / Wave64 Interpreter
+// CPU RDNA2 Wave32 / Wave64 Interpreter
 // ---------------------------------------------------------------------------
 Status ExecuteRdna2Cpu(
     const Xs2ShaderContainer& container,

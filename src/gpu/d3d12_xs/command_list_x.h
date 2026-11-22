@@ -7,9 +7,104 @@
 #include <vector>
 
 #include "openscarlett/gpu/d3d12_xs_abi.h"
+#include "openscarlett/gpu/xg_xs_abi.h"
 #include "proxies_x.h"
 
 namespace openscarlett::d3d12_xs {
+
+// Clean-room COM interface for placed tiled texture management, 64KB tile-pool mapping,
+// subresource pitch queries, and untile/retile barrier coherency diagnostics (Leonida #1674).
+// Returned via CommandListX::QueryInterface (zero extra DLL exports needed on MinGW-w64).
+// {6A94F8C3-7D42-4A1E-9C35-B8E10F4A2D13}
+inline constexpr GUID IID_IOpenScarlettTiledPlacedManager = {
+    0x6a94f8c3u, 0x7d42u, 0x4a1eu,
+    {0x9cu, 0x35u, 0xb8u, 0xe1u, 0x0fu, 0x4au, 0x2du, 0x13u}
+};
+
+struct D3D12XBOX_TILED_PLACED_DESC {
+    ID3D12Heap* placed_heap = nullptr;
+    uint64_t heap_offset_bytes = 0ull;
+    uint32_t xg_tile_mode = static_cast<uint32_t>(XG_TILE_MODE_2D_THIN_64KB_S);
+    uint32_t initial_state = static_cast<uint32_t>(D3D12_RESOURCE_STATE_COMMON);
+    uint64_t tile_pool_base_offset_bytes = 0ull;  // 0 => default to heap_offset_bytes
+};
+
+struct D3D12XBOX_TILED_PLACED_SUBRESOURCE_PITCH {
+    uint32_t subresource_index = 0u;
+    uint32_t mip_level = 0u;
+    uint32_t array_slice = 0u;
+    uint32_t width_elements = 0u;
+    uint32_t height_elements = 0u;
+    uint32_t depth_elements = 1u;
+    uint32_t tiles_x = 0u;
+    uint32_t tiles_y = 0u;
+    uint32_t tiles_z = 1u;
+    uint32_t tile_size_bytes = 65536u;
+    uint32_t bytes_per_element = 4u;
+    uint32_t linear_row_pitch_bytes = 256u;
+    uint64_t subresource_offset_bytes = 0ull;
+    uint64_t heap_subresource_offset_bytes = 0ull;
+    uint64_t subresource_size_bytes = 0ull;
+    uint32_t tile_pool_start_index_64kb = 0u;
+    uint32_t tile_pool_count_64kb = 0u;
+    uint32_t current_state = static_cast<uint32_t>(D3D12_RESOURCE_STATE_COMMON);
+    uint32_t dirty_for_flush = 0u;
+};
+
+struct D3D12XBOX_TILED_PLACED_TILE_MAPPING {
+    uint32_t subresource_index = 0u;
+    uint32_t logical_tile_x = 0u;
+    uint32_t logical_tile_y = 0u;
+    uint32_t logical_tile_z = 0u;
+    uint32_t heap_tile_index_64kb = 0u;
+    uint64_t pool_byte_offset = 0ull;
+    uint32_t mapped = 1u;
+};
+
+struct D3D12XBOX_TILED_PLACED_INFO {
+    uint64_t heap_offset_bytes = 0ull;
+    uint64_t tile_pool_base_offset_bytes = 0ull;
+    uint64_t total_surface_bytes = 0ull;
+    uint32_t xg_tile_mode = 0u;
+    uint32_t subresource_count = 0u;
+    uint32_t total_64kb_tiles = 0u;
+    uint32_t mapped_tile_count = 0u;
+    uint32_t current_state = 0u;
+    uint64_t untile_copy_count = 0ull;
+    uint64_t retile_copy_count = 0ull;
+    uint64_t copy_resource_bridge_count = 0ull;
+    uint64_t copy_tiles_bridge_count = 0ull;
+    uint64_t barrier_transition_count = 0ull;
+    uint64_t aliasing_barrier_count = 0ull;
+    uint64_t coherency_flush_count = 0ull;
+    uint32_t used_gpu_untile_bridge = 0u;
+};
+
+struct IOpenScarlettTiledPlacedManager : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE RegisterPlacedTiledTexture(
+        ID3D12Resource* resource,
+        const D3D12XBOX_TILED_PLACED_DESC* desc) = 0;
+    virtual HRESULT STDMETHODCALLTYPE UnregisterPlacedTiledTexture(
+        ID3D12Resource* resource) = 0;
+    virtual HRESULT STDMETHODCALLTYPE UpdatePlacedTileMappings(
+        ID3D12Resource* resource,
+        uint32_t mapping_count,
+        const D3D12XBOX_TILED_PLACED_TILE_MAPPING* mappings) = 0;
+    virtual HRESULT STDMETHODCALLTYPE QueryPlacedTiledSubresourcePitch(
+        ID3D12Resource* resource,
+        uint32_t subresource_index,
+        D3D12XBOX_TILED_PLACED_SUBRESOURCE_PITCH* out_pitch) = 0;
+    virtual HRESULT STDMETHODCALLTYPE QueryPlacedTiledTextureInfo(
+        ID3D12Resource* resource,
+        D3D12XBOX_TILED_PLACED_INFO* out_info) = 0;
+    virtual HRESULT STDMETHODCALLTYPE QueryPlacedTileMapping(
+        ID3D12Resource* resource,
+        uint32_t subresource_index,
+        uint32_t tile_x,
+        uint32_t tile_y,
+        uint32_t tile_z,
+        D3D12XBOX_TILED_PLACED_TILE_MAPPING* out_mapping) = 0;
+};
 
 class DeviceX;
 class CommandListExtendedProxy;
@@ -87,7 +182,8 @@ struct DeferredCpuWait {
 
 class CommandListX final
     : public ID3D12GraphicsCommandListX,
-      public IOpenScarlettCommandListExtState {
+      public IOpenScarlettCommandListExtState,
+      public IOpenScarlettTiledPlacedManager {
 public:
     CommandListX(DeviceX* parent_device, ID3D12GraphicsCommandList* host_list);
     ~CommandListX();
@@ -354,6 +450,31 @@ public:
     HRESULT STDMETHODCALLTYPE GetCommandListExtState(
         D3D12XBOX_CMDLIST_EXT_STATE* out_state) const noexcept override;
 
+    // IOpenScarlettTiledPlacedManager
+    HRESULT STDMETHODCALLTYPE RegisterPlacedTiledTexture(
+        ID3D12Resource* resource,
+        const D3D12XBOX_TILED_PLACED_DESC* desc) override;
+    HRESULT STDMETHODCALLTYPE UnregisterPlacedTiledTexture(
+        ID3D12Resource* resource) override;
+    HRESULT STDMETHODCALLTYPE UpdatePlacedTileMappings(
+        ID3D12Resource* resource,
+        uint32_t mapping_count,
+        const D3D12XBOX_TILED_PLACED_TILE_MAPPING* mappings) override;
+    HRESULT STDMETHODCALLTYPE QueryPlacedTiledSubresourcePitch(
+        ID3D12Resource* resource,
+        uint32_t subresource_index,
+        D3D12XBOX_TILED_PLACED_SUBRESOURCE_PITCH* out_pitch) override;
+    HRESULT STDMETHODCALLTYPE QueryPlacedTiledTextureInfo(
+        ID3D12Resource* resource,
+        D3D12XBOX_TILED_PLACED_INFO* out_info) override;
+    HRESULT STDMETHODCALLTYPE QueryPlacedTileMapping(
+        ID3D12Resource* resource,
+        uint32_t subresource_index,
+        uint32_t tile_x,
+        uint32_t tile_y,
+        uint32_t tile_z,
+        D3D12XBOX_TILED_PLACED_TILE_MAPPING* out_mapping) override;
+
 private:
     friend class CommandListExtendedProxy;
 
@@ -429,6 +550,33 @@ private:
     std::vector<DeferredCpuWrite32> deferred_cpu_writes_;
     std::vector<DeferredCpuWait> deferred_cpu_waits_;
     void RecordMirroredResourceGpuWrite(ID3D12Resource* host_resource);
+
+    // Sprint 13 placed tiled texture transient buffers & bridge helpers (Leonida #1674)
+    std::mutex tiled_transient_mutex_;
+    std::vector<ID3D12Resource*> tiled_transient_resources_;
+    void TrackTiledTransientResource(ID3D12Resource* res);
+    void ReleaseTiledTransientResources();
+    bool TryBridgePlacedTiledCopyTextureRegion(
+        const D3D12_TEXTURE_COPY_LOCATION& dst_loc,
+        UINT dst_x,
+        UINT dst_y,
+        UINT dst_z,
+        const D3D12_TEXTURE_COPY_LOCATION& src_loc,
+        const D3D12_BOX* src_box);
+    bool TryBridgePlacedTiledCopyResource(
+        ID3D12Resource* host_dst,
+        ID3D12Resource* host_src);
+    bool TryBridgePlacedTiledCopyTiles(
+        ID3D12Resource* host_tiled_res,
+        const D3D12_TILED_RESOURCE_COORDINATE* start_coord,
+        const D3D12_TILE_REGION_SIZE* region_size,
+        ID3D12Resource* host_buffer,
+        UINT64 buffer_offset_bytes,
+        D3D12_TILE_COPY_FLAGS flags);
+    void TrackPlacedTiledResourceBarriers(
+        UINT num_barriers,
+        const D3D12_RESOURCE_BARRIER* unwrapped_barriers,
+        std::vector<D3D12_RESOURCE_BARRIER>& extra_coherency_barriers);
 };
 
 }  // namespace openscarlett::d3d12_xs

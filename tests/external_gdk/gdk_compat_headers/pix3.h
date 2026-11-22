@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Microsoft PIX3 (<pix3.h>) public header backed by pixevt.dll.
+// MIT Microsoft PIX3 (<pix3.h>) public header backed by pixevt.dll.
 
 #include <cstdint>
 

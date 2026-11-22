@@ -1,9 +1,12 @@
 #include "openscarlett/gpu/rdna2_xbox_container.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstring>
+#include <set>
 #include <sstream>
+#include <unordered_map>
 
 namespace openscarlett {
 
@@ -88,27 +91,52 @@ void AppendStaticSampler(std::vector<uint8_t>& out, const XboxStaticSamplerInfo&
     AppendLe32(out, s.shader_visibility);
 }
 
-void ParseSignatureChunk(
+bool IsValidSemanticAscii(const uint8_t* data, size_t size, uint32_t name_off) noexcept {
+    if (!data || name_off >= size) return false;
+    const size_t max_len = std::min<size_t>(size - name_off, 128u);
+    if (max_len == 0u) return false;
+    size_t len = 0u;
+    while (len < max_len && data[name_off + len] != 0u) {
+        const uint8_t ch = data[name_off + len];
+        if (ch < 0x20u || ch > 0x7Eu) return false;
+        ++len;
+    }
+    if (len == 0u || name_off + len >= size || data[name_off + len] != 0u) return false;
+    return true;
+}
+
+bool TryParseSignatureChunkWithStride(
     const uint8_t* data,
     size_t size,
-    bool is_v1,
+    uint32_t count,
+    uint32_t table_off,
+    uint32_t stride,
+    bool strict_ascii,
     std::vector<XboxSignatureParamDesc>& out_params) {
-    if (!data || size < 8u) return;
-    const uint32_t count = ReadLe32(data + 0u);
-    const size_t stride = is_v1 ? 32u : 24u;
-    if (count > 256u || 8u + static_cast<size_t>(count) * stride > size) return;
+    if (stride != 24u && stride != 28u && stride != 32u) return false;
+    const uint64_t table_end = static_cast<uint64_t>(table_off) +
+                               static_cast<uint64_t>(count) * static_cast<uint64_t>(stride);
+    if (table_end > size) return false;
 
-    out_params.clear();
-    out_params.reserve(count);
+    const bool has_stream = (stride == 28u || stride == 32u);
+    const bool has_min_prec = (stride == 32u);
+
+    std::vector<XboxSignatureParamDesc> parsed;
+    parsed.reserve(count);
     for (uint32_t i = 0u; i < count; ++i) {
-        const uint8_t* rec = data + 8u + static_cast<size_t>(i) * stride;
+        const uint8_t* rec = data + table_off + static_cast<size_t>(i) * stride;
         XboxSignatureParamDesc e{};
         size_t off = 0u;
-        if (is_v1) {
+        if (has_stream) {
             e.stream = ReadLe32(rec + 0u);
             off = 4u;
         }
         const uint32_t name_off = ReadLe32(rec + off + 0u);
+        if (strict_ascii) {
+            if (static_cast<uint64_t>(name_off) < table_end || !IsValidSemanticAscii(data, size, name_off)) {
+                return false;
+            }
+        }
         e.semantic_index = ReadLe32(rec + off + 4u);
         e.system_value_type = ReadLe32(rec + off + 8u);
         e.component_type = ReadLe32(rec + off + 12u);
@@ -116,7 +144,7 @@ void ParseSignatureChunk(
         const uint32_t masks = ReadLe32(rec + off + 20u);
         e.mask = static_cast<uint8_t>(masks & 0xFFu);
         e.rw_mask = static_cast<uint8_t>((masks >> 8) & 0xFFu);
-        // Optional clean-room extension: upper byte of masks can encode explicit interp mode when non-zero
+        // Optional extension: upper byte of masks can encode explicit interp mode when non-zero
         const uint8_t interp_hint = static_cast<uint8_t>((masks >> 16) & 0xFFu);
         if (interp_hint >= 1u && interp_hint <= 5u) {
             e.interp_mode = static_cast<Rdna2InterpMode>(interp_hint - 1u);
@@ -124,16 +152,54 @@ void ParseSignatureChunk(
             // D3D12 / HLSL requires integer stage inputs/outputs to be Flat (nointerpolation)
             e.interp_mode = Rdna2InterpMode::Flat;
         }
-        if (is_v1) {
+        if (has_min_prec) {
             e.min_precision = ReadLe32(rec + 28u);
         }
         if (name_off < size) {
             size_t end = name_off;
-            while (end < size && data[end] != 0u) ++end;
+            const size_t limit = std::min<size_t>(size, static_cast<size_t>(name_off) + 128u);
+            while (end < limit && data[end] != 0u) ++end;
             e.semantic_name.assign(reinterpret_cast<const char*>(data + name_off), end - name_off);
         }
-        out_params.push_back(std::move(e));
+        parsed.push_back(std::move(e));
     }
+    out_params = std::move(parsed);
+    return true;
+}
+
+uint32_t ParseSignatureChunk(
+    const uint8_t* data,
+    size_t size,
+    uint32_t expected_stride,
+    std::vector<XboxSignatureParamDesc>& out_params) {
+    if (!data || size < 8u) return 0u;
+    const uint32_t count = ReadLe32(data + 0u);
+    uint32_t table_off = ReadLe32(data + 4u);
+    if (table_off == 0u) {
+        table_off = 8u;
+    }
+    if (count > 256u || table_off < 8u || table_off > size) {
+        return 0u;
+    }
+
+    // Try expected stride first (24 for ISGN/OSGN/PSGN, 28 for OSG5, 32 for ISG1/OSG1/PSG1)
+    // with strict semantic-table bounds validation; gracefully adapt if an Xbox container packs
+    // 24-byte D3D11_SIGNATURE_PARAMETER_DESC elements vs 32-byte extended elements.
+    if (TryParseSignatureChunkWithStride(data, size, count, table_off, expected_stride, true, out_params)) {
+        return expected_stride;
+    }
+    const uint32_t fallbacks[3] = {24u, 32u, 28u};
+    for (uint32_t alt : fallbacks) {
+        if (alt == expected_stride) continue;
+        if (TryParseSignatureChunkWithStride(data, size, count, table_off, alt, true, out_params)) {
+            return alt;
+        }
+    }
+    // Non-strict fallback for synthetic chunks without string table entries (still strictly bounds-checked)
+    if (TryParseSignatureChunkWithStride(data, size, count, table_off, expected_stride, false, out_params)) {
+        return expected_stride;
+    }
+    return 0u;
 }
 
 std::vector<uint8_t> BuildSignatureChunk(
@@ -231,7 +297,7 @@ void ApplyRegisterWrite(uint32_t reg_dw, uint32_t val, Rdna2PgmRegisterSetup& se
 
     auto decode_rsrc3 = [&](uint32_t v) {
         setup.pgm_rsrc3 = v;
-        // Clean-room wave32/wave64 indicator bit in RSRC3[31] (1 = Wave64, 0 = native RDNA2 Wave32)
+        // Wave32/wave64 indicator bit in RSRC3[31] (1 = Wave64, 0 = native RDNA2 Wave32)
         if (((v >> 31) & 1u) != 0u) {
             setup.wave_size = 64u;
             // Recompute VGPR count using wave64 granularity if RSRC1 was already seen
@@ -452,6 +518,58 @@ void EmitRawExecSop2(std::vector<uint32_t>& words, uint16_t raw_op, uint8_t sdst
     }
 }
 
+void EmitRawBvh64IntersectRay(
+    std::vector<uint32_t>& words,
+    uint8_t vdata,
+    uint8_t vaddr,
+    uint8_t srsrc,
+    uint8_t dmask) {
+    // GFX10.3 / RDNA2 MIMG 64-bit encoding:
+    // w0: [31:26] = 0x3C, [24:18] = raw_op[6:0], [11:8] = dmask, [0] = raw_op[7]
+    // w1: [20:16] = srsrc (quad-SGPR index), [15:8] = vdata, [7:0] = vaddr
+    const uint16_t raw_op = kMimgRawImageBvh64IntersectRay;
+    const uint32_t w0 = (0x3Cu << 26) |
+                        (static_cast<uint32_t>(raw_op & 0x7Fu) << 18) |
+                        (static_cast<uint32_t>(dmask & 0xFu) << 8) |
+                        static_cast<uint32_t>((raw_op >> 7) & 1u);
+    const uint32_t w1 = (static_cast<uint32_t>(srsrc & 0x1Fu) << 16) |
+                        (static_cast<uint32_t>(vdata) << 8) |
+                        static_cast<uint32_t>(vaddr);
+    words.push_back(w0);
+    words.push_back(w1);
+}
+
+bool IsXboxShaderContainerBlob(const void* data, size_t size) noexcept {
+    if (!data || size < 4u) return false;
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    if (std::memcmp(bytes, "XS2\0", 4u) == 0) {
+        return size >= kXs2HeaderSizeBytes;
+    }
+    if (size < 32u || std::memcmp(bytes, "DXBC", 4u) != 0) {
+        return false;
+    }
+    const uint32_t total_size = ReadLe32(bytes + 24u);
+    const uint32_t chunk_count = ReadLe32(bytes + 28u);
+    if (total_size < 32u || total_size > size || chunk_count == 0u || chunk_count > 128u) {
+        return false;
+    }
+    const uint64_t dir_end = 32ull + static_cast<uint64_t>(chunk_count) * 4ull;
+    if (dir_end > total_size) return false;
+
+    for (uint32_t i = 0u; i < chunk_count; ++i) {
+        const uint32_t off = ReadLe32(bytes + 32u + static_cast<size_t>(i) * 4u);
+        if (static_cast<uint64_t>(off) + 8ull > total_size) continue;
+        if (std::memcmp(bytes + off, "XBOX", 4u) == 0 ||
+            std::memcmp(bytes + off, "XS2M", 4u) == 0 ||
+            std::memcmp(bytes + off, "RDNA", 4u) == 0 ||
+            std::memcmp(bytes + off, "PM4R", 4u) == 0 ||
+            std::memcmp(bytes + off, "RREG", 4u) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 Status DisassembleRdna2Extended(
     const std::vector<uint32_t>& words,
     std::vector<Rdna2Instruction>& out_instructions) {
@@ -468,6 +586,47 @@ Status DisassembleRdna2Extended(
     size_t pc = 0u;
     while (pc < words.size()) {
         const uint32_t w0 = words[pc];
+
+        // Check extended MIMG image_bvh64_intersect_ray (raw_op 0xE7)
+        if ((w0 >> 26) == 0x3Cu) {
+            const uint16_t raw_op = static_cast<uint16_t>(((w0 >> 18) & 0x7Fu) | ((w0 & 1u) << 7));
+            if (raw_op == kMimgRawImageBvh64IntersectRay) {
+                if (pc + 1u >= words.size()) {
+                    return Status::Error(StatusCode::ParseError, "Truncated image_bvh64_intersect_ray instruction");
+                }
+                const uint32_t w1 = words[pc + 1u];
+                Rdna2Instruction inst{};
+                inst.word_offset = static_cast<uint32_t>(pc);
+                inst.raw_words[0] = w0;
+                inst.raw_words[1] = w1;
+                inst.word_count = 2u;
+                inst.encoding = Rdna2Encoding::MIMG;
+                inst.opcode = Rdna2Opcode::IMAGE_BVH_INTERSECT_RAY;
+                inst.raw_opcode = raw_op;
+                inst.slc = ((w0 >> 25) & 1u) != 0u;
+                inst.glc = ((w0 >> 13) & 1u) != 0u;
+                inst.mimg_unrm = ((w0 >> 12) & 1u) != 0u;
+                inst.mimg_dmask = static_cast<uint8_t>((w0 >> 8) & 0xFu);
+                inst.dlc = ((w0 >> 7) & 1u) != 0u;
+                inst.mimg_dim = static_cast<uint8_t>((w0 >> 3) & 0x7u);
+                inst.ssamp = static_cast<uint8_t>((w1 >> 21) & 0x1Fu);
+                inst.srsrc = static_cast<uint8_t>((w1 >> 16) & 0x1Fu);
+                const uint8_t vdata = static_cast<uint8_t>((w1 >> 8) & 0xFFu);
+                const uint8_t vaddr = static_cast<uint8_t>(w1 & 0xFFu);
+                inst.dst = Rdna2Operand::Vgpr(vdata);
+                inst.src[0] = Rdna2Operand::Vgpr(vaddr);
+                inst.src_count = 1u;
+                inst.operand_width = Rdna2OperandWidth::Bits64;
+                inst.mnemonic = "image_bvh64_intersect_ray";
+                inst.disasm = "image_bvh64_intersect_ray v" + std::to_string(vdata) +
+                              ", v" + std::to_string(vaddr) + ", s[" +
+                              std::to_string(static_cast<uint32_t>(inst.srsrc) * 4u) + ":" +
+                              std::to_string(static_cast<uint32_t>(inst.srsrc) * 4u + 3u) + "]";
+                out_instructions.push_back(std::move(inst));
+                pc += 2u;
+                continue;
+            }
+        }
 
         // Check extended SOP1 EXEC-mask opcodes
         if ((w0 >> 23) == 0x17Du) {
@@ -880,6 +1039,13 @@ std::vector<uint8_t> BuildPm4RegisterBlock(const Rdna2PgmRegisterSetup& setup, S
         if (rsrc3 != 0u) {
             AppendPm4SetReg(out, kPm4ItSetShReg, kRdna2ShRegBaseDword, r3_reg, {rsrc3});
         }
+        if ((stage == ShaderStage::Mesh || stage == ShaderStage::Amplification) &&
+            (setup.threadgroup_x > 0u || setup.threadgroup_y > 0u || setup.threadgroup_z > 0u)) {
+            AppendPm4SetReg(out, kPm4ItSetShReg, kRdna2ShRegBaseDword, kRegComputeNumThreadX,
+                            {setup.threadgroup_x ? setup.threadgroup_x : 1u,
+                             setup.threadgroup_y ? setup.threadgroup_y : 1u,
+                             setup.threadgroup_z ? setup.threadgroup_z : 1u});
+        }
     }
 
     if (setup.spi_ps_input_ena != 0u || setup.spi_ps_input_addr != 0u) {
@@ -1119,7 +1285,7 @@ bool TryExtractPm4AndIsaFromRdnaChunk(
         }
     }
 
-    // 2. Clean-room "RDNA" structured payload:
+    // 2. "RDNA" structured payload:
     //    [0..3]: "RDNA" magic
     //    [4..7]: stage (ShaderStage uint32)
     //    [8..11]: pm4_byte_size
@@ -1201,6 +1367,7 @@ Status ParseFullXboxShaderContainer(const void* data, size_t size, XboxParsedSha
         out_parsed.has_raw_rdna_isa = !out_parsed.xs2.code_words.empty();
         out_parsed.rdna_isa_words = out_parsed.xs2.code_words;
         out_parsed.shader_payload_fourcc = "XS2";
+        (void)InferShaderRootBindingsWhenRts0Absent(out_parsed);
         return Status::Ok();
     }
 
@@ -1271,17 +1438,24 @@ Status ParseFullXboxShaderContainer(const void* data, size_t size, XboxParsedSha
                 return st;
             }
         } else if (std::memcmp(chunk.fourcc, "ISG1", 4u) == 0) {
-            ParseSignatureChunk(chunk.data.data(), chunk.data.size(), true, out_parsed.input_signature);
+            out_parsed.input_sig_element_stride =
+                ParseSignatureChunk(chunk.data.data(), chunk.data.size(), 32u, out_parsed.input_signature);
         } else if (std::memcmp(chunk.fourcc, "ISGN", 4u) == 0 && out_parsed.input_signature.empty()) {
-            ParseSignatureChunk(chunk.data.data(), chunk.data.size(), false, out_parsed.input_signature);
+            out_parsed.input_sig_element_stride =
+                ParseSignatureChunk(chunk.data.data(), chunk.data.size(), 24u, out_parsed.input_signature);
         } else if (std::memcmp(chunk.fourcc, "OSG1", 4u) == 0) {
-            ParseSignatureChunk(chunk.data.data(), chunk.data.size(), true, out_parsed.output_signature);
+            out_parsed.output_sig_element_stride =
+                ParseSignatureChunk(chunk.data.data(), chunk.data.size(), 32u, out_parsed.output_signature);
+        } else if (std::memcmp(chunk.fourcc, "OSG5", 4u) == 0 && out_parsed.output_signature.empty()) {
+            out_parsed.output_sig_element_stride =
+                ParseSignatureChunk(chunk.data.data(), chunk.data.size(), 28u, out_parsed.output_signature);
         } else if (std::memcmp(chunk.fourcc, "OSGN", 4u) == 0 && out_parsed.output_signature.empty()) {
-            ParseSignatureChunk(chunk.data.data(), chunk.data.size(), false, out_parsed.output_signature);
+            out_parsed.output_sig_element_stride =
+                ParseSignatureChunk(chunk.data.data(), chunk.data.size(), 24u, out_parsed.output_signature);
         } else if (std::memcmp(chunk.fourcc, "PSG1", 4u) == 0) {
-            ParseSignatureChunk(chunk.data.data(), chunk.data.size(), true, out_parsed.patch_constant_signature);
+            (void)ParseSignatureChunk(chunk.data.data(), chunk.data.size(), 32u, out_parsed.patch_constant_signature);
         } else if (std::memcmp(chunk.fourcc, "PSGN", 4u) == 0 && out_parsed.patch_constant_signature.empty()) {
-            ParseSignatureChunk(chunk.data.data(), chunk.data.size(), false, out_parsed.patch_constant_signature);
+            (void)ParseSignatureChunk(chunk.data.data(), chunk.data.size(), 24u, out_parsed.patch_constant_signature);
         } else if (std::memcmp(chunk.fourcc, "RTS0", 4u) == 0) {
             if (auto st = ParseRts0RootSignature(chunk.data.data(), chunk.data.size(), out_parsed.root_signature);
                 !st.ok()) {
@@ -1323,7 +1497,7 @@ Status ParseFullXboxShaderContainer(const void* data, size_t size, XboxParsedSha
         }
     }
 
-    // Build user-data SGPR map if RTS0 is present
+    // Build user-data SGPR map if RTS0 is present, otherwise infer from PM4/ISA (mesh & graphics/compute).
     if (out_parsed.root_signature.present) {
         const ShaderStage eff_stage =
             (out_parsed.has_xs2 && out_parsed.xs2.stage != ShaderStage::Unknown)
@@ -1339,6 +1513,9 @@ Status ParseFullXboxShaderContainer(const void* data, size_t size, XboxParsedSha
                                    out_parsed.sgpr_map,
                                    max_sgprs);
     }
+
+    // Always analyze VS v0/v3 system IDs & BVH ray-intersection ops, and infer root bindings when RTS0 absent.
+    (void)InferShaderRootBindingsWhenRts0Absent(out_parsed);
 
     out_parsed.format = out_parsed.has_xs2
                             ? XboxShaderBlobFormat::XboxDxbc
@@ -1647,6 +1824,799 @@ Status ValidateAndMatchStageInterpolation(
                : Status::Error(StatusCode::ShaderError,
                                out_report.errors.empty() ? "VS->PS interpolation linkage failed"
                                                          : out_report.errors.front());
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 13: VS v0/v3 Prologue Analysis, BVH RayQuery Detection,
+//            Missing-RTS0 Mesh/Shader Root-Table Inference, & Container Lifting
+// ---------------------------------------------------------------------------
+namespace {
+
+void AnalyzeVsSystemIdsAndBvhOps(
+    const XboxParsedShaderContainer& container,
+    const std::vector<Rdna2Instruction>& instructions,
+    XboxVsPrologueInfo& out_vs,
+    XboxBvhIntersectInfo& out_bvh) {
+    out_vs = XboxVsPrologueInfo{};
+    out_bvh = XboxBvhIntersectInfo{};
+
+    const ShaderStage eff_stage =
+        (container.has_xs2 && container.xs2.stage != ShaderStage::Unknown)
+            ? container.xs2.stage
+            : container.reg_setup.inferred_stage;
+
+    if (eff_stage == ShaderStage::Vertex) {
+        for (const auto& sig : container.input_signature) {
+            const std::string sem = ToUpperAscii(sig.semantic_name);
+            if (sem == "SV_VERTEXID") {
+                out_vs.declared_vertex_id_in_sig = true;
+            } else if (sem == "SV_INSTANCEID") {
+                out_vs.declared_instance_id_in_sig = true;
+            }
+        }
+    }
+
+    std::array<bool, 256> written_vgpr{};
+    auto check_vgpr_read = [&](uint8_t idx) {
+        if (eff_stage != ShaderStage::Vertex) return;
+        if (idx == 0u && !written_vgpr[0]) {
+            out_vs.uses_vertex_id_v0 = true;
+        } else if (idx == 3u && !written_vgpr[3]) {
+            out_vs.uses_instance_id_v3 = true;
+        }
+    };
+
+    for (const auto& inst : instructions) {
+        // Detect RDNA2 BVH ray-intersection instructions (0xE6 image_bvh_intersect_ray, 0xE7 image_bvh64_intersect_ray)
+        if (inst.encoding == Rdna2Encoding::MIMG &&
+            (inst.opcode == Rdna2Opcode::IMAGE_BVH_INTERSECT_RAY ||
+             inst.raw_opcode == kMimgRawImageBvhIntersectRay ||
+             inst.raw_opcode == kMimgRawImageBvh64IntersectRay)) {
+            out_bvh.detected = true;
+            if (inst.raw_opcode == kMimgRawImageBvh64IntersectRay) {
+                out_bvh.is_64bit = true;
+            }
+            out_bvh.srsrc_sgpr = static_cast<uint8_t>(inst.srsrc * 4u);
+            ++out_bvh.instruction_count;
+            out_bvh.threadgroup_x = container.xs2.threadgroup_x ? container.xs2.threadgroup_x : 64u;
+        }
+
+        if (eff_stage == ShaderStage::Vertex) {
+            // Check reads BEFORE marking destination written.
+            if (inst.opcode == Rdna2Opcode::V_FMAC_F32 ||
+                inst.opcode == Rdna2Opcode::V_FMAC_F16 ||
+                inst.opcode == Rdna2Opcode::V_MAC_F32) {
+                if (inst.dst.kind == Rdna2OperandKind::Vgpr) {
+                    check_vgpr_read(static_cast<uint8_t>(inst.dst.reg_index));
+                }
+            }
+            for (uint8_t s = 0u; s < inst.src_count && s < 4u; ++s) {
+                if (inst.src[s].kind == Rdna2OperandKind::Vgpr) {
+                    // For MUBUF/MTBUF loads, src[0] is the vdata destination register (not a read).
+                    if ((inst.encoding == Rdna2Encoding::MUBUF || inst.encoding == Rdna2Encoding::MTBUF) &&
+                        inst.opcode != Rdna2Opcode::BUFFER_STORE_DWORD && s == 0u) {
+                        continue;
+                    }
+                    // For EXP, only enabled channels are read.
+                    if (inst.encoding == Rdna2Encoding::EXP && ((inst.exp_en & (1u << s)) == 0u)) {
+                        continue;
+                    }
+                    check_vgpr_read(static_cast<uint8_t>(inst.src[s].reg_index));
+                }
+            }
+            if (inst.encoding == Rdna2Encoding::MIMG && inst.src_count > 0u &&
+                inst.src[0].kind == Rdna2OperandKind::Vgpr &&
+                inst.opcode != Rdna2Opcode::IMAGE_STORE) {
+                const uint8_t base = static_cast<uint8_t>(inst.src[0].reg_index);
+                check_vgpr_read(base);
+                if (base + 1u < 256u) check_vgpr_read(static_cast<uint8_t>(base + 1u));
+            }
+
+            // Mark destination VGPRs written.
+            if (inst.dst.kind == Rdna2OperandKind::Vgpr && inst.dst.reg_index < 256u) {
+                written_vgpr[inst.dst.reg_index] = true;
+                if (inst.encoding == Rdna2Encoding::MIMG && inst.opcode != Rdna2Opcode::IMAGE_STORE) {
+                    const uint8_t dmask = inst.mimg_dmask ? inst.mimg_dmask : 0xFu;
+                    uint8_t reg = static_cast<uint8_t>(inst.dst.reg_index);
+                    for (uint32_t c = 0u; c < 4u && reg < 256u; ++c) {
+                        if ((dmask & (1u << c)) != 0u) {
+                            written_vgpr[reg++] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+bool IsIdentChar(char c) noexcept {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
+std::string ReplaceWholeToken(const std::string& src, const std::string& token, const std::string& repl) {
+    if (token.empty()) return src;
+    std::string out;
+    out.reserve(src.size() + 32u);
+    size_t pos = 0u;
+    while (pos < src.size()) {
+        const size_t hit = src.find(token, pos);
+        if (hit == std::string::npos) {
+            out.append(src, pos, std::string::npos);
+            break;
+        }
+        const bool left_ok = (hit == 0u) || !IsIdentChar(src[hit - 1u]);
+        const size_t end = hit + token.size();
+        const bool right_ok = (end >= src.size()) || !IsIdentChar(src[end]);
+        out.append(src, pos, hit - pos);
+        if (left_ok && right_ok) {
+            out.append(repl);
+        } else {
+            out.append(token);
+        }
+        pos = end;
+    }
+    return out;
+}
+
+void PatchVsHlslForInstanceIdPrologue(
+    std::string& hlsl,
+    bool inject_v3_iid,
+    uint8_t sentinel_sgpr,
+    bool orig_uses_root_consts,
+    uint32_t orig_max_root_const) {
+    // 1. Add SV_InstanceID parameter to VS entry signature
+    const std::string old_sig = "VSOut main(uint _vid : SV_VertexID)";
+    const std::string new_sig = "VSOut main(uint _vid : SV_VertexID, uint _iid : SV_InstanceID)";
+    const size_t sig_pos = hlsl.find(old_sig);
+    if (sig_pos != std::string::npos) {
+        hlsl.replace(sig_pos, old_sig.size(), new_sig);
+    }
+
+    if (!inject_v3_iid || sentinel_sgpr >= 16u) {
+        return;
+    }
+
+    // 2. Clean up synthetic cbuffer _os_root_consts if it was only added/expanded for sentinel_sgpr
+    const std::string cb_hdr = "cbuffer _os_root_consts : register(b0) {\n";
+    const size_t cb_pos = hlsl.find(cb_hdr);
+    if (cb_pos != std::string::npos) {
+        const size_t cb_end = hlsl.find("};\n", cb_pos);
+        if (cb_end != std::string::npos) {
+            if (!orig_uses_root_consts) {
+                hlsl.erase(cb_pos, (cb_end + 3u) - cb_pos);
+            } else if (orig_max_root_const < sentinel_sgpr) {
+                std::ostringstream rebuilt;
+                rebuilt << cb_hdr;
+                for (uint32_t i = 0u; i <= orig_max_root_const; ++i) {
+                    rebuilt << "    uint _rc" << i << ";\n";
+                }
+                rebuilt << "};\n";
+                hlsl.replace(cb_pos, (cb_end + 3u) - cb_pos, rebuilt.str());
+            }
+        }
+    }
+
+    // 3. Replace all references to _rc<sentinel_sgpr> with _iid (SV_InstanceID)
+    hlsl = ReplaceWholeToken(hlsl, "_rc" + std::to_string(sentinel_sgpr), "_iid");
+}
+
+bool PatchVsSpirvForInstanceIdPrologue(std::vector<uint32_t>& spirv, uint8_t sentinel_sgpr) {
+    if (spirv.size() < 5u || spirv[0] != 0x07230203u || sentinel_sgpr >= 16u) {
+        return false;
+    }
+    constexpr uint16_t kOpEntryPoint = 15u;
+    constexpr uint16_t kOpTypeInt = 21u;
+    constexpr uint16_t kOpTypePointer = 32u;
+    constexpr uint16_t kOpConstant = 43u;
+    constexpr uint16_t kOpFunction = 54u;
+    constexpr uint16_t kOpVariable = 59u;
+    constexpr uint16_t kOpLoad = 61u;
+    constexpr uint16_t kOpAccessChain = 65u;
+    constexpr uint16_t kOpDecorate = 71u;
+    constexpr uint16_t kOpBitcast = 124u;
+    constexpr uint32_t kScInput = 1u;
+    constexpr uint32_t kScUniform = 2u;
+    constexpr uint32_t kDecBuiltIn = 11u;
+    constexpr uint32_t kBuiltInInstanceIndex = 43u;
+
+    uint32_t next_id = spirv[3];
+    uint32_t t_i32 = 0u;
+    uint32_t t_u32 = 0u;
+    uint32_t t_ptr_in_i32 = 0u;
+    uint32_t c_i32_sentinel = 0u;
+    std::set<uint32_t> uniform_vars;
+
+    size_t entry_point_pos = 0u;
+    size_t last_decor_end = 0u;
+    size_t first_func_pos = 0u;
+
+    size_t pos = 5u;
+    while (pos < spirv.size()) {
+        const uint32_t hdr = spirv[pos];
+        const uint16_t wc = static_cast<uint16_t>((hdr >> 16) & 0xFFFFu);
+        const uint16_t op = static_cast<uint16_t>(hdr & 0xFFFFu);
+        if (wc == 0u || pos + wc > spirv.size()) return false;
+
+        if (op == kOpEntryPoint && entry_point_pos == 0u) {
+            entry_point_pos = pos;
+        } else if (op == kOpDecorate) {
+            last_decor_end = pos + wc;
+        } else if (op == kOpTypeInt && wc == 4u && spirv[pos + 2u] == 32u) {
+            if (spirv[pos + 3u] == 1u) t_i32 = spirv[pos + 1u];
+            else if (spirv[pos + 3u] == 0u) t_u32 = spirv[pos + 1u];
+        } else if (op == kOpTypePointer && wc == 4u &&
+                   spirv[pos + 2u] == kScInput && t_i32 != 0u && spirv[pos + 3u] == t_i32) {
+            t_ptr_in_i32 = spirv[pos + 1u];
+        } else if (op == kOpConstant && wc == 4u &&
+                   t_i32 != 0u && spirv[pos + 1u] == t_i32 && spirv[pos + 3u] == sentinel_sgpr) {
+            c_i32_sentinel = spirv[pos + 2u];
+        } else if (op == kOpVariable && wc >= 4u && spirv[pos + 3u] == kScUniform) {
+            uniform_vars.insert(spirv[pos + 2u]);
+        } else if (op == kOpFunction && first_func_pos == 0u) {
+            first_func_pos = pos;
+        }
+        pos += wc;
+    }
+
+    if (entry_point_pos == 0u || first_func_pos == 0u || t_i32 == 0u || t_u32 == 0u ||
+        c_i32_sentinel == 0u || uniform_vars.empty()) {
+        return false;
+    }
+
+    // Locate OpAccessChain %ptr_ty %ptr %var_rc %c_i32_sentinel followed by OpLoad %t_u32 %res %ptr
+    size_t ac_pos = 0u;
+    uint16_t ac_wc = 0u;
+    size_t ld_pos = 0u;
+    uint16_t ld_wc = 0u;
+    uint32_t loaded_res_id = 0u;
+
+    pos = first_func_pos;
+    while (pos < spirv.size()) {
+        const uint32_t hdr = spirv[pos];
+        const uint16_t wc = static_cast<uint16_t>((hdr >> 16) & 0xFFFFu);
+        const uint16_t op = static_cast<uint16_t>(hdr & 0xFFFFu);
+        if (wc == 0u || pos + wc > spirv.size()) return false;
+
+        if (op == kOpAccessChain && wc == 5u &&
+            uniform_vars.count(spirv[pos + 3u]) > 0u &&
+            spirv[pos + 4u] == c_i32_sentinel) {
+            const uint32_t ptr_id = spirv[pos + 2u];
+            const size_t next_p = pos + wc;
+            if (next_p < spirv.size()) {
+                const uint32_t nh = spirv[next_p];
+                const uint16_t nwc = static_cast<uint16_t>((nh >> 16) & 0xFFFFu);
+                const uint16_t nop = static_cast<uint16_t>(nh & 0xFFFFu);
+                if (nop == kOpLoad && nwc >= 4u &&
+                    spirv[next_p + 1u] == t_u32 && spirv[next_p + 3u] == ptr_id) {
+                    ac_pos = pos;
+                    ac_wc = wc;
+                    ld_pos = next_p;
+                    ld_wc = nwc;
+                    loaded_res_id = spirv[next_p + 2u];
+                    break;
+                }
+            }
+        }
+        pos += wc;
+    }
+    if (ac_pos == 0u || loaded_res_id == 0u) {
+        return false;
+    }
+
+    const bool need_ptr_type = (t_ptr_in_i32 == 0u);
+    if (need_ptr_type) {
+        t_ptr_in_i32 = next_id++;
+    }
+    const uint32_t var_iid = next_id++;
+    const uint32_t tmp_iid_i32 = next_id++;
+
+    std::vector<uint32_t> patched;
+    patched.reserve(spirv.size() + 32u);
+    // Header
+    patched.push_back(spirv[0]);
+    patched.push_back(spirv[1]);
+    patched.push_back(spirv[2]);
+    patched.push_back(next_id);
+    patched.push_back(spirv[4]);
+
+    pos = 5u;
+    bool inserted_decor = false;
+    bool inserted_var = false;
+    while (pos < spirv.size()) {
+        const uint32_t hdr = spirv[pos];
+        const uint16_t wc = static_cast<uint16_t>((hdr >> 16) & 0xFFFFu);
+
+        if (pos == entry_point_pos) {
+            // Append var_iid to OpEntryPoint interface list
+            const uint16_t new_wc = static_cast<uint16_t>(wc + 1u);
+            patched.push_back((static_cast<uint32_t>(new_wc) << 16) | (hdr & 0xFFFFu));
+            for (uint16_t k = 1u; k < wc; ++k) patched.push_back(spirv[pos + k]);
+            patched.push_back(var_iid);
+            pos += wc;
+            continue;
+        }
+        if (pos == first_func_pos && !inserted_var) {
+            if (need_ptr_type) {
+                patched.push_back((4u << 16) | kOpTypePointer);
+                patched.push_back(t_ptr_in_i32);
+                patched.push_back(kScInput);
+                patched.push_back(t_i32);
+            }
+            patched.push_back((4u << 16) | kOpVariable);
+            patched.push_back(t_ptr_in_i32);
+            patched.push_back(var_iid);
+            patched.push_back(kScInput);
+            inserted_var = true;
+        }
+        if (pos == ac_pos) {
+            // Replace OpAccessChain + OpLoad with OpLoad %t_i32 %tmp %var_iid + OpBitcast %t_u32 %res %tmp
+            patched.push_back((4u << 16) | kOpLoad);
+            patched.push_back(t_i32);
+            patched.push_back(tmp_iid_i32);
+            patched.push_back(var_iid);
+
+            patched.push_back((4u << 16) | kOpBitcast);
+            patched.push_back(t_u32);
+            patched.push_back(loaded_res_id);
+            patched.push_back(tmp_iid_i32);
+            pos = ld_pos + ld_wc;
+            continue;
+        }
+
+        for (uint16_t k = 0u; k < wc; ++k) {
+            patched.push_back(spirv[pos + k]);
+        }
+        pos += wc;
+
+        if (!inserted_decor && pos == last_decor_end) {
+            patched.push_back((4u << 16) | kOpDecorate);
+            patched.push_back(var_iid);
+            patched.push_back(kDecBuiltIn);
+            patched.push_back(kBuiltInInstanceIndex);
+            inserted_decor = true;
+        }
+    }
+
+    if (!inserted_decor || !inserted_var) {
+        return false;
+    }
+    if (!ValidateSpirvBinary(patched).ok()) {
+        return false;
+    }
+    spirv = std::move(patched);
+    return true;
+}
+
+}  // namespace
+
+bool InferShaderRootBindingsWhenRts0Absent(XboxParsedShaderContainer& container) {
+    if (!container.has_xs2 || container.rdna_isa_words.empty()) {
+        return false;
+    }
+
+    std::vector<Rdna2Instruction> instructions;
+    if (!DisassembleRdna2Extended(container.rdna_isa_words, instructions).ok()) {
+        return false;
+    }
+
+    // Always populate VS v0/v3 prologue metadata and BVH ray-intersection detection.
+    AnalyzeVsSystemIdsAndBvhOps(container, instructions, container.vs_prologue, container.bvh_info);
+
+    if (container.root_signature.present) {
+        return false;
+    }
+
+    const ShaderStage eff_stage =
+        (container.xs2.stage != ShaderStage::Unknown)
+            ? container.xs2.stage
+            : container.reg_setup.inferred_stage;
+
+    std::array<bool, 106> written_sgpr{};
+    bool uses_root_consts = false;
+    uint32_t max_root_const = 0u;
+    bool uses_smem_cbv = false;
+    std::set<uint32_t> uav_slots;
+    uint32_t srv_count = 0u;
+    bool uses_tex2d_srv = false;
+    bool uses_tex3d_srv = false;
+    bool uses_texcube_srv = false;
+    bool uses_sampler = false;
+    bool uses_tex_uav = false;
+    bool uses_tex_u32_uav = false;
+
+    for (const auto& inst : instructions) {
+        // Track unread SGPRs s0..s15 read directly (inline root constants; skip s3 merged_wave_info on MS/GS)
+        for (uint8_t s = 0u; s < inst.src_count && s < 4u; ++s) {
+            if (inst.src[s].kind == Rdna2OperandKind::Sgpr && inst.src[s].reg_index < 16u) {
+                const uint32_t idx = inst.src[s].reg_index;
+                if (inst.encoding == Rdna2Encoding::SMEM) continue;
+                if ((eff_stage == ShaderStage::Mesh || eff_stage == ShaderStage::Geometry) && idx == 3u) {
+                    continue;
+                }
+                if (!written_sgpr[idx]) {
+                    uses_root_consts = true;
+                    max_root_const = std::max(max_root_const, idx);
+                }
+            }
+        }
+
+        if (inst.encoding == Rdna2Encoding::SMEM) {
+            uses_smem_cbv = true;
+        } else if (inst.encoding == Rdna2Encoding::MUBUF || inst.encoding == Rdna2Encoding::MTBUF) {
+            const uint32_t slot = (inst.srsrc == 0u) ? 0u : 1u;
+            uav_slots.insert(slot);
+        } else if (inst.encoding == Rdna2Encoding::FLAT &&
+                   (inst.opcode == Rdna2Opcode::GLOBAL_LOAD_DWORD ||
+                    inst.opcode == Rdna2Opcode::GLOBAL_STORE_DWORD ||
+                    inst.opcode == Rdna2Opcode::FLAT_LOAD_DWORD ||
+                    inst.opcode == Rdna2Opcode::FLAT_STORE_DWORD)) {
+            uav_slots.insert(0u);
+        } else if (inst.encoding == Rdna2Encoding::MIMG) {
+            if (inst.opcode == Rdna2Opcode::IMAGE_BVH_INTERSECT_RAY ||
+                inst.raw_opcode == kMimgRawImageBvhIntersectRay ||
+                inst.raw_opcode == kMimgRawImageBvh64IntersectRay) {
+                // Multi-window BVH4 RayQuery ABI: b0 + t0..t2 + u0
+                srv_count = std::max(srv_count, 3u);
+                uav_slots.insert(0u);
+            } else if (inst.opcode == Rdna2Opcode::IMAGE_LOAD ||
+                       inst.opcode == Rdna2Opcode::IMAGE_SAMPLE ||
+                       inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_LZ) {
+                uses_tex2d_srv = true;
+                if (inst.opcode == Rdna2Opcode::IMAGE_SAMPLE ||
+                    inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_LZ) {
+                    uses_sampler = true;
+                }
+            } else if (inst.opcode == Rdna2Opcode::IMAGE_LOAD_MIP) {
+                if (inst.mimg_dim == 2u) uses_tex3d_srv = true;
+                else if (inst.mimg_dim == 3u) uses_texcube_srv = true;
+                else uses_tex2d_srv = true;
+            } else if (inst.opcode == Rdna2Opcode::IMAGE_STORE) {
+                uses_tex_uav = true;
+            } else if (inst.opcode == Rdna2Opcode::IMAGE_ATOMIC_CMPSWAP) {
+                uses_tex_uav = true;
+                uses_tex_u32_uav = true;
+            }
+        }
+
+        if (inst.dst.kind == Rdna2OperandKind::Sgpr && inst.dst.reg_index < 106u) {
+            written_sgpr[inst.dst.reg_index] = true;
+        }
+    }
+
+    const uint32_t tex_srv_total =
+        (uses_tex2d_srv ? 1u : 0u) + (uses_tex3d_srv ? 1u : 0u) + (uses_texcube_srv ? 1u : 0u);
+    srv_count = std::max(srv_count, tex_srv_total);
+
+    uint32_t uav_count = 0u;
+    if (!uav_slots.empty()) {
+        uav_count = (*uav_slots.rbegin()) + 1u;
+    }
+    if (uses_tex_uav) {
+        const uint32_t base_rw_u = (uav_count >= 2u) ? 2u : 1u;
+        uav_count = std::max(uav_count, base_rw_u + (uses_tex_u32_uav ? 2u : 1u));
+    }
+
+    const bool is_mesh_or_amp =
+        (eff_stage == ShaderStage::Mesh || eff_stage == ShaderStage::Amplification);
+    const bool has_any_resource =
+        uses_root_consts || uses_smem_cbv || srv_count > 0u || uav_count > 0u ||
+        uses_sampler || container.bvh_info.detected;
+    const bool mesh_has_user_sgprs =
+        is_mesh_or_amp && container.reg_setup.present && container.reg_setup.user_sgpr_count > 0u;
+
+    if (!has_any_resource && !mesh_has_user_sgprs) {
+        return false;
+    }
+
+    XboxRootSignatureDesc inferred{};
+    inferred.present = true;
+    inferred.version = 2u;  // D3D_ROOT_SIGNATURE_VERSION_1_1
+    inferred.flags = 0u;
+
+    // 1. Inline root constants / CBV b0
+    if (container.bvh_info.detected) {
+        XboxRootParameter cbv{};
+        cbv.type = XboxRootParamType::Cbv;
+        cbv.shader_visibility = 0u;
+        cbv.shader_register = 0u;
+        cbv.register_space = 0u;
+        inferred.parameters.push_back(std::move(cbv));
+    } else if (uses_root_consts) {
+        XboxRootParameter rc{};
+        rc.type = XboxRootParamType::Constants32Bit;
+        rc.shader_visibility = 0u;
+        rc.shader_register = 0u;
+        rc.register_space = 0u;
+        rc.num_32bit_values = max_root_const + 1u;
+        inferred.parameters.push_back(std::move(rc));
+    }
+
+    // 2. Inferred CBV/SRV/UAV descriptor table (xbox-emulator #129 mesh shader table inference)
+    XboxRootParameter tbl{};
+    tbl.type = XboxRootParamType::DescriptorTable;
+    tbl.shader_visibility = 0u;  // D3D12_SHADER_VISIBILITY_ALL
+    if (uses_smem_cbv && !uses_root_consts && !container.bvh_info.detected) {
+        XboxDescriptorRange cbv_r{};
+        cbv_r.range_type = XboxDescriptorRangeType::Cbv;
+        cbv_r.num_descriptors = 1u;
+        cbv_r.base_shader_register = 0u;
+        cbv_r.register_space = 0u;
+        tbl.descriptor_ranges.push_back(cbv_r);
+    }
+    if (srv_count > 0u) {
+        XboxDescriptorRange srv_r{};
+        srv_r.range_type = XboxDescriptorRangeType::Srv;
+        srv_r.num_descriptors = srv_count;
+        srv_r.base_shader_register = 0u;
+        srv_r.register_space = 0u;
+        tbl.descriptor_ranges.push_back(srv_r);
+    }
+    if (uav_count > 0u) {
+        XboxDescriptorRange uav_r{};
+        uav_r.range_type = XboxDescriptorRangeType::Uav;
+        uav_r.num_descriptors = uav_count;
+        uav_r.base_shader_register = 0u;
+        uav_r.register_space = 0u;
+        tbl.descriptor_ranges.push_back(uav_r);
+    }
+    if (tbl.descriptor_ranges.empty() && mesh_has_user_sgprs) {
+        // Mesh shader without RTS0 declaring PM4 user SGPRs: infer a default SRV table (t0)
+        XboxDescriptorRange srv_r{};
+        srv_r.range_type = XboxDescriptorRangeType::Srv;
+        srv_r.num_descriptors = 1u;
+        srv_r.base_shader_register = 0u;
+        srv_r.register_space = 0u;
+        tbl.descriptor_ranges.push_back(srv_r);
+    }
+    if (!tbl.descriptor_ranges.empty()) {
+        inferred.parameters.push_back(std::move(tbl));
+    }
+
+    // 3. Inferred Sampler descriptor table if IMAGE_SAMPLE* is used
+    if (uses_sampler) {
+        XboxRootParameter stbl{};
+        stbl.type = XboxRootParamType::DescriptorTable;
+        stbl.shader_visibility = 0u;
+        XboxDescriptorRange sr{};
+        sr.range_type = XboxDescriptorRangeType::Sampler;
+        sr.num_descriptors = 1u;
+        sr.base_shader_register = 0u;
+        sr.register_space = 0u;
+        stbl.descriptor_ranges.push_back(sr);
+        inferred.parameters.push_back(std::move(stbl));
+    }
+
+    container.inferred_root_signature = std::move(inferred);
+    container.root_signature_inferred = true;
+
+    const uint32_t max_sgprs =
+        (container.reg_setup.present && container.reg_setup.user_sgpr_count > 16u)
+            ? std::min(32u, container.reg_setup.user_sgpr_count)
+            : 16u;
+    (void)BuildUserSgprRootMap(
+        container.inferred_root_signature,
+        container.reg_setup.present ? &container.reg_setup : nullptr,
+        eff_stage,
+        container.sgpr_map,
+        max_sgprs);
+    return true;
+}
+
+Status LiftXboxShaderContainer(
+    const void* data,
+    size_t size,
+    XboxContainerLiftResult& out_result,
+    const XboxContainerLiftOptions& options) {
+    out_result = XboxContainerLiftResult{};
+    if (!data || size < 4u) {
+        return Status::Error(StatusCode::InvalidArgument, "Empty Xbox shader container buffer");
+    }
+
+    if (auto st = ParseFullXboxShaderContainer(data, size, out_result.parsed); !st.ok()) {
+        return st;
+    }
+    if (!out_result.parsed.has_xs2) {
+        return Status::Error(StatusCode::UnsupportedFormat,
+                             "Container does not carry an Xbox XS2/RDNA2 shader payload");
+    }
+
+    out_result.root_signature_inferred = out_result.parsed.root_signature_inferred;
+    out_result.uses_ray_query_bridge = out_result.parsed.bvh_info.detected;
+    out_result.lift.container = out_result.parsed.xs2;
+
+    if (auto st = DisassembleRdna2Extended(out_result.parsed.xs2.code_words, out_result.lift.instructions);
+        !st.ok()) {
+        return st;
+    }
+
+    Rdna2LiftOptions eff_opts = options.lift_options;
+    if (eff_opts.stage_contract.pixel_inputs.empty() && eff_opts.stage_contract.vertex_fetches.empty()) {
+        ApplyXboxContainerToLiftOptions(out_result.parsed, eff_opts);
+    }
+
+    // VS v0 (SV_VertexID) + v3 (SV_InstanceID) auto-load prologue (xbox-emulator #125)
+    const bool is_vs = (out_result.parsed.xs2.stage == ShaderStage::Vertex);
+    const bool want_iid_v3 =
+        is_vs && options.enable_vs_system_id_prologue && out_result.parsed.vs_prologue.uses_instance_id_v3;
+    const bool want_iid_sig =
+        is_vs && options.enable_vs_system_id_prologue &&
+        (want_iid_v3 || out_result.parsed.vs_prologue.declared_instance_id_in_sig);
+
+    bool orig_uses_rc = false;
+    uint32_t orig_max_rc = 0u;
+    uint8_t sentinel_sgpr = 0xFFu;
+    std::vector<Rdna2Instruction> build_instructions = out_result.lift.instructions;
+
+    if (want_iid_v3) {
+        std::array<bool, 16> sgpr_touched{};
+        std::array<bool, 16> sgpr_written{};
+        bool has_getpc = false;
+        for (const auto& inst : out_result.lift.instructions) {
+            if (inst.opcode == Rdna2Opcode::S_GETPC_B64) has_getpc = true;
+            for (uint8_t s = 0u; s < inst.src_count && s < 4u; ++s) {
+                if (inst.src[s].kind == Rdna2OperandKind::Sgpr && inst.src[s].reg_index < 16u) {
+                    const uint32_t idx = inst.src[s].reg_index;
+                    sgpr_touched[idx] = true;
+                    if (!sgpr_written[idx] && inst.encoding != Rdna2Encoding::SMEM) {
+                        orig_uses_rc = true;
+                        orig_max_rc = std::max(orig_max_rc, idx);
+                    }
+                }
+            }
+            if (inst.encoding == Rdna2Encoding::MUBUF || inst.encoding == Rdna2Encoding::MTBUF ||
+                inst.encoding == Rdna2Encoding::MIMG) {
+                const uint32_t base = static_cast<uint32_t>(inst.srsrc) * 4u;
+                for (uint32_t k = 0u; k < 4u && base + k < 16u; ++k) sgpr_touched[base + k] = true;
+            } else if (inst.encoding == Rdna2Encoding::SMEM) {
+                const uint32_t base = static_cast<uint32_t>(inst.sbase) * 2u;
+                for (uint32_t k = 0u; k < 4u && base + k < 16u; ++k) sgpr_touched[base + k] = true;
+            }
+            if (inst.dst.kind == Rdna2OperandKind::Sgpr && inst.dst.reg_index < 16u) {
+                sgpr_touched[inst.dst.reg_index] = true;
+                sgpr_written[inst.dst.reg_index] = true;
+            }
+        }
+        for (int s = 15; s >= 0; --s) {
+            if (!sgpr_touched[static_cast<size_t>(s)]) {
+                sentinel_sgpr = static_cast<uint8_t>(s);
+                break;
+            }
+        }
+        if (sentinel_sgpr == 0xFFu) {
+            sentinel_sgpr = 15u;
+        }
+        if (!has_getpc) {
+            Rdna2Instruction mov_iid{};
+            mov_iid.word_offset = 0u;
+            mov_iid.word_count = 1u;
+            mov_iid.encoding = Rdna2Encoding::VOP1;
+            mov_iid.opcode = Rdna2Opcode::V_MOV_B32;
+            mov_iid.dst = Rdna2Operand::Vgpr(3u);
+            mov_iid.src[0] = Rdna2Operand::Sgpr(sentinel_sgpr);
+            mov_iid.src_count = 1u;
+            mov_iid.mnemonic = "v_mov_b32";
+            mov_iid.disasm = "v_mov_b32 v3, s" + std::to_string(sentinel_sgpr);
+
+            build_instructions.clear();
+            build_instructions.reserve(out_result.lift.instructions.size() + 1u);
+            build_instructions.push_back(std::move(mov_iid));
+            for (auto inst : out_result.lift.instructions) {
+                inst.word_offset += 1u;
+                build_instructions.push_back(std::move(inst));
+            }
+            out_result.parsed.vs_prologue.injected_iid_sentinel_sgpr = sentinel_sgpr;
+        }
+    }
+
+    const StageContractTable* contract_ptr =
+        (!eff_opts.stage_contract.vertex_fetches.empty() ||
+         !eff_opts.stage_contract.pixel_inputs.empty() ||
+         eff_opts.stage_contract.texture_srv_format != Rdna2TextureFormat::Float4)
+            ? &eff_opts.stage_contract
+            : nullptr;
+
+    if (auto st = BuildRdna2Ir(out_result.lift.container, build_instructions, out_result.lift.ir, contract_ptr);
+        !st.ok()) {
+        return st;
+    }
+    out_result.lift.ir.mesh_has_payload = eff_opts.mesh_has_payload;
+
+    // Optional paired VS<->PS interpolation linkage reconciliation
+    if (options.paired_other_stage != nullptr) {
+        XboxPsoInterpLinkageReport linkage{};
+        if (out_result.parsed.xs2.stage == ShaderStage::Vertex &&
+            options.paired_other_stage->xs2.stage == ShaderStage::Pixel) {
+            (void)ValidateAndMatchStageInterpolation(
+                out_result.parsed, *options.paired_other_stage, linkage, &out_result.lift.ir, nullptr);
+        } else if (out_result.parsed.xs2.stage == ShaderStage::Pixel &&
+                   options.paired_other_stage->xs2.stage == ShaderStage::Vertex) {
+            (void)ValidateAndMatchStageInterpolation(
+                *options.paired_other_stage, out_result.parsed, linkage, nullptr, &out_result.lift.ir);
+        }
+    }
+
+    if (auto st = OptimizeRdna2Ir(out_result.lift.ir); !st.ok()) {
+        return st;
+    }
+    out_result.lift.inserted_lockstep_lds_barriers = out_result.lift.ir.inserted_lockstep_lds_barriers;
+
+    const bool stage_supports_spirv =
+        (out_result.lift.ir.stage == ShaderStage::Compute ||
+         out_result.lift.ir.stage == ShaderStage::Vertex ||
+         out_result.lift.ir.stage == ShaderStage::Pixel ||
+         out_result.lift.ir.stage == ShaderStage::Amplification ||
+         (out_result.lift.ir.stage == ShaderStage::Mesh && eff_opts.emit_mesh_spirv));
+
+    if (eff_opts.emit_spirv && stage_supports_spirv) {
+        if (auto st = EmitSpirv(out_result.lift.ir, out_result.lift.spirv_words); !st.ok()) {
+            return st;
+        }
+        if (want_iid_v3 && sentinel_sgpr < 16u) {
+            (void)PatchVsSpirvForInstanceIdPrologue(out_result.lift.spirv_words, sentinel_sgpr);
+        }
+        if (auto st = ValidateSpirvBinary(out_result.lift.spirv_words); !st.ok()) {
+            return st;
+        }
+        if (eff_opts.validate_spirv_external) {
+            const std::string env =
+                ((out_result.lift.ir.stage == ShaderStage::Mesh ||
+                  out_result.lift.ir.stage == ShaderStage::Amplification) &&
+                 eff_opts.spirv_target_env == "vulkan1.2")
+                    ? "vulkan1.3"
+                    : eff_opts.spirv_target_env;
+            if (auto st = ValidateSpirvExternal(out_result.lift.spirv_words, out_result.lift.spirv_val_diagnostics,
+                                                eff_opts.spirv_val_path, env);
+                !st.ok()) {
+                return st;
+            }
+        }
+    }
+
+    if (eff_opts.emit_hlsl) {
+        if (auto st = EmitHlsl(out_result.lift.ir, out_result.lift.hlsl_source,
+                               out_result.lift.hlsl_target, eff_opts.use_sm65);
+            !st.ok()) {
+            return st;
+        }
+        if (want_iid_sig) {
+            PatchVsHlslForInstanceIdPrologue(
+                out_result.lift.hlsl_source, want_iid_v3, sentinel_sgpr, orig_uses_rc, orig_max_rc);
+            out_result.vs_v3_instance_id_auto_loaded = true;
+        }
+        if (is_vs) {
+            out_result.vs_v0_auto_loaded =
+                out_result.parsed.vs_prologue.uses_vertex_id_v0 ||
+                out_result.parsed.vs_prologue.declared_vertex_id_in_sig;
+        }
+        if (!eff_opts.target_profile_override.empty()) {
+            out_result.lift.hlsl_target = eff_opts.target_profile_override;
+        }
+        if (eff_opts.compile_dxil_with_dxc) {
+            Status dxc_st = Status::Error(StatusCode::NotFound, "DXC not invoked");
+            if (options.use_in_process_dxc && IsInProcessDxcAvailable(eff_opts.dxc_path)) {
+                dxc_st = CompileHlslInProcessDxc(
+                    out_result.lift.hlsl_source, out_result.lift.hlsl_target, "main",
+                    out_result.lift.pc_dxil, out_result.lift.dxc_diagnostics, eff_opts.dxc_path);
+            }
+            if (!dxc_st.ok()) {
+                dxc_st = CompileHlslWithDxc(
+                    out_result.lift.hlsl_source, out_result.lift.hlsl_target, "main",
+                    out_result.lift.pc_dxil, out_result.lift.dxc_diagnostics, eff_opts.dxc_path);
+            }
+            if (!dxc_st.ok()) {
+                return dxc_st;
+            }
+            if (eff_opts.resign_dxil &&
+                !VerifyDxbcContainerHash(out_result.lift.pc_dxil.data(), out_result.lift.pc_dxil.size())) {
+                if (auto rs = ResignDxilContainer(out_result.lift.pc_dxil); !rs.ok()) {
+                    return rs;
+                }
+            }
+        }
+    }
+
+    return Status::Ok();
 }
 
 }  // namespace openscarlett

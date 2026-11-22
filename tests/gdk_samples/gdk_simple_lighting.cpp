@@ -1,4 +1,4 @@
-// OpenScarlett Clean-Room MIT Standalone Xbox-ABI Guest Sample (Wave 4):
+// OpenScarlett MIT Standalone Xbox-ABI Guest Sample (Wave 4):
 // SimpleLighting — DirectXTK12-style multi-frame 3D Blinn-Phong lit scene
 // (faceted occluding 3D cube + smooth 3D UV-sphere + checkered 3D ground plane),
 // directional + orbiting point light Blinn-Phong diffuse & specular shading,

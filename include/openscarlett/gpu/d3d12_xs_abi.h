@@ -20,7 +20,7 @@
 
 #if defined(_WIN32)
 
-// Clean-room Xbox Series X|S (Scarlett) D3D12X ABI definitions based on public GDK documentation.
+// Xbox Series X|S (Scarlett) D3D12X ABI definitions.
 
 using D3D12XBOX_FRAME_PIPELINE_TOKEN = uint64_t;
 constexpr D3D12XBOX_FRAME_PIPELINE_TOKEN D3D12XBOX_FRAME_PIPELINE_TOKEN_NULL = 0ull;
@@ -276,7 +276,7 @@ struct D3D12XBOX_VULKAN_ROUTING_STATS {
     char vulkan_device_name[128] = {};
 };
 
-// Clean-room OpenScarlett COM interface IIDs for Xbox D3D12X proxy interfaces.
+// OpenScarlett COM interface IIDs for Xbox D3D12X proxy interfaces.
 // {4F534431-3258-4445-5600-000000000001}
 inline constexpr GUID IID_ID3D12DeviceX = {
     0x4F534431u, 0x3258u, 0x4445u, {0x56u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x01u}};

@@ -3,7 +3,7 @@
 
 #include <cstdint>
 
-// Clean-room MIT DirectXTK12 RenderTargetState subset for untouched Xbox-GDK-Samples.
+// MIT DirectXTK12 RenderTargetState subset for untouched Xbox-GDK-Samples.
 namespace DirectX {
 
 class RenderTargetState {

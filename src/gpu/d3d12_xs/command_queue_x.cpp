@@ -599,6 +599,7 @@ struct FindMainWindowCtx {
     DWORD preferred_tid = 0;
     HWND best_same_thread = nullptr;
     HWND best_any_thread = nullptr;
+    HWND best_hidden_same_thread = nullptr;
 };
 
 BOOL CALLBACK EnumProcessMainWindowProc(HWND hwnd, LPARAM lParam) {
@@ -606,14 +607,18 @@ BOOL CALLBACK EnumProcessMainWindowProc(HWND hwnd, LPARAM lParam) {
     DWORD wpid = 0;
     const DWORD wtid = GetWindowThreadProcessId(hwnd, &wpid);
     if (wpid != ctx->pid) return TRUE;
-    if (IsWindowVisible(hwnd) == FALSE) return TRUE;
     if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
     wchar_t cls[64]{};
     if (GetClassNameW(hwnd, cls, 64) > 0) {
         if (wcscmp(cls, L"ConsoleWindowClass") == 0 ||
             wcscmp(cls, L"MSCTFIME UI") == 0 ||
             wcscmp(cls, L"IME") == 0 ||
-            wcscmp(cls, L"tooltips_class32") == 0) {
+            wcscmp(cls, L"Default IME") == 0 ||
+            wcscmp(cls, L"tooltips_class32") == 0 ||
+            wcscmp(cls, L"DDEMLEvent") == 0 ||
+            wcscmp(cls, L"CicMarshalWndClass") == 0 ||
+            wcscmp(cls, L"GDI+ Hook Window Class") == 0 ||
+            wcscmp(cls, L"OleMainThreadWndClass") == 0) {
             return TRUE;
         }
     }
@@ -621,12 +626,20 @@ BOOL CALLBACK EnumProcessMainWindowProc(HWND hwnd, LPARAM lParam) {
     if (GetClientRect(hwnd, &cr) == FALSE || (cr.right - cr.left) < 64 || (cr.bottom - cr.top) < 64) {
         return TRUE;
     }
-    if (wtid == ctx->preferred_tid) {
-        ctx->best_same_thread = hwnd;
-        return FALSE;  // Exact match on calling thread
-    }
-    if (!ctx->best_any_thread) {
-        ctx->best_any_thread = hwnd;
+    const bool visible = (IsWindowVisible(hwnd) != FALSE);
+    if (visible) {
+        if (wtid == ctx->preferred_tid) {
+            ctx->best_same_thread = hwnd;
+            return FALSE;  // Exact visible match on calling thread
+        }
+        if (!ctx->best_any_thread) {
+            ctx->best_any_thread = hwnd;
+        }
+    } else if (wtid == ctx->preferred_tid && !ctx->best_hidden_same_thread) {
+        // Title-created offscreen/hidden console window fallback (e.g. Minecraft/GDK startup or headless CI)
+        if (GetWindowTextLengthW(hwnd) > 0) {
+            ctx->best_hidden_same_thread = hwnd;
+        }
     }
     return TRUE;
 }
@@ -640,7 +653,9 @@ HWND DiscoverProcessMainWindow() noexcept {
         return ctx.best_same_thread;
     }
     EnumWindows(&EnumProcessMainWindowProc, reinterpret_cast<LPARAM>(&ctx));
-    return ctx.best_same_thread ? ctx.best_same_thread : ctx.best_any_thread;
+    if (ctx.best_same_thread) return ctx.best_same_thread;
+    if (ctx.best_any_thread) return ctx.best_any_thread;
+    return ctx.best_hidden_same_thread;
 }
 
 }  // namespace
@@ -676,6 +691,89 @@ CommandQueueX::CommandQueueX(
 void CommandQueueX::SetSubmitHook(QueueSubmitHookFn fn, void* user_ctx) noexcept {
     submit_hook_ctx_.store(user_ctx, std::memory_order_release);
     submit_hook_.store(fn, std::memory_order_release);
+}
+
+HWND CommandQueueX::EffectiveOutputWindow() const noexcept {
+    std::lock_guard<std::mutex> lock(present_mutex_);
+    if (present_config_.OutputWindow && IsWindow(present_config_.OutputWindow) != FALSE) {
+        return present_config_.OutputWindow;
+    }
+    if (attached_hwnd_ && IsWindow(attached_hwnd_) != FALSE) {
+        return attached_hwnd_;
+    }
+    if (!explicit_window_detached_ && device_x_) {
+        HWND dev_hwnd = device_x_->DefaultWindow();
+        if (dev_hwnd && IsWindow(dev_hwnd) != FALSE) {
+            return dev_hwnd;
+        }
+    }
+    return nullptr;
+}
+
+bool CommandQueueX::AdoptTitleWindow(HWND hwnd) noexcept {
+    if (!hwnd || IsWindow(hwnd) == FALSE) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(present_mutex_);
+        explicit_window_detached_ = false;
+        if (swapchain_ && swapchain_hwnd_ != hwnd) {
+            ReleaseSwapChainLocked();
+        }
+        attached_hwnd_ = hwnd;
+        AttachWindowSubclassLocked(hwnd);
+    }
+    if (device_x_) {
+        device_x_->AdoptTitleWindow(hwnd);
+    }
+    return true;
+}
+
+HWND CommandQueueX::ResolveTargetOutputWindowLocked(
+    const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters,
+    bool force_headless) {
+    if (force_headless) {
+        return nullptr;
+    }
+    if (pPresentParameters && pPresentParameters->OutputWindow &&
+        IsWindow(pPresentParameters->OutputWindow) != FALSE) {
+        if (!attached_hwnd_) {
+            attached_hwnd_ = pPresentParameters->OutputWindow;
+            explicit_window_detached_ = false;
+            if (device_x_ && !device_x_->DefaultWindow()) {
+                device_x_->AdoptTitleWindow(pPresentParameters->OutputWindow);
+            }
+        }
+        return pPresentParameters->OutputWindow;
+    }
+    if (present_config_.OutputWindow && IsWindow(present_config_.OutputWindow) != FALSE) {
+        return present_config_.OutputWindow;
+    }
+    if (attached_hwnd_ && IsWindow(attached_hwnd_) != FALSE) {
+        return attached_hwnd_;
+    }
+    if (attached_hwnd_ && IsWindow(attached_hwnd_) == FALSE) {
+        // Attached window was destroyed; clear stale handle so a newly created title window can be adopted.
+        attached_hwnd_ = nullptr;
+    }
+    if (!explicit_window_detached_) {
+        if (device_x_) {
+            HWND dev_hwnd = device_x_->DefaultWindow();
+            if (dev_hwnd && IsWindow(dev_hwnd) != FALSE) {
+                attached_hwnd_ = dev_hwnd;
+                return dev_hwnd;
+            }
+        }
+        HWND discovered = DiscoverProcessMainWindow();
+        if (discovered && IsWindow(discovered) != FALSE) {
+            attached_hwnd_ = discovered;
+            if (device_x_ && !device_x_->DefaultWindow()) {
+                device_x_->AdoptTitleWindow(discovered);
+            }
+            return discovered;
+        }
+    }
+    return nullptr;
 }
 
 CommandQueueX::~CommandQueueX() {
@@ -851,14 +949,10 @@ void STDMETHODCALLTYPE CommandQueueX::CopyTileMappings(
 void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     UINT NumCommandLists,
     ID3D12CommandList* const* ppCommandLists) {
-    // Auto-flush any dirty title unified-memory textures & TitleVAMirror pages before GPU work samples them.
-    if (device_x_ && host_queue_ && queue_type_ == D3D12_COMMAND_LIST_TYPE_DIRECT) {
-        if (device_x_->HasDirtyUnifiedTextures()) {
-            device_x_->FlushDirtyUnifiedTextures(host_queue_, nullptr);
-        }
-        if (device_x_->HasMirroredTitleVaRegions()) {
-            device_x_->FlushMirroredTitleVaPagesOnQueue(host_queue_, queue_type_, nullptr);
-        }
+    // Auto-sync all dirty/modified unified-memory textures, unified heap buffers, & TitleVAMirror
+    // pages BEFORE submitting host command lists so GPU shaders never sample stale CPU memory.
+    if (device_x_ && host_queue_) {
+        (void)device_x_->SyncAllUnifiedResourcesBeforeSubmit(host_queue_, queue_type_);
     }
 
     // Unwrap any CommandListX* wrappers back to native host ID3D12CommandList* pointers.
@@ -2039,16 +2133,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     std::shared_ptr<WindowCallbackState> pump_state;
     {
         std::lock_guard<std::mutex> lock(present_mutex_);
-        pump_hwnd = (pPresentParameters && pPresentParameters->OutputWindow)
-                        ? pPresentParameters->OutputWindow
-                        : (present_config_.OutputWindow ? present_config_.OutputWindow : attached_hwnd_);
-        if (!pump_hwnd && !force_headless) {
-            HWND discovered = DiscoverProcessMainWindow();
-            if (discovered && IsWindow(discovered) != FALSE) {
-                attached_hwnd_ = discovered;
-                pump_hwnd = discovered;
-            }
-        }
+        pump_hwnd = ResolveTargetOutputWindowLocked(pPresentParameters, force_headless);
         if (pump_hwnd && IsWindow(pump_hwnd) != FALSE) {
             AttachWindowSubclassLocked(pump_hwnd);
             pump_state = window_state_;
@@ -2102,11 +2187,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         ((exit_after_frames > 0ull && this_non_blank_frame == exit_after_frames) ||
          (exit_after_frames == 0ull && (this_non_blank_frame == 1ull || this_non_blank_frame == 10ull)));
 
-    HWND target_hwnd = force_headless
-                           ? nullptr
-                           : ((pPresentParameters && pPresentParameters->OutputWindow)
-                                  ? pPresentParameters->OutputWindow
-                                  : (present_config_.OutputWindow ? present_config_.OutputWindow : attached_hwnd_));
+    HWND target_hwnd = ResolveTargetOutputWindowLocked(pPresentParameters, force_headless);
     const bool use_swapchain = (target_hwnd != nullptr && IsWindow(target_hwnd) != FALSE);
 
     bool window_minimized = false;
@@ -2640,13 +2721,8 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::ResumeX() {
 }
 
 HRESULT STDMETHODCALLTYPE CommandQueueX::KickoffX() {
-    if (device_x_ && host_queue_ && queue_type_ == D3D12_COMMAND_LIST_TYPE_DIRECT) {
-        if (device_x_->HasDirtyUnifiedTextures()) {
-            device_x_->FlushDirtyUnifiedTextures(host_queue_, nullptr);
-        }
-        if (device_x_->HasMirroredTitleVaRegions()) {
-            device_x_->FlushMirroredTitleVaPagesOnQueue(host_queue_, queue_type_, nullptr);
-        }
+    if (device_x_ && host_queue_) {
+        (void)device_x_->SyncAllUnifiedResourcesBeforeSubmit(host_queue_, queue_type_);
     }
     {
         std::lock_guard<std::mutex> lock(present_mutex_);
@@ -2871,19 +2947,25 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::Write32BitValueX(
 
 // IOpenScarlettPresentCapture
 HRESULT STDMETHODCALLTYPE CommandQueueX::SetOutputWindow(HWND hwnd) {
-    std::lock_guard<std::mutex> lock(present_mutex_);
-    if (attached_hwnd_ != hwnd ||
-        subclassed_hwnd_ != hwnd ||
-        (swapchain_ && swapchain_hwnd_ != hwnd)) {
-        if (swapchain_ && swapchain_hwnd_ != hwnd) {
-            ReleaseSwapChainLocked();
+    {
+        std::lock_guard<std::mutex> lock(present_mutex_);
+        explicit_window_detached_ = (hwnd == nullptr);
+        if (attached_hwnd_ != hwnd ||
+            subclassed_hwnd_ != hwnd ||
+            (swapchain_ && swapchain_hwnd_ != hwnd)) {
+            if (swapchain_ && swapchain_hwnd_ != hwnd) {
+                ReleaseSwapChainLocked();
+            }
+            attached_hwnd_ = hwnd;
+            if (hwnd && IsWindow(hwnd) != FALSE) {
+                AttachWindowSubclassLocked(hwnd);
+            } else {
+                DetachWindowSubclassLocked();
+            }
         }
-        attached_hwnd_ = hwnd;
-        if (hwnd && IsWindow(hwnd) != FALSE) {
-            AttachWindowSubclassLocked(hwnd);
-        } else {
-            DetachWindowSubclassLocked();
-        }
+    }
+    if (device_x_ && hwnd && IsWindow(hwnd) != FALSE && !device_x_->DefaultWindow()) {
+        device_x_->AdoptTitleWindow(hwnd);
     }
     return S_OK;
 }
@@ -2930,6 +3012,12 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::GetPresentWindowState(
 
     std::lock_guard<std::mutex> lock(present_mutex_);
     HWND effective_hwnd = subclassed_hwnd_ ? subclassed_hwnd_ : attached_hwnd_;
+    if (!effective_hwnd && !explicit_window_detached_ && device_x_) {
+        HWND dev_hwnd = device_x_->DefaultWindow();
+        if (dev_hwnd && IsWindow(dev_hwnd) != FALSE) {
+            effective_hwnd = dev_hwnd;
+        }
+    }
     const bool has_win = (effective_hwnd != nullptr && IsWindow(effective_hwnd) != FALSE);
 
     if (window_state_) {

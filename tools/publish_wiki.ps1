@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Syncs OpenScarlett's canonical wiki/*.md pages to the GitHub Wiki repository
     (https://github.com/californiaAlmonds/OpenScarlett.wiki.git).

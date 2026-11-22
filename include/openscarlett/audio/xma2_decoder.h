@@ -55,7 +55,7 @@ void Xma2ForwardMdct(const float* windowed_in, float* spectral_out, uint32_t blo
 void Xma2InverseMdct(const float* spectral_in, float* time_out, uint32_t block_size);
 void Xma2ComputeSineWindow(float* window_out, uint32_t window_len);
 
-// Clean-room encoder: transforms interleaved float32 PCM (in [-1, 1]) via windowed MDCT,
+// Encoder: transforms interleaved float32 PCM (in [-1, 1]) via windowed MDCT,
 // Bark-band scale factor quantization, and bitstream packing into standard 2048-byte XMA2 packets.
 Status Xma2EncodePcmToPackets(
     const float* interleaved_pcm,

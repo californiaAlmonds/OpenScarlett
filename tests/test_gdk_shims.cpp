@@ -1024,43 +1024,77 @@ void TestXGameRuntimeThunksParity() {
         OS_REQUIRE(user_vt->XUserFindForDevice(&dev_id, &found_dev) == XGR_S_OK && found_dev != nullptr);
         XUserCloseHandle(found_dev);
 
-        // Token & signature (UTF-8)
+        // Token & signature (UTF-8 & UTF-16) — opt in to synthetic XSTS tokens
         {
-            XAsyncBlock tab{};
-            OS_REQUIRE(user_vt->XUserGetTokenAndSignatureAsync(
-                           user, XUserGetTokenAndSignatureOptions_None,
-                           "GET", "https://example.invalid/api",
-                           0, nullptr, 0, nullptr, &tab) == XGR_S_OK);
-            size_t tsz = 0;
-            OS_REQUIRE(user_vt->XUserGetTokenAndSignatureResultSize(&tab, &tsz) == XGR_S_OK);
-            OS_REQUIRE(tsz > sizeof(XUserGetTokenAndSignatureData));
-            std::vector<uint8_t> tbuf(tsz, 0);
-            XUserGetTokenAndSignatureData* tdata = nullptr;
-            size_t tused = 0;
-            OS_REQUIRE(user_vt->XUserGetTokenAndSignatureResult(
-                           &tab, tbuf.size(), tbuf.data(), &tdata, &tused) == XGR_S_OK);
-            OS_REQUIRE(tdata != nullptr && tdata->token != nullptr && tdata->signature != nullptr);
-            OS_REQUIRE(std::strstr(tdata->token, "XBL3.0") != nullptr);
-            OS_REQUIRE(tused == tsz);
-        }
+            struct ScopedMockXstsEnv {
+                bool had_prev = false;
+                std::string prev;
+                ScopedMockXstsEnv() {
+#if defined(_WIN32)
+                    char buf[256]{};
+                    const DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_MOCK_XSTS", buf, sizeof(buf));
+                    if (n > 0 && n < sizeof(buf)) {
+                        had_prev = true;
+                        prev.assign(buf, n);
+                    }
+                    ::SetEnvironmentVariableA("OPENSCARLETT_MOCK_XSTS", "1");
+#else
+                    const char* v = std::getenv("OPENSCARLETT_MOCK_XSTS");
+                    if (v) {
+                        had_prev = true;
+                        prev = v;
+                    }
+                    setenv("OPENSCARLETT_MOCK_XSTS", "1", 1);
+#endif
+                }
+                ~ScopedMockXstsEnv() {
+#if defined(_WIN32)
+                    ::SetEnvironmentVariableA("OPENSCARLETT_MOCK_XSTS", had_prev ? prev.c_str() : nullptr);
+#else
+                    if (had_prev) setenv("OPENSCARLETT_MOCK_XSTS", prev.c_str(), 1);
+                    else unsetenv("OPENSCARLETT_MOCK_XSTS");
+#endif
+                }
+            } mock_xsts_guard;
 
-        // Token & signature (UTF-16)
-        {
-            XAsyncBlock wab{};
-            OS_REQUIRE(XUserGetTokenAndSignatureUtf16Async(
-                           user, XUserGetTokenAndSignatureOptions_ForceRefresh,
-                           L"POST", L"https://example.invalid/utf16",
-                           0, nullptr, 0, nullptr, &wab) == XGR_S_OK);
-            size_t wsz = 0;
-            OS_REQUIRE(XUserGetTokenAndSignatureUtf16ResultSize(&wab, &wsz) == XGR_S_OK);
-            OS_REQUIRE(wsz > sizeof(XUserGetTokenAndSignatureUtf16Data));
-            std::vector<uint8_t> wbuf(wsz, 0);
-            XUserGetTokenAndSignatureUtf16Data* wdata = nullptr;
-            size_t wused = 0;
-            OS_REQUIRE(XUserGetTokenAndSignatureUtf16Result(
-                           &wab, wbuf.size(), wbuf.data(), &wdata, &wused) == XGR_S_OK);
-            OS_REQUIRE(wdata != nullptr && wdata->token != nullptr && wdata->signature != nullptr);
-            OS_REQUIRE(wdata->tokenCount > 5 && wdata->signatureCount > 5);
+            // Token & signature (UTF-8)
+            {
+                XAsyncBlock tab{};
+                OS_REQUIRE(user_vt->XUserGetTokenAndSignatureAsync(
+                               user, XUserGetTokenAndSignatureOptions_None,
+                               "GET", "https://example.invalid/api",
+                               0, nullptr, 0, nullptr, &tab) == XGR_S_OK);
+                size_t tsz = 0;
+                OS_REQUIRE(user_vt->XUserGetTokenAndSignatureResultSize(&tab, &tsz) == XGR_S_OK);
+                OS_REQUIRE(tsz > sizeof(XUserGetTokenAndSignatureData));
+                std::vector<uint8_t> tbuf(tsz, 0);
+                XUserGetTokenAndSignatureData* tdata = nullptr;
+                size_t tused = 0;
+                OS_REQUIRE(user_vt->XUserGetTokenAndSignatureResult(
+                               &tab, tbuf.size(), tbuf.data(), &tdata, &tused) == XGR_S_OK);
+                OS_REQUIRE(tdata != nullptr && tdata->token != nullptr && tdata->signature != nullptr);
+                OS_REQUIRE(std::strstr(tdata->token, "XBL3.0") != nullptr);
+                OS_REQUIRE(tused == tsz);
+            }
+
+            // Token & signature (UTF-16)
+            {
+                XAsyncBlock wab{};
+                OS_REQUIRE(XUserGetTokenAndSignatureUtf16Async(
+                               user, XUserGetTokenAndSignatureOptions_ForceRefresh,
+                               L"POST", L"https://example.invalid/utf16",
+                               0, nullptr, 0, nullptr, &wab) == XGR_S_OK);
+                size_t wsz = 0;
+                OS_REQUIRE(XUserGetTokenAndSignatureUtf16ResultSize(&wab, &wsz) == XGR_S_OK);
+                OS_REQUIRE(wsz > sizeof(XUserGetTokenAndSignatureUtf16Data));
+                std::vector<uint8_t> wbuf(wsz, 0);
+                XUserGetTokenAndSignatureUtf16Data* wdata = nullptr;
+                size_t wused = 0;
+                OS_REQUIRE(XUserGetTokenAndSignatureUtf16Result(
+                               &wab, wbuf.size(), wbuf.data(), &wdata, &wused) == XGR_S_OK);
+                OS_REQUIRE(wdata != nullptr && wdata->token != nullptr && wdata->signature != nullptr);
+                OS_REQUIRE(wdata->tokenCount > 5 && wdata->signatureCount > 5);
+            }
         }
 
         // Default audio endpoint UTF-16

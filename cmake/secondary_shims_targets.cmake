@@ -1,4 +1,4 @@
-# OpenScarlett Clean-Room MIT Secondary Console / GDK Shim DLLs
+# OpenScarlett MIT Secondary Console / GDK Shim DLLs
 # Owned by wave1/secondary-shims-queryapi worktree.
 
 # 1. pixevt.dll

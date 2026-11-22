@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Xbox Audio Co-Processor HAL (AcpHal.dll) ABI definitions for OpenScarlett.
+// Xbox Audio Co-Processor HAL (AcpHal.dll) ABI definitions for OpenScarlett.
 // Routes hardware ACP XMA2 decode commands directly to openscarlett::Xma2Decoder.
 
 #include <cstddef>

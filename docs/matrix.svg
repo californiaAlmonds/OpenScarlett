@@ -33,7 +33,7 @@
     <text class="lbl" x="26" y="155">MIMG (Images / Samplers / BVH)</text>
     <rect x="224" y="147" width="156" height="9" rx="4.5" fill="#21262d"/>
     <rect x="224" y="147" width="156" height="9" rx="4.5" fill="#2ea043"/>
-    <text class="mono" x="440" y="155" text-anchor="end">96/85</text>
+    <text class="mono" x="440" y="155" text-anchor="end">97/85</text>
     <text class="lbl" x="458" y="155">FLAT / GLOBAL / SCRATCH</text>
     <rect x="656" y="147" width="156" height="9" rx="4.5" fill="#21262d"/>
     <rect x="656" y="147" width="156" height="9" rx="4.5" fill="#2ea043"/>
@@ -109,7 +109,7 @@
     <rect x="26" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="26" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="36" y="482">xgameruntime</text>
-    <text class="tiny" x="36" y="493">345 exports · high</text>
+    <text class="tiny" x="36" y="493">346 exports · high</text>
     <rect x="197" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="197" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="207" y="482">XSAPI.GDK.C</text>
@@ -117,7 +117,7 @@
     <rect x="368" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="368" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="378" y="482">kernelx</text>
-    <text class="tiny" x="378" y="493">73 exports · high</text>
+    <text class="tiny" x="378" y="493">88 exports · high</text>
     <rect x="539" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="539" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="549" y="482">XCurl</text>

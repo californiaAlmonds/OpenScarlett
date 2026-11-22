@@ -99,7 +99,7 @@ struct TitleVaMirrorStats {
     uint64_t completed_readbacks = 0;
 };
 
-// Clean-room 64-bit Xbox Title-VA Unified Memory Mirror for discrete-VRAM PCs.
+// 64-bit Xbox Title-VA Unified Memory Mirror for discrete-VRAM PCs.
 //
 // Tracks placed 64-bit guest virtual address regions backed by Win32 MEM_WRITE_WATCH
 // CPU memory and mirrored to discrete PC GPU default-heap shadow resources:

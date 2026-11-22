@@ -638,15 +638,15 @@ Status InspectXvdBytes(const std::vector<uint8_t>& bytes,
         ParseXvcInfoFromBuffer(bytes, static_cast<size_t>(g.xvc_info_offset), out_report);
     }
 
-    // 8. Clear container accessibility diagnostic (strictly no DRM bypass).
+    // 8. Container accessibility diagnostic.
     out_report.can_inspect_filesystem_directly =
         (!out_report.is_encrypted && !out_report.is_payload_truncated);
 
     if (out_report.is_encrypted) {
         out_report.container_status_summary =
             "ENCRYPTED XVD/XVC container (EncryptionDisabled flag not set). "
-            "OpenScarlett performs read-only header inspection only and does not decrypt DRM-protected "
-            "packages; supply an unencrypted/unpacked package directory with loose files to run.";
+            "Only the unencrypted header can be inspected; "
+            "supply an unpacked package directory with loose files to run.";
     } else if (out_report.is_payload_truncated) {
         out_report.container_status_summary =
             "UNENCRYPTED XVD/XVC header (EncryptionDisabled set), but container payload is truncated "
@@ -654,7 +654,7 @@ Status InspectXvdBytes(const std::vector<uint8_t>& bytes,
     } else {
         out_report.container_status_summary =
             "UNENCRYPTED / UNPACKED XVD/XVC container (EncryptionDisabled set). "
-            "Filesystem payload begins at DriveDataOffset and can be inspected without decryption.";
+            "Filesystem payload begins at DriveDataOffset and can be inspected directly.";
     }
 
     return Status::Ok();

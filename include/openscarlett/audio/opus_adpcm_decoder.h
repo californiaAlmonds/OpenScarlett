@@ -1,6 +1,6 @@
 #pragma once
 
-// Clean-room MIT Opus (0x704F via native Windows MSOpusDecoder.dll MFT)
+// Opus (0x704F via native Windows MSOpusDecoder.dll MFT)
 // and IMA-ADPCM (0x0011 WAV / 0x0069 Xbox ADPCM) audio decoders for OpenScarlett.
 
 #include <cstddef>
@@ -14,7 +14,7 @@
 namespace openscarlett {
 
 // ===========================================================================
-// 1. Clean-Room IMA-ADPCM Codec (0x0011 Microsoft WAV & 0x0069 Xbox ADPCM)
+// 1. IMA-ADPCM Codec (0x0011 Microsoft WAV & 0x0069 Xbox ADPCM)
 // ===========================================================================
 
 struct ImaAdpcmConfig {
@@ -33,7 +33,7 @@ struct ImaAdpcmDecodeStats {
 // Computes default samples-per-channel per block for Microsoft WAV / Xbox IMA-ADPCM.
 uint16_t ImaAdpcmComputeSamplesPerBlock(uint16_t channels, uint16_t block_align) noexcept;
 
-// Clean-room IMA-ADPCM encoder (mono or stereo, interleaved float32 PCM in [-1, 1]).
+// IMA-ADPCM encoder (mono or stereo, interleaved float32 PCM in [-1, 1]).
 // Encodes into standard 4-byte-per-channel header + 4-byte-per-channel 8-sample chunk blocks.
 Status ImaAdpcmEncodePcmToBlocks(
     const float* interleaved_pcm,
@@ -43,7 +43,7 @@ Status ImaAdpcmEncodePcmToBlocks(
     uint16_t* out_block_align = nullptr,
     uint16_t* out_samples_per_block = nullptr);
 
-// Clean-room IMA-ADPCM encoder from interleaved int16 PCM.
+// IMA-ADPCM encoder from interleaved int16 PCM.
 Status ImaAdpcmEncodeInt16ToBlocks(
     const int16_t* interleaved_pcm,
     size_t pcm_frames_per_channel,
@@ -139,10 +139,10 @@ bool ExtractOpusPackets(
     OpusPacketFraming framing,
     std::vector<OpusPacketSlice>& out_packets);
 
-// Clean-room RFC 6716 CELT fullband (48 kHz, 20 ms = 960 samples/channel) valid test packet
+// RFC 6716 CELT fullband (48 kHz, 20 ms = 960 samples/channel) valid test packet
 // builder. Produces genuine RFC 6716 CELT packets that Windows MSOpusDecoder.dll decodes into
 // non-empty, finite, bounded float32 PCM frames.
-std::vector<uint8_t> BuildCleanRoomOpusTestPacket(
+std::vector<uint8_t> BuildOpusTestPacket(
     uint16_t channels,
     uint32_t frame_index = 0u,
     size_t payload_bytes = 64u);

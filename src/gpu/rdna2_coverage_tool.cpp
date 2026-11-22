@@ -1,5 +1,5 @@
 // OpenScarlett - MIT License
-// Clean-room GFX10.3 (RDNA2) 779-opcode ISA coverage auditor & 3,000+ shader corpus benchmark.
+// GFX10.3 (RDNA2) 779-opcode ISA coverage auditor & 3,000+ shader corpus benchmark.
 
 #include "rdna2_coverage_tool.h"
 
@@ -57,7 +57,7 @@ namespace openscarlett {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Portable Clean-Room Helpers (MSVC / Clang-CL / MinGW-w64)
+// Portable Helpers (MSVC / Clang-CL / MinGW-w64)
 // ---------------------------------------------------------------------------
 uint32_t FloatToBits(float f) noexcept {
     uint32_t b = 0u;
@@ -2131,7 +2131,7 @@ GeneratedCorpusShader GenerateCorpusShader(uint32_t workload_idx, uint32_t varia
 }
 
 // ---------------------------------------------------------------------------
-// Portable Clean-Room COM RAII Pointer (Zero WRL Dependency -> MSVC/Clang/MinGW)
+// Portable COM RAII Pointer (Zero WRL Dependency -> MSVC/Clang/MinGW)
 // ---------------------------------------------------------------------------
 #if defined(_WIN32)
 template <typename T>
@@ -2260,9 +2260,15 @@ struct D3D12BenchContext {
     bool WaitGpu() {
         ++fence_val;
         if (FAILED(queue->Signal(fence.Get(), fence_val))) return false;
-        if (fence->GetCompletedValue() < fence_val) {
+        const uint64_t completed = fence->GetCompletedValue();
+        if (completed == UINT64_MAX) return false;
+        if (completed < fence_val) {
             if (FAILED(fence->SetEventOnCompletion(fence_val, fence_event))) return false;
-            if (WaitForSingleObject(fence_event, 15000) != WAIT_OBJECT_0) return false;
+            if (WaitForSingleObject(fence_event, 15000u) != WAIT_OBJECT_0) {
+                if (is_warp) warp_hung = true;
+                return false;
+            }
+            if (fence->GetCompletedValue() == UINT64_MAX) return false;
         }
         return true;
     }
@@ -2291,11 +2297,13 @@ struct D3D12BenchContext {
         return res;
     }
 
+    bool warp_hung = false;
     bool RunComputeDualUav(const std::vector<uint8_t>& dxil,
                            const std::vector<uint32_t>& in_uav0,
                            const std::vector<uint32_t>& init_uav1,
                            std::vector<uint32_t>& out_uav1,
                            uint32_t group_x) {
+        if (!device || warp_hung || device->GetDeviceRemovedReason() != S_OK) return false;
         const uint64_t in_bytes = std::max<uint64_t>(4u, static_cast<uint64_t>(in_uav0.size()) * 4u);
         const uint64_t out_bytes = std::max<uint64_t>(4u, static_cast<uint64_t>(init_uav1.size()) * 4u);
         out_uav1.assign(init_uav1.size(), 0u);
@@ -2327,7 +2335,10 @@ struct D3D12BenchContext {
         cpd.pRootSignature = root_sig.Get();
         cpd.CS = {dxil.data(), dxil.size()};
         ComRef<ID3D12PipelineState> pso;
-        if (FAILED(device->CreateComputePipelineState(&cpd, OS_BENCH_IID(ID3D12PipelineState), pso.PutVoid()))) {
+        const HRESULT pso_hr = device->CreateComputePipelineState(&cpd, OS_BENCH_IID(ID3D12PipelineState), pso.PutVoid());
+        if (FAILED(pso_hr)) {
+            std::fprintf(stderr, "[D3D12-BENCH] CreateComputePipelineState failed (warp=%d, hr=0x%08X)\n",
+                         is_warp ? 1 : 0, static_cast<unsigned>(pso_hr));
             return false;
         }
 
@@ -2378,10 +2389,19 @@ struct D3D12BenchContext {
         cmd_list->ResourceBarrier(1, &to_copy);
         cmd_list->CopyResource(rb.Get(), out_gpu.Get());
 
-        if (FAILED(cmd_list->Close())) return false;
+        const HRESULT exec_close_hr = cmd_list->Close();
+        if (FAILED(exec_close_hr)) {
+            std::fprintf(stderr, "[D3D12-BENCH] cmd_list->Close failed (warp=%d, hr=0x%08X)\n",
+                         is_warp ? 1 : 0, static_cast<unsigned>(exec_close_hr));
+            return false;
+        }
         ID3D12CommandList* lists[] = {cmd_list.Get()};
         queue->ExecuteCommandLists(1, lists);
-        if (!WaitGpu()) return false;
+        if (!WaitGpu()) {
+            std::fprintf(stderr, "[D3D12-BENCH] WaitGpu failed (warp=%d, removed=0x%08X)\n",
+                         is_warp ? 1 : 0, static_cast<unsigned>(device->GetDeviceRemovedReason()));
+            return false;
+        }
 
         if (FAILED(rb->Map(0, nullptr, &mapped))) return false;
         if (!out_uav1.empty()) std::memcpy(out_uav1.data(), mapped, static_cast<size_t>(out_bytes));
@@ -2454,7 +2474,10 @@ struct D3D12BenchContext {
         cpd.pRootSignature = root_sig.Get();
         cpd.CS = {dxil.data(), dxil.size()};
         ComRef<ID3D12PipelineState> pso;
-        if (FAILED(device->CreateComputePipelineState(&cpd, OS_BENCH_IID(ID3D12PipelineState), pso.PutVoid()))) {
+        const HRESULT pso_hr = device->CreateComputePipelineState(&cpd, OS_BENCH_IID(ID3D12PipelineState), pso.PutVoid());
+        if (FAILED(pso_hr)) {
+            std::fprintf(stderr, "[D3D12-BENCH] CreateComputePipelineState failed (warp=%d, hr=0x%08X)\n",
+                         is_warp ? 1 : 0, static_cast<unsigned>(pso_hr));
             return false;
         }
 
@@ -2513,10 +2536,19 @@ struct D3D12BenchContext {
         cmd_list->ResourceBarrier(1, &to_copy);
         cmd_list->CopyResource(rb.Get(), out_gpu.Get());
 
-        if (FAILED(cmd_list->Close())) return false;
+        const HRESULT exec_close_hr = cmd_list->Close();
+        if (FAILED(exec_close_hr)) {
+            std::fprintf(stderr, "[D3D12-BENCH] cmd_list->Close failed (warp=%d, hr=0x%08X)\n",
+                         is_warp ? 1 : 0, static_cast<unsigned>(exec_close_hr));
+            return false;
+        }
         ID3D12CommandList* lists[] = {cmd_list.Get()};
         queue->ExecuteCommandLists(1, lists);
-        if (!WaitGpu()) return false;
+        if (!WaitGpu()) {
+            std::fprintf(stderr, "[D3D12-BENCH] WaitGpu failed (warp=%d, removed=0x%08X)\n",
+                         is_warp ? 1 : 0, static_cast<unsigned>(device->GetDeviceRemovedReason()));
+            return false;
+        }
 
         if (FAILED(rb->Map(0, nullptr, &mapped))) return false;
         if (!out_uav1.empty()) std::memcpy(out_uav1.data(), mapped, static_cast<size_t>(out_bytes));
@@ -2635,7 +2667,10 @@ struct D3D12BenchContext {
         cpd.pRootSignature = root_sig.Get();
         cpd.CS = {dxil.data(), dxil.size()};
         ComRef<ID3D12PipelineState> pso;
-        if (FAILED(device->CreateComputePipelineState(&cpd, OS_BENCH_IID(ID3D12PipelineState), pso.PutVoid()))) {
+        const HRESULT pso_hr = device->CreateComputePipelineState(&cpd, OS_BENCH_IID(ID3D12PipelineState), pso.PutVoid());
+        if (FAILED(pso_hr)) {
+            std::fprintf(stderr, "[D3D12-BENCH] CreateComputePipelineState failed (warp=%d, hr=0x%08X)\n",
+                         is_warp ? 1 : 0, static_cast<unsigned>(pso_hr));
             return false;
         }
 
@@ -2809,10 +2844,19 @@ struct D3D12BenchContext {
         copy_tex_to_buf(rb_f4.Get(), rw_f4.Get(), DXGI_FORMAT_R32G32B32A32_FLOAT);
         copy_tex_to_buf(rb_u32.Get(), rw_u32.Get(), DXGI_FORMAT_R32_UINT);
 
-        if (FAILED(cmd_list->Close())) return false;
+        const HRESULT exec_close_hr = cmd_list->Close();
+        if (FAILED(exec_close_hr)) {
+            std::fprintf(stderr, "[D3D12-BENCH] cmd_list->Close failed (warp=%d, hr=0x%08X)\n",
+                         is_warp ? 1 : 0, static_cast<unsigned>(exec_close_hr));
+            return false;
+        }
         ID3D12CommandList* lists[] = {cmd_list.Get()};
         queue->ExecuteCommandLists(1, lists);
-        if (!WaitGpu()) return false;
+        if (!WaitGpu()) {
+            std::fprintf(stderr, "[D3D12-BENCH] WaitGpu failed (warp=%d, removed=0x%08X)\n",
+                         is_warp ? 1 : 0, static_cast<unsigned>(device->GetDeviceRemovedReason()));
+            return false;
+        }
 
         if (FAILED(rb_buf->Map(0, nullptr, &mapped))) return false;
         if (!out_uav1.empty()) std::memcpy(out_uav1.data(), mapped, static_cast<size_t>(out_bytes));
@@ -2915,10 +2959,19 @@ struct D3D12BenchContext {
         src_loc.SubresourceIndex = 0u;
         cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
 
-        if (FAILED(cmd_list->Close())) return false;
+        const HRESULT exec_close_hr = cmd_list->Close();
+        if (FAILED(exec_close_hr)) {
+            std::fprintf(stderr, "[D3D12-BENCH] cmd_list->Close failed (warp=%d, hr=0x%08X)\n",
+                         is_warp ? 1 : 0, static_cast<unsigned>(exec_close_hr));
+            return false;
+        }
         ID3D12CommandList* lists[] = {cmd_list.Get()};
         queue->ExecuteCommandLists(1, lists);
-        if (!WaitGpu()) return false;
+        if (!WaitGpu()) {
+            std::fprintf(stderr, "[D3D12-BENCH] WaitGpu failed (warp=%d, removed=0x%08X)\n",
+                         is_warp ? 1 : 0, static_cast<unsigned>(device->GetDeviceRemovedReason()));
+            return false;
+        }
 
         void* mapped = nullptr;
         if (FAILED(rb->Map(0, nullptr, &mapped))) return false;
@@ -3589,11 +3642,26 @@ void BuildExtendedSvGpuKernels(std::vector<PreparedExtKernel>& kernels, std::str
             store_scc();
         }
 
-        // Straight-line SOPP ops
+        // Straight-line SOPK subvector loop markers + SOPP hints/debug-branch no-ops
+        enc(code, "s_subvector_loop_begin", 0u, {}, 0);
+        enc(code, "s_subvector_loop_end", 0u, {}, 0);
         enc(code, "s_nop", 0u, {}, 0);
         enc(code, "s_waitcnt", 0u, {}, 0);
         enc(code, "s_sleep", 0u, {}, 1);
         enc(code, "s_setprio", 0u, {}, 1);
+        enc(code, "s_wakeup", 0u, {}, 0);
+        enc(code, "s_setkill", 0u, {}, 0);
+        enc(code, "s_sendmsg", 0u, {}, 0);
+        enc(code, "s_incperflevel", 0u, {}, 0);
+        enc(code, "s_decperflevel", 0u, {}, 0);
+        enc(code, "s_cbranch_cdbgsys", 0u, {}, 0);
+        enc(code, "s_cbranch_cdbguser", 0u, {}, 0);
+        enc(code, "s_cbranch_cdbgsys_or_user", 0u, {}, 0);
+        enc(code, "s_cbranch_cdbgsys_and_user", 0u, {}, 0);
+        enc(code, "s_set_gpr_idx_off", 0u, {}, 0);
+        enc(code, "s_set_gpr_idx_mode", 0u, {}, 0);
+        enc(code, "s_round_mode", 0u, {}, 0);
+        enc(code, "s_denorm_mode", 0u, {}, 0);
         enc(code, "s_icache_inv", 0u, {}, 0);
         enc(code, "s_ttracedata", 0u, {}, 0);
         enc(code, "s_ttracedata_imm", 0u, {}, 7);
@@ -3623,6 +3691,8 @@ void BuildExtendedSvGpuKernels(std::vector<PreparedExtKernel>& kernels, std::str
         for (uint8_t k = 0; k < 16u; ++k) store_s(code, static_cast<uint8_t>(16u + k), slot);
         enc(code, "s_gl1_inv", 0u, {}, 0);
         enc(code, "s_dcache_inv", 0u, {}, 0);
+        enc(code, "s_atc_probe", 0u, {Rdna2Operand::Sgpr(0)}, 0);
+        enc(code, "s_atc_probe_buffer", 0u, {Rdna2Operand::Sgpr(0)}, 0);
         enc(code, "s_buffer_load_dword", 4u, {Rdna2Operand::Sgpr(0)}, 12); store_s(code, 4u, slot);
         enc(code, "s_buffer_load_dwordx2", 4u, {Rdna2Operand::Sgpr(0)}, 16); store_s64(code, 4u, slot);
         enc(code, "s_buffer_load_dwordx4", 4u, {Rdna2Operand::Sgpr(0)}, 24);
@@ -4152,6 +4222,1193 @@ void BuildExtendedSvGpuKernels(std::vector<PreparedExtKernel>& kernels, std::str
         for (uint32_t i = 0; i < 32u; ++i) uav0[i] = FloatToBits(0.25f + static_cast<float>(i) * 0.125f);
         AppendSvKernel(kernels, "sv_vintrp_all", 0u, 32u, code, uav0, 192u, {},
                        ExtKernelKind::DualUav, ExtParityMode::ExactU32, true, first_error);
+    }
+
+    // -----------------------------------------------------------------------
+    // Extended SV64 / FP64 / INT64 / SaveExec / MovRel / V_CMPX / HwReg Lifter
+    // Lifts real decoded RDNA2 GFX10.3 binary streams to SM 6.5 HLSL for live
+    // D3D12 HW (GTX 1650 Ti) + D3D12 WARP execution verified bit-exact against
+    // ExecuteScalarVectorCpu.
+    // -----------------------------------------------------------------------
+    auto lift_sv64_hlsl = [](const std::vector<SvDecodedInst>& decoded, uint32_t tg_x) -> std::string {
+        auto hex_u32 = [](uint32_t v) -> std::string {
+            char buf[24]{};
+            std::snprintf(buf, sizeof(buf), "0x%08Xu", v);
+            return buf;
+        };
+
+        auto read_s32 = [&](const Rdna2Operand& op) -> std::string {
+            switch (op.kind) {
+                case Rdna2OperandKind::Sgpr:        return "s[" + std::to_string(op.reg_index & 63u) + "]";
+                case Rdna2OperandKind::InlineInt:   return hex_u32(static_cast<uint32_t>(op.int_value));
+                case Rdna2OperandKind::InlineFloat: return hex_u32(FloatToBits(op.float_value));
+                case Rdna2OperandKind::Literal32:   return hex_u32(op.literal_bits);
+                case Rdna2OperandKind::VccLo:       return "_vcc_lo";
+                case Rdna2OperandKind::VccHi:       return "_vcc_hi";
+                case Rdna2OperandKind::ExecLo:      return "_exec_lo";
+                case Rdna2OperandKind::ExecHi:      return "_exec_hi";
+                case Rdna2OperandKind::M0:          return "_m0";
+                case Rdna2OperandKind::Scc:         return "(_scc ? 1u : 0u)";
+                default:                            return "0u";
+            }
+        };
+
+        auto read_s64 = [&](const Rdna2Operand& op) -> std::string {
+            switch (op.kind) {
+                case Rdna2OperandKind::Sgpr:
+                    return "uint2(s[" + std::to_string(op.reg_index & 63u) + "], s[" +
+                           std::to_string((op.reg_index + 1u) & 63u) + "])";
+                case Rdna2OperandKind::InlineInt: {
+                    const uint64_t sext = static_cast<uint64_t>(static_cast<int64_t>(op.int_value));
+                    return "uint2(" + hex_u32(static_cast<uint32_t>(sext)) + ", " +
+                           hex_u32(static_cast<uint32_t>(sext >> 32u)) + ")";
+                }
+                case Rdna2OperandKind::InlineFloat: {
+                    const double dv = static_cast<double>(op.float_value);
+                    uint64_t bits = 0ull;
+                    std::memcpy(&bits, &dv, sizeof(bits));
+                    return "uint2(" + hex_u32(static_cast<uint32_t>(bits)) + ", " +
+                           hex_u32(static_cast<uint32_t>(bits >> 32u)) + ")";
+                }
+                case Rdna2OperandKind::Literal32:
+                    return "uint2(" + hex_u32(op.literal_bits) + ", 0u)";
+                case Rdna2OperandKind::VccLo:
+                case Rdna2OperandKind::VccHi:
+                    return "uint2(_vcc_lo, _vcc_hi)";
+                case Rdna2OperandKind::ExecLo:
+                case Rdna2OperandKind::ExecHi:
+                    return "uint2(_exec_lo, _exec_hi)";
+                case Rdna2OperandKind::M0:
+                    return "uint2(_m0, 0u)";
+                case Rdna2OperandKind::Scc:
+                    return "uint2(_scc ? 1u : 0u, 0u)";
+                default:
+                    return "uint2(0u, 0u)";
+            }
+        };
+
+        auto read_v32 = [&](const Rdna2Operand& op) -> std::string {
+            if (op.kind == Rdna2OperandKind::Vgpr) {
+                return "v[" + std::to_string(op.reg_index & 63u) + "]";
+            }
+            return read_s32(op);
+        };
+
+        auto read_v64 = [&](const Rdna2Operand& op) -> std::string {
+            if (op.kind == Rdna2OperandKind::Vgpr) {
+                return "uint2(v[" + std::to_string(op.reg_index & 63u) + "], v[" +
+                       std::to_string((op.reg_index + 1u) & 63u) + "])";
+            }
+            return read_s64(op);
+        };
+
+        auto write_s32 = [&](std::ostringstream& os, const Rdna2Operand& dst, const std::string& expr) {
+            if (dst.kind == Rdna2OperandKind::Sgpr) {
+                os << "    s[" << (dst.reg_index & 63u) << "] = " << expr << ";\n";
+            } else if (dst.kind == Rdna2OperandKind::ExecLo) {
+                os << "    _exec_lo = " << expr << ";\n";
+            } else if (dst.kind == Rdna2OperandKind::ExecHi) {
+                os << "    _exec_hi = " << expr << ";\n";
+            } else if (dst.kind == Rdna2OperandKind::VccLo) {
+                os << "    _vcc_lo = " << expr << ";\n";
+            } else if (dst.kind == Rdna2OperandKind::VccHi) {
+                os << "    _vcc_hi = " << expr << ";\n";
+            } else if (dst.kind == Rdna2OperandKind::M0) {
+                os << "    _m0 = " << expr << ";\n";
+            }
+        };
+
+        auto write_s64 = [&](std::ostringstream& os, const Rdna2Operand& dst, const std::string& expr_u2) {
+            os << "    { uint2 _w64 = " << expr_u2 << "; ";
+            if (dst.kind == Rdna2OperandKind::Sgpr) {
+                os << "s[" << (dst.reg_index & 63u) << "] = _w64.x; s[" << ((dst.reg_index + 1u) & 63u) << "] = _w64.y; }\n";
+            } else if (dst.kind == Rdna2OperandKind::ExecLo || dst.kind == Rdna2OperandKind::ExecHi) {
+                os << "_exec_lo = _w64.x; _exec_hi = _w64.y; }\n";
+            } else if (dst.kind == Rdna2OperandKind::VccLo || dst.kind == Rdna2OperandKind::VccHi) {
+                os << "_vcc_lo = _w64.x; _vcc_hi = _w64.y; }\n";
+            } else {
+                os << "}\n";
+            }
+        };
+
+        bool uses_vopc = false;
+        for (const auto& sv : decoded) {
+            if (sv.base.encoding == Rdna2Encoding::VOPC) { uses_vopc = true; break; }
+        }
+        std::ostringstream os;
+        os << "// Generated by OpenScarlett SV64/FP64/INT64/EXEC/V_CMPX Lifter (SM 6.5)\n"
+           << "RWByteAddressBuffer _uav0 : register(u0);\n"
+           << "RWByteAddressBuffer _uav1 : register(u1);\n";
+        if (uses_vopc) {
+            os << "groupshared uint _wm_shared;\n";
+        }
+        os << "uint _ff1_64(uint2 x) {\n"
+           << "    if (x.x != 0u) return firstbitlow(x.x);\n"
+           << "    if (x.y != 0u) return 32u + firstbitlow(x.y);\n"
+           << "    return 0xFFFFFFFFu;\n"
+           << "}\n"
+           << "uint _ff0_64(uint2 x) { return _ff1_64(uint2(~x.x, ~x.y)); }\n"
+           << "uint _flbit_u64(uint2 x) {\n"
+           << "    if (x.y != 0u) return 31u - firstbithigh(x.y);\n"
+           << "    if (x.x != 0u) return 63u - firstbithigh(x.x);\n"
+           << "    return 0xFFFFFFFFu;\n"
+           << "}\n"
+           << "uint _flbit_i64(uint2 x) {\n"
+           << "    if ((x.x == 0u && x.y == 0u) || (x.x == 0xFFFFFFFFu && x.y == 0xFFFFFFFFu)) return 0xFFFFFFFFu;\n"
+           << "    uint2 u = ((x.y & 0x80000000u) != 0u) ? uint2(~x.x, ~x.y) : x;\n"
+           << "    return _flbit_u64(u);\n"
+           << "}\n"
+           << "uint2 _shl64(uint2 x, uint sh) {\n"
+           << "    uint s = sh & 63u;\n"
+           << "    uint lo = (s >= 32u) ? 0u : (x.x << (s & 31u));\n"
+           << "    uint hi_lt = (s == 0u) ? x.y : ((x.y << (s & 31u)) | (x.x >> ((32u - s) & 31u)));\n"
+           << "    uint hi = (s >= 32u) ? (x.x << (s & 31u)) : hi_lt;\n"
+           << "    return uint2(lo, hi);\n"
+           << "}\n"
+           << "uint2 _lshr64(uint2 x, uint sh) {\n"
+           << "    uint s = sh & 63u;\n"
+           << "    uint hi = (s >= 32u) ? 0u : (x.y >> (s & 31u));\n"
+           << "    uint lo_lt = (s == 0u) ? x.x : ((x.x >> (s & 31u)) | (x.y << ((32u - s) & 31u)));\n"
+           << "    uint lo = (s >= 32u) ? (x.y >> (s & 31u)) : lo_lt;\n"
+           << "    return uint2(lo, hi);\n"
+           << "}\n"
+           << "uint2 _ashr64(uint2 x, uint sh) {\n"
+           << "    uint s = sh & 63u;\n"
+           << "    uint fill = asuint(asint(x.y) >> 31);\n"
+           << "    uint hi = (s >= 32u) ? fill : asuint(asint(x.y) >> (s & 31u));\n"
+           << "    uint lo_lt = (s == 0u) ? x.x : ((x.x >> (s & 31u)) | (x.y << ((32u - s) & 31u)));\n"
+           << "    uint lo = (s >= 32u) ? asuint(asint(x.y) >> (s & 31u)) : lo_lt;\n"
+           << "    return uint2(lo, hi);\n"
+           << "}\n"
+           << "uint2 _bfm64(uint w_in, uint o_in) {\n"
+           << "    uint w = w_in & 63u;\n"
+           << "    uint2 m = (w == 0u) ? uint2(0u, 0u) : ((w < 32u) ? uint2((1u << w) - 1u, 0u) : ((w == 32u) ? uint2(0xFFFFFFFFu, 0u) : uint2(0xFFFFFFFFu, (1u << (w - 32u)) - 1u)));\n"
+           << "    return _shl64(m, o_in);\n"
+           << "}\n"
+           << "uint2 _add64(uint2 a, uint2 b) {\n"
+           << "    uint lo = a.x + b.x;\n"
+           << "    uint c = (lo < a.x) ? 1u : 0u;\n"
+           << "    return uint2(lo, a.y + b.y + c);\n"
+           << "}\n"
+           << "uint2 _mul_u64_u32(uint a, uint b) {\n"
+           << "    uint a0 = a & 0xFFFFu, a1 = a >> 16u, b0 = b & 0xFFFFu, b1 = b >> 16u;\n"
+           << "    uint p0 = a0 * b0, p1 = a0 * b1, p2 = a1 * b0, p3 = a1 * b1;\n"
+           << "    uint mid = (p0 >> 16u) + (p1 & 0xFFFFu) + (p2 & 0xFFFFu);\n"
+           << "    uint lo = (p0 & 0xFFFFu) | ((mid & 0xFFFFu) << 16u);\n"
+           << "    uint hi = p3 + (p1 >> 16u) + (p2 >> 16u) + (mid >> 16u);\n"
+           << "    return uint2(lo, hi);\n"
+           << "}\n"
+           << "uint2 _mul_i64_i32(uint au, uint bu) {\n"
+           << "    uint2 r = _mul_u64_u32(au, bu);\n"
+           << "    if (asint(au) < 0) r.y -= bu;\n"
+           << "    if (asint(bu) < 0) r.y -= au;\n"
+           << "    return r;\n"
+           << "}\n"
+           << "uint2 _sub64(uint2 a, uint2 b) {\n"
+           << "    uint lo = a.x - b.x;\n"
+           << "    uint br = (a.x < b.x) ? 1u : 0u;\n"
+           << "    return uint2(lo, a.y - b.y - br);\n"
+           << "}\n"
+           << "bool _f64_is_nan(uint2 u) {\n"
+           << "    return ((u.y & 0x7FF00000u) == 0x7FF00000u) && (((u.y & 0xFFFFFu) != 0u) || (u.x != 0u));\n"
+           << "}\n"
+           << "bool _f64_is_zero(uint2 u) { return (((u.y & 0x7FFFFFFFu) | u.x) == 0u); }\n"
+           << "bool _f64_lt(uint2 a, uint2 b) {\n"
+           << "    bool nan_zz = _f64_is_nan(a) || _f64_is_nan(b) || (_f64_is_zero(a) && _f64_is_zero(b));\n"
+           << "    bool na = (a.y & 0x80000000u) != 0u; bool nb = (b.y & 0x80000000u) != 0u;\n"
+           << "    uint2 ma = uint2(a.x, a.y & 0x7FFFFFFFu); uint2 mb = uint2(b.x, b.y & 0x7FFFFFFFu);\n"
+           << "    bool mlt = (ma.y < mb.y) || (ma.y == mb.y && ma.x < mb.x);\n"
+           << "    bool mgt = (ma.y > mb.y) || (ma.y == mb.y && ma.x > mb.x);\n"
+           << "    return !nan_zz && ((na != nb) ? na : (na ? mgt : mlt));\n"
+           << "}\n"
+           << "bool _f64_eq(uint2 a, uint2 b) {\n"
+           << "    bool nan_ab = _f64_is_nan(a) || _f64_is_nan(b);\n"
+           << "    bool zz = _f64_is_zero(a) && _f64_is_zero(b);\n"
+           << "    return !nan_ab && (zz || (a.x == b.x && a.y == b.y));\n"
+           << "}\n"
+           << "uint2 _pack_f64_grs(uint sign, int exp_b, uint2 m56) {\n"
+           << "    bool is_z = (m56.x == 0u && m56.y == 0u);\n"
+           << "    bool ovf = (m56.y >= 0x1000000u);\n"
+           << "    uint msb = (m56.y != 0u) ? (32u + firstbithigh(m56.y)) : ((m56.x != 0u) ? firstbithigh(m56.x) : 55u);\n"
+           << "    uint lsh = (!ovf && msb < 55u) ? (55u - msb) : 0u;\n"
+           << "    uint2 m_ovf = _lshr64(m56, 1u); m_ovf.x |= (m56.x & 1u);\n"
+           << "    uint2 mn = ovf ? m_ovf : _shl64(m56, lsh);\n"
+           << "    int e = ovf ? (exp_b + 1) : (exp_b - int(lsh));\n"
+           << "    uint grs = mn.x & 7u; uint lsb = (mn.x >> 3u) & 1u;\n"
+           << "    uint2 m52 = _lshr64(mn, 3u);\n"
+           << "    bool inc = (grs > 4u) || (grs == 4u && lsb != 0u);\n"
+           << "    m52 = inc ? _add64(m52, uint2(1u, 0u)) : m52;\n"
+           << "    bool ovf2 = (m52.y >= 0x200000u);\n"
+           << "    m52 = ovf2 ? _lshr64(m52, 1u) : m52;\n"
+           << "    e = ovf2 ? (e + 1) : e;\n"
+           << "    uint2 res = uint2(m52.x, sign | (uint(e) << 20u) | (m52.y & 0xFFFFFu));\n"
+           << "    res = (e >= 2047) ? uint2(0u, sign | 0x7FF00000u) : res;\n"
+           << "    res = (e <= 0) ? uint2(0u, sign) : res;\n"
+           << "    return is_z ? uint2(0u, 0u) : res;\n"
+           << "}\n"
+           << "uint2 _add_f64(uint2 a, uint2 b) {\n"
+           << "    uint sa = a.y & 0x80000000u; uint sb = b.y & 0x80000000u;\n"
+           << "    uint ea = (a.y >> 20u) & 0x7FFu; uint eb = (b.y >> 20u) & 0x7FFu;\n"
+           << "    uint2 ma = _shl64(uint2(a.x, (a.y & 0xFFFFFu) | 0x100000u), 3u);\n"
+           << "    uint2 mb = _shl64(uint2(b.x, (b.y & 0xFFFFFu) | 0x100000u), 3u);\n"
+           << "    bool sw = (ea < eb) || (ea == eb && ((ma.y < mb.y) || (ma.y == mb.y && ma.x < mb.x)));\n"
+           << "    uint s_hi = sw ? sb : sa; uint s_lo = sw ? sa : sb;\n"
+           << "    uint e_hi = sw ? eb : ea; uint e_lo = sw ? ea : eb;\n"
+           << "    uint2 m_hi = sw ? mb : ma; uint2 m_lo = sw ? ma : mb;\n"
+           << "    uint diff = e_hi - e_lo;\n"
+           << "    uint2 lost = (diff > 0u && diff < 57u) ? _shl64(m_lo, 64u - diff) : uint2(0u, 0u);\n"
+           << "    uint st = ((lost.x | lost.y) != 0u) ? 1u : 0u;\n"
+           << "    uint2 m_lo_sh = _lshr64(m_lo, (diff < 57u) ? diff : 0u); m_lo_sh.x |= st;\n"
+           << "    uint2 mb_al = (diff >= 57u) ? uint2(1u, 0u) : ((diff > 0u) ? m_lo_sh : m_lo);\n"
+           << "    uint2 raw = (s_hi == s_lo) ? _add64(m_hi, mb_al) : _sub64(m_hi, mb_al);\n"
+           << "    uint2 r = _pack_f64_grs(s_hi, int(e_hi), raw);\n"
+           << "    r = (eb == 0x7FFu) ? b : r; r = (ea == 0x7FFu) ? a : r;\n"
+           << "    r = _f64_is_zero(b) ? a : r;\n"
+           << "    r = _f64_is_zero(a) ? (_f64_is_zero(b) ? uint2(0u, a.y & b.y) : b) : r;\n"
+           << "    r = _f64_is_nan(b) ? b : r; r = _f64_is_nan(a) ? a : r;\n"
+           << "    return r;\n"
+           << "}\n"
+           << "uint2 _sub_f64(uint2 a, uint2 b) { return _add_f64(a, uint2(b.x, b.y ^ 0x80000000u)); }\n"
+           << "uint2 _mul_f64(uint2 a, uint2 b) {\n"
+           << "    uint sign = (a.y ^ b.y) & 0x80000000u;\n"
+           << "    uint ea = (a.y >> 20u) & 0x7FFu; uint eb = (b.y >> 20u) & 0x7FFu;\n"
+           << "    uint2 ma = uint2(a.x, (a.y & 0xFFFFFu) | 0x100000u);\n"
+           << "    uint2 mb = uint2(b.x, (b.y & 0xFFFFFu) | 0x100000u);\n"
+           << "    uint2 p0 = _mul_u64_u32(ma.x, mb.x); uint2 p1 = _mul_u64_u32(ma.x, mb.y);\n"
+           << "    uint2 p2 = _mul_u64_u32(ma.y, mb.x); uint2 p3 = _mul_u64_u32(ma.y, mb.y);\n"
+           << "    uint2 mid = _add64(uint2(p0.y, 0u), _add64(uint2(p1.x, 0u), uint2(p2.x, 0u)));\n"
+           << "    uint2 hi = _add64(p3, _add64(uint2(p1.y, 0u), _add64(uint2(p2.y, 0u), uint2(mid.y, 0u))));\n"
+           << "    bool b105 = (hi.y & 0x200u) != 0u;\n"
+           << "    int exp_b = int(ea) + int(eb) - 1023 + (b105 ? 1 : 0);\n"
+           << "    uint st1 = (p0.x != 0u || ((mid.x & 0x3FFFFu) != 0u)) ? 1u : 0u;\n"
+           << "    uint st0 = (p0.x != 0u || ((mid.x & 0x1FFFFu) != 0u)) ? 1u : 0u;\n"
+           << "    uint2 m1 = uint2(((mid.x >> 18u) | (hi.x << 14u)) | st1, (hi.x >> 18u) | (hi.y << 14u));\n"
+           << "    uint2 m0 = uint2(((mid.x >> 17u) | (hi.x << 15u)) | st0, (hi.x >> 17u) | (hi.y << 15u));\n"
+           << "    uint2 r = _pack_f64_grs(sign, exp_b, b105 ? m1 : m0);\n"
+           << "    r = (ea == 0x7FFu || eb == 0x7FFu) ? uint2(0u, sign | 0x7FF00000u) : r;\n"
+           << "    r = (_f64_is_zero(a) || _f64_is_zero(b)) ? uint2(0u, sign) : r;\n"
+           << "    r = _f64_is_nan(b) ? b : r; r = _f64_is_nan(a) ? a : r;\n"
+           << "    return r;\n"
+           << "}\n"
+           << "uint2 _f64_from_u32(uint x) {\n"
+           << "    if (x == 0u) return uint2(0u, 0u);\n"
+           << "    uint msb = firstbithigh(x);\n"
+           << "    uint2 m = _shl64(uint2(x ^ (1u << msb), 0u), 52u - msb);\n"
+           << "    return uint2(m.x, ((1023u + msb) << 20u) | m.y);\n"
+           << "}\n"
+           << "uint2 _f64_from_i32(int x) {\n"
+           << "    if (x == 0) return uint2(0u, 0u);\n"
+           << "    uint sign = (x < 0) ? 0x80000000u : 0u;\n"
+           << "    uint ax = (x < 0) ? (0u - asuint(x)) : asuint(x);\n"
+           << "    uint2 r = _f64_from_u32(ax); r.y |= sign; return r;\n"
+           << "}\n"
+           << "uint2 _f64_from_f32(float f) {\n"
+           << "    uint b = asuint(f); uint sign = b & 0x80000000u;\n"
+           << "    uint ex = (b >> 23u) & 0xFFu; uint fr = b & 0x7FFFFFu;\n"
+           << "    if (ex == 0u) {\n"
+           << "        if (fr == 0u) return uint2(0u, sign);\n"
+           << "        uint msb = firstbithigh(fr);\n"
+           << "        uint2 m = _shl64(uint2(fr ^ (1u << msb), 0u), 52u - msb);\n"
+           << "        return uint2(m.x, sign | ((1023u - 126u - (23u - msb)) << 20u) | m.y);\n"
+           << "    }\n"
+           << "    if (ex == 0xFFu) return uint2(fr << 29u, sign | 0x7FF00000u | (fr >> 3u));\n"
+           << "    return uint2(fr << 29u, sign | ((ex + (1023u - 127u)) << 20u) | (fr >> 3u));\n"
+           << "}\n"
+           << "float _f32_from_f64(uint2 u) {\n"
+           << "    uint sign = u.y & 0x80000000u; uint ex = (u.y >> 20u) & 0x7FFu; uint hi_fr = u.y & 0xFFFFFu;\n"
+           << "    if (ex == 0u) return asfloat(sign);\n"
+           << "    if (ex == 0x7FFu) return (hi_fr == 0u && u.x == 0u) ? asfloat(sign | 0x7F800000u) : asfloat(sign | 0x7FC00000u);\n"
+           << "    int fe = int(ex) - 1023 + 127;\n"
+           << "    if (fe <= 0) return asfloat(sign);\n"
+           << "    if (fe >= 255) return asfloat(sign | 0x7F800000u);\n"
+           << "    uint mant = (hi_fr << 3u) | (u.x >> 29u); uint rem = u.x & 0x1FFFFFFFu;\n"
+           << "    if (rem > 0x10000000u || (rem == 0x10000000u && ((mant & 1u) != 0u))) {\n"
+           << "        mant += 1u; if (mant >= 0x800000u) { mant = 0u; fe += 1; }\n"
+           << "    }\n"
+           << "    if (fe >= 255) return asfloat(sign | 0x7F800000u);\n"
+           << "    return asfloat(sign | (uint(fe) << 23u) | (mant & 0x7FFFFFu));\n"
+           << "}\n"
+           << "uint _i32_from_f64(uint2 u) {\n"
+           << "    bool neg = (u.y & 0x80000000u) != 0u;\n"
+           << "    int ex = int((u.y >> 20u) & 0x7FFu) - 1023;\n"
+           << "    if (ex < 0) return 0u;\n"
+           << "    if (ex >= 31) return neg ? 0x80000000u : 0x7FFFFFFFu;\n"
+           << "    uint2 m = _lshr64(uint2(u.x, (u.y & 0xFFFFFu) | 0x100000u), uint(52 - ex));\n"
+           << "    return neg ? (0u - m.x) : m.x;\n"
+           << "}\n"
+           << "uint _u32_from_f64(uint2 u) {\n"
+           << "    if ((u.y & 0x80000000u) != 0u) return 0u;\n"
+           << "    int ex = int((u.y >> 20u) & 0x7FFu) - 1023;\n"
+           << "    if (ex < 0) return 0u;\n"
+           << "    if (ex >= 32) return 0xFFFFFFFFu;\n"
+           << "    uint2 m = _lshr64(uint2(u.x, (u.y & 0xFFFFFu) | 0x100000u), uint(52 - ex));\n"
+           << "    return m.x;\n"
+           << "}\n"
+           << "uint2 _trunc_f64(uint2 u) {\n"
+           << "    int ex = int((u.y >> 20u) & 0x7FFu) - 1023;\n"
+           << "    uint fb = (ex < 0) ? 52u : ((ex >= 52) ? 0u : uint(52 - ex));\n"
+           << "    uint hi_clr = (fb >= 32u) ? (fb - 32u) : 0u;\n"
+           << "    uint hi_mask = (hi_clr == 0u) ? 0xFFFFFFFFu : (~((1u << hi_clr) - 1u));\n"
+           << "    uint lo_mask = (fb >= 32u) ? 0u : ((fb == 0u) ? 0xFFFFFFFFu : (~((1u << fb) - 1u)));\n"
+           << "    uint2 t = uint2(u.x & lo_mask, u.y & hi_mask);\n"
+           << "    return (ex < 0) ? uint2(0u, u.y & 0x80000000u) : ((ex >= 52) ? u : t);\n"
+           << "}\n"
+           << "uint2 _ldexp_f64(uint2 u, int ex) {\n"
+           << "    int cur = int((u.y >> 20u) & 0x7FFu) + ex;\n"
+           << "    uint2 r = uint2(u.x, (u.y & 0x800FFFFFu) | ((uint(cur) & 0x7FFu) << 20u));\n"
+           << "    return _f64_is_zero(u) ? u : r;\n"
+           << "}\n"
+           << "uint2 _floor_f64(uint2 d) { uint2 t = _trunc_f64(d); return _f64_lt(d, t) ? _sub_f64(t, uint2(0u, 0x3FF00000u)) : t; }\n"
+           << "uint2 _ceil_f64(uint2 d) { uint2 t = _trunc_f64(d); return _f64_lt(t, d) ? _add_f64(t, uint2(0u, 0x3FF00000u)) : t; }\n"
+           << "uint2 _rndne_f64(uint2 d) {\n"
+           << "    uint2 fl = _floor_f64(d); uint2 fr = _sub_f64(d, fl); uint2 half_v = uint2(0u, 0x3FE00000u);\n"
+           << "    uint2 half_fl = _ldexp_f64(fl, -1);\n"
+           << "    bool inc = _f64_lt(half_v, fr) || (_f64_eq(fr, half_v) && !_f64_eq(_trunc_f64(half_fl), half_fl));\n"
+           << "    return inc ? _add_f64(fl, uint2(0u, 0x3FF00000u)) : fl;\n"
+           << "}\n"
+           << "uint2 _rcp_f64(uint2 x) {\n"
+           << "    uint2 y = _f64_from_f32(1.0f / _f32_from_f64(x));\n"
+           << "    uint2 two = uint2(0u, 0x40000000u);\n"
+           << "    [loop] for (uint it = 0u; it < 2u; ++it) y = _mul_f64(y, _sub_f64(two, _mul_f64(x, y)));\n"
+           << "    return _f64_is_zero(x) ? uint2(0u, (x.y & 0x80000000u) | 0x7FF00000u) : y;\n"
+           << "}\n"
+           << "uint2 _rsq_f64(uint2 x) {\n"
+           << "    uint2 y = _f64_from_f32(rsqrt(max(1e-30f, _f32_from_f64(x))));\n"
+           << "    uint2 hx = _ldexp_f64(x, -1); uint2 th = uint2(0u, 0x3FF80000u);\n"
+           << "    [loop] for (uint it = 0u; it < 2u; ++it) y = _mul_f64(y, _sub_f64(th, _mul_f64(hx, _mul_f64(y, y))));\n"
+           << "    return ((x.y & 0x80000000u) != 0u || _f64_is_zero(x)) ? uint2(0u, 0x7FF80000u) : y;\n"
+           << "}\n"
+           << "uint2 _sqrt_f64(uint2 x) {\n"
+           << "    uint2 r = _mul_f64(x, _rsq_f64(x));\n"
+           << "    return ((x.y & 0x80000000u) != 0u || _f64_is_zero(x)) ? uint2(0u, 0u) : r;\n"
+           << "}\n"
+           << "uint _frexp_exp_f64(uint2 u) {\n"
+           << "    if (_f64_is_zero(u)) return 0u;\n"
+           << "    int ex = int((u.y >> 20u) & 0x7FFu) - 1022;\n"
+           << "    return asuint(ex);\n"
+           << "}\n"
+           << "uint2 _frexp_mant_f64(uint2 u) {\n"
+           << "    if (_f64_is_zero(u)) return u;\n"
+           << "    return uint2(u.x, (u.y & 0x800FFFFFu) | 0x3FE00000u);\n"
+           << "}\n"
+           << "bool _fclass_f32(float x, uint mask) {\n"
+           << "    uint b = asuint(x); bool neg = (b >> 31u) != 0u; uint ex = (b >> 23u) & 0xFFu; uint fr = b & 0x7FFFFFu;\n"
+           << "    uint bit_i = 0u;\n"
+           << "    if (ex == 0xFFu) bit_i = (fr == 0u) ? (neg ? 2u : 9u) : (((fr & 0x400000u) != 0u) ? 1u : 0u);\n"
+           << "    else if (ex == 0u) bit_i = (fr == 0u) ? (neg ? 5u : 6u) : (neg ? 4u : 7u);\n"
+           << "    else bit_i = neg ? 3u : 8u;\n"
+           << "    return ((mask >> bit_i) & 1u) != 0u;\n"
+           << "}\n"
+           << "bool _fclass_f64(uint2 u, uint mask) {\n"
+           << "    bool neg = (u.y >> 31u) != 0u; uint ex = (u.y >> 20u) & 0x7FFu; uint hfr = u.y & 0xFFFFFu;\n"
+           << "    uint bit_i = 0u;\n"
+           << "    if (ex == 0x7FFu) bit_i = (hfr == 0u && u.x == 0u) ? (neg ? 2u : 9u) : (((hfr & 0x80000u) != 0u) ? 1u : 0u);\n"
+           << "    else if (ex == 0u) bit_i = (hfr == 0u && u.x == 0u) ? (neg ? 5u : 6u) : (neg ? 4u : 7u);\n"
+           << "    else bit_i = neg ? 3u : 8u;\n"
+           << "    return ((mask >> bit_i) & 1u) != 0u;\n"
+           << "}\n"
+           << "bool _cmp_u64(uint2 a, uint2 b, uint op) {\n"
+           << "    bool eq = (a.x == b.x && a.y == b.y);\n"
+           << "    bool lt = (a.y < b.y) || (a.y == b.y && a.x < b.x);\n"
+           << "    if (op == 1u) return lt;\n"
+           << "    if (op == 2u) return eq;\n"
+           << "    if (op == 3u) return lt || eq;\n"
+           << "    if (op == 4u) return !lt && !eq;\n"
+           << "    if (op == 5u) return !eq;\n"
+           << "    if (op == 6u) return !lt;\n"
+           << "    return op == 7u;\n"
+           << "}\n"
+           << "bool _cmp_i64(uint2 a, uint2 b, uint op) {\n"
+           << "    return _cmp_u64(uint2(a.x, a.y ^ 0x80000000u), uint2(b.x, b.y ^ 0x80000000u), op);\n"
+           << "}\n"
+           << "bool _cmp_f64(uint2 a, uint2 b, uint cc) {\n"
+           << "    bool un = _f64_is_nan(a) || _f64_is_nan(b);\n"
+           << "    bool lt = !un && _f64_lt(a, b);\n"
+           << "    bool eq = !un && _f64_eq(a, b);\n"
+           << "    bool gt = !un && !lt && !eq;\n"
+           << "    if (cc == 0u) return false;\n"
+           << "    if (cc == 1u) return lt;\n"
+           << "    if (cc == 2u) return eq;\n"
+           << "    if (cc == 3u) return lt || eq;\n"
+           << "    if (cc == 4u) return gt;\n"
+           << "    if (cc == 5u) return !un && !eq;\n"
+           << "    if (cc == 6u) return gt || eq;\n"
+           << "    if (cc == 7u) return !un;\n"
+           << "    if (cc == 8u) return un;\n"
+           << "    if (cc == 9u) return un || lt;\n"
+           << "    if (cc == 10u) return un || eq;\n"
+           << "    if (cc == 11u) return un || lt || eq;\n"
+           << "    if (cc == 12u) return un || gt;\n"
+           << "    if (cc == 13u) return un || !eq;\n"
+           << "    if (cc == 14u) return un || gt || eq;\n"
+           << "    return true;\n"
+           << "}\n"
+           << "bool _cmp_f32(float a, float b, uint cc) {\n"
+           << "    bool un = ((asuint(a) & 0x7FFFFFFFu) > 0x7F800000u) || ((asuint(b) & 0x7FFFFFFFu) > 0x7F800000u);\n"
+           << "    if (cc == 0u) return false;\n"
+           << "    if (cc == 1u) return !un && (a < b);\n"
+           << "    if (cc == 2u) return !un && (a == b);\n"
+           << "    if (cc == 3u) return !un && (a <= b);\n"
+           << "    if (cc == 4u) return !un && (a > b);\n"
+           << "    if (cc == 5u) return !un && (a != b);\n"
+           << "    if (cc == 6u) return !un && (a >= b);\n"
+           << "    if (cc == 7u) return !un;\n"
+           << "    if (cc == 8u) return un;\n"
+           << "    if (cc == 9u) return un || (a < b);\n"
+           << "    if (cc == 10u) return un || (a == b);\n"
+           << "    if (cc == 11u) return un || (a <= b);\n"
+           << "    if (cc == 12u) return un || (a > b);\n"
+           << "    if (cc == 13u) return un || (a != b);\n"
+           << "    if (cc == 14u) return un || (a >= b);\n"
+           << "    return true;\n"
+           << "}\n"
+           << "uint _sad_u8(uint s0, uint s1, uint s2) {\n"
+           << "    uint r = s2;\n"
+           << "    [unroll] for (uint k = 0u; k < 4u; ++k) {\n"
+           << "        uint a = (s0 >> (k * 8u)) & 0xFFu; uint b = (s1 >> (k * 8u)) & 0xFFu;\n"
+           << "        r += (a >= b) ? (a - b) : (b - a);\n"
+           << "    }\n"
+           << "    return r;\n"
+           << "}\n"
+           << "[numthreads(" << tg_x << ", 1, 1)]\n"
+           << "void main(uint3 _gid : SV_DispatchThreadID, uint _lid : SV_GroupIndex) {\n"
+           << "    uint s[64]; uint v[64]; uint _hwreg[32];\n"
+           << "    [unroll] for (uint _i = 0u; _i < 64u; ++_i) { s[_i] = 0u; v[_i] = 0u; }\n"
+           << "    [unroll] for (uint _i = 0u; _i < 32u; ++_i) { _hwreg[_i] = 0u; }\n"
+           << "    v[0] = _gid.x;\n"
+           << "    bool _scc = false;\n"
+           << "    uint _vcc_lo = 0u; uint _vcc_hi = 0u;\n"
+           << "    uint _exec_lo = " << ((tg_x >= 32u) ? "0xFFFFFFFFu" : hex_u32((1u << tg_x) - 1u)) << ";\n"
+           << "    uint _exec_hi = 0u;\n"
+           << "    uint _m0 = 0u;\n";
+
+        auto emit_wave_mask = [&](const std::string& cond_expr, bool to_exec) {
+            os << "    { bool _act = ((_exec_lo >> _lid) & 1u) != 0u;\n"
+               << "      bool _cr = _act && (" << cond_expr << ");\n"
+               << "      if (_lid == 0u) _wm_shared = 0u;\n"
+               << "      GroupMemoryBarrierWithGroupSync();\n"
+               << "      if (_cr) InterlockedOr(_wm_shared, 1u << _lid);\n"
+               << "      GroupMemoryBarrierWithGroupSync();\n"
+               << "      uint _wm = _wm_shared;\n"
+               << "      GroupMemoryBarrierWithGroupSync();\n";
+            if (to_exec) {
+                os << "      _exec_lo = _wm; _exec_hi = 0u; }\n";
+            } else {
+                os << "      _vcc_lo = _wm; _vcc_hi = 0u; }\n";
+            }
+        };
+
+        uint64_t step_counter = 0ull;
+        for (const auto& sv : decoded) {
+            ++step_counter;
+            const auto& inst = sv.base;
+            const auto* e = sv.entry;
+            const Rdna2Encoding enc = inst.encoding;
+            const uint16_t raw = inst.raw_opcode;
+
+            if (enc == Rdna2Encoding::MUBUF) {
+                const uint32_t vd = inst.src[0].reg_index & 63u;
+                const uint32_t va = inst.src[1].reg_index & 63u;
+                const std::string addr = inst.offen
+                    ? ("(v[" + std::to_string(va) + "] + " + std::to_string(inst.mem_offset) + "u)")
+                    : (std::to_string(inst.mem_offset) + "u");
+                const char* buf = (inst.srsrc == 0u) ? "_uav0" : "_uav1";
+                if (inst.opcode == Rdna2Opcode::BUFFER_LOAD_DWORD) {
+                    os << "    if (((_exec_lo >> _lid) & 1u) != 0u) v[" << vd << "] = " << buf << ".Load(" << addr << ");\n";
+                } else if (inst.opcode == Rdna2Opcode::BUFFER_STORE_DWORD) {
+                    os << "    if (((_exec_lo >> _lid) & 1u) != 0u) " << buf << ".Store(" << addr << ", v[" << vd << "]);\n";
+                }
+                continue;
+            }
+            if (!e) continue;
+
+            if (enc == Rdna2Encoding::SOPP) {
+                if (raw == 0x01u || raw == 0x1Bu || raw == 0x1Eu || raw == 0x1Fu) break;
+                continue;
+            }
+            if (enc == Rdna2Encoding::SMEM) {
+                if (raw == 0x24u || raw == 0x25u) {
+                    const uint32_t lo = static_cast<uint32_t>(step_counter);
+                    const uint32_t hi = static_cast<uint32_t>(step_counter >> 32u);
+                    write_s64(os, inst.dst, "uint2(" + hex_u32(lo) + ", " + hex_u32(hi) + ")");
+                }
+                continue;
+            }
+            if (enc == Rdna2Encoding::SOP2) {
+                if (raw == 0x25u) {
+                    write_s64(os, inst.dst, "_bfm64(" + read_s32(inst.src[0]) + ", " + read_s32(inst.src[1]) + ")");
+                } else if (raw == 0x0Au) {
+                    write_s32(os, inst.dst, "(_scc ? " + read_s32(inst.src[0]) + " : " + read_s32(inst.src[1]) + ")");
+                }
+                continue;
+            }
+            if (enc == Rdna2Encoding::SOPK) {
+                const uint32_t uimm = static_cast<uint32_t>(static_cast<uint16_t>(inst.simm16));
+                const uint32_t hw_id = uimm & 0x3Fu;
+                const uint32_t off = (uimm >> 6u) & 0x1Fu;
+                const uint32_t sz = ((uimm >> 11u) & 0x1Fu) + 1u;
+                const uint32_t mask = (sz >= 32u) ? 0xFFFFFFFFu : ((1u << sz) - 1u);
+                if (raw == 0x12u) {
+                    if (hw_id < 32u) {
+                        write_s32(os, inst.dst, "((_hwreg[" + std::to_string(hw_id) + "] >> " + std::to_string(off) + "u) & " + hex_u32(mask) + ")");
+                    } else {
+                        write_s32(os, inst.dst, "0u");
+                    }
+                } else if (raw == 0x13u || raw == 0x15u) {
+                    if (hw_id < 32u) {
+                        const uint32_t smask = (sz >= 32u) ? 0xFFFFFFFFu : (mask << off);
+                        const std::string sv_expr = (raw == 0x15u && inst.src_count > 0u) ? hex_u32(inst.src[0].literal_bits) : read_s32(inst.dst);
+                        os << "    _hwreg[" << hw_id << "] = (_hwreg[" << hw_id << "] & " << hex_u32(~smask)
+                           << ") | ((" << sv_expr << " << " << off << "u) & " << hex_u32(smask) << ");\n";
+                    }
+                }
+                continue;
+            }
+            if (enc == Rdna2Encoding::SOP1) {
+                const std::string s0 = (inst.src_count > 0u) ? read_s32(inst.src[0]) : "0u";
+                const std::string s0_64 = (inst.src_count > 0u) ? read_s64(inst.src[0]) : "uint2(0u, 0u)";
+                switch (raw) {
+                    case 0x03: write_s32(os, inst.dst, s0); break;
+                    case 0x04: write_s64(os, inst.dst, s0_64); break;
+                    case 0x12: write_s32(os, inst.dst, "_ff0_64(" + s0_64 + ")"); break;
+                    case 0x14: write_s32(os, inst.dst, "_ff1_64(" + s0_64 + ")"); break;
+                    case 0x16: write_s32(os, inst.dst, "_flbit_u64(" + s0_64 + ")"); break;
+                    case 0x18: write_s32(os, inst.dst, "_flbit_i64(" + s0_64 + ")"); break;
+                    case 0x1F: {
+                        const uint64_t next_pc_bytes = static_cast<uint64_t>(inst.word_offset + inst.word_count) << 2u;
+                        write_s64(os, inst.dst, "uint2(" + hex_u32(static_cast<uint32_t>(next_pc_bytes)) + ", " +
+                                                 hex_u32(static_cast<uint32_t>(next_pc_bytes >> 32u)) + ")");
+                        break;
+                    }
+                    case 0x2E:
+                        write_s32(os, inst.dst, "s[(" + std::to_string(inst.src[0].reg_index) + "u + _m0) & 63u]");
+                        break;
+                    case 0x2F:
+                        write_s64(os, inst.dst, "uint2(s[(" + std::to_string(inst.src[0].reg_index) + "u + _m0) & 63u], s[(" +
+                                                 std::to_string(inst.src[0].reg_index) + "u + _m0 + 1u) & 63u])");
+                        break;
+                    case 0x30:
+                        os << "    s[(" << inst.dst.reg_index << "u + _m0) & 63u] = " << s0 << ";\n";
+                        break;
+                    case 0x31:
+                        os << "    { uint2 _mr = " << s0_64 << "; s[(" << inst.dst.reg_index << "u + _m0) & 63u] = _mr.x; "
+                           << "s[(" << inst.dst.reg_index << "u + _m0 + 1u) & 63u] = _mr.y; }\n";
+                        break;
+                    case 0x49:
+                        os << "    s[(" << inst.dst.reg_index << "u + ((_m0 >> 16u) & 0xFFFFu)) & 63u] = s[("
+                           << inst.src[0].reg_index << "u + (_m0 & 0xFFFFu)) & 63u];\n";
+                        break;
+                    case 0x4A:
+                        os << "    { uint _di = (" << inst.dst.reg_index << "u + ((_m0 >> 16u) & 0xFFFFu)) & 63u; "
+                           << "uint _si = (" << inst.src[0].reg_index << "u + (_m0 & 0xFFFFu)) & 63u; "
+                           << "s[_di] = s[_si]; s[(_di + 1u) & 63u] = s[(_si + 1u) & 63u]; }\n";
+                        break;
+                    case 0x24: case 0x25: case 0x26: case 0x27:
+                    case 0x28: case 0x29: case 0x2A: case 0x2B:
+                    case 0x37: case 0x38: case 0x39: case 0x3A: {
+                        const bool is_wrexec = (raw == 0x39u || raw == 0x3Au);
+                        os << "    { uint2 _s0 = " << s0_64 << "; uint2 _oe = uint2(_exec_lo, _exec_hi); uint2 _ne = _oe;\n";
+                        if (raw == 0x24u) os << "      _ne = uint2(_s0.x & _oe.x, _s0.y & _oe.y);\n";
+                        else if (raw == 0x25u) os << "      _ne = uint2(_s0.x | _oe.x, _s0.y | _oe.y);\n";
+                        else if (raw == 0x26u) os << "      _ne = uint2(_s0.x ^ _oe.x, _s0.y ^ _oe.y);\n";
+                        else if (raw == 0x27u || raw == 0x3Au) os << "      _ne = uint2(_s0.x & ~_oe.x, _s0.y & ~_oe.y);\n";
+                        else if (raw == 0x28u) os << "      _ne = uint2(_s0.x | ~_oe.x, _s0.y | ~_oe.y);\n";
+                        else if (raw == 0x29u) os << "      _ne = uint2(~(_s0.x & _oe.x), ~(_s0.y & _oe.y));\n";
+                        else if (raw == 0x2Au) os << "      _ne = uint2(~(_s0.x | _oe.x), ~(_s0.y | _oe.y));\n";
+                        else if (raw == 0x2Bu) os << "      _ne = uint2(~(_s0.x ^ _oe.x), ~(_s0.y ^ _oe.y));\n";
+                        else if (raw == 0x37u || raw == 0x39u) os << "      _ne = uint2(~_s0.x & _oe.x, ~_s0.y & _oe.y);\n";
+                        else if (raw == 0x38u) os << "      _ne = uint2(~_s0.x | _oe.x, ~_s0.y | _oe.y);\n";
+                        os << "      _exec_lo = _ne.x; _exec_hi = _ne.y; _scc = (_ne.x != 0u || _ne.y != 0u);\n";
+                        const char* out_v = is_wrexec ? "_ne" : "_oe";
+                        os << "      s[" << (inst.dst.reg_index & 63u) << "] = " << out_v << ".x; s["
+                           << ((inst.dst.reg_index + 1u) & 63u) << "] = " << out_v << ".y; }\n";
+                        break;
+                    }
+                    case 0x3C: case 0x3D: case 0x3E: case 0x3F:
+                    case 0x40: case 0x41: case 0x42: case 0x43:
+                    case 0x44: case 0x45: case 0x46: case 0x47: {
+                        const bool is_wrexec = (raw == 0x46u || raw == 0x47u);
+                        os << "    { uint _s0 = " << s0 << "; uint _oe = _exec_lo; uint _ne = _oe;\n";
+                        if (raw == 0x3Cu) os << "      _ne = _s0 & _oe;\n";
+                        else if (raw == 0x3Du) os << "      _ne = _s0 | _oe;\n";
+                        else if (raw == 0x3Eu) os << "      _ne = _s0 ^ _oe;\n";
+                        else if (raw == 0x3Fu || raw == 0x47u) os << "      _ne = _s0 & ~_oe;\n";
+                        else if (raw == 0x40u) os << "      _ne = _s0 | ~_oe;\n";
+                        else if (raw == 0x41u) os << "      _ne = ~(_s0 & _oe);\n";
+                        else if (raw == 0x42u) os << "      _ne = ~(_s0 | _oe);\n";
+                        else if (raw == 0x43u) os << "      _ne = ~(_s0 ^ _oe);\n";
+                        else if (raw == 0x44u || raw == 0x46u) os << "      _ne = ~_s0 & _oe;\n";
+                        else if (raw == 0x45u) os << "      _ne = ~_s0 | _oe;\n";
+                        os << "      _exec_lo = _ne; _scc = (_ne != 0u);\n";
+                        os << "      s[" << (inst.dst.reg_index & 63u) << "] = " << (is_wrexec ? "_ne" : "_oe") << "; }\n";
+                        break;
+                    }
+                    default: break;
+                }
+                continue;
+            }
+            if (enc == Rdna2Encoding::VOP1) {
+                const uint32_t vd = inst.dst.reg_index & 63u;
+                const uint32_t vd1 = (vd + 1u) & 63u;
+                const std::string s0 = read_v32(inst.src[0]);
+                const std::string s0_64 = read_v64(inst.src[0]);
+                os << "    if (((_exec_lo >> _lid) & 1u) != 0u) {\n";
+                switch (raw) {
+                    case 0x01: os << "        v[" << vd << "] = " << s0 << ";\n"; break;
+                    case 0x03: os << "        v[" << vd << "] = _i32_from_f64(" << s0_64 << ");\n"; break;
+                    case 0x04: os << "        { uint2 _r = _f64_from_i32(asint(" << s0 << ")); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n"; break;
+                    case 0x0E: os << "        v[" << vd << "] = asuint((float)((asint((" << s0 << " & 0xFu) << 28u)) >> 28) * 0.0625f);\n"; break;
+                    case 0x0F: os << "        v[" << vd << "] = asuint(_f32_from_f64(" << s0_64 << "));\n"; break;
+                    case 0x10: os << "        { uint2 _r = _f64_from_f32(asfloat(" << s0 << ")); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n"; break;
+                    case 0x15: os << "        v[" << vd << "] = _u32_from_f64(" << s0_64 << ");\n"; break;
+                    case 0x16: os << "        { uint2 _r = _f64_from_u32(" << s0 << "); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n"; break;
+                    case 0x17: os << "        { uint2 _r = _trunc_f64(" << s0_64 << "); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n"; break;
+                    case 0x18: os << "        { uint2 _r = _ceil_f64(" << s0_64 << "); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n"; break;
+                    case 0x19: os << "        { uint2 _r = _rndne_f64(" << s0_64 << "); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n"; break;
+                    case 0x1A: os << "        { uint2 _r = _floor_f64(" << s0_64 << "); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n"; break;
+                    case 0x2F: os << "        { uint2 _r = _rcp_f64(" << s0_64 << "); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n"; break;
+                    case 0x31: os << "        { uint2 _r = _rsq_f64(" << s0_64 << "); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n"; break;
+                    case 0x34: os << "        { uint2 _r = _sqrt_f64(" << s0_64 << "); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n"; break;
+                    case 0x3C: os << "        v[" << vd << "] = _frexp_exp_f64(" << s0_64 << ");\n"; break;
+                    case 0x3D: os << "        { uint2 _r = _frexp_mant_f64(" << s0_64 << "); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n"; break;
+                    case 0x3E: os << "        { uint2 _d = " << s0_64 << "; uint2 _r = _sub_f64(_d, _floor_f64(_d)); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n"; break;
+                    case 0x42: os << "        v[(" << vd << "u + _m0) & 63u] = " << s0 << ";\n"; break;
+                    case 0x43: os << "        v[" << vd << "] = v[(" << (inst.src[0].reg_index & 63u) << "u + _m0) & 63u];\n"; break;
+                    case 0x44:
+                    case 0x48: os << "        v[(" << vd << "u + _m0) & 63u] = v[(" << (inst.src[0].reg_index & 63u) << "u + _m0) & 63u];\n"; break;
+                    default: break;
+                }
+                os << "    }\n";
+                continue;
+            }
+            if (enc == Rdna2Encoding::VOP2) {
+                const uint32_t vd = inst.dst.reg_index & 63u;
+                const std::string s0 = read_v32(inst.src[0]);
+                const std::string s1 = read_v32(inst.src[1]);
+                os << "    if (((_exec_lo >> _lid) & 1u) != 0u) {\n";
+                if (raw == 0x18u) os << "        v[" << vd << "] = " << s1 << " << (" << s0 << " & 31u);\n";
+                else if (raw == 0x1Cu) os << "        v[" << vd << "] = " << s0 << " | " << s1 << ";\n";
+                else if (raw == 0x01u) os << "        v[" << vd << "] = (((_vcc_lo >> _lid) & 1u) != 0u) ? " << s1 << " : " << s0 << ";\n";
+                os << "    }\n";
+                continue;
+            }
+            if (enc == Rdna2Encoding::VOPC) {
+                const uint16_t cop = raw;
+                const bool to_exec = e->writes_exec;
+                std::string cond = "false";
+                if (cop == 0x88u || cop == 0x98u) {
+                    cond = "_fclass_f32(asfloat(" + read_v32(inst.src[0]) + "), " + read_v32(inst.src[1]) + ")";
+                } else if (cop == 0xA8u || cop == 0xB8u) {
+                    cond = "_fclass_f64(" + read_v64(inst.src[0]) + ", " + read_v32(inst.src[1]) + ")";
+                } else if (cop == 0x8Fu || cop == 0x9Fu) {
+                    cond = "_fclass_f32(f16tof32(" + read_v32(inst.src[0]) + " & 0xFFFFu), " + read_v32(inst.src[1]) + ")";
+                } else if ((cop >= 0x10u && cop <= 0x1Fu) || (cop >= 0x30u && cop <= 0x3Fu)) {
+                    cond = "_cmp_f32(asfloat(" + read_v32(inst.src[0]) + "), asfloat(" + read_v32(inst.src[1]) + "), " + std::to_string(cop & 15u) + "u)";
+                } else if ((cop >= 0x20u && cop <= 0x2Fu) || (cop >= 0x40u && cop <= 0x4Fu)) {
+                    cond = "_cmp_f64(" + read_v64(inst.src[0]) + ", " + read_v64(inst.src[1]) + ", " + std::to_string(cop & 15u) + "u)";
+                } else if ((cop >= 0xC8u && cop <= 0xCFu) || (cop >= 0xD8u && cop <= 0xDFu) ||
+                           (cop >= 0xE8u && cop <= 0xEFu) || (cop >= 0xF8u && cop <= 0xFFu)) {
+                    const uint32_t cc = ((cop & 0x10u) ? 8u : 0u) | (cop & 7u);
+                    cond = "_cmp_f32(f16tof32(" + read_v32(inst.src[0]) + " & 0xFFFFu), f16tof32(" + read_v32(inst.src[1]) + " & 0xFFFFu), " + std::to_string(cc) + "u)";
+                } else if ((cop >= 0x50u && cop <= 0x57u) || (cop >= 0x70u && cop <= 0x77u)) {
+                    const uint32_t c = cop & 7u;
+                    const std::string a = "(asint((" + read_v32(inst.src[0]) + " & 0xFFFFu) << 16u) >> 16)";
+                    const std::string b = "(asint((" + read_v32(inst.src[1]) + " & 0xFFFFu) << 16u) >> 16)";
+                    const char* ops[8] = {"false", "<", "==", "<=", ">", "!=", ">=", "true"};
+                    cond = (c == 0u || c == 7u) ? ops[c] : (a + " " + ops[c] + " " + b);
+                } else if ((cop >= 0x60u && cop <= 0x67u) || (cop >= 0x78u && cop <= 0x7Fu)) {
+                    const uint32_t c = cop & 7u;
+                    const std::string a = "(" + read_v32(inst.src[0]) + " & 0xFFFFu)";
+                    const std::string b = "(" + read_v32(inst.src[1]) + " & 0xFFFFu)";
+                    const char* ops[8] = {"false", "<", "==", "<=", ">", "!=", ">=", "true"};
+                    cond = (c == 0u || c == 7u) ? ops[c] : (a + " " + ops[c] + " " + b);
+                } else if ((cop >= 0x80u && cop <= 0x87u) || (cop >= 0x90u && cop <= 0x97u)) {
+                    const uint32_t c = cop & 7u;
+                    const std::string a = "asint(" + read_v32(inst.src[0]) + ")";
+                    const std::string b = "asint(" + read_v32(inst.src[1]) + ")";
+                    const char* ops[8] = {"false", "<", "==", "<=", ">", "!=", ">=", "true"};
+                    cond = (c == 0u || c == 7u) ? ops[c] : (a + " " + ops[c] + " " + b);
+                } else if ((cop >= 0xA0u && cop <= 0xA7u) || (cop >= 0xB0u && cop <= 0xB7u)) {
+                    cond = "_cmp_i64(" + read_v64(inst.src[0]) + ", " + read_v64(inst.src[1]) + ", " + std::to_string(cop & 7u) + "u)";
+                } else if ((cop >= 0xC0u && cop <= 0xC7u) || (cop >= 0xD0u && cop <= 0xD7u)) {
+                    const uint32_t c = cop & 7u;
+                    const std::string a = read_v32(inst.src[0]);
+                    const std::string b = read_v32(inst.src[1]);
+                    const char* ops[8] = {"false", "<", "==", "<=", ">", "!=", ">=", "true"};
+                    cond = (c == 0u || c == 7u) ? ops[c] : (a + " " + ops[c] + " " + b);
+                } else if ((cop >= 0xE0u && cop <= 0xE7u) || (cop >= 0xF0u && cop <= 0xF7u)) {
+                    cond = "_cmp_u64(" + read_v64(inst.src[0]) + ", " + read_v64(inst.src[1]) + ", " + std::to_string(cop & 7u) + "u)";
+                }
+                emit_wave_mask(cond, to_exec);
+                continue;
+            }
+            if (enc == Rdna2Encoding::VOP3) {
+                const uint32_t vd = inst.dst.reg_index & 63u;
+                const uint32_t vd1 = (vd + 1u) & 63u;
+                const std::string s0 = read_v32(inst.src[0]);
+                const std::string s1 = (inst.src_count >= 2u) ? read_v32(inst.src[1]) : "0u";
+                const std::string s2 = (inst.src_count >= 3u) ? read_v32(inst.src[2]) : "0u";
+                const std::string u0 = read_v64(inst.src[0]);
+                const std::string u1 = (inst.src_count >= 2u) ? read_v64(inst.src[1]) : "uint2(0u, 0u)";
+                const std::string u2 = (inst.src_count >= 3u) ? read_v64(inst.src[2]) : "uint2(0u, 0u)";
+                os << "    if (((_exec_lo >> _lid) & 1u) != 0u) {\n";
+                switch (raw) {
+                    case 0x14D:
+                    case 0x163:
+                        os << "        { uint2 _r = _add_f64(_mul_f64(" << u0 << ", " << u1 << "), " << u2 << "); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n";
+                        break;
+                    case 0x160:
+                        os << "        { uint2 _d0 = " << u0 << ", _d1 = " << u1 << ", _d2 = " << u2 << "; "
+                           << "bool _neg = (((_d1.y ^ _d2.y) & 0x80000000u) != 0u); "
+                           << "v[" << vd << "] = _d0.x; v[" << vd1 << "] = (_d0.y & 0x7FFFFFFFu) | (_neg ? 0x80000000u : 0u); }\n";
+                        break;
+                    case 0x161:
+                        os << "        v[" << vd << "] = asuint(ldexp(asfloat(" << s0 << "), asint(" << s1 << ")));\n";
+                        break;
+                    case 0x162:
+                        os << "        v[" << vd << "] = asuint(mad(asfloat(" << s0 << "), asfloat(" << s1 << "), asfloat(" << s2 << ")));\n";
+                        break;
+                    case 0x165:
+                    case 0x166:
+                        os << "        { uint2 _r = _add64(" << u2 << ", uint2(_sad_u8(" << u0 << ".x, " << s1 << ", 0u), 0u)); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n";
+                        break;
+                    case 0x167:
+                    case 0x16F:
+                        os << "        { uint2 _r = " << u0 << "; v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n";
+                        break;
+                    case 0x16C:
+                        os << "        { uint2 _r = _add64(_mul_u64_u32(" << s0 << ", " << s1 << "), " << u2 << "); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n";
+                        break;
+                    case 0x16D:
+                        os << "        { uint2 _r = _add64(_mul_i64_i32(" << s0 << ", " << s1 << "), " << u2 << "); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n";
+                        break;
+                    case 0x16E:
+                        os << "        v[" << vd << "] = " << s0 << ";\n";
+                        break;
+                    case 0x170:
+                        os << "        { uint2 _r = _add_f64(" << u0 << ", " << u1 << "); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n";
+                        break;
+                    case 0x171:
+                        os << "        { uint2 _r = _mul_f64(" << u0 << ", " << u1 << "); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n";
+                        break;
+                    case 0x172:
+                        os << "        { uint2 _a = " << u0 << ", _b = " << u1 << "; uint2 _r = _f64_lt(_a, _b) ? _a : _b; v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n";
+                        break;
+                    case 0x173:
+                        os << "        { uint2 _a = " << u0 << ", _b = " << u1 << "; uint2 _r = _f64_lt(_b, _a) ? _a : _b; v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n";
+                        break;
+                    case 0x174:
+                        os << "        { uint2 _r = _ldexp_f64(" << u0 << ", asint(" << s1 << ")); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n";
+                        break;
+                    case 0x175:
+                        os << "        { uint2 _r = _shl64(" << u1 << ", " << s0 << "); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n";
+                        break;
+                    case 0x176:
+                        os << "        { uint2 _r = _lshr64(" << u1 << ", " << s0 << "); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n";
+                        break;
+                    case 0x177:
+                        os << "        { uint2 _r = _ashr64(" << u1 << ", " << s0 << "); v[" << vd << "] = _r.x; v[" << vd1 << "] = _r.y; }\n";
+                        break;
+                    default: break;
+                }
+                os << "    }\n";
+            }
+        }
+        os << "}\n";
+        return os.str();
+    };
+
+    auto append_sv64_kernel = [&](const char* name,
+                                  uint32_t workload_idx,
+                                  uint32_t tg_x,
+                                  const std::vector<uint32_t>& code,
+                                  const std::vector<uint32_t>& uav0,
+                                  size_t uav1_dwords) {
+        std::vector<SvDecodedInst> decoded;
+        Status dst = DecodeScalarVectorStream(code, decoded);
+        if (!dst.ok()) {
+            if (first_error.empty()) first_error = std::string("SV64 decode failed (") + name + "): " + dst.message;
+            return;
+        }
+        SvWaveState wave{};
+        wave.Reset(32u);
+        wave.SeedThreadIds(0u);
+        wave.exec = (tg_x >= 32u) ? 0xFFFFFFFFull : ((1ull << tg_x) - 1ull);
+        wave.uav0 = uav0;
+        wave.uav1.assign(uav1_dwords, 0u);
+        Status cst = ExecuteScalarVectorCpu(decoded, wave);
+        if (!cst.ok()) {
+            if (first_error.empty()) first_error = std::string("SV64 CPU ref failed (") + name + "): " + cst.message;
+            return;
+        }
+        const size_t eff_dwords = std::max(uav1_dwords, wave.uav1.size());
+        PreparedExtKernel k{};
+        k.name = name;
+        k.workload_idx = workload_idx;
+        k.kind = ExtKernelKind::DualUav;
+        k.parity_mode = ExtParityMode::ExactU32;
+        k.allow_vulkan = false;
+        k.group_x = 1u;
+        k.uav0 = uav0;
+        k.init_uav1.assign(eff_dwords, 0u);
+        k.expected_uav1 = wave.uav1;
+        k.expected_uav1.resize(eff_dwords, 0u);
+        k.hlsl_source = lift_sv64_hlsl(decoded, tg_x);
+        k.mnemonics.reserve(decoded.size());
+        for (const auto& sv : decoded) {
+            if (sv.entry && sv.entry->mnemonic) k.mnemonics.emplace_back(sv.entry->mnemonic);
+        }
+        kernels.push_back(std::move(k));
+    };
+
+    // 17. SV64-A: SOP1 64-bit bitscan + SaveExec/Wrexec (b64/b32) + MovRel + GetPC + SOP2 s_bfm_b64 + SOPK HwReg + SMEM memtime
+    {
+        std::vector<uint32_t> code;
+        uint16_t slot = 0u;
+        enc(code, "s_mov_b32", 4u, {Rdna2Operand::LiteralU32(0x13579BDFu)});
+        enc(code, "s_mov_b32", 5u, {Rdna2Operand::LiteralU32(0x00F0AA55u)});
+        enc(code, "s_mov_b32", 6u, {Rdna2Operand::LiteralU32(0xF0F00F0Fu)});
+        enc(code, "s_mov_b32", 7u, {Rdna2Operand::LiteralU32(0x000000AAu)});
+        enc(code, "s_mov_b32", 8u, {Rdna2Operand::LiteralU32(0xFFFFFFFFu)});
+        enc(code, "s_mov_b32", 9u, {Rdna2Operand::LiteralU32(0x00000000u)});
+
+        // SOP1 64-bit bit-scan + s_getpc_b64
+        enc(code, "s_ff0_i32_b64", 12u, {Rdna2Operand::Sgpr(4)}); store_s(code, 12u, slot);
+        enc(code, "s_ff1_i32_b64", 12u, {Rdna2Operand::Sgpr(4)}); store_s(code, 12u, slot);
+        enc(code, "s_flbit_i32_b64", 12u, {Rdna2Operand::Sgpr(4)}); store_s(code, 12u, slot);
+        enc(code, "s_flbit_i32_i64", 12u, {Rdna2Operand::Sgpr(4)}); store_s(code, 12u, slot);
+        enc(code, "s_getpc_b64", 14u, {}); store_s64(code, 14u, slot);
+
+        // SOP2 s_bfm_b64
+        enc(code, "s_bfm_b64", 14u, {Rdna2Operand::InlineInt(19), Rdna2Operand::InlineInt(25)}); store_s64(code, 14u, slot);
+
+        // SMEM s_memtime & s_memrealtime
+        enc(code, "s_memtime", 14u, {}); store_s64(code, 14u, slot);
+        enc(code, "s_memrealtime", 14u, {}); store_s64(code, 14u, slot);
+
+        // SOPK s_setreg_b32 / s_setreg_imm32_b32 / s_getreg_b32
+        const int32_t hw_desc = (3 /*hw_id*/ | (4 << 6) /*off=4*/ | (11 << 11) /*size=12*/);
+        enc(code, "s_mov_b32", 18u, {Rdna2Operand::LiteralU32(0x00000ABCu)});
+        enc(code, "s_setreg_b32", 18u, {}, hw_desc);
+        enc(code, "s_getreg_b32", 12u, {}, hw_desc); store_s(code, 12u, slot);
+        const int32_t hw_desc2 = (4 | (8 << 6) | (15 << 11));
+        enc(code, "s_setreg_imm32_b32", 0u, {Rdna2Operand::LiteralU32(0x0000BEEFu)}, hw_desc2);
+        enc(code, "s_getreg_b32", 12u, {}, hw_desc2); store_s(code, 12u, slot);
+
+        // SOP1 MovRel (m0-indexed SGPR moves)
+        enc(code, "s_mov_b32", 20u, {Rdna2Operand::LiteralU32(0x11112222u)});
+        enc(code, "s_mov_b32", 21u, {Rdna2Operand::LiteralU32(0x33334444u)});
+        enc(code, "s_mov_b32", 22u, {Rdna2Operand::LiteralU32(0x55556666u)});
+        enc(code, "s_mov_b32", 23u, {Rdna2Operand::LiteralU32(0x77778888u)});
+        enc(code, "s_mov_b32", 124u /*M0*/, {Rdna2Operand::InlineInt(1)});
+        enc(code, "s_movrels_b32", 12u, {Rdna2Operand::Sgpr(20)}); store_s(code, 12u, slot);
+        enc(code, "s_movrels_b64", 14u, {Rdna2Operand::Sgpr(20)}); store_s64(code, 14u, slot);
+        enc(code, "s_movreld_b32", 24u, {Rdna2Operand::Sgpr(22)}); store_s(code, 25u, slot);
+        enc(code, "s_movreld_b64", 26u, {Rdna2Operand::Sgpr(20)}); store_s64(code, 27u, slot);
+        enc(code, "s_mov_b32", 124u /*M0*/, {Rdna2Operand::LiteralU32((2u << 16u) | 1u)});
+        if (LookupScalarVectorByName("s_movrelsd_2_b32")) {
+            enc(code, "s_movrelsd_2_b32", 28u, {Rdna2Operand::Sgpr(20)}); store_s(code, 30u, slot);
+        }
+
+        // SOP1 ALL SaveExec / Wrexec 64-bit & 32-bit variants
+        const char* kExec64Ops[] = {
+            "s_and_saveexec_b64", "s_or_saveexec_b64", "s_xor_saveexec_b64", "s_andn2_saveexec_b64",
+            "s_orn2_saveexec_b64", "s_nand_saveexec_b64", "s_nor_saveexec_b64", "s_xnor_saveexec_b64",
+            "s_andn1_saveexec_b64", "s_orn1_saveexec_b64", "s_andn1_wrexec_b64", "s_andn2_wrexec_b64",
+        };
+        for (const char* op : kExec64Ops) {
+            if (!LookupScalarVectorByName(op)) continue;
+            enc(code, "s_mov_b64", 126u /*EXEC*/, {Rdna2Operand::Sgpr(6)});
+            enc(code, op, 14u, {Rdna2Operand::Sgpr(4)});
+            enc(code, "s_mov_b64", 16u, {Rdna2Operand::ExecLo()});
+            enc(code, "s_mov_b64", 126u /*EXEC*/, {Rdna2Operand::Sgpr(8)});
+            store_s64(code, 14u, slot);
+            store_s64(code, 16u, slot);
+        }
+        const char* kExec32Ops[] = {
+            "s_and_saveexec_b32", "s_or_saveexec_b32", "s_xor_saveexec_b32", "s_andn2_saveexec_b32",
+            "s_orn2_saveexec_b32", "s_nand_saveexec_b32", "s_nor_saveexec_b32", "s_xnor_saveexec_b32",
+            "s_andn1_saveexec_b32", "s_orn1_saveexec_b32", "s_andn1_wrexec_b32", "s_andn2_wrexec_b32",
+        };
+        for (const char* op : kExec32Ops) {
+            if (!LookupScalarVectorByName(op)) continue;
+            enc(code, "s_mov_b64", 126u /*EXEC*/, {Rdna2Operand::Sgpr(6)});
+            enc(code, op, 14u, {Rdna2Operand::Sgpr(4)});
+            enc(code, "s_mov_b32", 16u, {Rdna2Operand::ExecLo()});
+            enc(code, "s_mov_b64", 126u /*EXEC*/, {Rdna2Operand::Sgpr(8)});
+            store_s(code, 14u, slot);
+            store_s(code, 16u, slot);
+        }
+        enc(code, "s_endpgm", 0u, {});
+
+        append_sv64_kernel("sv64_sop_exec_hwreg_movrel", 11u, 32u, code, std::vector<uint32_t>(128u, 0u), 128u);
+    }
+
+    // 18A. SV64-B0: VOP1 MovRel (4 m0-indexed VGPR moves — isolated so v[64] stays SSA in FP64 kernels!)
+    {
+        std::vector<uint32_t> code;
+        uint16_t slot = 0u;
+        enc(code, "v_lshlrev_b32", 1u, {Rdna2Operand::InlineInt(2), Rdna2Operand::Vgpr(0)});
+        AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 6u, 1u, 0u, 0u, true);
+        enc(code, "s_mov_b32", 124u /*M0*/, {Rdna2Operand::InlineInt(1)});
+        enc(code, "v_mov_b32", 20u, {Rdna2Operand::Vgpr(0)});
+        enc(code, "v_mov_b32", 21u, {Rdna2Operand::Vgpr(6)});
+        enc(code, "v_movreld_b32", 22u, {Rdna2Operand::Vgpr(20)}); store_v(code, 23u, slot);
+        enc(code, "v_movrels_b32", 24u, {Rdna2Operand::Vgpr(20)}); store_v(code, 24u, slot);
+        enc(code, "v_movrelsd_b32", 25u, {Rdna2Operand::Vgpr(20)}); store_v(code, 26u, slot);
+        if (LookupScalarVectorByName("v_movrelsd_2_b32")) {
+            enc(code, "v_movrelsd_2_b32", 27u, {Rdna2Operand::Vgpr(20)}); store_v(code, 28u, slot);
+        }
+        enc(code, "s_endpgm", 0u, {});
+        std::vector<uint32_t> uav0(32u, 0u);
+        for (uint32_t i = 0; i < 32u; ++i) uav0[i] = 0x100u + i * 7u;
+        append_sv64_kernel("sv64_vop1_movrel", 0u, 32u, code, uav0, static_cast<size_t>(slot) * 32u);
+    }
+
+    // 18B. SV64-B1/B2/B3: VOP1 FP64 (16 ops) + v_cvt_off_f32_i4 split into 3 compact tg_x=32 kernels
+    // so every kernel stays small (~4-8KB DXIL) and compiles/executes in milliseconds on both HW and WARP!
+    {
+        std::vector<uint32_t> uav0(224u, 0u);
+        const double kSq[4] = {0.25, 1.0, 4.0, 16.0};
+        const double kFr[4] = {2.25, -2.75, 3.5, -4.5};
+        for (uint32_t i = 0; i < 32u; ++i) {
+            uint64_t b0 = 0ull, b1 = 0ull;
+            std::memcpy(&b0, &kSq[i & 3u], sizeof(b0));
+            std::memcpy(&b1, &kFr[i & 3u], sizeof(b1));
+            uav0[i] = static_cast<uint32_t>(b0);
+            uav0[32u + i] = static_cast<uint32_t>(b0 >> 32u);
+            uav0[64u + i] = static_cast<uint32_t>(b1);
+            uav0[96u + i] = static_cast<uint32_t>(b1 >> 32u);
+            uav0[128u + i] = static_cast<uint32_t>((i & 1u) ? -static_cast<int32_t>(i + 3u) : static_cast<int32_t>(i + 7u));
+        }
+
+        // B1: Conversions, Trunc, Frexp (10 ops, ZERO FP64 add/mul -> ~4KB DXIL!)
+        {
+            std::vector<uint32_t> code;
+            uint16_t slot = 0u;
+            enc(code, "v_lshlrev_b32", 1u, {Rdna2Operand::InlineInt(2), Rdna2Operand::Vgpr(0)});
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 4u, 1u, 0u, 256u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 5u, 1u, 0u, 384u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 6u, 1u, 0u, 512u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 18u, 1u, 0u, 640u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 19u, 1u, 0u, 768u, true);
+            enc(code, "v_cvt_i32_f64", 10u, {Rdna2Operand::Vgpr(18)}); store_v(code, 10u, slot);
+            enc(code, "v_cvt_f64_i32", 10u, {Rdna2Operand::Vgpr(6)}); store_v(code, 10u, slot); store_v(code, 11u, slot);
+            enc(code, "v_cvt_off_f32_i4", 10u, {Rdna2Operand::Vgpr(0)}); store_v(code, 10u, slot);
+            enc(code, "v_cvt_f32_f64", 10u, {Rdna2Operand::Vgpr(18)}); store_v(code, 10u, slot);
+            enc(code, "v_cvt_f64_f32", 10u, {Rdna2Operand::Vgpr(10)}); store_v(code, 10u, slot); store_v(code, 11u, slot);
+            enc(code, "v_cvt_u32_f64", 10u, {Rdna2Operand::Vgpr(18)}); store_v(code, 10u, slot);
+            enc(code, "v_cvt_f64_u32", 10u, {Rdna2Operand::Vgpr(0)}); store_v(code, 10u, slot); store_v(code, 11u, slot);
+            enc(code, "v_trunc_f64", 10u, {Rdna2Operand::Vgpr(4)}); store_v(code, 10u, slot); store_v(code, 11u, slot);
+            enc(code, "v_frexp_exp_i32_f64", 10u, {Rdna2Operand::Vgpr(4)}); store_v(code, 10u, slot);
+            enc(code, "v_frexp_mant_f64", 10u, {Rdna2Operand::Vgpr(4)}); store_v(code, 10u, slot); store_v(code, 11u, slot);
+            enc(code, "s_endpgm", 0u, {});
+            append_sv64_kernel("sv64_vop1_f64_cvt", 0u, 32u, code, uav0, static_cast<size_t>(slot) * 32u);
+        }
+
+        // B2: Rounding + Fract (4 ops: ceil, rndne, floor, fract)
+        {
+            std::vector<uint32_t> code;
+            uint16_t slot = 0u;
+            enc(code, "v_lshlrev_b32", 1u, {Rdna2Operand::InlineInt(2), Rdna2Operand::Vgpr(0)});
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 4u, 1u, 0u, 256u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 5u, 1u, 0u, 384u, true);
+            enc(code, "v_ceil_f64", 10u, {Rdna2Operand::Vgpr(4)}); store_v(code, 10u, slot); store_v(code, 11u, slot);
+            enc(code, "v_rndne_f64", 10u, {Rdna2Operand::Vgpr(4)}); store_v(code, 10u, slot); store_v(code, 11u, slot);
+            enc(code, "v_floor_f64", 10u, {Rdna2Operand::Vgpr(4)}); store_v(code, 10u, slot); store_v(code, 11u, slot);
+            enc(code, "v_fract_f64", 10u, {Rdna2Operand::Vgpr(4)}); store_v(code, 10u, slot); store_v(code, 11u, slot);
+            enc(code, "s_endpgm", 0u, {});
+            append_sv64_kernel("sv64_vop1_f64_round", 0u, 32u, code, uav0, static_cast<size_t>(slot) * 32u);
+        }
+
+        // B3: Transcendentals (3 ops: rcp, rsq, sqrt)
+        {
+            std::vector<uint32_t> code;
+            uint16_t slot = 0u;
+            enc(code, "v_lshlrev_b32", 1u, {Rdna2Operand::InlineInt(2), Rdna2Operand::Vgpr(0)});
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 2u, 1u, 0u, 0u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 3u, 1u, 0u, 128u, true);
+            enc(code, "v_rcp_f64", 10u, {Rdna2Operand::Vgpr(2)}); store_v(code, 10u, slot); store_v(code, 11u, slot);
+            enc(code, "v_rsq_f64", 10u, {Rdna2Operand::Vgpr(2)}); store_v(code, 10u, slot); store_v(code, 11u, slot);
+            enc(code, "v_sqrt_f64", 10u, {Rdna2Operand::Vgpr(2)}); store_v(code, 10u, slot); store_v(code, 11u, slot);
+            enc(code, "s_endpgm", 0u, {});
+            append_sv64_kernel("sv64_vop1_f64_trans", 0u, 32u, code, uav0, static_cast<size_t>(slot) * 32u);
+        }
+    }
+
+    // 19. SV64-C: ALL remaining VOPC opcodes (64-bit f64/i64/u64 + ALL v_cmpx_* variants) split into 2 compact kernels
+    {
+        std::vector<uint32_t> uav0(384u, 0u);
+        const uint32_t kF32A[4] = {FloatToBits(1.0f), FloatToBits(2.0f), FloatToBits(3.0f), 0x7FC00000u};
+        const uint32_t kF32B[4] = {FloatToBits(2.0f), FloatToBits(2.0f), FloatToBits(1.0f), FloatToBits(1.0f)};
+        const double kD64A[4] = {1.0, 2.0, 3.0, -1.5};
+        const double kD64B[4] = {2.0, 2.0, 1.0, 1.0};
+        const uint64_t kI64A[4] = {0xFFFFFFFFFFFFFFF0ull, 0x0000000100000010ull, 0x0000000000008005ull, 0x0000000100000010ull};
+        const uint64_t kI64B[4] = {0x0000000000000010ull, 0x0000000100000010ull, 0x0000000000000005ull, 0xFFFFFFFFFFFFFFF0ull};
+        const uint32_t kF16A[4] = {0x3C00u, 0x4000u, 0x4200u, 0x7E00u};
+        const uint32_t kF16B[4] = {0x4000u, 0x4000u, 0x3C00u, 0x3C00u};
+        for (uint32_t i = 0; i < 32u; ++i) {
+            uint64_t da = 0ull, db = 0ull;
+            std::memcpy(&da, &kD64A[i & 3u], sizeof(da));
+            std::memcpy(&db, &kD64B[i & 3u], sizeof(db));
+            uav0[i] = kF32A[i & 3u];
+            uav0[32u + i] = kF32B[i & 3u];
+            uav0[64u + i] = static_cast<uint32_t>(da);
+            uav0[96u + i] = static_cast<uint32_t>(da >> 32u);
+            uav0[128u + i] = static_cast<uint32_t>(db);
+            uav0[160u + i] = static_cast<uint32_t>(db >> 32u);
+            uav0[192u + i] = static_cast<uint32_t>(kI64A[i & 3u]);
+            uav0[224u + i] = static_cast<uint32_t>(kI64A[i & 3u] >> 32u);
+            uav0[256u + i] = static_cast<uint32_t>(kI64B[i & 3u]);
+            uav0[288u + i] = static_cast<uint32_t>(kI64B[i & 3u] >> 32u);
+            uav0[320u + i] = kF16A[i & 3u];
+            uav0[352u + i] = kF16B[i & 3u];
+        }
+
+        using SvEntryT = std::decay_t<decltype(GetScalarVectorOpcodeTable()[0])>;
+        std::vector<const SvEntryT*> vopc_ops;
+        for (const auto& entry : GetScalarVectorOpcodeTable()) {
+            if (entry.encoding != Rdna2Encoding::VOPC) continue;
+            if (!entry.writes_exec && entry.bit_width != 64u) continue;
+            vopc_ops.push_back(&entry);
+        }
+        const size_t chunk = (vopc_ops.size() + 3u) / 4u;
+        const char* kVopcNames[4] = {"sv64_vopc_p1", "sv64_vopc_p2", "sv64_vopc_p3", "sv64_vopc_p4"};
+        for (size_t part = 0u; part < 4u; ++part) {
+            const size_t lo_i = part * chunk;
+            const size_t hi_i = std::min(vopc_ops.size(), lo_i + chunk);
+            if (lo_i >= hi_i) continue;
+            std::vector<uint32_t> code;
+            uint16_t slot = 0u;
+            enc(code, "v_lshlrev_b32", 1u, {Rdna2Operand::InlineInt(2), Rdna2Operand::Vgpr(0)});
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 2u, 1u, 0u, 0u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 3u, 1u, 0u, 128u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 4u, 1u, 0u, 256u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 5u, 1u, 0u, 384u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 6u, 1u, 0u, 512u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 7u, 1u, 0u, 640u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 8u, 1u, 0u, 768u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 9u, 1u, 0u, 896u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 10u, 1u, 0u, 1024u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 11u, 1u, 0u, 1152u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 12u, 1u, 0u, 1280u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 13u, 1u, 0u, 1408u, true);
+            enc(code, "v_mov_b32", 14u, {Rdna2Operand::LiteralU32(0x100u)});
+            enc(code, "s_mov_b32", 20u, {Rdna2Operand::LiteralU32(0xFFFFFFFFu)});
+            enc(code, "s_mov_b32", 21u, {Rdna2Operand::LiteralU32(0x00000000u)});
+            for (size_t idx = lo_i; idx < hi_i; ++idx) {
+                const auto& entry = *vopc_ops[idx];
+                uint8_t s0_v = 2u, s1_v = 3u;
+                const uint16_t cop = entry.raw_opcode;
+                if (cop == 0x88u || cop == 0x98u) { s0_v = 2u; s1_v = 14u; }
+                else if (cop == 0xA8u || cop == 0xB8u) { s0_v = 4u; s1_v = 14u; }
+                else if (cop == 0x8Fu || cop == 0x9Fu) { s0_v = 12u; s1_v = 14u; }
+                else if ((cop >= 0x20u && cop <= 0x2Fu) || (cop >= 0x40u && cop <= 0x4Fu)) { s0_v = 4u; s1_v = 6u; }
+                else if ((cop >= 0xA0u && cop <= 0xA7u) || (cop >= 0xB0u && cop <= 0xB7u) ||
+                         (cop >= 0xE0u && cop <= 0xE7u) || (cop >= 0xF0u && cop <= 0xF7u)) { s0_v = 8u; s1_v = 10u; }
+                else if ((cop >= 0xC8u && cop <= 0xCFu) || (cop >= 0xD8u && cop <= 0xDFu) ||
+                         (cop >= 0xE8u && cop <= 0xEFu) || (cop >= 0xF8u && cop <= 0xFFu)) { s0_v = 12u; s1_v = 13u; }
+                else if ((cop >= 0x50u && cop <= 0x7Fu) || (cop >= 0x80u && cop <= 0x97u) ||
+                         (cop >= 0xC0u && cop <= 0xD7u)) { s0_v = 8u; s1_v = 10u; }
+
+                enc(code, entry.mnemonic, 0u, {Rdna2Operand::Vgpr(s0_v), Rdna2Operand::Vgpr(s1_v)});
+                if (entry.writes_exec) {
+                    enc(code, "s_mov_b32", 18u, {Rdna2Operand::ExecLo()});
+                    enc(code, "s_mov_b64", 126u /*EXEC*/, {Rdna2Operand::Sgpr(20)});
+                } else {
+                    enc(code, "s_mov_b32", 18u, {Rdna2Operand::VccLo()});
+                }
+                store_s(code, 18u, slot);
+            }
+            enc(code, "s_endpgm", 0u, {});
+            append_sv64_kernel(kVopcNames[part], 1u, 32u, code, uav0, std::max<size_t>(64u, static_cast<size_t>(slot) + 8u));
+        }
+    }
+
+    // 20. SV64-D: VOP3 FP64 + 64-bit Shifts + MAD64 + Div/Trig/QSAD/MQSAD split into 2 compact tg_x=32 kernels
+    {
+        std::vector<uint32_t> uav0(256u, 0u);
+        const double kA[4] = {1.5, 2.25, 0.5, 4.0};
+        const double kB[4] = {0.25, 1.0, 2.5, 0.5};
+        const double kC[4] = {-0.75, 1.25, -2.0, 3.5};
+        for (uint32_t i = 0; i < 32u; ++i) {
+            uint64_t ba = 0ull, bb = 0ull, bc = 0ull;
+            std::memcpy(&ba, &kA[i & 3u], sizeof(ba));
+            std::memcpy(&bb, &kB[i & 3u], sizeof(bb));
+            std::memcpy(&bc, &kC[i & 3u], sizeof(bc));
+            uav0[i] = static_cast<uint32_t>(ba);
+            uav0[32u + i] = static_cast<uint32_t>(ba >> 32u);
+            uav0[64u + i] = static_cast<uint32_t>(bb);
+            uav0[96u + i] = static_cast<uint32_t>(bb >> 32u);
+            uav0[128u + i] = static_cast<uint32_t>(bc);
+            uav0[160u + i] = static_cast<uint32_t>(bc >> 32u);
+            uav0[192u + i] = FloatToBits(static_cast<float>(kA[i & 3u]));
+            uav0[224u + i] = FloatToBits(static_cast<float>(kB[i & 3u]));
+        }
+
+        // D1: 16 non-add/mul 64-bit & misc VOP3 ops (ZERO FP64 add/mul -> ~5KB DXIL!)
+        {
+            std::vector<uint32_t> code;
+            uint16_t slot = 0u;
+            enc(code, "v_lshlrev_b32", 1u, {Rdna2Operand::InlineInt(2), Rdna2Operand::Vgpr(0)});
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 2u, 1u, 0u, 0u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 3u, 1u, 0u, 128u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 4u, 1u, 0u, 256u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 5u, 1u, 0u, 384u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 6u, 1u, 0u, 512u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 7u, 1u, 0u, 640u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 8u, 1u, 0u, 768u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 9u, 1u, 0u, 896u, true);
+            auto emit_if = [&](const char* mnem, uint8_t dst, const std::vector<Rdna2Operand>& srcs, bool is64) {
+                if (!LookupScalarVectorByName(mnem)) return;
+                enc(code, mnem, dst, srcs);
+                store_v(code, dst, slot);
+                if (is64) store_v(code, static_cast<uint8_t>(dst + 1u), slot);
+            };
+            emit_if("v_div_fixup_f64", 10u, {Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(4), Rdna2Operand::Vgpr(6)}, true);
+            emit_if("v_ldexp_f32", 10u, {Rdna2Operand::Vgpr(8), Rdna2Operand::InlineInt(2)}, false);
+            emit_if("v_div_fmas_f32", 10u, {Rdna2Operand::Vgpr(8), Rdna2Operand::Vgpr(9), Rdna2Operand::Vgpr(8)}, false);
+            emit_if("v_qsad_pk_u16_u8", 10u, {Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(4), Rdna2Operand::Vgpr(6)}, true);
+            emit_if("v_mqsad_pk_u16_u8", 10u, {Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(4), Rdna2Operand::Vgpr(6)}, true);
+            emit_if("v_trig_preop_f64", 10u, {Rdna2Operand::Vgpr(2), Rdna2Operand::InlineInt(0)}, true);
+            emit_if("v_mad_u64_u32", 10u, {Rdna2Operand::Vgpr(0), Rdna2Operand::InlineInt(17), Rdna2Operand::Vgpr(6)}, true);
+            emit_if("v_mad_i64_i32", 10u, {Rdna2Operand::Vgpr(0), Rdna2Operand::InlineInt(-7), Rdna2Operand::Vgpr(6)}, true);
+            emit_if("v_div_scale_f32", 10u, {Rdna2Operand::Vgpr(8), Rdna2Operand::Vgpr(9), Rdna2Operand::Vgpr(8)}, false);
+            emit_if("v_div_scale_f64", 10u, {Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(4), Rdna2Operand::Vgpr(6)}, true);
+            emit_if("v_min_f64", 10u, {Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(4)}, true);
+            emit_if("v_max_f64", 10u, {Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(4)}, true);
+            emit_if("v_ldexp_f64", 10u, {Rdna2Operand::Vgpr(2), Rdna2Operand::InlineInt(2)}, true);
+            emit_if("v_lshlrev_b64", 10u, {Rdna2Operand::InlineInt(13), Rdna2Operand::Vgpr(2)}, true);
+            emit_if("v_lshrrev_b64", 10u, {Rdna2Operand::InlineInt(11), Rdna2Operand::Vgpr(4)}, true);
+            emit_if("v_ashrrev_i64", 10u, {Rdna2Operand::InlineInt(17), Rdna2Operand::Vgpr(6)}, true);
+            enc(code, "s_endpgm", 0u, {});
+            append_sv64_kernel("sv64_vop3_i64_misc", 2u, 32u, code, uav0, static_cast<size_t>(slot) * 32u);
+        }
+
+        // D2: 4 FP64 ALU ops (v_fma_f64, v_div_fmas_f64, v_add_f64, v_mul_f64)
+        {
+            std::vector<uint32_t> code;
+            uint16_t slot = 0u;
+            enc(code, "v_lshlrev_b32", 1u, {Rdna2Operand::InlineInt(2), Rdna2Operand::Vgpr(0)});
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 2u, 1u, 0u, 0u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 3u, 1u, 0u, 128u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 4u, 1u, 0u, 256u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 5u, 1u, 0u, 384u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 6u, 1u, 0u, 512u, true);
+            AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 7u, 1u, 0u, 640u, true);
+            auto emit_if = [&](const char* mnem, uint8_t dst, const std::vector<Rdna2Operand>& srcs) {
+                if (!LookupScalarVectorByName(mnem)) return;
+                enc(code, mnem, dst, srcs);
+                store_v(code, dst, slot);
+                store_v(code, static_cast<uint8_t>(dst + 1u), slot);
+            };
+            emit_if("v_fma_f64", 10u, {Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(4), Rdna2Operand::Vgpr(6)});
+            emit_if("v_div_fmas_f64", 10u, {Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(4), Rdna2Operand::Vgpr(6)});
+            emit_if("v_add_f64", 10u, {Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(4)});
+            emit_if("v_mul_f64", 10u, {Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(4)});
+            enc(code, "s_endpgm", 0u, {});
+            append_sv64_kernel("sv64_vop3_f64_alu", 2u, 32u, code, uav0, static_cast<size_t>(slot) * 32u);
+        }
     }
 }
 #endif
@@ -4834,6 +6091,71 @@ void BuildExtendedMemGpuKernels(std::vector<PreparedExtKernel>& kernels, std::st
                         ExtKernelKind::Tex2D, false,
                         std::vector<float>(64u, 0.0f), std::vector<float>(16u, 0.0f), init_u32,
                         false, true, first_error);
+    }
+
+    // 11. Remaining 8 Mem/Img/DS/GLOBAL opcodes -> 100% (226/226) across ALL 8 Mem/Img families!
+    // Covers: buffer_atomic_add_x2, global_atomic_add_x2, ds_add_u64, ds_rsub_u32,
+    //         ds_min_f32, ds_max_f32, ds_write2_b64, ds_read2_b64
+    {
+        std::vector<uint32_t> code;
+        MemImgEncodeParams p{};
+        p.srsrc_sgpr = 0u;
+        // v10..v11 = 64-bit seed {0xFFFFFFFE, 0x00000001}
+        // v12..v13 = 64-bit addend {0x00000005, 0x00000002} -> sum = {0x00000003, 0x00000004} (tests carry!)
+        // v14..v15 = {10u, 25u} for ds_rsub_u32 (25 - 10 = 15)
+        // v16..v17 = {1.5f, -2.25f} for ds_min_f32 / ds_max_f32
+        p.vdata = 10u; p.offset = 0;  enc(code, "buffer_load_dwordx4", p);
+        p.vdata = 14u; p.offset = 16; enc(code, "buffer_load_dwordx4", p);
+
+        // A. buffer_atomic_add_x2 on uav1[0..1] (with glc return -> v20..21)
+        p = {}; p.srsrc_sgpr = 4u; p.vdata = 10u; p.offset = 0; enc(code, "buffer_store_dwordx2", p);
+        p = {}; p.srsrc_sgpr = 0u; p.vdata = 20u; p.offset = 8; enc(code, "buffer_load_dwordx2", p);
+        p = {}; p.srsrc_sgpr = 4u; p.vdata = 20u; p.offset = 0; p.glc = true; enc(code, "buffer_atomic_add_x2", p);
+        p = {}; p.srsrc_sgpr = 4u; p.vdata = 20u; p.offset = 16; enc(code, "buffer_store_dwordx2", p);
+
+        // B. global_atomic_add_x2 on uav1[2..3] (with glc return -> v22..23)
+        p = {}; p.vaddr = 1u; p.saddr = 4u; p.vdata = 10u; p.offset = 8; enc(code, "global_store_dwordx2", p);
+        p = {}; p.vaddr = 1u; p.saddr = 4u; p.vdst = 22u; p.vdata = 12u; p.offset = 8; p.glc = true;
+        enc(code, "global_atomic_add_x2", p);
+        p = {}; p.srsrc_sgpr = 4u; p.vdata = 22u; p.offset = 24; enc(code, "buffer_store_dwordx2", p);
+
+        // C. ds_add_u64 in LDS[0..7] -> read back into uav1[8..9]
+        p = {}; p.vaddr = 1u; p.data0 = 10u; p.offset = 0; enc(code, "ds_write_b64", p);
+        p = {}; p.vaddr = 1u; p.data0 = 12u; p.offset = 0; enc(code, "ds_add_u64", p);
+        p = {}; p.vaddr = 1u; p.vdst = 24u; p.offset = 0; enc(code, "ds_read_b64", p);
+        p = {}; p.srsrc_sgpr = 4u; p.vdata = 24u; p.offset = 32; enc(code, "buffer_store_dwordx2", p);
+
+        // D. ds_rsub_u32, ds_min_f32, ds_max_f32 in LDS[16, 20, 24] -> uav1[10..12]
+        p = {}; p.vaddr = 1u; p.data0 = 14u; p.offset = 16; enc(code, "ds_write_b32", p);
+        p = {}; p.vaddr = 1u; p.data0 = 15u; p.offset = 16; enc(code, "ds_rsub_u32", p);
+        p = {}; p.vaddr = 1u; p.vdst = 26u; p.offset = 16; enc(code, "ds_read_b32", p);
+
+        p = {}; p.vaddr = 1u; p.data0 = 16u; p.offset = 20; enc(code, "ds_write_b32", p);
+        p = {}; p.vaddr = 1u; p.data0 = 17u; p.offset = 20; enc(code, "ds_min_f32", p);
+        p = {}; p.vaddr = 1u; p.vdst = 27u; p.offset = 20; enc(code, "ds_read_b32", p);
+
+        p = {}; p.vaddr = 1u; p.data0 = 17u; p.offset = 24; enc(code, "ds_write_b32", p);
+        p = {}; p.vaddr = 1u; p.data0 = 16u; p.offset = 24; enc(code, "ds_max_f32", p);
+        p = {}; p.vaddr = 1u; p.vdst = 28u; p.offset = 24; enc(code, "ds_read_b32", p);
+
+        p = {}; p.srsrc_sgpr = 4u; p.vdata = 26u; p.offset = 40; enc(code, "buffer_store_dwordx3", p);
+
+        // E. ds_write2_b64 + ds_read2_b64 -> uav1[13..16]
+        p = {}; p.vaddr = 1u; p.data0 = 10u; p.data1 = 12u; p.offset = 0; p.offset0 = 8; p.offset1 = 10;
+        enc(code, "ds_write2_b64", p);
+        p = {}; p.vaddr = 1u; p.vdst = 30u; p.offset = 0; p.offset0 = 8; p.offset1 = 10;
+        enc(code, "ds_read2_b64", p);
+        p = {}; p.srsrc_sgpr = 4u; p.vdata = 30u; p.offset = 52; enc(code, "buffer_store_dwordx4", p);
+
+        code.push_back(0xBF810000u);
+
+        std::vector<uint32_t> uav0(20u, 0u);
+        uav0[0] = 0xFFFFFFFEu; uav0[1] = 0x00000001u;
+        uav0[2] = 0x00000005u; uav0[3] = 0x00000002u;
+        uav0[4] = 10u; uav0[5] = 25u;
+        uav0[6] = FloatToBits(1.5f); uav0[7] = FloatToBits(-2.25f);
+        AppendMemKernel(kernels, "mem_64bit_ds_extra", 8u, 1u, code, uav0, 20u,
+                        ExtKernelKind::DualUav, true, {}, {}, {}, false, false, first_error);
     }
 }
 #endif

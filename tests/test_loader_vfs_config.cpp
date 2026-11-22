@@ -270,7 +270,7 @@ void TestGameConfigParserAndResolution() {
         "  <!-- Identity with entities & irregular newlines -->\n"
         "  <Identity\n"
         "      Name = \"OpenScarlett.Sample_A&amp;B\"\n"
-        "      Publisher = 'CN=OpenScarlett &lt;Clean-Room&gt;, O=&quot;MIT&quot; &apos;Org&apos;'\n"
+        "      Publisher = 'CN=OpenScarlett &lt;Studio&gt;, O=&quot;MIT&quot; &apos;Org&apos;'\n"
         "      Version = \"2.4.1.0\" />\n"
         "  <TitleId>  0x7e750470 \t </TitleId>\n"
         "  <MSAAppId>\n    000000004C26CAD4\n  </MSAAppId>\n"
@@ -288,7 +288,7 @@ void TestGameConfigParserAndResolution() {
     OS_REQUIRE(ParseGameConfigXml(rich_xml, "memory_rich.config", cfg).ok());
     OS_REQUIRE(cfg.config_version == "1");
     OS_REQUIRE(cfg.identity.name == "OpenScarlett.Sample_A&B");
-    OS_REQUIRE(cfg.identity.publisher == "CN=OpenScarlett <Clean-Room>, O=\"MIT\" 'Org'");
+    OS_REQUIRE(cfg.identity.publisher == "CN=OpenScarlett <Studio>, O=\"MIT\" 'Org'");
     OS_REQUIRE(cfg.identity.version == "2.4.1.0");
     OS_REQUIRE(cfg.title_id == "0x7e750470");
     OS_REQUIRE(cfg.has_title_id);
@@ -1490,7 +1490,7 @@ void TestStoreBootstrapDiagnostics() {
         OS_REQUIRE(d.is_gamelaunchhelper);
         OS_REQUIRE(d.message.find("GamingServices") != std::string::npos);
         OS_REQUIRE(d.message.find("AppModel") != std::string::npos);
-        OS_REQUIRE(d.message.find("ACLs") != std::string::npos);
+        OS_REQUIRE(d.message.find("unpacked package directory") != std::string::npos);
     }
 
     // 10B. XboxGames package with MicrosoftGame.config exiting 0 with 0 symbols -> detected!

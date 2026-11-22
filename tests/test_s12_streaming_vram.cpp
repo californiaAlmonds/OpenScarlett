@@ -73,7 +73,7 @@ fs::path GetRepoLocalTempDir() {
     return dir;
 }
 
-// Clean-room custom XOR-keyed codec for testing DirectStorage custom decompression callbacks.
+// Custom XOR-keyed codec for testing DirectStorage custom decompression callbacks.
 struct CustomXorContext {
     uint8_t key = 0x5Au;
     std::atomic<uint32_t> invoke_count{0u};

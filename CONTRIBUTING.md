@@ -24,11 +24,9 @@ OpenScarlett is currently developed and verified primarily on a single laptop (*
 
 ---
 
-## 2. Clean-Room Code Contributions
+## 2. Code Contributions
 
-### Strict Legal & Licensing Policy
-- **100% Original MIT Clean-Room Code:** All contributions must be original implementations written from public documentation (Microsoft GDK docs, DirectX 12 / DXIL specs, AMD RDNA2 ISA Manual, Khronos Vulkan / SPIR-V specs).
-- **No Proprietary / Copyrighted Material:** Never copy code from unlicensed repositories, and **never** commit or request encryption keys, retail `.xvc`/`.xvd` decryption, DRM bypasses, firmware dumps, or copyrighted game assets.
+All contributions are submitted under the [MIT License](LICENSE).
 
 ### Building Locally (Windows 10 / 11 x64)
 Requirements: Visual Studio 2022 (MSVC C++20) + Windows 10/11 SDK (`dxc.exe`) + CMake 3.20+ + Ninja.

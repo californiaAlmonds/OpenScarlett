@@ -2414,7 +2414,7 @@ void OPENSCARLETT_XAUDIO2_CALL SourceVoiceImpl::DestroyVoice() {
 }
 
 // ===========================================================================
-// Clean-Room ISpatialAudioClient / ISpatialAudioObjectRenderStream / ISpatialAudioObject
+// ISpatialAudioClient / ISpatialAudioObjectRenderStream / ISpatialAudioObject
 //   Thread-safe & re-entrancy-hardened under heavy concurrent streaming load!
 // ===========================================================================
 constexpr int32_t OS_SPTLAUDCLNT_E_DESTROYED = static_cast<int32_t>(0x88890100u);
@@ -2903,7 +2903,7 @@ private:
 };
 
 // ===========================================================================
-// X3DAudio Clean-Room 3D Spatialization Engine
+// X3DAudio 3D Spatialization Engine
 // ===========================================================================
 constexpr uint32_t kX3dAudioMagic = 0x58334441u;  // "X3DA"
 
@@ -3037,7 +3037,7 @@ std::vector<SpeakerSlot> BuildSpeakerLayout(uint32_t mask, uint32_t dst_channels
 }
 
 // ===========================================================================
-// XAudio2FX Clean-Room COM APOs (Reverb & VolumeMeter)
+// XAudio2FX COM APOs (Reverb & VolumeMeter)
 // ===========================================================================
 class ReverbApoImpl final : public OS_IXAPOParameters {
 public:

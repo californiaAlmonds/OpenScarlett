@@ -2,10 +2,51 @@
 #include <DirectXMath.h>
 #include <DirectXPackedVector.h>
 
-// Clean-room MIT DirectXTK12 SimpleMath subset for untouched Xbox-GDK-Samples.
+// MIT DirectXTK12 SimpleMath subset for untouched Xbox-GDK-Samples.
 
 namespace DirectX {
 namespace SimpleMath {
+
+struct Vector3 : public XMFLOAT3 {
+    Vector3() noexcept : XMFLOAT3(0.f, 0.f, 0.f) {}
+    constexpr Vector3(float ix, float iy, float iz) noexcept : XMFLOAT3(ix, iy, iz) {}
+    Vector3(const XMFLOAT3& v) noexcept : XMFLOAT3(v) {}
+    Vector3(const Vector3&) = default;
+    Vector3& operator=(const Vector3&) = default;
+    Vector3& operator=(const XMFLOAT3& v) noexcept {
+        x = v.x;
+        y = v.y;
+        z = v.z;
+        return *this;
+    }
+    Vector3(FXMVECTOR v) noexcept { XMStoreFloat3(this, v); }
+    Vector3& operator=(FXMVECTOR v) noexcept {
+        XMStoreFloat3(this, v);
+        return *this;
+    }
+    operator XMVECTOR() const noexcept { return XMLoadFloat3(this); }
+};
+
+struct Vector4 : public XMFLOAT4 {
+    Vector4() noexcept : XMFLOAT4(0.f, 0.f, 0.f, 0.f) {}
+    constexpr Vector4(float ix, float iy, float iz, float iw) noexcept : XMFLOAT4(ix, iy, iz, iw) {}
+    Vector4(const XMFLOAT4& v) noexcept : XMFLOAT4(v) {}
+    Vector4(const Vector4&) = default;
+    Vector4& operator=(const Vector4&) = default;
+    Vector4& operator=(const XMFLOAT4& v) noexcept {
+        x = v.x;
+        y = v.y;
+        z = v.z;
+        w = v.w;
+        return *this;
+    }
+    Vector4(FXMVECTOR v) noexcept { XMStoreFloat4(this, v); }
+    Vector4& operator=(FXMVECTOR v) noexcept {
+        XMStoreFloat4(this, v);
+        return *this;
+    }
+    operator XMVECTOR() const noexcept { return XMLoadFloat4(this); }
+};
 
 struct Matrix : public XMFLOAT4X4 {
     Matrix() noexcept
