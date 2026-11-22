@@ -190,7 +190,7 @@ void TestDirectStorageSubmittedCancelBoundsAndPhysicalPages() {
         OS_REQUIRE(ev != nullptr);
 
         std::vector<uint8_t> dst96(gdef_plain.size(), 0xCCu);
-        DSTORAGE_REQUEST r_big{};
+        OpenScarlettDStorageRequestDesc r_big{};
         r_big.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_GDEFLATE;
         r_big.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
         r_big.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -199,7 +199,7 @@ void TestDirectStorageSubmittedCancelBoundsAndPhysicalPages() {
         r_big.Destination.Memory.Buffer = dst96.data();
         r_big.Destination.Memory.Size = static_cast<uint32_t>(dst96.size());
         r_big.UncompressedSize = static_cast<uint32_t>(gdef_plain.size());
-        q->EnqueueRequest(&r_big);
+        OpenScarlettDStorageEnqueueRequestDesc(q, &r_big);
         q->EnqueueStatus(st, 0u);
         q->EnqueueSetEvent(ev);
         q->Submit();
@@ -214,7 +214,7 @@ void TestDirectStorageSubmittedCancelBoundsAndPhysicalPages() {
         // Restore 32 MiB staging limit and retry -> succeeds!
         OS_REQUIRE(factory->SetStagingBufferSize(DSTORAGE_DEFAULT_STAGING_BUFFER_SIZE) == OS_DSTORAGE_S_OK);
         ResetEvent(ev);
-        q->EnqueueRequest(&r_big);
+        OpenScarlettDStorageEnqueueRequestDesc(q, &r_big);
         q->EnqueueStatus(st, 1u);
         q->EnqueueSetEvent(ev);
         q->Submit();
@@ -252,7 +252,7 @@ void TestDirectStorageSubmittedCancelBoundsAndPhysicalPages() {
         std::vector<std::vector<uint8_t>> cancel_dsts(kCancelCount, std::vector<uint8_t>(gdef_plain.size(), 0xDDu));
 
         for (uint32_t i = 0u; i < kLeadCount; ++i) {
-            DSTORAGE_REQUEST r{};
+            OpenScarlettDStorageRequestDesc r{};
             r.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_GDEFLATE;
             r.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
             r.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -262,10 +262,10 @@ void TestDirectStorageSubmittedCancelBoundsAndPhysicalPages() {
             r.Destination.Memory.Size = static_cast<uint32_t>(lead_dsts[i].size());
             r.UncompressedSize = static_cast<uint32_t>(gdef_plain.size());
             r.CancellationTag = 0x10000000ull | i;
-            q->EnqueueRequest(&r);
+            OpenScarlettDStorageEnqueueRequestDesc(q, &r);
         }
         for (uint32_t i = 0u; i < kCancelCount; ++i) {
-            DSTORAGE_REQUEST r{};
+            OpenScarlettDStorageRequestDesc r{};
             r.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_GDEFLATE;
             r.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
             r.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -275,7 +275,7 @@ void TestDirectStorageSubmittedCancelBoundsAndPhysicalPages() {
             r.Destination.Memory.Size = static_cast<uint32_t>(cancel_dsts[i].size());
             r.UncompressedSize = static_cast<uint32_t>(gdef_plain.size());
             r.CancellationTag = 0xDEAD0000ull | i;
-            q->EnqueueRequest(&r);
+            OpenScarlettDStorageEnqueueRequestDesc(q, &r);
         }
         q->EnqueueStatus(st, 0u);
         q->EnqueueSetEvent(ev);
@@ -356,7 +356,7 @@ void TestDirectStorageSubmittedCancelBoundsAndPhysicalPages() {
         OS_REQUIRE(ev != nullptr);
 
         // Request 0: GDeflate directly into 128 KiB physical-page mapping
-        DSTORAGE_REQUEST r_phys{};
+        OpenScarlettDStorageRequestDesc r_phys{};
         r_phys.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_GDEFLATE;
         r_phys.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
         r_phys.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -365,11 +365,11 @@ void TestDirectStorageSubmittedCancelBoundsAndPhysicalPages() {
         r_phys.Destination.Memory.Buffer = va_write;
         r_phys.Destination.Memory.Size = static_cast<uint32_t>(2u * k64KiB);
         r_phys.UncompressedSize = static_cast<uint32_t>(gdef_plain.size());
-        q->EnqueueRequest(&r_phys);
+        OpenScarlettDStorageEnqueueRequestDesc(q, &r_phys);
         q->EnqueueStatus(st, 0u);
 
         // Request 1: BCPack directly into XMemAlloc(XALLOC_MEMTYPE_PHYSICAL) destination
-        DSTORAGE_REQUEST r_xmem{};
+        OpenScarlettDStorageRequestDesc r_xmem{};
         r_xmem.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_BCPACK;
         r_xmem.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
         r_xmem.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -378,7 +378,7 @@ void TestDirectStorageSubmittedCancelBoundsAndPhysicalPages() {
         r_xmem.Destination.Memory.Buffer = xmem_dst;
         r_xmem.Destination.Memory.Size = static_cast<uint32_t>(bc7_plain.size());
         r_xmem.UncompressedSize = static_cast<uint32_t>(bc7_plain.size());
-        q->EnqueueRequest(&r_xmem);
+        OpenScarlettDStorageEnqueueRequestDesc(q, &r_xmem);
         q->EnqueueStatus(st, 1u);
         q->EnqueueSetEvent(ev);
         q->Submit();
@@ -401,7 +401,7 @@ void TestDirectStorageSubmittedCancelBoundsAndPhysicalPages() {
         uint32_t old_prot = 0u;
         OS_REQUIRE(KernelXVirtualProtectFromApp(va_write, 2u * k64KiB, PAGE_READONLY, &old_prot) == 1);
         ResetEvent(ev);
-        q->EnqueueRequest(&r_phys);
+        OpenScarlettDStorageEnqueueRequestDesc(q, &r_phys);
         q->EnqueueStatus(st, 2u);
         q->EnqueueSetEvent(ev);
         q->Submit();

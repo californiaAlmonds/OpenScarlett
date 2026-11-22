@@ -454,7 +454,7 @@ int main() {
         std::vector<uint8_t> raw_out(kRawBytes, 0u);
         std::vector<uint8_t> gdef_out(kGDefUncompBytes, 0u);
 
-        DSTORAGE_REQUEST r0{};
+        OpenScarlettDStorageRequestDesc r0{};
         r0.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
         r0.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
         r0.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -464,10 +464,10 @@ int main() {
         r0.Destination.Memory.Buffer = raw_out.data();
         r0.Destination.Memory.Size = kRawBytes;
         r0.UncompressedSize = kRawBytes;
-        dsq->EnqueueRequest(&r0);
+        OpenScarlettDStorageEnqueueRequestDesc(dsq, &r0);
         dsq->EnqueueStatus(status, 0);
 
-        DSTORAGE_REQUEST r1{};
+        OpenScarlettDStorageRequestDesc r1{};
         r1.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_GDEFLATE;
         r1.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
         r1.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -477,7 +477,7 @@ int main() {
         r1.Destination.Memory.Buffer = gdef_out.data();
         r1.Destination.Memory.Size = kGDefUncompBytes;
         r1.UncompressedSize = kGDefUncompBytes;
-        dsq->EnqueueRequest(&r1);
+        OpenScarlettDStorageEnqueueRequestDesc(dsq, &r1);
         dsq->EnqueueStatus(status, 1);
 
         HANDLE ev = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);

@@ -693,19 +693,19 @@ int main() {
         std::vector<uint32_t> batch_b(8192u, 0u);  // 32 KiB at offset 65536
         std::vector<uint8_t> gdef_out(65536u, 0u);
 
-        DSTORAGE_REQUEST r0{};
-        r0.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
+        DSTORAGE_REQUEST r0{};  // Xbox layout: file source, no decompression
         r0.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
-        r0.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
-        r0.Source.File = {raw_file.Get(), 0ull, 32768u};
-        r0.Destination.Memory = {batch_a.data(), 32768u};
-        r0.UncompressedSize = 32768u;
+        r0.File = raw_file.Get();
+        r0.FileOffset = 0ull;
+        r0.SourceSize = 32768u;
+        r0.Destination = batch_a.data();
+        r0.DestinationSize = 32768u;
         r0.CancellationTag = 0x0001ull;
         queues[0]->EnqueueRequest(&r0);
         queues[0]->EnqueueStatus(status.Get(), 0u);
 
         // Cancelled speculative request tagged 0xDEAD0001 (must not trigger error)
-        DSTORAGE_REQUEST r_cancel{};
+        OpenScarlettDStorageRequestDesc r_cancel{};
         r_cancel.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_GDEFLATE;
         r_cancel.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
         r_cancel.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -713,27 +713,27 @@ int main() {
         r_cancel.Destination.Memory = {gdef_out.data(), 32u};
         r_cancel.UncompressedSize = 32u;
         r_cancel.CancellationTag = 0xDEAD0001ull;
-        queues[0]->EnqueueRequest(&r_cancel);
+        OpenScarlettDStorageEnqueueRequestDesc(queues[0].Get(), &r_cancel);
         queues[0]->CancelRequestsWithTag(0xFFFF0000ull, 0xDEAD0000ull);
 
         DSTORAGE_REQUEST r1{};
-        r1.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
         r1.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
-        r1.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
-        r1.Source.File = {raw_file.Get(), 65536ull, 32768u};
-        r1.Destination.Memory = {batch_b.data(), 32768u};
-        r1.UncompressedSize = 32768u;
+        r1.File = raw_file.Get();
+        r1.FileOffset = 65536ull;
+        r1.SourceSize = 32768u;
+        r1.Destination = batch_b.data();
+        r1.DestinationSize = 32768u;
         queues[1]->EnqueueRequest(&r1);
         queues[1]->EnqueueStatus(status.Get(), 1u);
 
-        DSTORAGE_REQUEST r2{};
+        OpenScarlettDStorageRequestDesc r2{};
         r2.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_GDEFLATE;
         r2.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
         r2.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
         r2.Source.File = {gdef_file.Get(), 0ull, static_cast<uint32_t>(gdef_info.FileSize)};
         r2.Destination.Memory = {gdef_out.data(), 65536u};
         r2.UncompressedSize = 65536u;
-        queues[2]->EnqueueRequest(&r2);
+        OpenScarlettDStorageEnqueueRequestDesc(queues[2].Get(), &r2);
         queues[2]->EnqueueStatus(status.Get(), 2u);
 
         HANDLE ev_done = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -801,12 +801,11 @@ int main() {
             if (!as_ev) return Fail("CreateEventW(as_ev)");
             for (uint32_t i = 0; i < kHalf - 1u; ++i) {
                 DSTORAGE_REQUEST r{};
-                r.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
                 r.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
-                r.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
-                r.Source.Memory = {srcs[i].data(), 32u};
-                r.Destination.Memory = {dsts[i].data(), 32u};
-                r.UncompressedSize = 32u;
+                r.Source = srcs[i].data();
+                r.SourceSize = 32u;
+                r.Destination = dsts[i].data();
+                r.DestinationSize = 32u;
                 mq->EnqueueRequest(&r);
             }
             mq->EnqueueStatus(status.Get(), 3u);
@@ -814,12 +813,11 @@ int main() {
             // 64th request triggers auto-submit WITHOUT Submit()
             {
                 DSTORAGE_REQUEST r{};
-                r.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
                 r.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
-                r.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
-                r.Source.Memory = {srcs[kHalf - 1u].data(), 32u};
-                r.Destination.Memory = {dsts[kHalf - 1u].data(), 32u};
-                r.UncompressedSize = 32u;
+                r.Source = srcs[kHalf - 1u].data();
+                r.SourceSize = 32u;
+                r.Destination = dsts[kHalf - 1u].data();
+                r.DestinationSize = 32u;
                 mq->EnqueueRequest(&r);
             }
             const DWORD wrc = ::WaitForSingleObject(as_ev, 5000u);

@@ -688,7 +688,7 @@ void TestDirectStorageHardening() {
 
         // Enqueue 63 requests + status + event (still 1 short of half-full auto-submit!)
         for (uint32_t i = 0u; i < kThreshold - 1u; ++i) {
-            DSTORAGE_REQUEST r{};
+            OpenScarlettDStorageRequestDesc r{};
             r.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
             r.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
             r.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -697,7 +697,7 @@ void TestDirectStorageHardening() {
             r.Destination.Memory.Buffer = dst_bufs[i].data();
             r.Destination.Memory.Size = 64u;
             r.UncompressedSize = 64u;
-            q->EnqueueRequest(&r);
+            OpenScarlettDStorageEnqueueRequestDesc(q, &r);
         }
         q->EnqueueStatus(st, 0u);
         q->EnqueueSetEvent(ev);
@@ -709,7 +709,7 @@ void TestDirectStorageHardening() {
 
         // Enqueue 64th request WITHOUT calling Submit() -> triggers automatic flush!
         {
-            DSTORAGE_REQUEST r{};
+            OpenScarlettDStorageRequestDesc r{};
             r.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
             r.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
             r.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -718,7 +718,7 @@ void TestDirectStorageHardening() {
             r.Destination.Memory.Buffer = dst_bufs[kThreshold - 1u].data();
             r.Destination.Memory.Size = 64u;
             r.UncompressedSize = 64u;
-            q->EnqueueRequest(&r);
+            OpenScarlettDStorageEnqueueRequestDesc(q, &r);
         }
 
         // Wait on event (no Submit() was ever called!)
@@ -770,7 +770,7 @@ void TestDirectStorageHardening() {
         }
 
         for (uint32_t i = 0u; i < kBurst; ++i) {
-            DSTORAGE_REQUEST r{};
+            OpenScarlettDStorageRequestDesc r{};
             r.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
             r.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
             r.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -779,7 +779,7 @@ void TestDirectStorageHardening() {
             r.Destination.Memory.Buffer = dst_bufs[i].data();
             r.Destination.Memory.Size = 128u;
             r.UncompressedSize = 128u;
-            q->EnqueueRequest(&r);
+            OpenScarlettDStorageEnqueueRequestDesc(q, &r);
 
             if ((i & 31u) == 0u) {
                 DSTORAGE_QUEUE_INFO qi{};
@@ -839,7 +839,7 @@ void TestDirectStorageHardening() {
         std::array<uint8_t, 32> unused_dst{};
 
         // Enqueue 1 valid request
-        DSTORAGE_REQUEST r_ok{};
+        OpenScarlettDStorageRequestDesc r_ok{};
         r_ok.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
         r_ok.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
         r_ok.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -849,10 +849,10 @@ void TestDirectStorageHardening() {
         r_ok.Destination.Memory.Size = 32u;
         r_ok.UncompressedSize = 32u;
         r_ok.CancellationTag = 0x11110001ull;
-        q->EnqueueRequest(&r_ok);
+        OpenScarlettDStorageEnqueueRequestDesc(q, &r_ok);
 
         // Enqueue 3 malformed / guaranteed-to-fail requests tagged 0xCAFE00xx
-        DSTORAGE_REQUEST r_bad1{};
+        OpenScarlettDStorageRequestDesc r_bad1{};
         r_bad1.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
         r_bad1.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
         r_bad1.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -861,9 +861,9 @@ void TestDirectStorageHardening() {
         r_bad1.Destination.Memory.Buffer = nullptr;
         r_bad1.Destination.Memory.Size = 0u;
         r_bad1.CancellationTag = 0xCAFE0001ull;
-        q->EnqueueRequest(&r_bad1);
+        OpenScarlettDStorageEnqueueRequestDesc(q, &r_bad1);
 
-        DSTORAGE_REQUEST r_bad2{};
+        OpenScarlettDStorageRequestDesc r_bad2{};
         r_bad2.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_GDEFLATE;
         r_bad2.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
         r_bad2.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -873,11 +873,11 @@ void TestDirectStorageHardening() {
         r_bad2.Destination.Memory.Size = 32u;
         r_bad2.UncompressedSize = 32u;
         r_bad2.CancellationTag = 0xCAFE0002ull;
-        q->EnqueueRequest(&r_bad2);
+        OpenScarlettDStorageEnqueueRequestDesc(q, &r_bad2);
 
-        DSTORAGE_REQUEST r_bad3 = r_bad2;
+        OpenScarlettDStorageRequestDesc r_bad3 = r_bad2;
         r_bad3.CancellationTag = 0xCAFE00FFull;
-        q->EnqueueRequest(&r_bad3);
+        OpenScarlettDStorageEnqueueRequestDesc(q, &r_bad3);
 
         // Cancel all 0xCAFE____ requests BEFORE Submit()
         q->CancelRequestsWithTag(0xFFFF0000ull, 0xCAFE0000ull);
@@ -900,7 +900,7 @@ void TestDirectStorageHardening() {
         // Contrast: enqueue 1 UN-cancelled failing request and verify error reporting still works!
         ResetEvent(ev);
         r_bad2.CancellationTag = 0x22220001ull;
-        q->EnqueueRequest(&r_bad2);
+        OpenScarlettDStorageEnqueueRequestDesc(q, &r_bad2);
         q->EnqueueStatus(st, 1u);
         q->EnqueueSetEvent(ev);
         q->Submit();

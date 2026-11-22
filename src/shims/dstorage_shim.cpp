@@ -666,12 +666,72 @@ public:
         return rem;
     }
 
+    // Title entry point: `request` is the Xbox dstorage_xs.h DSTORAGE_REQUEST (0x48 bytes).
     void OPENSCARLETT_DSTORAGE_CALL EnqueueRequest(const DSTORAGE_REQUEST* request) override {
         RecordOk("IDStorageQueueX::EnqueueRequest", 3);
         if (!request) return;
         QueueItem item{};
         item.kind = QueueItem::Kind::Request;
-        item.request = *request;
+        item.xbox_options = request->Options.AsUINT64;
+        item.decode_hr = DecodeXboxRequest(*request, item.request);
+        EnqueueRequestItem(item);
+    }
+
+    // Host-extension entry point (OpenScarlettDStorageEnqueueRequestDesc).
+    void EnqueueRequestDesc(const OpenScarlettDStorageRequestDesc& request) {
+        QueueItem item{};
+        item.kind = QueueItem::Kind::Request;
+        item.request = request;
+        EnqueueRequestItem(item);
+    }
+
+    void SetDevice(void* device) { device_ = device; }
+
+    // Decodes a title's DSTORAGE_REQUEST into the shim's internal request. Returns S_OK when the
+    // shim can execute it, otherwise the HRESULT the request completes with. Sizes, pointers and
+    // the cancellation tag are always copied so cancellation and error records still work.
+    static int32_t DecodeXboxRequest(const DSTORAGE_REQUEST& x, OpenScarlettDStorageRequestDesc& out) {
+        out = OpenScarlettDStorageRequestDesc{};
+        const uint64_t opts = x.Options.AsUINT64;
+        const bool from_memory = (opts & DSTORAGE_REQUEST_OPTION_SOURCE_TYPE_MASK) != 0u;
+        out.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
+        out.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
+        out.Options.SourceType = from_memory ? DSTORAGE_REQUEST_SOURCE_MEMORY : DSTORAGE_REQUEST_SOURCE_FILE;
+        if (from_memory) {
+            out.Source.Memory.Source = x.Source;
+            out.Source.Memory.Size = x.SourceSize;
+        } else {
+            out.Source.File.Source = x.File;
+            out.Source.File.Offset = x.FileOffset;
+            out.Source.File.Size = x.SourceSize;
+        }
+        out.Destination.Memory.Buffer = x.Destination;
+        out.Destination.Memory.Size = x.DestinationSize;
+        out.UncompressedSize = x.DestinationSize;
+        out.CancellationTag = x.CancellationTag;
+        out.Name = x.Name;
+
+        if ((opts & DSTORAGE_REQUEST_OPTION_RESERVED_MASK) != 0u) {
+            return OS_DSTORAGE_E_INVALIDARG;
+        }
+        // Physical-page arrays (XMemAllocatePhysicalPages) and hardware swizzle are not emulated.
+        if ((opts & (DSTORAGE_REQUEST_OPTION_DEST_PHYSICAL_MASK |
+                     DSTORAGE_REQUEST_OPTION_SOURCE_PHYSICAL_MASK |
+                     DSTORAGE_REQUEST_OPTION_SWIZZLE_MASK)) != 0u) {
+            return OS_DSTORAGE_E_INVALIDARG;
+        }
+        // RFC 1950 zlib and console BCPack are real console formats. The shim's ZLIB/BCPACK codecs
+        // implement OpenScarlett's own synthetic container, so routing console data to them would
+        // corrupt it; such requests fail with a decompression error instead.
+        if ((opts & (DSTORAGE_REQUEST_OPTION_ZLIB_MASK | DSTORAGE_REQUEST_OPTION_BCPACK_MASK)) != 0u) {
+            return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
+        }
+        return OS_DSTORAGE_S_OK;
+    }
+
+private:
+    struct QueueItem;
+    void EnqueueRequestItem(QueueItem& item) {
         if (item.request.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE &&
             item.request.Source.File.Source) {
             item.request.Source.File.Source->AddRef();
@@ -700,6 +760,7 @@ public:
         }
     }
 
+public:
     void OPENSCARLETT_DSTORAGE_CALL EnqueueStatus(
         IDStorageStatusArrayX* statusArray, uint32_t index) override {
         RecordOk("IDStorageQueueX::EnqueueStatus", 4);
@@ -871,7 +932,7 @@ public:
 
                 int32_t hr = OS_DSTORAGE_S_OK;
                 if (!item.canceled) {
-                    hr = ExecuteRequest(item.request);
+                    hr = (item.decode_hr < 0) ? item.decode_hr : ExecuteRequest(item.request);
                 }
                 bool was_canceled = item.canceled || (hr == OS_DSTORAGE_E_CANCELLED);
                 {
@@ -888,7 +949,7 @@ public:
                 } else if (hr < 0) {
                     completed_failed_count_.fetch_add(1u, std::memory_order_relaxed);
                     if (batch_hr_ >= 0) batch_hr_ = hr;
-                    RecordFailure(hr, item.request);
+                    RecordFailure(hr, item);
                 } else {
                     completed_ok_count_.fetch_add(1u, std::memory_order_relaxed);
                 }
@@ -932,7 +993,9 @@ private:
         enum class Kind { Request, Status, Event };
         Kind kind = Kind::Request;
         bool canceled = false;
-        DSTORAGE_REQUEST request{};
+        OpenScarlettDStorageRequestDesc request{};
+        int32_t decode_hr = OS_DSTORAGE_S_OK;  // non-S_OK: the title request is failed without executing
+        uint64_t xbox_options = 0u;            // DSTORAGE_REQUEST_OPTIONS of a title request
         DStorageStatusArrayImpl* status_array = nullptr;
         uint32_t status_index = 0;
         void* event_handle = nullptr;
@@ -974,7 +1037,7 @@ private:
     }
 
     int32_t AcquireSourceBytes(
-        const DSTORAGE_REQUEST& req,
+        const OpenScarlettDStorageRequestDesc& req,
         size_t staging_limit,
         std::vector<uint8_t>& file_buf,
         const uint8_t*& out_ptr,
@@ -1013,7 +1076,7 @@ private:
     }
 
     int32_t DecompressToVector(
-        const DSTORAGE_REQUEST& req,
+        const OpenScarlettDStorageRequestDesc& req,
         const uint8_t* src_ptr,
         size_t src_size,
         size_t staging_limit,
@@ -1126,7 +1189,7 @@ private:
 
 #if defined(_WIN32)
     int32_t ExecuteGpuBufferRequest(
-        const DSTORAGE_REQUEST& req,
+        const OpenScarlettDStorageRequestDesc& req,
         const uint8_t* src_ptr,
         size_t src_size,
         size_t staging_limit) {
@@ -1148,7 +1211,7 @@ private:
             return OS_DSTORAGE_E_REQUEST_TOO_LARGE;
         }
 
-        ID3D12Device* dev = static_cast<ID3D12Device*>(desc_.Device);
+        ID3D12Device* dev = static_cast<ID3D12Device*>(device_);
         ID3D12Device* queried_dev = nullptr;
         if (!dev) {
             if (FAILED(dst_res->GetDevice(OS_UUIDOF(ID3D12Device),
@@ -1204,7 +1267,7 @@ private:
     }
 
     int32_t ExecuteGpuTextureRequest(
-        const DSTORAGE_REQUEST& req,
+        const OpenScarlettDStorageRequestDesc& req,
         const uint8_t* src_ptr,
         size_t src_size,
         size_t staging_limit) {
@@ -1225,7 +1288,7 @@ private:
         if (!caller_desc) {
             // Treat Buffer directly as ID3D12Resource* for raw linear subresource 0 upload.
             local_desc.d3d12_resource = req.Destination.Memory.Buffer;
-            local_desc.d3d12_device = desc_.Device;
+            local_desc.d3d12_device = device_;
         }
 
         auto* dst_tex = static_cast<ID3D12Resource*>(local_desc.d3d12_resource);
@@ -1241,7 +1304,7 @@ private:
 
         // 2. Resolve D3D12 device and target texture geometry.
         ID3D12Device* dev = static_cast<ID3D12Device*>(
-            local_desc.d3d12_device ? local_desc.d3d12_device : desc_.Device);
+            local_desc.d3d12_device ? local_desc.d3d12_device : device_);
         ID3D12Device* queried_dev = nullptr;
         if (!dev) {
             if (FAILED(dst_tex->GetDevice(OS_UUIDOF(ID3D12Device),
@@ -1457,7 +1520,7 @@ private:
     }
 #endif
 
-    int32_t ExecuteRequest(const DSTORAGE_REQUEST& req) {
+    int32_t ExecuteRequest(const OpenScarlettDStorageRequestDesc& req) {
         auto is_canceled = [&]() -> bool {
             return current_cancel_requested_.load(std::memory_order_acquire);
         };
@@ -1685,12 +1748,36 @@ private:
         }
     }
 
-    void RecordFailure(int32_t hr, const DSTORAGE_REQUEST& req) {
+    void RecordFailure(int32_t hr, const QueueItem& item) {
+        const OpenScarlettDStorageRequestDesc& req = item.request;
         std::lock_guard<std::mutex> lk(error_mutex_);
         if (error_record_.FailureCount == 0) {
-            error_record_.FirstFailure.HResult = hr;
-            error_record_.FirstFailure.CommandType = 0;
-            error_record_.FirstFailure.FailedRequest = req;
+            auto& ff = error_record_.FirstFailure;
+            ff.HResult = hr;
+            ff.CommandType = DSTORAGE_COMMAND_TYPE_REQUEST;
+            auto& r = ff.Request;
+            r.Options.AsUINT64 = item.xbox_options;
+            if (item.xbox_options == 0u &&
+                req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY) {
+                r.Options.SourceType = 1u;
+            }
+            r.Destination = req.Destination.Memory.Buffer;
+            r.DestinationSize = req.Destination.Memory.Size;
+            if (req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE) {
+                r.FileOffset = req.Source.File.Offset;
+                r.SourceSize = req.Source.File.Size;
+            } else {
+                r.Source = const_cast<void*>(req.Source.Memory.Source);
+                r.SourceSize = req.Source.Memory.Size;
+            }
+            r.CancellationTag = req.CancellationTag;
+            if (req.Name) {
+                size_t i = 0;
+                for (; i + 1u < DSTORAGE_REQUEST_MAX_NAME && req.Name[i] != '\0'; ++i) {
+                    r.Name[i] = req.Name[i];
+                }
+                r.Name[i] = '\0';
+            }
         }
         ++error_record_.FailureCount;
 #if defined(_WIN32)
@@ -1736,6 +1823,7 @@ private:
 
     std::atomic<uint32_t> ref_count_{1};
     DSTORAGE_QUEUE_DESC desc_{};
+    void* device_ = nullptr;  // host ID3D12Device (OpenScarlettDStorageSetQueueDevice)
     std::shared_ptr<std::atomic<uint32_t>> staging_size_ref_;
     uint16_t auto_submit_threshold_ = DSTORAGE_MIN_QUEUE_CAPACITY / 2u;
     std::string name_storage_;
@@ -1931,6 +2019,10 @@ public:
             !GuidEquals(riid, IID_OS_DStorage_IUnknown)) {
             return RecordHr("IDStorageFactoryX::CreateQueue", OS_DSTORAGE_E_NOINTERFACE, 3);
         }
+        if (desc->SourceType != DSTORAGE_REQUEST_SOURCE_FILE &&
+            desc->SourceType != DSTORAGE_REQUEST_SOURCE_MEMORY) {
+            return RecordHr("IDStorageFactoryX::CreateQueue", OS_DSTORAGE_E_INVALIDARG, 3);
+        }
         auto* q = new (std::nothrow) DStorageQueueImpl(*desc, staging_size_);
         if (!q) {
             return RecordHr("IDStorageFactoryX::CreateQueue", OS_DSTORAGE_E_OUTOFMEMORY, 3);
@@ -2074,6 +2166,23 @@ int32_t OPENSCARLETT_DSTORAGE_CALL DStorageSetConfiguration1(
     std::lock_guard<std::mutex> lk(cfg.mutex);
     cfg.config = *configuration;
     return RecordHr("DStorageSetConfiguration1", OS_DSTORAGE_S_OK);
+}
+
+int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageEnqueueRequestDesc(
+    IDStorageQueueX* queue, const OpenScarlettDStorageRequestDesc* request) {
+    if (!queue || !request) {
+        return RecordHr("OpenScarlettDStorageEnqueueRequestDesc", OS_DSTORAGE_E_INVALIDARG);
+    }
+    static_cast<DStorageQueueImpl*>(queue)->EnqueueRequestDesc(*request);
+    return RecordHr("OpenScarlettDStorageEnqueueRequestDesc", OS_DSTORAGE_S_OK);
+}
+
+int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageSetQueueDevice(IDStorageQueueX* queue, void* d3d12_device) {
+    if (!queue) {
+        return RecordHr("OpenScarlettDStorageSetQueueDevice", OS_DSTORAGE_E_INVALIDARG);
+    }
+    static_cast<DStorageQueueImpl*>(queue)->SetDevice(d3d12_device);
+    return RecordHr("OpenScarlettDStorageSetQueueDevice", OS_DSTORAGE_S_OK);
 }
 
 int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageGetQueueStats(

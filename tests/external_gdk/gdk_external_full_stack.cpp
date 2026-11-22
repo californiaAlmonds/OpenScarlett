@@ -878,7 +878,7 @@ int main(int argc, char** argv) {
         }
 
         DSTORAGE_QUEUE_DESC qd{DSTORAGE_REQUEST_SOURCE_FILE, DSTORAGE_MIN_QUEUE_CAPACITY,
-                               DSTORAGE_PRIORITY_NORMAL, "fs_q", nullptr};
+                               DSTORAGE_PRIORITY_NORMAL, "fs_q"};
         ComPtr<IDStorageQueueX1> q;
         ComPtr<IDStorageStatusArrayX> st;
         if (FAILED(factory->CreateQueue(&qd, __uuidof(IDStorageQueueX1),
@@ -889,31 +889,32 @@ int main(int argc, char** argv) {
         }
         std::vector<uint8_t> raw_out(16384u, 0u);
         std::vector<uint8_t> gdef_out(65536u, 0u);
-        DSTORAGE_REQUEST r0{};
-        r0.Options = {DSTORAGE_COMPRESSION_FORMAT_NONE, DSTORAGE_REQUEST_SOURCE_FILE,
-                      DSTORAGE_REQUEST_DESTINATION_MEMORY, {}};
-        r0.Source.File = {f_raw.Get(), 0ull, 16384u};
-        r0.Destination.Memory = {raw_out.data(), 16384u};
-        r0.UncompressedSize = 16384u;
+        DSTORAGE_REQUEST r0{};  // Xbox layout: file source, no decompression
+        r0.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+        r0.File = f_raw.Get();
+        r0.FileOffset = 0ull;
+        r0.SourceSize = 16384u;
+        r0.Destination = raw_out.data();
+        r0.DestinationSize = 16384u;
         q->EnqueueRequest(&r0);
 
-        DSTORAGE_REQUEST r1{};
+        OpenScarlettDStorageRequestDesc r1{};
         r1.Options = {DSTORAGE_COMPRESSION_FORMAT_GDEFLATE, DSTORAGE_REQUEST_SOURCE_FILE,
-                      DSTORAGE_REQUEST_DESTINATION_MEMORY, {}};
+                      DSTORAGE_REQUEST_DESTINATION_MEMORY};
         r1.Source.File = {f_gdef.Get(), 0ull, static_cast<uint32_t>(gdef_i.FileSize)};
         r1.Destination.Memory = {gdef_out.data(), 65536u};
         r1.UncompressedSize = 65536u;
-        q->EnqueueRequest(&r1);
+        OpenScarlettDStorageEnqueueRequestDesc(q.Get(), &r1);
 
         // Cancelled failing request (isolated from FailureCount & error_event)
-        DSTORAGE_REQUEST r_bad{};
+        OpenScarlettDStorageRequestDesc r_bad{};
         r_bad.Options = {DSTORAGE_COMPRESSION_FORMAT_GDEFLATE, DSTORAGE_REQUEST_SOURCE_FILE,
-                         DSTORAGE_REQUEST_DESTINATION_MEMORY, {}};
+                         DSTORAGE_REQUEST_DESTINATION_MEMORY};
         r_bad.Source.File = {f_raw.Get(), 0ull, 32u};
         r_bad.Destination.Memory = {gdef_out.data(), 32u};
         r_bad.UncompressedSize = 32u;
         r_bad.CancellationTag = 0xBEEF0001ull;
-        q->EnqueueRequest(&r_bad);
+        OpenScarlettDStorageEnqueueRequestDesc(q.Get(), &r_bad);
         q->CancelRequestsWithTag(0xFFFF0000ull, 0xBEEF0000ull);
 
         HANDLE ev = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -939,7 +940,7 @@ int main(int argc, char** argv) {
 
         // Half-full auto-submit WITHOUT Submit()
         DSTORAGE_QUEUE_DESC mqd{DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_MIN_QUEUE_CAPACITY,
-                                DSTORAGE_PRIORITY_REALTIME, "fs_auto", nullptr};
+                                DSTORAGE_PRIORITY_REALTIME, "fs_auto"};
         ComPtr<IDStorageQueueX1> mq;
         if (FAILED(factory->CreateQueue(&mqd, __uuidof(IDStorageQueueX1),
                                         reinterpret_cast<void**>(mq.ReleaseAndGetAddressOf())))) {
@@ -954,22 +955,22 @@ int main(int argc, char** argv) {
         HANDLE aev = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
         for (uint32_t i = 0; i < kHalf - 1u; ++i) {
             DSTORAGE_REQUEST mr{};
-            mr.Options = {DSTORAGE_COMPRESSION_FORMAT_NONE, DSTORAGE_REQUEST_SOURCE_MEMORY,
-                          DSTORAGE_REQUEST_DESTINATION_MEMORY, {}};
-            mr.Source.Memory = {ms[i].data(), 16u};
-            mr.Destination.Memory = {md[i].data(), 16u};
-            mr.UncompressedSize = 16u;
+            mr.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
+            mr.Source = ms[i].data();
+            mr.SourceSize = 16u;
+            mr.Destination = md[i].data();
+            mr.DestinationSize = 16u;
             mq->EnqueueRequest(&mr);
         }
         mq->EnqueueStatus(st.Get(), 1u);
         mq->EnqueueSetEvent(aev);
         {
             DSTORAGE_REQUEST mr{};
-            mr.Options = {DSTORAGE_COMPRESSION_FORMAT_NONE, DSTORAGE_REQUEST_SOURCE_MEMORY,
-                          DSTORAGE_REQUEST_DESTINATION_MEMORY, {}};
-            mr.Source.Memory = {ms[kHalf - 1u].data(), 16u};
-            mr.Destination.Memory = {md[kHalf - 1u].data(), 16u};
-            mr.UncompressedSize = 16u;
+            mr.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
+            mr.Source = ms[kHalf - 1u].data();
+            mr.SourceSize = 16u;
+            mr.Destination = md[kHalf - 1u].data();
+            mr.DestinationSize = 16u;
             mq->EnqueueRequest(&mr);
         }
         const DWORD aw = ::WaitForSingleObject(aev, 5000u);

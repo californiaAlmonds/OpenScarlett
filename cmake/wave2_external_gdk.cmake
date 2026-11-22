@@ -103,10 +103,15 @@ if(WIN32 AND NOT "${_os_ms_dstorage_root}" STREQUAL "")
         ${_os_gdk_compat_inc}
         "${_os_ms_dstorage_root}"
     )
+    # Build the samples' Xbox Series path: DirectStorageCrossPlatform.h then includes <dstorage_xs.h>
+    # (the compat header) and fills the Xbox DSTORAGE_REQUEST fields (File/FileOffset/SourceSize/...),
+    # which is what dstorage_xs.dll receives from a title. _GAMING_DESKTOP would select PC dstorage.h.
     target_compile_definitions(gdk_ms_directstorage_real PRIVATE
         WIN32_LEAN_AND_MEAN
         NOMINMAX
-        _GAMING_DESKTOP=1
+        _GAMING_XBOX=1
+        _GAMING_XBOX_SCARLETT=1
+        _GRDK_VER=0x585D073C
     )
     target_link_libraries(gdk_ms_directstorage_real PRIVATE
         dstorage_xs

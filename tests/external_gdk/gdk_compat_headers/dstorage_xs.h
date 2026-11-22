@@ -33,9 +33,31 @@ enum DSTORAGE_PRIORITY : int8_t {
     DSTORAGE_PRIORITY_REALTIME = 2,
 };
 
-enum DSTORAGE_REQUEST_SOURCE_TYPE : uint8_t {
+enum DSTORAGE_REQUEST_SOURCE_TYPE : uint64_t {
     DSTORAGE_REQUEST_SOURCE_FILE = 0,
     DSTORAGE_REQUEST_SOURCE_MEMORY = 1,
+};
+
+enum DSTORAGE_BCPACK_MODE : uint64_t {
+    DSTORAGE_BCPACK_MODE_NONE = 0,
+    DSTORAGE_BCPACK_MODE_BC1 = 1,
+    DSTORAGE_BCPACK_MODE_BC2 = 2,
+    DSTORAGE_BCPACK_MODE_BC3 = 3,
+    DSTORAGE_BCPACK_MODE_BC4 = 4,
+    DSTORAGE_BCPACK_MODE_BC5 = 5,
+    DSTORAGE_BCPACK_MODE_BC6H = 6,
+    DSTORAGE_BCPACK_MODE_BC7 = 7,
+};
+
+enum DSTORAGE_SWIZZLE_MODE : uint64_t {
+    DSTORAGE_SWIZZLE_MODE_NONE = 0,
+};
+
+enum DSTORAGE_COMMAND_TYPE : int32_t {
+    DSTORAGE_COMMAND_TYPE_NONE = -1,
+    DSTORAGE_COMMAND_TYPE_REQUEST = 0,
+    DSTORAGE_COMMAND_TYPE_STATUS = 1,
+    DSTORAGE_COMMAND_TYPE_SIGNAL = 2,
 };
 
 enum DSTORAGE_REQUEST_DESTINATION_TYPE : uint8_t {
@@ -61,7 +83,7 @@ enum DSTORAGE_DEBUG : uint32_t {
 };
 
 constexpr uint16_t DSTORAGE_MIN_QUEUE_CAPACITY = 128u;
-constexpr uint16_t DSTORAGE_MAX_QUEUE_CAPACITY = 2000u;
+constexpr uint16_t DSTORAGE_MAX_QUEUE_CAPACITY = 0x2000u;
 
 struct IDStorageFileX;
 struct IDStorageStatusArrayX;
@@ -91,19 +113,115 @@ struct DSTORAGE_CONFIGURATION1 {
     int32_t ForceFileBuffering;
 };
 
+// Title-facing structures, laid out as in Microsoft's dstorage_xs.h (see
+// include/openscarlett/io/dstorage_abi.h for the per-field offsets and doc links).
+#pragma warning(push)
+#pragma warning(disable : 4201)
+
 struct DSTORAGE_QUEUE_DESC {
     DSTORAGE_REQUEST_SOURCE_TYPE SourceType;
     uint16_t Capacity;
     DSTORAGE_PRIORITY Priority;
     const char* Name;
-    void* Device;
 };
 
-struct DSTORAGE_REQUEST_OPTIONS {
+union DSTORAGE_REQUEST_OPTIONS {
+    struct {
+        UINT64 ZlibDecompress : 1;
+        UINT64 BcpackMode : 4;
+        UINT64 SwizzleMode : 16;
+        UINT64 DestinationIsPhysicalPages : 1;
+        UINT64 SourceType : 1;
+        UINT64 SourceIsPhysicalPages : 1;
+        UINT64 Reserved : 40;
+    };
+    UINT64 AsUINT64;
+};
+
+struct DSTORAGE_REQUEST {
+    DSTORAGE_REQUEST_OPTIONS Options;
+    union {
+        void* Destination;
+        struct {
+            PULONG_PTR DestinationPageArray;
+            UINT16 DestinationPageOffset;
+        };
+    };
+    UINT32 DestinationSize;
+    union {
+        struct {
+            IDStorageFileX* File;
+            UINT64 FileOffset;
+        };
+        void* Source;
+        struct {
+            PULONG_PTR SourcePageArray;
+            UINT16 SourcePageOffset;
+        };
+    };
+    UINT32 SourceSize;
+    UINT32 IntermediateSize;
+    UINT64 CancellationTag;
+    const CHAR* Name;
+};
+
+struct DSTORAGE_FILE_INFO {
+    uint64_t FileSize;
+};
+
+#define DSTORAGE_REQUEST_MAX_NAME 64
+
+struct DSTORAGE_ERROR_RECORD {
+    UINT32 FailureCount;
+    struct {
+        HRESULT HResult;
+        DSTORAGE_COMMAND_TYPE CommandType;
+        union {
+            struct {
+                DSTORAGE_REQUEST_OPTIONS Options;
+                void* Destination;
+                UINT32 DestinationSize;
+                WCHAR Filename[MAX_PATH];
+                UINT64 FileOffset;
+                void* Source;
+                UINT32 SourceSize;
+                UINT64 CancellationTag;
+                CHAR Name[DSTORAGE_REQUEST_MAX_NAME];
+            } Request;
+            struct {
+                IDStorageStatusArrayX* StatusArray;
+                UINT32 Index;
+            } Status;
+            struct {
+                struct ID3D12Fence* Fence;
+                UINT64 Value;
+            } Signal;
+        };
+    } FirstFailure;
+};
+
+struct DSTORAGE_QUEUE_INFO {
+    DSTORAGE_QUEUE_DESC Desc;
+    uint16_t EmptySlotCount;
+    uint16_t RequestCountUntilAutoSubmit;
+};
+
+#pragma warning(pop)
+
+static_assert(sizeof(DSTORAGE_QUEUE_DESC) == 0x18, "DSTORAGE_QUEUE_DESC");
+static_assert(sizeof(DSTORAGE_REQUEST) == 0x48, "DSTORAGE_REQUEST");
+static_assert(offsetof(DSTORAGE_REQUEST, DestinationSize) == 0x18 && offsetof(DSTORAGE_REQUEST, File) == 0x20 &&
+                  offsetof(DSTORAGE_REQUEST, FileOffset) == 0x28 && offsetof(DSTORAGE_REQUEST, SourceSize) == 0x30 &&
+                  offsetof(DSTORAGE_REQUEST, IntermediateSize) == 0x34 &&
+                  offsetof(DSTORAGE_REQUEST, CancellationTag) == 0x38 && offsetof(DSTORAGE_REQUEST, Name) == 0x40,
+              "DSTORAGE_REQUEST layout");
+static_assert(sizeof(DSTORAGE_ERROR_RECORD) == 0x290, "DSTORAGE_ERROR_RECORD");
+
+// OpenScarlett host extension (not in dstorage_xs.h): GDeflate and other PC-only request kinds.
+struct OpenScarlettDStorageRequestDescOptions {
     DSTORAGE_COMPRESSION_FORMAT CompressionFormat;
     DSTORAGE_REQUEST_SOURCE_TYPE SourceType;
     DSTORAGE_REQUEST_DESTINATION_TYPE DestinationType;
-    uint8_t Reserved[5];
 };
 
 struct DSTORAGE_SOURCE_MEMORY {
@@ -131,34 +249,13 @@ union DSTORAGE_DESTINATION {
     DSTORAGE_DESTINATION_MEMORY Memory;
 };
 
-struct DSTORAGE_REQUEST {
-    DSTORAGE_REQUEST_OPTIONS Options;
+struct OpenScarlettDStorageRequestDesc {
+    OpenScarlettDStorageRequestDescOptions Options;
     DSTORAGE_SOURCE Source;
     DSTORAGE_DESTINATION Destination;
     uint32_t UncompressedSize;
     uint64_t CancellationTag;
     const char* Name;
-};
-
-struct DSTORAGE_FILE_INFO {
-    uint64_t FileSize;
-};
-
-struct DSTORAGE_ERROR_FIRST_FAILURE {
-    HRESULT HResult;
-    uint32_t CommandType;
-    DSTORAGE_REQUEST FailedRequest;
-};
-
-struct DSTORAGE_ERROR_RECORD {
-    uint32_t FailureCount;
-    DSTORAGE_ERROR_FIRST_FAILURE FirstFailure;
-};
-
-struct DSTORAGE_QUEUE_INFO {
-    DSTORAGE_QUEUE_DESC Desc;
-    uint16_t EmptySlotCount;
-    uint16_t RequestCountUntilAutoSubmit;
 };
 
 struct __declspec(uuid("5DE95E7B-955A-4868-A73C-243B29F4B8DA"))
@@ -218,6 +315,8 @@ DSTORAGE_COMPAT_API HRESULT DSTORAGE_COMPAT_CALL DStorageSetConfiguration(
     const DSTORAGE_CONFIGURATION* configuration);
 DSTORAGE_COMPAT_API HRESULT DSTORAGE_COMPAT_CALL DStorageSetConfiguration1(
     const DSTORAGE_CONFIGURATION1* configuration);
+DSTORAGE_COMPAT_API HRESULT DSTORAGE_COMPAT_CALL OpenScarlettDStorageEnqueueRequestDesc(
+    IDStorageQueueX* queue, const OpenScarlettDStorageRequestDesc* request);
 
 #ifdef __cplusplus
 }

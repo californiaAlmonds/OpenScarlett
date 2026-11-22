@@ -70,11 +70,45 @@ enum DSTORAGE_PRIORITY : int8_t {
     DSTORAGE_PRIORITY_REALTIME = 2,
 };
 
-enum DSTORAGE_REQUEST_SOURCE_TYPE : uint8_t {
+// Xbox dstorage_xs.h declares DSTORAGE_REQUEST_SOURCE_TYPE with a UINT64 underlying type, which
+// makes DSTORAGE_QUEUE_DESC::SourceType 8 bytes wide (Capacity sits at +0x08, not +0x02).
+// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/enums/dstorage_request_source_type
+enum DSTORAGE_REQUEST_SOURCE_TYPE : uint64_t {
     DSTORAGE_REQUEST_SOURCE_FILE = 0,
     DSTORAGE_REQUEST_SOURCE_MEMORY = 1,
 };
 
+// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/enums/dstorage_bcpack_mode
+enum DSTORAGE_BCPACK_MODE : uint64_t {
+    DSTORAGE_BCPACK_MODE_NONE = 0,
+    DSTORAGE_BCPACK_MODE_BC1 = 1,
+    DSTORAGE_BCPACK_MODE_BC2 = 2,
+    DSTORAGE_BCPACK_MODE_BC3 = 3,
+    DSTORAGE_BCPACK_MODE_BC4 = 4,
+    DSTORAGE_BCPACK_MODE_BC5 = 5,
+    DSTORAGE_BCPACK_MODE_BC6H = 6,
+    DSTORAGE_BCPACK_MODE_BC7 = 7,
+};
+
+// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/enums/dstorage_swizzle_mode
+enum DSTORAGE_SWIZZLE_MODE : uint64_t {
+    DSTORAGE_SWIZZLE_MODE_NONE = 0,
+    DSTORAGE_SWIZZLE_MODE_4K_4K_8K = 1,
+    DSTORAGE_SWIZZLE_MODE_4K_4K_24K = 2,
+    DSTORAGE_SWIZZLE_MODE_4K_12K_4K_4K_8K = 3,
+    DSTORAGE_SWIZZLE_MODE_4K_12K_4K_12K = 4,
+};
+
+// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/enums/dstorage_command_type
+enum DSTORAGE_COMMAND_TYPE : int32_t {
+    DSTORAGE_COMMAND_TYPE_NONE = -1,
+    DSTORAGE_COMMAND_TYPE_REQUEST = 0,
+    DSTORAGE_COMMAND_TYPE_STATUS = 1,
+    DSTORAGE_COMMAND_TYPE_SIGNAL = 2,
+};
+
+// OpenScarlett host extension (PC DirectStorage concepts). Xbox dstorage_xs.h has no destination
+// type or compression-format enum; these only feed OpenScarlettDStorageRequestDesc below.
 enum DSTORAGE_REQUEST_DESTINATION_TYPE : uint8_t {
     DSTORAGE_REQUEST_DESTINATION_MEMORY = 0,
     DSTORAGE_REQUEST_DESTINATION_BUFFER = 1,
@@ -91,7 +125,7 @@ enum DSTORAGE_COMPRESSION_FORMAT : uint8_t {
 };
 
 constexpr uint16_t DSTORAGE_MIN_QUEUE_CAPACITY = 128u;
-constexpr uint16_t DSTORAGE_MAX_QUEUE_CAPACITY = 2000u;
+constexpr uint16_t DSTORAGE_MAX_QUEUE_CAPACITY = 0x2000u;  // 8192, per dstorage_xs.h
 
 constexpr uint32_t DSTORAGE_MIN_STAGING_BUFFER_SIZE = 64u * 1024u;           // 64 KiB
 constexpr uint32_t DSTORAGE_DEFAULT_STAGING_BUFFER_SIZE = 32u * 1024u * 1024u;  // 32 MiB
@@ -123,19 +157,171 @@ struct DSTORAGE_CONFIGURATION1 {
     int32_t ForceFileBuffering;
 };
 
+// ---------------------------------------------------------------------------
+// Title-facing Xbox structures (dstorage_xs.h). Layouts follow the public GDK reference:
+//   https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/structs/dstorage_queue_desc
+//   https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/structs/dstorage_request_options
+//   https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/structs/dstorage_request
+//   https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/structs/dstorage_queue_info
+//   https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/structs/dstorage_error_record
+// Microsoft's MIT Xbox-GDK-Samples ship the same layout in
+// Samples/System/SimpleDirectStorageCombo/DirectStorageWin32/dstorage_win32.h.
+// A title hands these to the shim by pointer, so every size and offset is asserted below.
+// ---------------------------------------------------------------------------
+
+#if defined(_MSC_VER)
+#  pragma warning(push)
+#  pragma warning(disable : 4201)  // nameless struct/union, as in dstorage_xs.h
+#endif
+
 struct DSTORAGE_QUEUE_DESC {
-    DSTORAGE_REQUEST_SOURCE_TYPE SourceType;
-    uint16_t Capacity;
-    DSTORAGE_PRIORITY Priority;
-    const char* Name;
-    void* Device;
+    DSTORAGE_REQUEST_SOURCE_TYPE SourceType;  // +0x00 (UINT64)
+    uint16_t Capacity;                        // +0x08
+    DSTORAGE_PRIORITY Priority;               // +0x0A (INT8)
+    const char* Name;                         // +0x10
 };
 
-struct DSTORAGE_REQUEST_OPTIONS {
+// 64-bit option word. Bit positions: ZlibDecompress 0, BcpackMode 1-4, SwizzleMode 5-20,
+// DestinationIsPhysicalPages 21, SourceType 22, SourceIsPhysicalPages 23, Reserved 24-63.
+union DSTORAGE_REQUEST_OPTIONS {
+    struct {
+        uint64_t ZlibDecompress : 1;
+        uint64_t BcpackMode : 4;   // DSTORAGE_BCPACK_MODE
+        uint64_t SwizzleMode : 16; // DSTORAGE_SWIZZLE_MODE
+        uint64_t DestinationIsPhysicalPages : 1;
+        uint64_t SourceType : 1;   // DSTORAGE_REQUEST_SOURCE_TYPE
+        uint64_t SourceIsPhysicalPages : 1;
+        uint64_t Reserved : 40;
+    };
+    uint64_t AsUINT64;
+};
+
+constexpr uint64_t DSTORAGE_REQUEST_OPTION_ZLIB_MASK = 1ull << 0;
+constexpr uint32_t DSTORAGE_REQUEST_OPTION_BCPACK_SHIFT = 1u;
+constexpr uint64_t DSTORAGE_REQUEST_OPTION_BCPACK_MASK = 0xFull << 1;
+constexpr uint32_t DSTORAGE_REQUEST_OPTION_SWIZZLE_SHIFT = 5u;
+constexpr uint64_t DSTORAGE_REQUEST_OPTION_SWIZZLE_MASK = 0xFFFFull << 5;
+constexpr uint64_t DSTORAGE_REQUEST_OPTION_DEST_PHYSICAL_MASK = 1ull << 21;
+constexpr uint64_t DSTORAGE_REQUEST_OPTION_SOURCE_TYPE_MASK = 1ull << 22;
+constexpr uint64_t DSTORAGE_REQUEST_OPTION_SOURCE_PHYSICAL_MASK = 1ull << 23;
+constexpr uint64_t DSTORAGE_REQUEST_OPTION_RESERVED_MASK = ~((1ull << 24) - 1ull);
+
+struct DSTORAGE_REQUEST {
+    DSTORAGE_REQUEST_OPTIONS Options;  // +0x00
+    union {                            // +0x08
+        void* Destination;
+        struct {
+            uintptr_t* DestinationPageArray;  // PULONG_PTR, 64 KiB page numbers
+            uint16_t DestinationPageOffset;   // +0x10
+        };
+    };
+    uint32_t DestinationSize;  // +0x18
+    union {                    // +0x20
+        struct {
+            IDStorageFileX* File;
+            uint64_t FileOffset;  // +0x28
+        };
+        void* Source;
+        struct {
+            uintptr_t* SourcePageArray;
+            uint16_t SourcePageOffset;  // +0x28
+        };
+    };
+    uint32_t SourceSize;        // +0x30
+    uint32_t IntermediateSize;  // +0x34
+    uint64_t CancellationTag;   // +0x38
+    const char* Name;           // +0x40
+};
+
+struct DSTORAGE_QUEUE_INFO {
+    DSTORAGE_QUEUE_DESC Desc;              // +0x00
+    uint16_t EmptySlotCount;               // +0x18
+    uint16_t RequestCountUntilAutoSubmit;  // +0x1A
+};
+
+constexpr uint32_t DSTORAGE_REQUEST_MAX_NAME = 64u;
+constexpr uint32_t DSTORAGE_ERROR_RECORD_MAX_PATH = 260u;  // MAX_PATH
+
+struct DSTORAGE_ERROR_RECORD {
+    uint32_t FailureCount;  // +0x00
+    struct {
+        int32_t HResult;                    // +0x08
+        DSTORAGE_COMMAND_TYPE CommandType;  // +0x0C
+        union {                             // +0x10
+            struct {
+                DSTORAGE_REQUEST_OPTIONS Options;                // +0x10
+                void* Destination;                               // +0x18
+                uint32_t DestinationSize;                        // +0x20
+                char16_t Filename[DSTORAGE_ERROR_RECORD_MAX_PATH];  // +0x24 (WCHAR)
+                uint64_t FileOffset;                             // +0x230
+                void* Source;                                    // +0x238
+                uint32_t SourceSize;                             // +0x240
+                uint64_t CancellationTag;                        // +0x248
+                char Name[DSTORAGE_REQUEST_MAX_NAME];            // +0x250
+            } Request;
+            struct {
+                IDStorageStatusArrayX* StatusArray;
+                uint32_t Index;
+            } Status;
+            struct {
+                void* Fence;  // ID3D12Fence*
+                uint64_t Value;
+            } Signal;
+        };
+    } FirstFailure;
+};
+
+#if defined(_MSC_VER)
+#  pragma warning(pop)
+#endif
+
+static_assert(sizeof(void*) == 8, "dstorage_xs.h layouts are x64-only");
+static_assert(sizeof(DSTORAGE_QUEUE_DESC) == 0x18, "DSTORAGE_QUEUE_DESC must be 0x18 bytes");
+static_assert(offsetof(DSTORAGE_QUEUE_DESC, Capacity) == 0x08, "DSTORAGE_QUEUE_DESC::Capacity");
+static_assert(offsetof(DSTORAGE_QUEUE_DESC, Priority) == 0x0A, "DSTORAGE_QUEUE_DESC::Priority");
+static_assert(offsetof(DSTORAGE_QUEUE_DESC, Name) == 0x10, "DSTORAGE_QUEUE_DESC::Name");
+static_assert(sizeof(DSTORAGE_REQUEST_OPTIONS) == 8, "DSTORAGE_REQUEST_OPTIONS must be 8 bytes");
+static_assert(sizeof(DSTORAGE_REQUEST) == 0x48, "DSTORAGE_REQUEST must be 0x48 bytes");
+static_assert(offsetof(DSTORAGE_REQUEST, Options) == 0x00, "DSTORAGE_REQUEST::Options");
+static_assert(offsetof(DSTORAGE_REQUEST, Destination) == 0x08, "DSTORAGE_REQUEST::Destination");
+static_assert(offsetof(DSTORAGE_REQUEST, DestinationPageArray) == 0x08, "DSTORAGE_REQUEST::DestinationPageArray");
+static_assert(offsetof(DSTORAGE_REQUEST, DestinationPageOffset) == 0x10, "DSTORAGE_REQUEST::DestinationPageOffset");
+static_assert(offsetof(DSTORAGE_REQUEST, DestinationSize) == 0x18, "DSTORAGE_REQUEST::DestinationSize");
+static_assert(offsetof(DSTORAGE_REQUEST, File) == 0x20, "DSTORAGE_REQUEST::File");
+static_assert(offsetof(DSTORAGE_REQUEST, Source) == 0x20, "DSTORAGE_REQUEST::Source");
+static_assert(offsetof(DSTORAGE_REQUEST, SourcePageArray) == 0x20, "DSTORAGE_REQUEST::SourcePageArray");
+static_assert(offsetof(DSTORAGE_REQUEST, FileOffset) == 0x28, "DSTORAGE_REQUEST::FileOffset");
+static_assert(offsetof(DSTORAGE_REQUEST, SourcePageOffset) == 0x28, "DSTORAGE_REQUEST::SourcePageOffset");
+static_assert(offsetof(DSTORAGE_REQUEST, SourceSize) == 0x30, "DSTORAGE_REQUEST::SourceSize");
+static_assert(offsetof(DSTORAGE_REQUEST, IntermediateSize) == 0x34, "DSTORAGE_REQUEST::IntermediateSize");
+static_assert(offsetof(DSTORAGE_REQUEST, CancellationTag) == 0x38, "DSTORAGE_REQUEST::CancellationTag");
+static_assert(offsetof(DSTORAGE_REQUEST, Name) == 0x40, "DSTORAGE_REQUEST::Name");
+static_assert(sizeof(DSTORAGE_QUEUE_INFO) == 0x20, "DSTORAGE_QUEUE_INFO must be 0x20 bytes");
+static_assert(offsetof(DSTORAGE_QUEUE_INFO, EmptySlotCount) == 0x18, "DSTORAGE_QUEUE_INFO::EmptySlotCount");
+static_assert(offsetof(DSTORAGE_QUEUE_INFO, RequestCountUntilAutoSubmit) == 0x1A,
+              "DSTORAGE_QUEUE_INFO::RequestCountUntilAutoSubmit");
+static_assert(sizeof(DSTORAGE_ERROR_RECORD) == 0x290, "DSTORAGE_ERROR_RECORD must be 0x290 bytes");
+static_assert(offsetof(DSTORAGE_ERROR_RECORD, FirstFailure) == 0x08, "DSTORAGE_ERROR_RECORD::FirstFailure");
+static_assert(offsetof(DSTORAGE_ERROR_RECORD, FirstFailure.CommandType) == 0x0C, "FirstFailure.CommandType");
+static_assert(offsetof(DSTORAGE_ERROR_RECORD, FirstFailure.Request.Options) == 0x10, "FirstFailure.Request.Options");
+static_assert(offsetof(DSTORAGE_ERROR_RECORD, FirstFailure.Request.Filename) == 0x24, "FirstFailure.Request.Filename");
+static_assert(offsetof(DSTORAGE_ERROR_RECORD, FirstFailure.Request.FileOffset) == 0x230, "FirstFailure.Request.FileOffset");
+static_assert(offsetof(DSTORAGE_ERROR_RECORD, FirstFailure.Request.CancellationTag) == 0x248,
+              "FirstFailure.Request.CancellationTag");
+static_assert(offsetof(DSTORAGE_ERROR_RECORD, FirstFailure.Request.Name) == 0x250, "FirstFailure.Request.Name");
+
+// ---------------------------------------------------------------------------
+// OpenScarlett host extension request (not part of dstorage_xs.h).
+// Before this split the shim treated this PC-DirectStorage-style struct as the title ABI, which made
+// IDStorageQueueX::EnqueueRequest misread every real Xbox DSTORAGE_REQUEST. It is kept for host-side
+// features titles cannot reach (GDeflate, D3D12 texture/buffer destinations, custom codecs) and is
+// submitted through OpenScarlettDStorageEnqueueRequestDesc(). Titles' requests are decoded into it.
+// ---------------------------------------------------------------------------
+
+struct OpenScarlettDStorageRequestDescOptions {
     DSTORAGE_COMPRESSION_FORMAT CompressionFormat;
     DSTORAGE_REQUEST_SOURCE_TYPE SourceType;
     DSTORAGE_REQUEST_DESTINATION_TYPE DestinationType;
-    uint8_t Reserved[5];
 };
 
 struct DSTORAGE_SOURCE_MEMORY {
@@ -163,8 +349,8 @@ union DSTORAGE_DESTINATION {
     DSTORAGE_DESTINATION_MEMORY Memory;
 };
 
-struct DSTORAGE_REQUEST {
-    DSTORAGE_REQUEST_OPTIONS Options;
+struct OpenScarlettDStorageRequestDesc {
+    OpenScarlettDStorageRequestDescOptions Options;
     DSTORAGE_SOURCE Source;
     DSTORAGE_DESTINATION Destination;
     uint32_t UncompressedSize;
@@ -174,23 +360,6 @@ struct DSTORAGE_REQUEST {
 
 struct DSTORAGE_FILE_INFO {
     uint64_t FileSize;
-};
-
-struct DSTORAGE_ERROR_FIRST_FAILURE {
-    int32_t HResult;
-    uint32_t CommandType;
-    DSTORAGE_REQUEST FailedRequest;
-};
-
-struct DSTORAGE_ERROR_RECORD {
-    uint32_t FailureCount;
-    DSTORAGE_ERROR_FIRST_FAILURE FirstFailure;
-};
-
-struct DSTORAGE_QUEUE_INFO {
-    DSTORAGE_QUEUE_DESC Desc;
-    uint16_t EmptySlotCount;
-    uint16_t RequestCountUntilAutoSubmit;
 };
 
 struct DSTORAGE_QUEUE_STATS {
@@ -269,6 +438,15 @@ OPENSCARLETT_DSTORAGE_API int32_t OPENSCARLETT_DSTORAGE_CALL DStorageSetConfigur
     const DSTORAGE_CONFIGURATION* configuration);
 OPENSCARLETT_DSTORAGE_API int32_t OPENSCARLETT_DSTORAGE_CALL DStorageSetConfiguration1(
     const DSTORAGE_CONFIGURATION1* configuration);
+
+// Submits a host-extension request (GDeflate, D3D12 destinations, custom codecs) to a queue.
+OPENSCARLETT_DSTORAGE_API int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageEnqueueRequestDesc(
+    IDStorageQueueX* queue, const OpenScarlettDStorageRequestDesc* request);
+
+// Attaches the host ID3D12Device used by D3D12 destinations. Xbox DSTORAGE_QUEUE_DESC has no
+// device field, so the shim cannot take it from the title's queue description.
+OPENSCARLETT_DSTORAGE_API int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageSetQueueDevice(
+    IDStorageQueueX* queue, void* d3d12_device);
 
 OPENSCARLETT_DSTORAGE_API int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageGetQueueStats(
     IDStorageQueueX* queue, DSTORAGE_QUEUE_STATS* outStats);

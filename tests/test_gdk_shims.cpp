@@ -729,7 +729,7 @@ void TestDirectStorage() {
     std::vector<uint8_t> bc7_out(bc7_src.size(), 0);
 
     // Request 1: Uncompressed file read
-    DSTORAGE_REQUEST r1{};
+    OpenScarlettDStorageRequestDesc r1{};
     r1.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
     r1.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
     r1.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -739,11 +739,11 @@ void TestDirectStorage() {
     r1.Destination.Memory.Buffer = raw_out.data();
     r1.Destination.Memory.Size = static_cast<uint32_t>(raw_out.size());
     r1.UncompressedSize = static_cast<uint32_t>(raw_payload.size());
-    queue->EnqueueRequest(&r1);
+    OpenScarlettDStorageEnqueueRequestDesc(queue, &r1);
     queue->EnqueueStatus(status, 0);
 
     // Request 2: GDeflate file decompress
-    DSTORAGE_REQUEST r2{};
+    OpenScarlettDStorageRequestDesc r2{};
     r2.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_GDEFLATE;
     r2.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
     r2.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -753,11 +753,11 @@ void TestDirectStorage() {
     r2.Destination.Memory.Buffer = gdef_out.data();
     r2.Destination.Memory.Size = static_cast<uint32_t>(gdef_out.size());
     r2.UncompressedSize = static_cast<uint32_t>(gdef_src.size());
-    queue->EnqueueRequest(&r2);
+    OpenScarlettDStorageEnqueueRequestDesc(queue, &r2);
     queue->EnqueueStatus(status, 1);
 
     // Request 3: BCPack memory decompress
-    DSTORAGE_REQUEST r3{};
+    OpenScarlettDStorageRequestDesc r3{};
     r3.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_BCPACK;
     r3.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
     r3.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -766,7 +766,7 @@ void TestDirectStorage() {
     r3.Destination.Memory.Buffer = bc7_out.data();
     r3.Destination.Memory.Size = static_cast<uint32_t>(bc7_out.size());
     r3.UncompressedSize = static_cast<uint32_t>(bc7_src.size());
-    queue->EnqueueRequest(&r3);
+    OpenScarlettDStorageEnqueueRequestDesc(queue, &r3);
     queue->EnqueueStatus(status, 2);
 
 #if defined(_WIN32)

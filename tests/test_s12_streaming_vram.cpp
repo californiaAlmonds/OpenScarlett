@@ -313,7 +313,7 @@ void TestDirectStorageStreamingHardening() {
 
         auto enqueue_batch = [&](IDStorageQueueX* q, std::vector<std::vector<uint8_t>>& dsts) {
             for (auto& d : dsts) {
-                DSTORAGE_REQUEST r{};
+                OpenScarlettDStorageRequestDesc r{};
                 r.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_GDEFLATE;
                 r.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
                 r.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -322,7 +322,7 @@ void TestDirectStorageStreamingHardening() {
                 r.Destination.Memory.Buffer = d.data();
                 r.Destination.Memory.Size = static_cast<uint32_t>(d.size());
                 r.UncompressedSize = static_cast<uint32_t>(heavy_plain.size());
-                q->EnqueueRequest(&r);
+                OpenScarlettDStorageEnqueueRequestDesc(q, &r);
             }
         };
 
@@ -415,7 +415,7 @@ void TestDirectStorageStreamingHardening() {
         // Enqueue 60 good + 3 malformed (tagged 0xBAD0xxxx) + status + event, cancel 0xBAD0xxxx,
         // then enqueue 64th request WITHOUT Submit() -> must auto-submit cleanly with 0 errors!
         for (uint32_t i = 0u; i < 60u; ++i) {
-            DSTORAGE_REQUEST r{};
+            OpenScarlettDStorageRequestDesc r{};
             r.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
             r.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
             r.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -425,10 +425,10 @@ void TestDirectStorageStreamingHardening() {
             r.Destination.Memory.Size = 64u;
             r.UncompressedSize = 64u;
             r.CancellationTag = 0x10000000ull | i;
-            q->EnqueueRequest(&r);
+            OpenScarlettDStorageEnqueueRequestDesc(q, &r);
         }
         for (uint32_t i = 0u; i < 3u; ++i) {
-            DSTORAGE_REQUEST bad{};
+            OpenScarlettDStorageRequestDesc bad{};
             bad.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_GDEFLATE;
             bad.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
             bad.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -437,14 +437,14 @@ void TestDirectStorageStreamingHardening() {
             bad.Destination.Memory.Buffer = nullptr;
             bad.Destination.Memory.Size = 0u;
             bad.CancellationTag = 0xBAD00000ull | i;
-            q->EnqueueRequest(&bad);
+            OpenScarlettDStorageEnqueueRequestDesc(q, &bad);
         }
         q->CancelRequestsWithTag(0xFFFF0000ull, 0xBAD00000ull);
         q->EnqueueStatus(st, 0u);
         q->EnqueueSetEvent(ev);
 
         // 64th request triggers automatic submission without Submit()
-        DSTORAGE_REQUEST r64{};
+        OpenScarlettDStorageRequestDesc r64{};
         r64.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
         r64.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
         r64.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -453,7 +453,7 @@ void TestDirectStorageStreamingHardening() {
         r64.Destination.Memory.Buffer = dst[63].data();
         r64.Destination.Memory.Size = 64u;
         r64.UncompressedSize = 64u;
-        q->EnqueueRequest(&r64);
+        OpenScarlettDStorageEnqueueRequestDesc(q, &r64);
 
         OS_REQUIRE(WaitForSingleObject(ev, 5000u) == WAIT_OBJECT_0);
         OS_REQUIRE(st->IsComplete(0u) && st->GetHResult(0u) == OS_DSTORAGE_S_OK);
@@ -475,7 +475,7 @@ void TestDirectStorageStreamingHardening() {
         for (uint32_t i = 0u; i < kBurst; ++i) {
             FillDeterministic(bsrc[i].data(), 32u, 0x9000u + i);
             bdst[i].fill(0u);
-            DSTORAGE_REQUEST br{};
+            OpenScarlettDStorageRequestDesc br{};
             br.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
             br.Options.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
             br.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -484,7 +484,7 @@ void TestDirectStorageStreamingHardening() {
             br.Destination.Memory.Buffer = bdst[i].data();
             br.Destination.Memory.Size = 32u;
             br.UncompressedSize = 32u;
-            q->EnqueueRequest(&br);
+            OpenScarlettDStorageEnqueueRequestDesc(q, &br);
         }
         ResetEvent(ev);
         q->EnqueueStatus(st, 1u);
@@ -542,7 +542,7 @@ void TestDirectStorageStreamingHardening() {
         OS_REQUIRE(ev != nullptr);
 
         std::vector<uint8_t> dst(plain.size(), 0u);
-        DSTORAGE_REQUEST r{};
+        OpenScarlettDStorageRequestDesc r{};
         r.Options.CompressionFormat = static_cast<DSTORAGE_COMPRESSION_FORMAT>(OS_DSTORAGE_CUSTOM_COMPRESSION_0);
         r.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
         r.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
@@ -552,7 +552,7 @@ void TestDirectStorageStreamingHardening() {
         r.Destination.Memory.Buffer = dst.data();
         r.Destination.Memory.Size = static_cast<uint32_t>(dst.size());
         r.UncompressedSize = static_cast<uint32_t>(plain.size());
-        q->EnqueueRequest(&r);
+        OpenScarlettDStorageEnqueueRequestDesc(q, &r);
         q->EnqueueStatus(st, 0u);
         q->EnqueueSetEvent(ev);
         q->Submit();
@@ -662,10 +662,10 @@ void TestDirectStorageBcPackToGpuUntilerTexture(const D3D12TestBackend& backend)
     qd.Capacity = DSTORAGE_MIN_QUEUE_CAPACITY;
     qd.Priority = DSTORAGE_PRIORITY_REALTIME;
     qd.Name = "bcpack_gpu_tex_q";
-    qd.Device = backend.device;
 
     IDStorageQueueX* q = nullptr;
     OS_REQUIRE(factory->CreateQueue(&qd, &IID_IDStorageQueueX, reinterpret_cast<void**>(&q)) == OS_DSTORAGE_S_OK);
+    OS_REQUIRE(OpenScarlettDStorageSetQueueDevice(q, backend.device) == OS_DSTORAGE_S_OK);
 
     IDStorageStatusArrayX* st = nullptr;
     OS_REQUIRE(factory->CreateStatusArray(1u, "tex_st", &IID_IDStorageStatusArrayX,
@@ -686,7 +686,7 @@ void TestDirectStorageBcPackToGpuUntilerTexture(const D3D12TestBackend& backend)
     tex_dest.prefer_gpu_untiler = 1u;
     tex_dest.allow_cpu_untile_fallback = 1u;
 
-    DSTORAGE_REQUEST req{};
+    OpenScarlettDStorageRequestDesc req{};
     req.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_BCPACK;
     req.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
     req.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_TEXTURE_REGION;
@@ -697,7 +697,7 @@ void TestDirectStorageBcPackToGpuUntilerTexture(const D3D12TestBackend& backend)
     req.Destination.Memory.Size = sizeof(tex_dest);
     req.UncompressedSize = static_cast<uint32_t>(tiled_bc7.size());
 
-    q->EnqueueRequest(&req);
+    OpenScarlettDStorageEnqueueRequestDesc(q, &req);
     q->EnqueueStatus(st, 0u);
     q->EnqueueSetEvent(ev);
     q->Submit();
