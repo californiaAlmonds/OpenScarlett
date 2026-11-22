@@ -105,6 +105,7 @@ set(_openscarlett_known_targets
     test_winrt_xs
     test_d3d12_xs_live
     test_gdk_shims
+    test_dstorage_xbox_request_layout
     test_kernelx
     test_guest_dummy
     test_apc_loader

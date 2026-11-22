@@ -92,3 +92,7 @@ target_link_libraries(test_gdk_shims PRIVATE
 set_tests_properties(test_gdk_shims PROPERTIES
     ENVIRONMENT "OPENSCARLETT_AUDIO_NULL=1"
 )
+
+# Title-ABI test: raw Xbox dstorage_xs.h DSTORAGE_REQUEST (0x48 bytes) through IDStorageQueueX.
+openscarlett_add_test(test_dstorage_xbox_request_layout tests/test_dstorage_xbox_request_layout.cpp)
+target_link_libraries(test_dstorage_xbox_request_layout PRIVATE dstorage_xs)
