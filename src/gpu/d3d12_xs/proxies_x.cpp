@@ -1290,8 +1290,9 @@ HRESULT STDMETHODCALLTYPE CommandSignatureXProxy::GetDevice(REFIID riid, void** 
 StateObjectXProxy::StateObjectXProxy(
     DeviceX* parent_device,
     ID3D12StateObject* host_so,
-    const D3D12_STATE_OBJECT_DESC* desc_hint)
-    : device_x_(parent_device), host_so_(host_so) {
+    const D3D12_STATE_OBJECT_DESC* desc_hint,
+    bool allow_dynamic_exports)
+    : device_x_(parent_device), host_so_(host_so), sw_allow_dynamic_exports_(allow_dynamic_exports) {
     if (device_x_) device_x_->AddRef();
     if (host_so_) {
         host_so_->AddRef();
@@ -1436,14 +1437,38 @@ void* STDMETHODCALLTYPE StateObjectXProxy::GetShaderIdentifier(LPCWSTR pExportNa
     if (!pExportName || !pExportName[0]) return nullptr;
     std::lock_guard<std::mutex> lock(sw_mutex_);
     auto it = sw_shader_ids_.find(pExportName);
-    return (it != sw_shader_ids_.end()) ? static_cast<void*>(it->second.data()) : nullptr;
+    if (it != sw_shader_ids_.end()) {
+        return static_cast<void*>(it->second.data());
+    }
+    if (!sw_allow_dynamic_exports_) {
+        return nullptr;
+    }
+    std::wstring key(pExportName);
+    std::array<uint8_t, 32> id{};
+    uint64_t h1 = 0xCBF29CE484222325ull;
+    uint64_t h2 = 0x51A7D3D120000001ull;
+    for (wchar_t ch : key) {
+        h1 = (h1 ^ static_cast<uint64_t>(ch)) * 0x100000001B3ull;
+        h2 = (h2 * 0x100000001B3ull) ^ static_cast<uint64_t>(ch + 0x9Eu);
+    }
+    std::memcpy(id.data() + 0u, &h1, 8u);
+    std::memcpy(id.data() + 8u, &h2, 8u);
+    const uint64_t tag = 0x4F53445852534254ull;  // "OSDXRSBT"
+    std::memcpy(id.data() + 16u, &tag, 8u);
+    const uint64_t len = static_cast<uint64_t>(key.size());
+    std::memcpy(id.data() + 24u, &len, 8u);
+    auto [ins_it, _] = sw_shader_ids_.emplace(std::move(key), id);
+    return static_cast<void*>(ins_it->second.data());
 }
 
 UINT64 STDMETHODCALLTYPE StateObjectXProxy::GetShaderStackSize(LPCWSTR pExportName) {
     if (host_props_) return host_props_->GetShaderStackSize(pExportName);
     if (!pExportName || !pExportName[0]) return 0ull;
     std::lock_guard<std::mutex> lock(sw_mutex_);
-    return (sw_shader_ids_.find(pExportName) != sw_shader_ids_.end()) ? 256ull : 0ull;
+    if (sw_shader_ids_.find(pExportName) != sw_shader_ids_.end() || sw_allow_dynamic_exports_) {
+        return 256ull;
+    }
+    return 0ull;
 }
 
 UINT64 STDMETHODCALLTYPE StateObjectXProxy::GetPipelineStackSize() {
@@ -1457,6 +1482,80 @@ void STDMETHODCALLTYPE StateObjectXProxy::SetPipelineStackSize(UINT64 PipelineSt
     } else {
         sw_pipeline_stack_size_.store(PipelineStackSizeInBytes, std::memory_order_relaxed);
     }
+}
+
+namespace {
+
+class SimpleZeroBlob final : public ID3DBlob {
+public:
+    explicit SimpleZeroBlob(bool owned_singleton) : owned_singleton_(owned_singleton) {
+        std::memset(buf_, 0, sizeof(buf_));
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+        if (!ppvObject) return E_POINTER;
+        *ppvObject = nullptr;
+        if (IsEqualIID(riid, OS_D3D12_IID(IUnknown)) || IsEqualIID(riid, __uuidof(ID3DBlob))) {
+            *ppvObject = static_cast<ID3DBlob*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        if (owned_singleton_) return 1u;
+        return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        if (owned_singleton_) return 1u;
+        const ULONG rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+        if (rem == 0u) delete this;
+        return rem;
+    }
+    LPVOID STDMETHODCALLTYPE GetBufferPointer() override { return buf_; }
+    SIZE_T STDMETHODCALLTYPE GetBufferSize() override { return sizeof(buf_); }
+
+private:
+    std::atomic<ULONG> ref_count_{1u};
+    bool owned_singleton_ = false;
+    uint8_t buf_[128]{};
+};
+
+}  // namespace
+
+HRESULT STDMETHODCALLTYPE StateObjectXProxy::GetPipelineReflectionX(void** ppOutReflection) {
+    if (!ppOutReflection) return E_POINTER;
+    *ppOutReflection = static_cast<ID3D12StateObjectXbox*>(this);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE StateObjectXProxy::GetReflectionBlobX(
+    UINT /*kind*/, UINT /*flags*/, ID3DBlob** ppOutBlob) {
+    if (!ppOutBlob) return E_POINTER;
+    auto* blob = new (std::nothrow) SimpleZeroBlob(false);
+    if (!blob) {
+        *ppOutBlob = nullptr;
+        return E_OUTOFMEMORY;
+    }
+    *ppOutBlob = blob;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE StateObjectXProxy::GetPropertyX(UINT propertyId, void* pOut16Bytes) {
+    if (!pOut16Bytes) return E_POINTER;
+    std::memset(pOut16Bytes, 0, 16u);
+    if (propertyId == 0u) {
+        auto* u32 = static_cast<uint32_t*>(pOut16Bytes);
+        u32[0] = 256u;
+        u32[1] = 0u;
+        return S_OK;
+    }
+    if (propertyId == 1u) {
+        static SimpleZeroBlob s_owned_blob(true);
+        ID3DBlob* blob_ptr = &s_owned_blob;
+        std::memcpy(pOut16Bytes, &blob_ptr, sizeof(blob_ptr));
+        return S_OK;
+    }
+    return S_OK;
 }
 
 }  // namespace openscarlett::d3d12_xs

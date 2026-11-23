@@ -904,7 +904,13 @@ public:
             return 0;
         }
 
-        const bool large_pages = (flAllocationType & (MEM_LARGE_PAGES | MEM_4MB_PAGES)) != 0u;
+        // On Xbox Series X, MEM_PHYSICAL (0x00400000) | MEM_LARGE_PAGES (0x20000000) uses 64 KiB
+        // physical pages unless MEM_4MB_PAGES (0x80000000) is explicitly requested.
+        constexpr uint32_t kMemPhysical = 0x00400000u;
+        const bool is_physical = (flAllocationType & kMemPhysical) != 0u;
+        const bool large_pages =
+            ((flAllocationType & MEM_4MB_PAGES) != 0u) ||
+            (!is_physical && (flAllocationType & MEM_LARGE_PAGES) != 0u);
         const size_t page_bytes = large_pages ? kPage4MB : kPage64KB;
         const MemoryPageSize page_enum = large_pages ? MemoryPageSize::Page4MB : MemoryPageSize::Page64KB;
         const uint64_t req_pages = *pNumberOfPages;
@@ -1319,14 +1325,19 @@ public:
             return nullptr;
         }
 
+        constexpr uint32_t kMemPhysical = 0x00400000u;
         const bool reserve_only =
             ((allocationType & MEM_RESERVE) != 0u) && ((allocationType & MEM_COMMIT) == 0u);
         const bool is_graphics = (allocationType & MEM_GRAPHICS) != 0u;
-        const bool is_large = (allocationType & (MEM_LARGE_PAGES | MEM_4MB_PAGES)) != 0u;
+        const bool is_physical = (allocationType & kMemPhysical) != 0u;
+        const bool is_large =
+            ((allocationType & MEM_4MB_PAGES) != 0u) ||
+            (!is_physical && (allocationType & MEM_LARGE_PAGES) != 0u);
 
-        // MEM_RESERVE | MEM_GRAPHICS creates a real OS virtual placeholder so
-        // MapTitleVirtualMemory / MapTitlePhysicalPages(va, ...) can bind physical pages directly.
-        if (reserve_only && is_graphics && baseAddress == nullptr &&
+        // MEM_RESERVE | (MEM_GRAPHICS or MEM_PHYSICAL) creates a real OS virtual placeholder so
+        // MapTitleVirtualMemory / MapTitlePhysicalPages / XMemMapPhysicalPages(va, ...) can bind
+        // physical pages directly into the reserved range.
+        if (reserve_only && (is_graphics || is_physical) && baseAddress == nullptr &&
             UnifiedMemoryManager::SupportsOsPlaceholders()) {
             const MemoryPageSize granule = is_large ? MemoryPageSize::Page4MB : MemoryPageSize::Page64KB;
             const size_t gran_bytes = is_large ? kPage4MB : kPage64KB;
@@ -1349,13 +1360,86 @@ public:
             return base;
         }
 
-        const size_t align = is_large ? kPage4MB : (is_graphics ? kPage64KB : kPage4KB);
+        const size_t align = is_large ? kPage4MB : ((is_graphics || is_physical) ? kPage64KB : kPage4KB);
         const size_t aligned_size = AlignUp(size, align);
 
         if ((allocationType & MEM_COMMIT) != 0u &&
             CurrentTitleUsedBytes() + aligned_size > GetTitleBudgetBytes()) {
             SetHostLastError(8u);
             return nullptr;
+        }
+
+        // If committing inside a previously reserved OS placeholder (e.g. UE5 XboxCommon
+        // FastAllocator calling XMemVirtualAlloc(va, size, MEM_COMMIT|MEM_PHYSICAL) inside a
+        // MEM_RESERVE|MEM_PHYSICAL reservation), commit each uncommitted granule page via
+        // UnifiedMemoryManager::MapPhysicalAlias(MEM_REPLACE_PLACEHOLDER).
+        if (baseAddress != nullptr && (allocationType & MEM_COMMIT) != 0u &&
+            UnifiedMemoryManager::SupportsOsPlaceholders()) {
+            const uintptr_t req = reinterpret_cast<uintptr_t>(baseAddress);
+            uintptr_t ph_base = 0u;
+            size_t ph_size = 0u;
+            bool in_placeholder = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                for (const auto& [b, rec] : app_allocs_) {
+                    if (rec.is_placeholder && req >= b && req < b + rec.size) {
+                        in_placeholder = true;
+                        ph_base = b;
+                        ph_size = rec.size;
+                        break;
+                    }
+                }
+            }
+            if (in_placeholder) {
+                // Windows VirtualAlloc2 placeholders can always be split at 64 KiB granularity,
+                // even when the enclosing reservation used 4 MiB alignment.
+                const size_t commit_gran = kPage64KB;
+                const uintptr_t page_start = req & ~(commit_gran - 1u);
+                const uintptr_t page_end = std::min<uintptr_t>(
+                    AlignUp(req + size, commit_gran), ph_base + ph_size);
+                const uint32_t mem_flags = ToUnifiedFlags(allocationType, protection);
+                const MemoryProtection prot = ToMemoryProtection(protection);
+                for (uintptr_t cur = page_start; cur < page_end; cur += commit_gran) {
+                    void* slot_ptr = reinterpret_cast<void*>(cur);
+                    UnifiedMemoryAlias existing{};
+                    if (memory_.LookupAliasByHostPtr(slot_ptr, existing)) {
+                        continue;
+                    }
+                    PhysicalAllocation phys{};
+                    Status ast = memory_.AllocatePhysicalPages(
+                        commit_gran, MemoryPageSize::Page64KB, mem_flags, phys);
+                    if (!ast.ok()) {
+                        SetHostLastError(8u);
+                        return nullptr;
+                    }
+                    UnifiedMemoryAlias alias{};
+                    Status mst = memory_.MapPhysicalAlias(
+                        phys.physical_id, 0u, commit_gran, prot, mem_flags, slot_ptr, alias);
+                    if (!mst.ok()) {
+                        (void)memory_.FreePhysicalPages(phys.physical_id);
+                        std::fprintf(stderr,
+                            "[OpenScarlett][kernelx] Placeholder commit FAILED at %p (req=%p size=%zu ph=%p+%zu): %s\n",
+                            slot_ptr, baseAddress, size, reinterpret_cast<void*>(ph_base), ph_size,
+                            mst.message.c_str());
+                        std::fflush(stderr);
+                        SetHostLastError(487u);
+                        return nullptr;
+                    }
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    ActiveTitleMapping mapping{};
+                    mapping.base_va = reinterpret_cast<uintptr_t>(alias.host_ptr);
+                    mapping.size_bytes = commit_gran;
+                    mapping.page_size_bytes = commit_gran;
+                    mapping.primary_physical_id = phys.physical_id;
+                    mapping.alloc_flags = allocationType;
+                    mapping.win32_protect = protection;
+                    mapping.owns_placeholder = false;
+                    mapping.alias_ptrs.push_back(alias.host_ptr);
+                    mappings_.emplace(mapping.base_va, std::move(mapping));
+                }
+                UpdateAndGetPeakTitleUsed();
+                return baseAddress;
+            }
         }
 
 #if defined(_WIN32)
@@ -1370,6 +1454,43 @@ public:
         }
         const DWORD win_prot = ToWin32PageProtect(protection);
         void* ptr = VirtualAlloc(baseAddress, aligned_size, win_alloc, win_prot);
+        if (!ptr && baseAddress != nullptr && (allocationType & MEM_COMMIT) != 0u &&
+            GetLastError() == ERROR_INVALID_ADDRESS) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(baseAddress, &mbi, sizeof(mbi)) != 0u) {
+                if (mbi.State == MEM_COMMIT) {
+                    ptr = baseAddress;
+                } else if (mbi.State == MEM_RESERVE && mbi.Type == MEM_PRIVATE) {
+                    // Untracked OS placeholder (e.g. reserved via kernelbase!VirtualAlloc2 or split
+                    // via MEM_PRESERVE_PLACEHOLDER): back directly with MapViewOfFile3(MEM_REPLACE_PLACEHOLDER).
+                    using PfnMapViewOfFile3 = PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void*, ULONG);
+                    static PfnMapViewOfFile3 s_map3 = []() -> PfnMapViewOfFile3 {
+                        HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
+                        return kb ? reinterpret_cast<PfnMapViewOfFile3>(GetProcAddress(kb, "MapViewOfFile3")) : nullptr;
+                    }();
+                    if (s_map3) {
+                        constexpr ULONG kMemReplacePlaceholder = 0x00004000u;
+                        constexpr DWORD kMemPreservePlaceholder = 0x00000002u;
+                        const size_t map_bytes = AlignUp(size, kPage64KB);
+                        if (mbi.RegionSize > map_bytes || mbi.BaseAddress != baseAddress) {
+                            (void)VirtualFree(baseAddress, map_bytes, MEM_RELEASE | kMemPreservePlaceholder);
+                        }
+                        const DWORD hi = static_cast<DWORD>((static_cast<uint64_t>(map_bytes) >> 32) & 0xFFFFFFFFull);
+                        const DWORD lo = static_cast<DWORD>(static_cast<uint64_t>(map_bytes) & 0xFFFFFFFFull);
+                        HANDLE hmap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, hi, lo, nullptr);
+                        if (hmap) {
+                            void* mapped = s_map3(
+                                hmap, GetCurrentProcess(), baseAddress, 0ull, map_bytes,
+                                kMemReplacePlaceholder, PAGE_READWRITE, nullptr, 0u);
+                            CloseHandle(hmap);
+                            if (mapped) {
+                                ptr = mapped;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if (!ptr) {
             return nullptr;
         }
@@ -1420,6 +1541,19 @@ public:
 
         std::lock_guard<std::mutex> lock(mutex_);
         const uintptr_t key = reinterpret_cast<uintptr_t>(address);
+        auto mit = mappings_.find(key);
+        if (mit != mappings_.end() && (freeType & MEM_DECOMMIT) != 0u && mit->second.pfns.empty()) {
+            const uint64_t phys_id = mit->second.primary_physical_id;
+            for (void* p : mit->second.alias_ptrs) {
+                (void)memory_.UnmapPhysicalAlias(p);
+            }
+            mappings_.erase(mit);
+            if (phys_id != 0ull) {
+                (void)memory_.FreePhysicalPages(phys_id);
+            }
+            return 1;
+        }
+
         auto it = app_allocs_.find(key);
         if (it != app_allocs_.end()) {
             if (it->second.is_placeholder) {

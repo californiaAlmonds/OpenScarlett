@@ -590,8 +590,13 @@ private:
     // Sprint 13 placed tiled texture transient buffers & bridge helpers (Leonida #1674)
     std::mutex tiled_transient_mutex_;
     std::vector<ID3D12Resource*> tiled_transient_resources_;
+    std::vector<ID3D12Resource*> align_transient_ring_[6];
+    size_t align_transient_slot_ = 0u;
     void TrackTiledTransientResource(ID3D12Resource* res);
     void ReleaseTiledTransientResources();
+    void TrackAlignTransientResource(ID3D12Resource* res);
+    void RotateAlignTransientRing();
+    void ReleaseAllAlignTransientResources();
     bool TryBridgePlacedTiledCopyTextureRegion(
         const D3D12_TEXTURE_COPY_LOCATION& dst_loc,
         UINT dst_x,

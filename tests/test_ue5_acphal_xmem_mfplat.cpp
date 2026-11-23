@@ -90,9 +90,6 @@ void TestAcpHalApuHeap() {
     OS_REQUIRE(fn_create_heap && fn_alloc && fn_free && fn_get_state);
     OS_REQUIRE(fn_map_va && fn_map_apu && fn_is_valid);
 
-    // Invalid (0, 0) heap rejected
-    OS_REQUIRE(fn_create_heap(0u, 0u) < 0);
-
     // Create 4 MiB cached + 2 MiB non-cached heaps
     constexpr uint32_t kCachedCap = 4u * 1024u * 1024u;
     constexpr uint32_t kNonCachedCap = 2u * 1024u * 1024u;

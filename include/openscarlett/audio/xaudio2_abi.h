@@ -113,8 +113,8 @@ struct OS_OPUSWAVEFORMAT {
 };
 static_assert(sizeof(OS_OPUSWAVEFORMAT) == 22,
               "OS_OPUSWAVEFORMAT must match 22-byte Xbox Opus ABI");
-#pragma pack(pop)
 
+// Microsoft xaudio2.h wraps all XAUDIO2_* structs in #pragma pack(push, 1).
 struct OS_XAUDIO2_BUFFER {
     uint32_t Flags;
     uint32_t AudioBytes;
@@ -126,6 +126,8 @@ struct OS_XAUDIO2_BUFFER {
     uint32_t LoopCount;
     void* pContext;
 };
+static_assert(sizeof(OS_XAUDIO2_BUFFER) == 44,
+              "OS_XAUDIO2_BUFFER must match 44-byte packed xaudio2.h ABI");
 
 struct OS_XAUDIO2_BUFFER_WMA {
     const uint32_t* pDecodedPacketCumulativeBytes;
@@ -137,6 +139,8 @@ struct OS_XAUDIO2_VOICE_STATE {
     uint32_t BuffersQueued;
     uint64_t SamplesPlayed;
 };
+static_assert(sizeof(OS_XAUDIO2_VOICE_STATE) == 20,
+              "OS_XAUDIO2_VOICE_STATE must match 20-byte packed xaudio2.h ABI");
 
 struct OS_XAUDIO2_VOICE_DETAILS {
     uint32_t CreationFlags;
@@ -182,6 +186,7 @@ struct OS_XAUDIO2_DEBUG_CONFIGURATION {
     int32_t LogFunctionName;
     int32_t LogTiming;
 };
+#pragma pack(pop)
 
 struct IXAudio2VoiceCallback {
     virtual void OPENSCARLETT_XAUDIO2_CALL OnVoiceProcessingPassStart(uint32_t BytesRequired) = 0;
@@ -199,11 +204,43 @@ struct IXAudio2EngineCallback {
     virtual void OPENSCARLETT_XAUDIO2_CALL OnCriticalError(int32_t Error) = 0;
 };
 
+// Matches real Microsoft XAudio2.9 IXAudio2Voice vtable (19 slots: 0..18),
+// placing IXAudio2SourceVoice::Start at Slot 19 (+0x98) and
+// IXAudio2MasteringVoice::GetChannelMask at Slot 19 (+0x98).
 struct IXAudio2Voice {
     virtual void OPENSCARLETT_XAUDIO2_CALL GetVoiceDetails(
         OS_XAUDIO2_VOICE_DETAILS* pVoiceDetails) = 0;
     virtual int32_t OPENSCARLETT_XAUDIO2_CALL SetOutputVoices(
         const OS_XAUDIO2_VOICE_SENDS* pSendList) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL SetEffectChain(
+        const void* pEffectChain) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL EnableEffect(
+        uint32_t EffectIndex, uint32_t OperationSet = OS_XAUDIO2_COMMIT_NOW) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL DisableEffect(
+        uint32_t EffectIndex, uint32_t OperationSet = OS_XAUDIO2_COMMIT_NOW) = 0;
+    virtual void OPENSCARLETT_XAUDIO2_CALL GetEffectState(
+        uint32_t EffectIndex, int32_t* pEnabled) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL SetEffectParameters(
+        uint32_t EffectIndex,
+        const void* pParameters,
+        uint32_t ParametersByteSize,
+        uint32_t OperationSet = OS_XAUDIO2_COMMIT_NOW) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL GetEffectParameters(
+        uint32_t EffectIndex,
+        void* pParameters,
+        uint32_t ParametersByteSize) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL SetFilterParameters(
+        const void* pParameters,
+        uint32_t OperationSet = OS_XAUDIO2_COMMIT_NOW) = 0;
+    virtual void OPENSCARLETT_XAUDIO2_CALL GetFilterParameters(
+        void* pParameters) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL SetOutputFilterParameters(
+        IXAudio2Voice* pDestinationVoice,
+        const void* pParameters,
+        uint32_t OperationSet = OS_XAUDIO2_COMMIT_NOW) = 0;
+    virtual void OPENSCARLETT_XAUDIO2_CALL GetOutputFilterParameters(
+        IXAudio2Voice* pDestinationVoice,
+        void* pParameters) = 0;
     virtual int32_t OPENSCARLETT_XAUDIO2_CALL SetVolume(
         float Volume, uint32_t OperationSet = OS_XAUDIO2_COMMIT_NOW) = 0;
     virtual void OPENSCARLETT_XAUDIO2_CALL GetVolume(float* pVolume) = 0;
@@ -213,6 +250,17 @@ struct IXAudio2Voice {
         uint32_t OperationSet = OS_XAUDIO2_COMMIT_NOW) = 0;
     virtual void OPENSCARLETT_XAUDIO2_CALL GetChannelVolumes(
         uint32_t Channels, float* pVolumes) = 0;
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL SetOutputMatrix(
+        IXAudio2Voice* pDestinationVoice,
+        uint32_t SourceChannels,
+        uint32_t DestinationChannels,
+        const float* pLevelMatrix,
+        uint32_t OperationSet = OS_XAUDIO2_COMMIT_NOW) = 0;
+    virtual void OPENSCARLETT_XAUDIO2_CALL GetOutputMatrix(
+        IXAudio2Voice* pDestinationVoice,
+        uint32_t SourceChannels,
+        uint32_t DestinationChannels,
+        float* pLevelMatrix) = 0;
     virtual void OPENSCARLETT_XAUDIO2_CALL DestroyVoice() = 0;
 };
 

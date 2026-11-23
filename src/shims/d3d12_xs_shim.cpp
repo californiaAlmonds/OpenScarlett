@@ -543,6 +543,1278 @@ bool EnvPrefersWarp() noexcept {
     return buf[0] == '1' || buf[0] == 't' || buf[0] == 'T' || buf[0] == 'y' || buf[0] == 'Y';
 }
 
+bool EnvEnablesD3D12Debug() noexcept {
+    char buf[16]{};
+    const DWORD len = GetEnvironmentVariableA(
+        "OPENSCARLETT_D3D12_DEBUG", buf, static_cast<DWORD>(sizeof(buf)));
+    if (len == 0u || len >= sizeof(buf)) return false;
+    return buf[0] == '1' || buf[0] == 't' || buf[0] == 'T' || buf[0] == 'y' || buf[0] == 'Y';
+}
+
+// ===========================================================================
+// Retail Xbox Series X (Scarlett d3d12_xs.h) ID3D12CommandQueue vtable adapter
+// wrapping CommandQueueX. Maps exact retail Scarlett slots:
+//   18 (+0x90): GetDesc (dual-ABI CINTERFACE / C++ sret)
+//   21 (+0xA8): SuspendX(UINT Flags)
+//   22 (+0xB0): ResumeX()
+//   30 (+0xF0): PresentX(UINT PlaneCount, pPlaneParams, pPresentParams)
+// ===========================================================================
+class ScarlettRetailCommandQueueProxy final : public ID3D12CommandQueue {
+public:
+    static constexpr size_t kVtblSlotCount = 40u;
+
+    static void* const* GetPatchedVtbl(const void* const* raw_vtbl) {
+        static void* s_vtbl[kVtblSlotCount]{};
+        static std::once_flag s_once;
+        std::call_once(s_once, [raw_vtbl]() {
+            std::memcpy(s_vtbl, raw_vtbl, sizeof(s_vtbl));
+            s_vtbl[18] = reinterpret_cast<void*>(&Thunk_GetDesc);
+        });
+        return s_vtbl;
+    }
+
+    static D3D12_COMMAND_QUEUE_DESC* STDMETHODCALLTYPE Thunk_GetDesc(void* arg0, void* arg1) {
+        ScarlettRetailCommandQueueProxy* self = nullptr;
+        D3D12_COMMAND_QUEUE_DESC* out = nullptr;
+        if (arg0 && reinterpret_cast<uintptr_t>(arg0) >= 0x10000u &&
+            *reinterpret_cast<void* const* const*>(arg0) == s_patched_vtbl_ptr_) {
+            self = static_cast<ScarlettRetailCommandQueueProxy*>(arg0);
+            out = static_cast<D3D12_COMMAND_QUEUE_DESC*>(arg1);
+        } else {
+            out = static_cast<D3D12_COMMAND_QUEUE_DESC*>(arg0);
+            self = static_cast<ScarlettRetailCommandQueueProxy*>(arg1);
+        }
+        if (out && self && self->inner_) {
+            *out = self->inner_->GetDesc();
+        }
+        return out;
+    }
+
+    explicit ScarlettRetailCommandQueueProxy(ID3D12CommandQueueX* inner)
+        : inner_(inner) {
+        if (inner_) {
+            inner_->AddRef();
+        }
+        const void* const* raw_vtbl = *reinterpret_cast<const void* const* const*>(this);
+        void* const* patched = GetPatchedVtbl(raw_vtbl);
+        s_patched_vtbl_ptr_ = patched;
+        *reinterpret_cast<void* const**>(this) = patched;
+    }
+
+    ~ScarlettRetailCommandQueueProxy() {
+        if (inner_) {
+            inner_->Release();
+            inner_ = nullptr;
+        }
+    }
+
+    // IUnknown (0..2)
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+        if (!ppvObject) return E_POINTER;
+        *ppvObject = nullptr;
+        if (IsEqualIID(riid, __uuidof(IUnknown)) ||
+            IsEqualIID(riid, __uuidof(ID3D12Object)) ||
+            IsEqualIID(riid, __uuidof(ID3D12DeviceChild)) ||
+            IsEqualIID(riid, __uuidof(ID3D12Pageable)) ||
+            IsEqualIID(riid, __uuidof(ID3D12CommandQueue))) {
+            *ppvObject = static_cast<ID3D12CommandQueue*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return inner_ ? inner_->QueryInterface(riid, ppvObject) : E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return ref_count_.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG n = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+        if (n == 0u) delete this;
+        return n;
+    }
+
+    // ID3D12Object (3..6)
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT* pDataSize, void* pData) override {
+        return inner_->GetPrivateData(guid, pDataSize, pData);
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT DataSize, const void* pData) override {
+        return inner_->SetPrivateData(guid, DataSize, pData);
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown* pData) override {
+        return inner_->SetPrivateDataInterface(guid, pData);
+    }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR Name) override { return inner_->SetName(Name); }
+
+    // ID3D12DeviceChild (7)
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** ppvDevice) override {
+        return inner_->GetDevice(riid, ppvDevice);
+    }
+
+    // ID3D12CommandQueue (8..18)
+    void STDMETHODCALLTYPE UpdateTileMappings(
+        ID3D12Resource* pResource, UINT NumResourceRegions,
+        const D3D12_TILED_RESOURCE_COORDINATE* pResourceRegionStartCoordinates,
+        const D3D12_TILE_REGION_SIZE* pResourceRegionSizes,
+        ID3D12Heap* pHeap, UINT NumRanges,
+        const D3D12_TILE_RANGE_FLAGS* pRangeFlags,
+        const UINT* pHeapRangeStartOffsets, const UINT* pRangeTileCounts,
+        D3D12_TILE_MAPPING_FLAGS Flags) override {
+        inner_->UpdateTileMappings(pResource, NumResourceRegions, pResourceRegionStartCoordinates,
+                                   pResourceRegionSizes, pHeap, NumRanges, pRangeFlags,
+                                   pHeapRangeStartOffsets, pRangeTileCounts, Flags);
+    }
+    void STDMETHODCALLTYPE CopyTileMappings(
+        ID3D12Resource* pDstResource, const D3D12_TILED_RESOURCE_COORDINATE* pDstRegionStartCoordinate,
+        ID3D12Resource* pSrcResource, const D3D12_TILED_RESOURCE_COORDINATE* pSrcRegionStartCoordinate,
+        const D3D12_TILE_REGION_SIZE* pRegionSize, D3D12_TILE_MAPPING_FLAGS Flags) override {
+        inner_->CopyTileMappings(pDstResource, pDstRegionStartCoordinate, pSrcResource,
+                                 pSrcRegionStartCoordinate, pRegionSize, Flags);
+    }
+    void STDMETHODCALLTYPE ExecuteCommandLists(UINT NumCommandLists, ID3D12CommandList* const* ppCommandLists) override {
+        inner_->ExecuteCommandLists(NumCommandLists, ppCommandLists);
+    }
+    void STDMETHODCALLTYPE SetMarker(UINT Metadata, const void* pData, UINT Size) override {
+        inner_->SetMarker(Metadata, pData, Size);
+    }
+    void STDMETHODCALLTYPE BeginEvent(UINT Metadata, const void* pData, UINT Size) override {
+        inner_->BeginEvent(Metadata, pData, Size);
+    }
+    void STDMETHODCALLTYPE EndEvent() override { inner_->EndEvent(); }
+    HRESULT STDMETHODCALLTYPE Signal(ID3D12Fence* pFence, UINT64 Value) override {
+        return inner_->Signal(pFence, Value);
+    }
+    HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence* pFence, UINT64 Value) override {
+        return inner_->Wait(pFence, Value);
+    }
+    HRESULT STDMETHODCALLTYPE GetTimestampFrequency(UINT64* pFrequency) override {
+        return inner_->GetTimestampFrequency(pFrequency);
+    }
+    HRESULT STDMETHODCALLTYPE GetClockCalibration(UINT64* pGpuTimestamp, UINT64* pCpuTimestamp) override {
+        return inner_->GetClockCalibration(pGpuTimestamp, pCpuTimestamp);
+    }
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    D3D12_COMMAND_QUEUE_DESC* STDMETHODCALLTYPE GetDesc(D3D12_COMMAND_QUEUE_DESC* pRet) override {
+        return inner_->GetDesc(pRet);
+    }
+#else
+    D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override { return inner_->GetDesc(); }
+#endif
+
+    HRESULT RecordUnimpl(int slot) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "ScarlettRetailCommandQueue::Slot_%d", slot);
+        std::fprintf(stderr, "[OpenScarlett][d3d12_xs] UNIMPL %s (+0x%X)\n", buf, slot * 8);
+        std::fflush(stderr);
+        OutputDebugStringA(buf);
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", buf, openscarlett::CallOutcome::NotImplemented, E_NOTIMPL, slot);
+        return E_NOTIMPL;
+    }
+
+    virtual HRESULT STDMETHODCALLTYPE Slot19() { return RecordUnimpl(19); }
+    virtual HRESULT STDMETHODCALLTYPE Slot20() { return RecordUnimpl(20); }
+    // Slot 21 (+0xA8): SuspendX
+    virtual HRESULT STDMETHODCALLTYPE SuspendX(uint32_t Flags) { return inner_->SuspendX(Flags); }
+    // Slot 22 (+0xB0): ResumeX
+    virtual HRESULT STDMETHODCALLTYPE ResumeX() { return inner_->ResumeX(); }
+    // Slot 23 (+0xB8): SignalX(ID3D12Fence* pFence, UINT64 Value, UINT FlushFlags)
+    virtual HRESULT STDMETHODCALLTYPE SignalX(ID3D12Fence* pFence, UINT64 Value, UINT /*FlushFlags*/) {
+        const HRESULT hr = inner_->Signal(pFence, Value);
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailCommandQueue::SignalX",
+            SUCCEEDED(hr) ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr, 23);
+        return hr;
+    }
+    virtual HRESULT STDMETHODCALLTYPE Slot24() { return RecordUnimpl(24); }
+    virtual HRESULT STDMETHODCALLTYPE Slot25() { return RecordUnimpl(25); }
+    virtual HRESULT STDMETHODCALLTYPE Slot26() { return RecordUnimpl(26); }
+    virtual HRESULT STDMETHODCALLTYPE Slot27() { return RecordUnimpl(27); }
+    virtual HRESULT STDMETHODCALLTYPE Slot28() { return RecordUnimpl(28); }
+    virtual HRESULT STDMETHODCALLTYPE Slot29() { return RecordUnimpl(29); }
+    // Slot 30 (+0xF0): PresentX
+    virtual HRESULT STDMETHODCALLTYPE PresentX(
+        UINT PlaneCount,
+        const D3D12XBOX_PRESENT_PLANE_PARAMETERS* pPlaneParameters,
+        const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters) {
+        return inner_->PresentX(PlaneCount, pPlaneParameters, pPresentParameters);
+    }
+    virtual HRESULT STDMETHODCALLTYPE Slot31() { return RecordUnimpl(31); }
+    virtual HRESULT STDMETHODCALLTYPE Slot32() { return RecordUnimpl(32); }
+    virtual HRESULT STDMETHODCALLTYPE Slot33() { return RecordUnimpl(33); }
+    virtual HRESULT STDMETHODCALLTYPE Slot34() { return RecordUnimpl(34); }
+    virtual HRESULT STDMETHODCALLTYPE Slot35() { return RecordUnimpl(35); }
+    virtual HRESULT STDMETHODCALLTYPE Slot36() { return RecordUnimpl(36); }
+    virtual HRESULT STDMETHODCALLTYPE Slot37() { return RecordUnimpl(37); }
+    virtual HRESULT STDMETHODCALLTYPE Slot38() { return RecordUnimpl(38); }
+    virtual HRESULT STDMETHODCALLTYPE Slot39() { return RecordUnimpl(39); }
+
+private:
+    static inline void* const* s_patched_vtbl_ptr_ = nullptr;
+    std::atomic<ULONG> ref_count_{1u};
+    ID3D12CommandQueueX* inner_ = nullptr;
+};
+
+// ===========================================================================
+// Retail Xbox Series X (Scarlett d3d12_xs.h) ID3D12GraphicsCommandList adapter
+// wrapping CommandListX.
+// - Reserves zeroed +0x08..+0x187 header so inline Xbox PM4 fast-paths see
+//   m_pCurrent (+0x18) == m_pLimit (+0x30) == 0 and branch to virtual methods.
+// - Matches exact retail Scarlett vtable layout:
+//     0..27  : identical to PC ID3D12GraphicsCommandList
+//     28..31 : BeginQuery, EndQuery, ResolveQueryData, SetPredication
+//     32..55 : SetDescriptorHeaps .. DiscardResource (PC 28..51 shifted +4)
+//     56..59 : SetMarker, BeginEvent, EndEvent, ExecuteIndirect
+// ===========================================================================
+class ScarlettRetailCommandListProxy final : public IUnknown {
+public:
+    explicit ScarlettRetailCommandListProxy(openscarlett::d3d12_xs::CommandListX* inner)
+        : inner_(inner) {
+        if (inner_) {
+            inner_->AddRef();
+            openscarlett::d3d12_xs::CommandListX::RegisterExternalAlias(
+                static_cast<const void*>(this), inner_);
+        }
+    }
+
+    ~ScarlettRetailCommandListProxy() {
+        openscarlett::d3d12_xs::CommandListX::UnregisterExternalAlias(
+            static_cast<const void*>(this));
+        if (inner_) {
+            inner_->Release();
+            inner_ = nullptr;
+        }
+    }
+
+    // IUnknown (0..2)
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+        if (!ppvObject) return E_POINTER;
+        *ppvObject = nullptr;
+        // Xbox Series X ID3D12GraphicsCommandList5/6 use console-specific Data4 bytes
+        // (verified live against UE5 FD3D12CommandListData constructor).
+        static constexpr GUID kXboxIidCmdList5 = {
+            0x55050859u, 0x4024u, 0x474Cu, {0x98u, 0xCFu, 0x64u, 0x5Bu, 0x51u, 0xDCu, 0x48u, 0x74u}};
+        static constexpr GUID kXboxIidCmdList6 = {
+            0xC3827890u, 0x4024u, 0x474Cu, {0x98u, 0xCFu, 0x64u, 0x5Bu, 0x51u, 0xDCu, 0x48u, 0x74u}};
+        if (IsEqualIID(riid, __uuidof(IUnknown)) ||
+            IsEqualIID(riid, __uuidof(ID3D12Object)) ||
+            IsEqualIID(riid, __uuidof(ID3D12DeviceChild)) ||
+            IsEqualIID(riid, __uuidof(ID3D12CommandList)) ||
+            IsEqualIID(riid, __uuidof(ID3D12GraphicsCommandList)) ||
+            IsEqualIID(riid, __uuidof(ID3D12GraphicsCommandList1)) ||
+            IsEqualIID(riid, __uuidof(ID3D12GraphicsCommandList2)) ||
+            IsEqualIID(riid, __uuidof(ID3D12GraphicsCommandList3)) ||
+            IsEqualIID(riid, __uuidof(ID3D12GraphicsCommandList4)) ||
+            IsEqualIID(riid, __uuidof(ID3D12GraphicsCommandList5)) ||
+            IsEqualIID(riid, __uuidof(ID3D12GraphicsCommandList6)) ||
+            IsEqualIID(riid, kXboxIidCmdList5) ||
+            IsEqualIID(riid, kXboxIidCmdList6)) {
+            *ppvObject = static_cast<void*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return inner_ ? inner_->QueryInterface(riid, ppvObject) : E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return ref_count_.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG n = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+        if (n == 0u) delete this;
+        return n;
+    }
+
+    // ID3D12Object (3..6)
+    virtual HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID g, UINT* sz, void* d) { return inner_->GetPrivateData(g, sz, d); }
+    virtual HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID g, UINT sz, const void* d) { return inner_->SetPrivateData(g, sz, d); }
+    virtual HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID g, const IUnknown* d) { return inner_->SetPrivateDataInterface(g, d); }
+    virtual HRESULT STDMETHODCALLTYPE SetName(LPCWSTR n) { return inner_->SetName(n); }
+    // ID3D12DeviceChild (7)
+    virtual HRESULT STDMETHODCALLTYPE GetDevice(REFIID r, void** d) { return inner_->GetDevice(r, d); }
+    // ID3D12CommandList (8)
+    virtual D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE GetType() { return inner_->GetType(); }
+    // ID3D12GraphicsCommandList (9..27: identical to PC)
+    virtual HRESULT STDMETHODCALLTYPE Close() { return inner_->Close(); }
+    virtual HRESULT STDMETHODCALLTYPE Reset(ID3D12CommandAllocator* a, ID3D12PipelineState* s) { return inner_->Reset(a, s); }
+    virtual void STDMETHODCALLTYPE ClearState(ID3D12PipelineState* s) { inner_->ClearState(s); }
+    virtual void STDMETHODCALLTYPE DrawInstanced(UINT vc, UINT ic, UINT sv, UINT si) { inner_->DrawInstanced(vc, ic, sv, si); }
+    virtual void STDMETHODCALLTYPE DrawIndexedInstanced(UINT ic, UINT inc, UINT si, INT bv, UINT sin) { inner_->DrawIndexedInstanced(ic, inc, si, bv, sin); }
+    virtual void STDMETHODCALLTYPE Dispatch(UINT x, UINT y, UINT z) { inner_->Dispatch(x, y, z); }
+    virtual void STDMETHODCALLTYPE CopyBufferRegion(ID3D12Resource* d, UINT64 doff, ID3D12Resource* s, UINT64 soff, UINT64 nb) { inner_->CopyBufferRegion(d, doff, s, soff, nb); }
+    virtual void STDMETHODCALLTYPE CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION* d, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* s, const D3D12_BOX* b) { inner_->CopyTextureRegion(d, x, y, z, s, b); }
+    virtual void STDMETHODCALLTYPE CopyResource(ID3D12Resource* d, ID3D12Resource* s) { inner_->CopyResource(d, s); }
+    virtual void STDMETHODCALLTYPE CopyTiles(ID3D12Resource* r, const D3D12_TILED_RESOURCE_COORDINATE* c, const D3D12_TILE_REGION_SIZE* sz, ID3D12Resource* b, UINT64 boff, D3D12_TILE_COPY_FLAGS f) { inner_->CopyTiles(r, c, sz, b, boff, f); }
+    virtual void STDMETHODCALLTYPE ResolveSubresource(ID3D12Resource* d, UINT ds, ID3D12Resource* s, UINT ss, DXGI_FORMAT f) { inner_->ResolveSubresource(d, ds, s, ss, f); }
+    virtual void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY t) { inner_->IASetPrimitiveTopology(t); }
+    virtual void STDMETHODCALLTYPE RSSetViewports(UINT n, const D3D12_VIEWPORT* v) { inner_->RSSetViewports(n, v); }
+    virtual void STDMETHODCALLTYPE RSSetScissorRects(UINT n, const D3D12_RECT* r) { inner_->RSSetScissorRects(n, r); }
+    virtual void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT b[4]) { inner_->OMSetBlendFactor(b); }
+    virtual void STDMETHODCALLTYPE OMSetStencilRef(UINT r) { inner_->OMSetStencilRef(r); }
+    virtual void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState* s) { inner_->SetPipelineState(s); }
+    virtual void STDMETHODCALLTYPE ResourceBarrier(UINT n, const D3D12_RESOURCE_BARRIER* b) { inner_->ResourceBarrier(n, b); }
+    virtual void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList* b) { inner_->ExecuteBundle(b); }
+    // Slots 28..31: retail Xbox Scarlett places Query/Predication here
+    virtual void STDMETHODCALLTYPE BeginQuery(ID3D12QueryHeap* qh, D3D12_QUERY_TYPE t, UINT idx) { inner_->BeginQuery(qh, t, idx); }
+    virtual void STDMETHODCALLTYPE EndQuery(ID3D12QueryHeap* qh, D3D12_QUERY_TYPE t, UINT idx) { inner_->EndQuery(qh, t, idx); }
+    virtual void STDMETHODCALLTYPE ResolveQueryData(ID3D12QueryHeap* qh, D3D12_QUERY_TYPE t, UINT si, UINT nq, ID3D12Resource* dst, UINT64 off) { inner_->ResolveQueryData(qh, t, si, nq, dst, off); }
+    virtual void STDMETHODCALLTYPE SetPredication(ID3D12Resource* buf, UINT64 off, D3D12_PREDICATION_OP op) { inner_->SetPredication(buf, off, op); }
+    // Slots 32..55: PC slots 28..51 shifted by +4
+    virtual void STDMETHODCALLTYPE SetDescriptorHeaps(UINT n, ID3D12DescriptorHeap* const* h) { inner_->SetDescriptorHeaps(n, h); }
+    virtual void STDMETHODCALLTYPE SetComputeRootSignature(ID3D12RootSignature* rs) { inner_->SetComputeRootSignature(rs); }
+    virtual void STDMETHODCALLTYPE SetGraphicsRootSignature(ID3D12RootSignature* rs) { inner_->SetGraphicsRootSignature(rs); }
+    virtual void STDMETHODCALLTYPE SetComputeRootDescriptorTable(UINT rp, D3D12_GPU_DESCRIPTOR_HANDLE h) { inner_->SetComputeRootDescriptorTable(rp, h); }
+    virtual void STDMETHODCALLTYPE SetGraphicsRootDescriptorTable(UINT rp, D3D12_GPU_DESCRIPTOR_HANDLE h) { inner_->SetGraphicsRootDescriptorTable(rp, h); }
+    virtual void STDMETHODCALLTYPE SetComputeRoot32BitConstant(UINT rp, UINT v, UINT off) { inner_->SetComputeRoot32BitConstant(rp, v, off); }
+    virtual void STDMETHODCALLTYPE SetGraphicsRoot32BitConstant(UINT rp, UINT v, UINT off) { inner_->SetGraphicsRoot32BitConstant(rp, v, off); }
+    virtual void STDMETHODCALLTYPE SetComputeRoot32BitConstants(UINT rp, UINT n, const void* d, UINT off) { inner_->SetComputeRoot32BitConstants(rp, n, d, off); }
+    virtual void STDMETHODCALLTYPE SetGraphicsRoot32BitConstants(UINT rp, UINT n, const void* d, UINT off) { inner_->SetGraphicsRoot32BitConstants(rp, n, d, off); }
+    virtual void STDMETHODCALLTYPE SetComputeRootConstantBufferView(UINT rp, D3D12_GPU_VIRTUAL_ADDRESS va) { inner_->SetComputeRootConstantBufferView(rp, va); }
+    virtual void STDMETHODCALLTYPE SetGraphicsRootConstantBufferView(UINT rp, D3D12_GPU_VIRTUAL_ADDRESS va) { inner_->SetGraphicsRootConstantBufferView(rp, va); }
+    virtual void STDMETHODCALLTYPE SetComputeRootShaderResourceView(UINT rp, D3D12_GPU_VIRTUAL_ADDRESS va) { inner_->SetComputeRootShaderResourceView(rp, va); }
+    virtual void STDMETHODCALLTYPE SetGraphicsRootShaderResourceView(UINT rp, D3D12_GPU_VIRTUAL_ADDRESS va) { inner_->SetGraphicsRootShaderResourceView(rp, va); }
+    virtual void STDMETHODCALLTYPE SetComputeRootUnorderedAccessView(UINT rp, D3D12_GPU_VIRTUAL_ADDRESS va) { inner_->SetComputeRootUnorderedAccessView(rp, va); }
+    virtual void STDMETHODCALLTYPE SetGraphicsRootUnorderedAccessView(UINT rp, D3D12_GPU_VIRTUAL_ADDRESS va) { inner_->SetGraphicsRootUnorderedAccessView(rp, va); }
+    virtual void STDMETHODCALLTYPE IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* v) { inner_->IASetIndexBuffer(v); }
+    virtual void STDMETHODCALLTYPE IASetVertexBuffers(UINT ss, UINT nv, const D3D12_VERTEX_BUFFER_VIEW* v) { inner_->IASetVertexBuffers(ss, nv, v); }
+    virtual void STDMETHODCALLTYPE SOSetTargets(UINT ss, UINT nv, const D3D12_STREAM_OUTPUT_BUFFER_VIEW* v) { inner_->SOSetTargets(ss, nv, v); }
+    virtual void STDMETHODCALLTYPE OMSetRenderTargets(UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* rtv, BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* dsv) { inner_->OMSetRenderTargets(n, rtv, single, dsv); }
+    virtual void STDMETHODCALLTYPE ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS f, FLOAT d, UINT8 s, UINT nr, const D3D12_RECT* r) { inner_->ClearDepthStencilView(dsv, f, d, s, nr, r); }
+    virtual void STDMETHODCALLTYPE ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT c[4], UINT nr, const D3D12_RECT* r) { inner_->ClearRenderTargetView(rtv, c, nr, r); }
+    virtual void STDMETHODCALLTYPE ClearUnorderedAccessViewUint(D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource* res, const UINT v[4], UINT nr, const D3D12_RECT* r) { inner_->ClearUnorderedAccessViewUint(g, c, res, v, nr, r); }
+    virtual void STDMETHODCALLTYPE ClearUnorderedAccessViewFloat(D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource* res, const FLOAT v[4], UINT nr, const D3D12_RECT* r) { inner_->ClearUnorderedAccessViewFloat(g, c, res, v, nr, r); }
+    virtual void STDMETHODCALLTYPE DiscardResource(ID3D12Resource* r, const D3D12_DISCARD_REGION* reg) { inner_->DiscardResource(r, reg); }
+    // Slots 56..59: identical to PC
+    virtual void STDMETHODCALLTYPE SetMarker(UINT m, const void* d, UINT sz) { inner_->SetMarker(m, d, sz); }
+    virtual void STDMETHODCALLTYPE BeginEvent(UINT m, const void* d, UINT sz) { inner_->BeginEvent(m, d, sz); }
+    virtual void STDMETHODCALLTYPE EndEvent() { inner_->EndEvent(); }
+    virtual void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature* cs, UINT mc, ID3D12Resource* ab, UINT64 aoff, ID3D12Resource* cb, UINT64 coff) { inner_->ExecuteIndirect(cs, mc, ab, aoff, cb, coff); }
+
+    // Safe telemetry stubs for any extended retail Scarlett slots 60..89
+    void RecordClUnimpl(int slot) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "ScarlettRetailCmdList::Slot_%d", slot);
+        std::fprintf(stderr, "[OpenScarlett][d3d12_xs] UNIMPL %s (+0x%X)\n", buf, slot * 8);
+        std::fflush(stderr);
+        OutputDebugStringA(buf);
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", buf, openscarlett::CallOutcome::NotImplemented, E_NOTIMPL, slot);
+    }
+    virtual void STDMETHODCALLTYPE Slot60() { RecordClUnimpl(60); }
+    virtual void STDMETHODCALLTYPE Slot61() { RecordClUnimpl(61); }
+    virtual void STDMETHODCALLTYPE Slot62() { RecordClUnimpl(62); }
+    virtual void STDMETHODCALLTYPE Slot63() { RecordClUnimpl(63); }
+    virtual void STDMETHODCALLTYPE Slot64() { RecordClUnimpl(64); }
+    virtual void STDMETHODCALLTYPE Slot65() { RecordClUnimpl(65); }
+    virtual void STDMETHODCALLTYPE Slot66() { RecordClUnimpl(66); }
+    virtual void STDMETHODCALLTYPE Slot67() { RecordClUnimpl(67); }
+    virtual void STDMETHODCALLTYPE Slot68() { RecordClUnimpl(68); }
+    virtual void STDMETHODCALLTYPE Slot69() { RecordClUnimpl(69); }
+    virtual void STDMETHODCALLTYPE Slot70() { RecordClUnimpl(70); }
+    virtual void STDMETHODCALLTYPE Slot71() { RecordClUnimpl(71); }
+    virtual void STDMETHODCALLTYPE Slot72() { RecordClUnimpl(72); }
+    virtual void STDMETHODCALLTYPE Slot73() { RecordClUnimpl(73); }
+    virtual void STDMETHODCALLTYPE Slot74() { RecordClUnimpl(74); }
+    virtual void STDMETHODCALLTYPE Slot75() { RecordClUnimpl(75); }
+    virtual void STDMETHODCALLTYPE Slot76() { RecordClUnimpl(76); }
+    virtual void STDMETHODCALLTYPE Slot77() { RecordClUnimpl(77); }
+    virtual void STDMETHODCALLTYPE Slot78() { RecordClUnimpl(78); }
+    virtual void STDMETHODCALLTYPE Slot79() { RecordClUnimpl(79); }
+    virtual void STDMETHODCALLTYPE Slot80() { RecordClUnimpl(80); }
+    virtual void STDMETHODCALLTYPE Slot81() { RecordClUnimpl(81); }
+    virtual void STDMETHODCALLTYPE Slot82() { RecordClUnimpl(82); }
+    // Slot 83 (+0x298): CopyTextureRegionX(pDst, DstX, DstY, DstZ, pSrc, pSrcBox, Flags)
+    virtual void STDMETHODCALLTYPE CopyTextureRegionX(
+        const D3D12_TEXTURE_COPY_LOCATION* pDst,
+        UINT DstX, UINT DstY, UINT DstZ,
+        const D3D12_TEXTURE_COPY_LOCATION* pSrc,
+        const D3D12_BOX* pSrcBox,
+        UINT /*Flags*/) {
+        inner_->CopyTextureRegion(pDst, DstX, DstY, DstZ, pSrc, pSrcBox);
+    }
+    virtual void STDMETHODCALLTYPE Slot84() { RecordClUnimpl(84); }
+    virtual void STDMETHODCALLTYPE Slot85() { RecordClUnimpl(85); }
+    virtual void STDMETHODCALLTYPE Slot86() { RecordClUnimpl(86); }
+    virtual void STDMETHODCALLTYPE Slot87() { RecordClUnimpl(87); }
+    virtual void STDMETHODCALLTYPE Slot88() { RecordClUnimpl(88); }
+    virtual void STDMETHODCALLTYPE Slot89() { RecordClUnimpl(89); }
+    virtual void STDMETHODCALLTYPE Slot90() { RecordClUnimpl(90); }
+    virtual void STDMETHODCALLTYPE Slot91() { RecordClUnimpl(91); }
+    virtual void STDMETHODCALLTYPE Slot92() { RecordClUnimpl(92); }
+    virtual void STDMETHODCALLTYPE Slot93() { RecordClUnimpl(93); }
+    virtual void STDMETHODCALLTYPE Slot94() { RecordClUnimpl(94); }
+    virtual void STDMETHODCALLTYPE Slot95() { RecordClUnimpl(95); }
+    virtual void STDMETHODCALLTYPE Slot96() { RecordClUnimpl(96); }
+    virtual void STDMETHODCALLTYPE Slot97() { RecordClUnimpl(97); }
+    virtual void STDMETHODCALLTYPE Slot98() { RecordClUnimpl(98); }
+    virtual void STDMETHODCALLTYPE Slot99() { RecordClUnimpl(99); }
+    virtual void STDMETHODCALLTYPE Slot100() { RecordClUnimpl(100); }
+    virtual void STDMETHODCALLTYPE Slot101() { RecordClUnimpl(101); }
+    virtual void STDMETHODCALLTYPE Slot102() { RecordClUnimpl(102); }
+    virtual void STDMETHODCALLTYPE Slot103() { RecordClUnimpl(103); }
+    virtual void STDMETHODCALLTYPE Slot104() { RecordClUnimpl(104); }
+    // Retail Scarlett ID3D12GraphicsCommandList1..6 (slots 105..124 = PC slots 60..79 shifted +45)
+    virtual void STDMETHODCALLTYPE AtomicCopyBufferUINT(
+        ID3D12Resource* d, UINT64 dof, ID3D12Resource* s, UINT64 sof, UINT dep,
+        ID3D12Resource* const* dr, const D3D12_SUBRESOURCE_RANGE_UINT64* sr) {
+        inner_->AtomicCopyBufferUINT(d, dof, s, sof, dep, dr, sr);
+    }
+    virtual void STDMETHODCALLTYPE AtomicCopyBufferUINT64(
+        ID3D12Resource* d, UINT64 dof, ID3D12Resource* s, UINT64 sof, UINT dep,
+        ID3D12Resource* const* dr, const D3D12_SUBRESOURCE_RANGE_UINT64* sr) {
+        inner_->AtomicCopyBufferUINT64(d, dof, s, sof, dep, dr, sr);
+    }
+    virtual void STDMETHODCALLTYPE OMSetDepthBounds(FLOAT mn, FLOAT mx) { inner_->OMSetDepthBounds(mn, mx); }
+    virtual void STDMETHODCALLTYPE SetSamplePositions(UINT ns, UINT np, D3D12_SAMPLE_POSITION* sp) {
+        inner_->SetSamplePositions(ns, np, sp);
+    }
+    virtual void STDMETHODCALLTYPE ResolveSubresourceRegion(
+        ID3D12Resource* d, UINT ds, UINT x, UINT y, ID3D12Resource* s, UINT ss,
+        D3D12_RECT* sr, DXGI_FORMAT f, D3D12_RESOLVE_MODE rm) {
+        inner_->ResolveSubresourceRegion(d, ds, x, y, s, ss, sr, f, rm);
+    }
+    virtual void STDMETHODCALLTYPE SetViewInstanceMask(UINT m) { inner_->SetViewInstanceMask(m); }
+    virtual void STDMETHODCALLTYPE WriteBufferImmediate(
+        UINT c, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER* p, const D3D12_WRITEBUFFERIMMEDIATE_MODE* m) {
+        inner_->WriteBufferImmediate(c, p, m);
+    }
+    virtual void STDMETHODCALLTYPE SetProtectedResourceSession(ID3D12ProtectedResourceSession* ps) {
+        inner_->SetProtectedResourceSession(ps);
+    }
+    virtual void STDMETHODCALLTYPE BeginRenderPass(
+        UINT n, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* r,
+        const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* d, D3D12_RENDER_PASS_FLAGS f) {
+        inner_->BeginRenderPass(n, r, d, f);
+    }
+    virtual void STDMETHODCALLTYPE EndRenderPass() { inner_->EndRenderPass(); }
+    virtual void STDMETHODCALLTYPE InitializeMetaCommand(ID3D12MetaCommand* mc, const void* d, SIZE_T s) {
+        inner_->InitializeMetaCommand(mc, d, s);
+    }
+    virtual void STDMETHODCALLTYPE ExecuteMetaCommand(ID3D12MetaCommand* mc, const void* d, SIZE_T s) {
+        inner_->ExecuteMetaCommand(mc, d, s);
+    }
+    virtual void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(
+        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* d, UINT n,
+        const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* p) {
+        inner_->BuildRaytracingAccelerationStructure(d, n, p);
+    }
+    virtual void STDMETHODCALLTYPE EmitRaytracingAccelerationStructurePostbuildInfo(
+        const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* d, UINT n,
+        const D3D12_GPU_VIRTUAL_ADDRESS* s) {
+        inner_->EmitRaytracingAccelerationStructurePostbuildInfo(d, n, s);
+    }
+    // Slot 119 (+0x3B8): CopyRaytracingAccelerationStructure
+    virtual void STDMETHODCALLTYPE CopyRaytracingAccelerationStructure(
+        D3D12_GPU_VIRTUAL_ADDRESS d, D3D12_GPU_VIRTUAL_ADDRESS s,
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE m) {
+        inner_->CopyRaytracingAccelerationStructure(d, s, m);
+    }
+    virtual void STDMETHODCALLTYPE SetPipelineState1(ID3D12StateObject* so) { inner_->SetPipelineState1(so); }
+    virtual void STDMETHODCALLTYPE DispatchRays(const D3D12_DISPATCH_RAYS_DESC* d) { inner_->DispatchRays(d); }
+    virtual void STDMETHODCALLTYPE RSSetShadingRate(D3D12_SHADING_RATE r, const D3D12_SHADING_RATE_COMBINER* c) {
+        inner_->RSSetShadingRate(r, c);
+    }
+    virtual void STDMETHODCALLTYPE RSSetShadingRateImage(ID3D12Resource* r) { inner_->RSSetShadingRateImage(r); }
+    virtual void STDMETHODCALLTYPE DispatchMesh(UINT x, UINT y, UINT z) { inner_->DispatchMesh(x, y, z); }
+    virtual void STDMETHODCALLTYPE Slot125() { RecordClUnimpl(125); }
+    virtual void STDMETHODCALLTYPE Slot126() { RecordClUnimpl(126); }
+    virtual void STDMETHODCALLTYPE Slot127() { RecordClUnimpl(127); }
+    virtual void STDMETHODCALLTYPE Slot128() { RecordClUnimpl(128); }
+    virtual void STDMETHODCALLTYPE Slot129() { RecordClUnimpl(129); }
+    virtual void STDMETHODCALLTYPE Slot130() { RecordClUnimpl(130); }
+    // Slot 131 (+0x418): Xbox ID3D12GraphicsCommandList6::BuildRaytracingAccelerationStructuresX
+    virtual void STDMETHODCALLTYPE BuildRaytracingAccelerationStructuresX(
+        UINT /*NumDescs*/, const void* /*pDescs*/) {
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailCmdList::BuildRaytracingAccelerationStructuresX",
+            openscarlett::CallOutcome::Ok, S_OK, 131);
+    }
+    virtual void STDMETHODCALLTYPE Slot132() { RecordClUnimpl(132); }
+    virtual void STDMETHODCALLTYPE Slot133() { RecordClUnimpl(133); }
+    virtual void STDMETHODCALLTYPE Slot134() { RecordClUnimpl(134); }
+    virtual void STDMETHODCALLTYPE Slot135() { RecordClUnimpl(135); }
+    virtual void STDMETHODCALLTYPE Slot136() { RecordClUnimpl(136); }
+    virtual void STDMETHODCALLTYPE Slot137() { RecordClUnimpl(137); }
+    virtual void STDMETHODCALLTYPE Slot138() { RecordClUnimpl(138); }
+    virtual void STDMETHODCALLTYPE Slot139() { RecordClUnimpl(139); }
+
+private:
+    // MUST remain the first member so +0x18 (m_pCurrent) and +0x30 (m_pLimit) are both 0!
+    uint8_t pm4_inline_zeros_[0x800]{};
+    std::atomic<ULONG> ref_count_{1u};
+    openscarlett::d3d12_xs::CommandListX* inner_ = nullptr;
+};
+
+// ===========================================================================
+// Retail Xbox Series X (Scarlett d3d12_xs.h, Version >= 0x00020000) ID3D12Device
+// vtable adapter wrapping DeviceX. Preserves PC/GDKX-test ID3D12Device8/DeviceX
+// layout for Version < 0x00020000 while exposing exact retail Scarlett vtable
+// slots (62: CreateComputePipelineStateX, 69: SetDriverFlagX, 73: CreateCommandListX,
+// 78: SetFrameIntervalX, 79: ScheduleFrameEventX, 80: WaitFrameEventX,
+// 81: GetFrameStatisticsX) for real Xbox Series X binaries.
+// ===========================================================================
+class ScarlettRetailDeviceProxy final : public ID3D12Device {
+public:
+    static constexpr size_t kVtblSlotCount = 128u;
+
+    static void* const* GetPatchedVtbl(const void* const* raw_vtbl) {
+        static void* s_vtbl[kVtblSlotCount]{};
+        static std::once_flag s_once;
+        std::call_once(s_once, [raw_vtbl]() {
+            std::memcpy(s_vtbl, raw_vtbl, sizeof(s_vtbl));
+            s_vtbl[25] = reinterpret_cast<void*>(&Thunk_GetResourceAllocationInfo);
+            s_vtbl[26] = reinterpret_cast<void*>(&Thunk_GetCustomHeapProperties);
+            s_vtbl[43] = reinterpret_cast<void*>(&Thunk_GetAdapterLuid);
+            s_vtbl[95] = reinterpret_cast<void*>(&Thunk_GetResourceAllocationInfo1);
+        });
+        return s_vtbl;
+    }
+
+    static D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE Thunk_GetResourceAllocationInfo1(
+        void* arg0,
+        void* arg1,
+        UINT visibleMask,
+        UINT numResourceDescs,
+        const D3D12_RESOURCE_DESC* pResourceDescs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) {
+        ScarlettRetailDeviceProxy* self = nullptr;
+        D3D12_RESOURCE_ALLOCATION_INFO* out_ret = nullptr;
+        if (arg0 && reinterpret_cast<uintptr_t>(arg0) >= 0x10000u &&
+            *reinterpret_cast<const void* const* const*>(arg0) == s_patched_vtbl_ptr_) {
+            self = static_cast<ScarlettRetailDeviceProxy*>(arg0);
+            out_ret = static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(arg1);
+        } else {
+            out_ret = static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(arg0);
+            self = static_cast<ScarlettRetailDeviceProxy*>(arg1);
+        }
+        D3D12_RESOURCE_ALLOCATION_INFO res{};
+        if (self && self->inner_) {
+            res = self->inner_->GetResourceAllocationInfo1(
+                visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1);
+        }
+        if (out_ret) {
+            *out_ret = res;
+        }
+        return out_ret;
+    }
+
+    static uint64_t STDMETHODCALLTYPE Thunk_GetAdapterLuid(ScarlettRetailDeviceProxy* self) {
+        if (!self || !self->inner_) return 0ull;
+        const LUID luid = self->inner_->GetAdapterLuid();
+        uint64_t raw = 0ull;
+        static_assert(sizeof(LUID) == sizeof(uint64_t), "LUID must be 8 bytes");
+        std::memcpy(&raw, &luid, sizeof(raw));
+        return raw;
+    }
+
+    static bool IsProxyPtr(void* p, const void* const* expected_vtbl) noexcept {
+        if (!p || reinterpret_cast<uintptr_t>(p) < 0x10000u) return false;
+        return *reinterpret_cast<const void* const* const*>(p) == expected_vtbl;
+    }
+
+    static D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE Thunk_GetResourceAllocationInfo(
+        void* arg0,
+        void* arg1,
+        UINT visibleMask,
+        UINT numResourceDescs,
+        const D3D12_RESOURCE_DESC* pResourceDescs) {
+        // Auto-detect CINTERFACE (RCX=sret, RDX=this) vs C++ COM (RCX=this, RDX=sret).
+        ScarlettRetailDeviceProxy* self = nullptr;
+        D3D12_RESOURCE_ALLOCATION_INFO* out_ret = nullptr;
+        if (arg0 && reinterpret_cast<uintptr_t>(arg0) >= 0x10000u &&
+            *reinterpret_cast<const void* const* const*>(arg0) == s_patched_vtbl_ptr_) {
+            self = static_cast<ScarlettRetailDeviceProxy*>(arg0);
+            out_ret = static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(arg1);
+        } else {
+            out_ret = static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(arg0);
+            self = static_cast<ScarlettRetailDeviceProxy*>(arg1);
+        }
+        D3D12_RESOURCE_ALLOCATION_INFO res{};
+        if (self && self->inner_) {
+            res = self->inner_->GetResourceAllocationInfo(visibleMask, numResourceDescs, pResourceDescs);
+        }
+        if (out_ret) {
+            *out_ret = res;
+        }
+        return out_ret;
+    }
+
+    static D3D12_HEAP_PROPERTIES* STDMETHODCALLTYPE Thunk_GetCustomHeapProperties(
+        void* arg0,
+        void* arg1,
+        UINT nodeMask,
+        D3D12_HEAP_TYPE heapType) {
+        ScarlettRetailDeviceProxy* self = nullptr;
+        D3D12_HEAP_PROPERTIES* out_ret = nullptr;
+        if (arg0 && reinterpret_cast<uintptr_t>(arg0) >= 0x10000u &&
+            *reinterpret_cast<const void* const* const*>(arg0) == s_patched_vtbl_ptr_) {
+            self = static_cast<ScarlettRetailDeviceProxy*>(arg0);
+            out_ret = static_cast<D3D12_HEAP_PROPERTIES*>(arg1);
+        } else {
+            out_ret = static_cast<D3D12_HEAP_PROPERTIES*>(arg0);
+            self = static_cast<ScarlettRetailDeviceProxy*>(arg1);
+        }
+        D3D12_HEAP_PROPERTIES res{};
+        if (self && self->inner_) {
+            res = self->inner_->GetCustomHeapProperties(nodeMask, heapType);
+        }
+        if (out_ret) {
+            *out_ret = res;
+        }
+        return out_ret;
+    }
+
+    explicit ScarlettRetailDeviceProxy(openscarlett::d3d12_xs::DeviceX* inner)
+        : inner_(inner) {
+        if (inner_) {
+            inner_->AddRef();
+        }
+        const void* const* raw_vtbl = *reinterpret_cast<const void* const* const*>(this);
+        void* const* patched = GetPatchedVtbl(raw_vtbl);
+        s_patched_vtbl_ptr_ = patched;
+        *reinterpret_cast<void* const**>(this) = patched;
+    }
+
+    ~ScarlettRetailDeviceProxy() {
+        if (inner_) {
+            inner_->Release();
+            inner_ = nullptr;
+        }
+    }
+
+    // IUnknown (slots 0..2)
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+        if (!ppvObject) return E_POINTER;
+        *ppvObject = nullptr;
+        // Xbox Series X ID3D12Device8 IID (verified live against UE5 XSXD3D12Device.cpp DeserializeStateObjectX).
+        static constexpr GUID kXboxIidD3D12Device8 = {
+            0x728F1FA2u, 0xEA11u, 0x4A9Fu, {0x9Bu, 0x52u, 0x9Bu, 0x42u, 0xA4u, 0x84u, 0xD5u, 0xC9u}};
+        static constexpr GUID kPcIidD3D12Device8 = {
+            0x9218E6BBu, 0xF944u, 0x4F7Eu, {0xA7u, 0x5Cu, 0xB1u, 0xB2u, 0xC7u, 0xB7u, 0x01u, 0xF3u}};
+        if (IsEqualIID(riid, __uuidof(IUnknown)) ||
+            IsEqualIID(riid, __uuidof(ID3D12Object)) ||
+            IsEqualIID(riid, __uuidof(ID3D12Device)) ||
+            IsEqualIID(riid, __uuidof(ID3D12Device1)) ||
+            IsEqualIID(riid, __uuidof(ID3D12Device2)) ||
+            IsEqualIID(riid, __uuidof(ID3D12Device3)) ||
+            IsEqualIID(riid, __uuidof(ID3D12Device4)) ||
+            IsEqualIID(riid, __uuidof(ID3D12Device5)) ||
+            IsEqualIID(riid, __uuidof(ID3D12Device6)) ||
+            IsEqualIID(riid, __uuidof(ID3D12Device7)) ||
+            IsEqualIID(riid, kXboxIidD3D12Device8) ||
+            IsEqualIID(riid, kPcIidD3D12Device8)) {
+            *ppvObject = static_cast<ID3D12Device*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return inner_ ? inner_->QueryInterface(riid, ppvObject) : E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return ref_count_.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG n = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+        if (n == 0u) {
+            delete this;
+        }
+        return n;
+    }
+
+    // ID3D12Object (slots 3..6)
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT* pDataSize, void* pData) override {
+        return inner_->GetPrivateData(guid, pDataSize, pData);
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT DataSize, const void* pData) override {
+        return inner_->SetPrivateData(guid, DataSize, pData);
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown* pData) override {
+        return inner_->SetPrivateDataInterface(guid, pData);
+    }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR Name) override {
+        return inner_->SetName(Name);
+    }
+
+    // ID3D12Device (slots 7..43)
+    UINT STDMETHODCALLTYPE GetNodeCount() override { return inner_->GetNodeCount(); }
+    HRESULT STDMETHODCALLTYPE CreateCommandQueue(
+        const D3D12_COMMAND_QUEUE_DESC* pDesc, REFIID riid, void** ppCommandQueue) override {
+        if (!ppCommandQueue) return E_POINTER;
+        *ppCommandQueue = nullptr;
+        ID3D12CommandQueueX* qx = nullptr;
+        const HRESULT hr = inner_->CreateCommandQueue(
+            pDesc, IID_ID3D12CommandQueueX, reinterpret_cast<void**>(&qx));
+        if (FAILED(hr) || !qx) return hr;
+        if (IsEqualIID(riid, __uuidof(ID3D12CommandQueue)) || IsEqualIID(riid, __uuidof(IUnknown))) {
+            auto* retail_q = new (std::nothrow) ScarlettRetailCommandQueueProxy(qx);
+            qx->Release();
+            if (!retail_q) return E_OUTOFMEMORY;
+            *ppCommandQueue = static_cast<ID3D12CommandQueue*>(retail_q);
+            return S_OK;
+        }
+        const HRESULT qhr = qx->QueryInterface(riid, ppCommandQueue);
+        qx->Release();
+        return qhr;
+    }
+    HRESULT STDMETHODCALLTYPE CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** ppCommandAllocator) override {
+        return inner_->CreateCommandAllocator(type, riid, ppCommandAllocator);
+    }
+    HRESULT STDMETHODCALLTYPE CreateGraphicsPipelineState(
+        const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pDesc, REFIID riid, void** ppPipelineState) override {
+        return inner_->CreateGraphicsPipelineState(pDesc, riid, ppPipelineState);
+    }
+    HRESULT STDMETHODCALLTYPE CreateComputePipelineState(
+        const D3D12_COMPUTE_PIPELINE_STATE_DESC* pDesc, REFIID riid, void** ppPipelineState) override {
+        return inner_->CreateComputePipelineState(pDesc, riid, ppPipelineState);
+    }
+    HRESULT WrapRetailCommandList(
+        UINT nodeMask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* pCommandAllocator,
+        ID3D12PipelineState* pInitialState, REFIID riid, void** ppCommandList) {
+        if (!ppCommandList) return E_POINTER;
+        *ppCommandList = nullptr;
+        ID3D12GraphicsCommandList* raw_cl = nullptr;
+        const HRESULT hr = inner_->CreateCommandList(
+            nodeMask, type, pCommandAllocator, pInitialState,
+            __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void**>(&raw_cl));
+        if (FAILED(hr) || !raw_cl) return hr;
+        auto* clx = openscarlett::d3d12_xs::CommandListX::TryFromCommandList(raw_cl);
+        if (clx &&
+            (IsEqualIID(riid, __uuidof(ID3D12GraphicsCommandList)) ||
+             IsEqualIID(riid, __uuidof(ID3D12CommandList)) ||
+             IsEqualIID(riid, __uuidof(IUnknown)))) {
+            auto* retail_cl = new (std::nothrow) ScarlettRetailCommandListProxy(clx);
+            raw_cl->Release();
+            if (!retail_cl) return E_OUTOFMEMORY;
+            *ppCommandList = static_cast<void*>(retail_cl);
+            return S_OK;
+        }
+        const HRESULT qhr = raw_cl->QueryInterface(riid, ppCommandList);
+        raw_cl->Release();
+        return qhr;
+    }
+
+    HRESULT STDMETHODCALLTYPE CreateCommandList(
+        UINT nodeMask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* pCommandAllocator,
+        ID3D12PipelineState* pInitialState, REFIID riid, void** ppCommandList) override {
+        return WrapRetailCommandList(nodeMask, type, pCommandAllocator, pInitialState, riid, ppCommandList);
+    }
+    HRESULT STDMETHODCALLTYPE CheckFeatureSupport(
+        D3D12_FEATURE Feature, void* pFeatureSupportData, UINT FeatureSupportDataSize) override {
+        return inner_->CheckFeatureSupport(Feature, pFeatureSupportData, FeatureSupportDataSize);
+    }
+    HRESULT STDMETHODCALLTYPE CreateDescriptorHeap(
+        const D3D12_DESCRIPTOR_HEAP_DESC* pDescriptorHeapDesc, REFIID riid, void** ppvHeap) override {
+        return inner_->CreateDescriptorHeap(pDescriptorHeapDesc, riid, ppvHeap);
+    }
+    UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapType) override {
+        return inner_->GetDescriptorHandleIncrementSize(DescriptorHeapType);
+    }
+    HRESULT STDMETHODCALLTYPE CreateRootSignature(
+        UINT nodeMask, const void* pBlobWithRootSignature, SIZE_T blobLengthInBytes,
+        REFIID riid, void** ppvRootSignature) override {
+        return inner_->CreateRootSignature(nodeMask, pBlobWithRootSignature, blobLengthInBytes, riid, ppvRootSignature);
+    }
+    void STDMETHODCALLTYPE CreateConstantBufferView(
+        const D3D12_CONSTANT_BUFFER_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) override {
+        inner_->CreateConstantBufferView(pDesc, DestDescriptor);
+    }
+    void STDMETHODCALLTYPE CreateShaderResourceView(
+        ID3D12Resource* pResource, const D3D12_SHADER_RESOURCE_VIEW_DESC* pDesc,
+        D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) override {
+        inner_->CreateShaderResourceView(pResource, pDesc, DestDescriptor);
+    }
+    void STDMETHODCALLTYPE CreateUnorderedAccessView(
+        ID3D12Resource* pResource, ID3D12Resource* pCounterResource,
+        const D3D12_UNORDERED_ACCESS_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) override {
+        inner_->CreateUnorderedAccessView(pResource, pCounterResource, pDesc, DestDescriptor);
+    }
+    void STDMETHODCALLTYPE CreateRenderTargetView(
+        ID3D12Resource* pResource, const D3D12_RENDER_TARGET_VIEW_DESC* pDesc,
+        D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) override {
+        inner_->CreateRenderTargetView(pResource, pDesc, DestDescriptor);
+    }
+    void STDMETHODCALLTYPE CreateDepthStencilView(
+        ID3D12Resource* pResource, const D3D12_DEPTH_STENCIL_VIEW_DESC* pDesc,
+        D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) override {
+        inner_->CreateDepthStencilView(pResource, pDesc, DestDescriptor);
+    }
+    void STDMETHODCALLTYPE CreateSampler(
+        const D3D12_SAMPLER_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) override {
+        inner_->CreateSampler(pDesc, DestDescriptor);
+    }
+    void STDMETHODCALLTYPE CopyDescriptors(
+        UINT NumDestDescriptorRanges, const D3D12_CPU_DESCRIPTOR_HANDLE* pDestDescriptorRangeStarts,
+        const UINT* pDestDescriptorRangeSizes, UINT NumSrcDescriptorRanges,
+        const D3D12_CPU_DESCRIPTOR_HANDLE* pSrcDescriptorRangeStarts, const UINT* pSrcDescriptorRangeSizes,
+        D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapsType) override {
+        inner_->CopyDescriptors(NumDestDescriptorRanges, pDestDescriptorRangeStarts, pDestDescriptorRangeSizes,
+                                NumSrcDescriptorRanges, pSrcDescriptorRangeStarts, pSrcDescriptorRangeSizes,
+                                DescriptorHeapsType);
+    }
+    void STDMETHODCALLTYPE CopyDescriptorsSimple(
+        UINT NumDescriptors, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptorRangeStart,
+        D3D12_CPU_DESCRIPTOR_HANDLE SrcDescriptorRangeStart,
+        D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapsType) override {
+        inner_->CopyDescriptorsSimple(NumDescriptors, DestDescriptorRangeStart, SrcDescriptorRangeStart,
+                                      DescriptorHeapsType);
+    }
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE GetResourceAllocationInfo(
+        D3D12_RESOURCE_ALLOCATION_INFO* pRet, UINT visibleMask, UINT numResourceDescs,
+        const D3D12_RESOURCE_DESC* pResourceDescs) override {
+        return inner_->GetResourceAllocationInfo(pRet, visibleMask, numResourceDescs, pResourceDescs);
+    }
+    D3D12_HEAP_PROPERTIES* STDMETHODCALLTYPE GetCustomHeapProperties(
+        D3D12_HEAP_PROPERTIES* pRet, UINT nodeMask, D3D12_HEAP_TYPE heapType) override {
+        return inner_->GetCustomHeapProperties(pRet, nodeMask, heapType);
+    }
+#else
+    D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo(
+        UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs) override {
+        return inner_->GetResourceAllocationInfo(visibleMask, numResourceDescs, pResourceDescs);
+    }
+    D3D12_HEAP_PROPERTIES STDMETHODCALLTYPE GetCustomHeapProperties(
+        UINT nodeMask, D3D12_HEAP_TYPE heapType) override {
+        return inner_->GetCustomHeapProperties(nodeMask, heapType);
+    }
+#endif
+    HRESULT STDMETHODCALLTYPE CreateCommittedResource(
+        const D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS HeapFlags,
+        const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialResourceState,
+        const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riidResource, void** ppvResource) override {
+        return inner_->CreateCommittedResource(pHeapProperties, HeapFlags, pDesc, InitialResourceState,
+                                               pOptimizedClearValue, riidResource, ppvResource);
+    }
+    HRESULT STDMETHODCALLTYPE CreateHeap(
+        const D3D12_HEAP_DESC* pDesc, REFIID riid, void** ppvHeap) override {
+        return inner_->CreateHeap(pDesc, riid, ppvHeap);
+    }
+    HRESULT STDMETHODCALLTYPE CreatePlacedResource(
+        ID3D12Heap* pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC* pDesc,
+        D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE* pOptimizedClearValue,
+        REFIID riid, void** ppvResource) override {
+        return inner_->CreatePlacedResource(pHeap, HeapOffset, pDesc, InitialState, pOptimizedClearValue, riid,
+                                            ppvResource);
+    }
+    HRESULT STDMETHODCALLTYPE CreateReservedResource(
+        const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialState,
+        const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riid, void** ppvResource) override {
+        return inner_->CreateReservedResource(pDesc, InitialState, pOptimizedClearValue, riid, ppvResource);
+    }
+    HRESULT STDMETHODCALLTYPE CreateSharedHandle(
+        ID3D12DeviceChild* pObject, const SECURITY_ATTRIBUTES* pAttributes, DWORD Access,
+        LPCWSTR Name, HANDLE* pHandle) override {
+        return inner_->CreateSharedHandle(pObject, pAttributes, Access, Name, pHandle);
+    }
+    HRESULT STDMETHODCALLTYPE OpenSharedHandle(HANDLE NTHandle, REFIID riid, void** ppvObj) override {
+        return inner_->OpenSharedHandle(NTHandle, riid, ppvObj);
+    }
+    HRESULT STDMETHODCALLTYPE OpenSharedHandleByName(LPCWSTR Name, DWORD Access, HANDLE* pNTHandle) override {
+        return inner_->OpenSharedHandleByName(Name, Access, pNTHandle);
+    }
+    HRESULT STDMETHODCALLTYPE MakeResident(UINT NumObjects, ID3D12Pageable* const* ppObjects) override {
+        return inner_->MakeResident(NumObjects, ppObjects);
+    }
+    HRESULT STDMETHODCALLTYPE Evict(UINT NumObjects, ID3D12Pageable* const* ppObjects) override {
+        return inner_->Evict(NumObjects, ppObjects);
+    }
+    HRESULT STDMETHODCALLTYPE CreateFence(
+        UINT64 InitialValue, D3D12_FENCE_FLAGS Flags, REFIID riid, void** ppFence) override {
+        return inner_->CreateFence(InitialValue, Flags, riid, ppFence);
+    }
+    HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override { return inner_->GetDeviceRemovedReason(); }
+    void STDMETHODCALLTYPE GetCopyableFootprints(
+        const D3D12_RESOURCE_DESC* pResourceDesc, UINT FirstSubresource, UINT NumSubresources,
+        UINT64 BaseOffset, D3D12_PLACED_SUBRESOURCE_FOOTPRINT* pLayouts, UINT* pNumRows,
+        UINT64* pRowSizeInBytes, UINT64* pTotalBytes) override {
+        inner_->GetCopyableFootprints(pResourceDesc, FirstSubresource, NumSubresources, BaseOffset,
+                                      pLayouts, pNumRows, pRowSizeInBytes, pTotalBytes);
+    }
+    HRESULT STDMETHODCALLTYPE CreateQueryHeap(
+        const D3D12_QUERY_HEAP_DESC* pDesc, REFIID riid, void** ppvHeap) override {
+        return inner_->CreateQueryHeap(pDesc, riid, ppvHeap);
+    }
+    HRESULT STDMETHODCALLTYPE SetStablePowerState(BOOL Enable) override {
+        return inner_->SetStablePowerState(Enable);
+    }
+    HRESULT STDMETHODCALLTYPE CreateCommandSignature(
+        const D3D12_COMMAND_SIGNATURE_DESC* pDesc, ID3D12RootSignature* pRootSignature,
+        REFIID riid, void** ppvCommandSignature) override {
+        return inner_->CreateCommandSignature(pDesc, pRootSignature, riid, ppvCommandSignature);
+    }
+    void STDMETHODCALLTYPE GetResourceTiling(
+        ID3D12Resource* pTiledResource, UINT* pNumTilesForEntireResource,
+        D3D12_PACKED_MIP_INFO* pPackedMipDesc, D3D12_TILE_SHAPE* pStandardTileShapeForNonPackedMips,
+        UINT* pNumSubresourceTilings, UINT FirstSubresourceTilingToGet,
+        D3D12_SUBRESOURCE_TILING* pSubresourceTilingsForNonPackedMips) override {
+        inner_->GetResourceTiling(pTiledResource, pNumTilesForEntireResource, pPackedMipDesc,
+                                  pStandardTileShapeForNonPackedMips, pNumSubresourceTilings,
+                                  FirstSubresourceTilingToGet, pSubresourceTilingsForNonPackedMips);
+    }
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    LUID* STDMETHODCALLTYPE GetAdapterLuid(LUID* pRet) override { return inner_->GetAdapterLuid(pRet); }
+#else
+    LUID STDMETHODCALLTYPE GetAdapterLuid() override { return inner_->GetAdapterLuid(); }
+#endif
+
+    // Retail Scarlett d3d12_xs.h ID3D12Device extended vtable (slots 44..89)
+    HRESULT RecordUnimpl(int slot) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "ScarlettRetailDevice::Slot_%d", slot);
+        std::fprintf(stderr, "[OpenScarlett][d3d12_xs] UNIMPL %s (+0x%X)\n", buf, slot * 8);
+        std::fflush(stderr);
+        OutputDebugStringA(buf);
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", buf, openscarlett::CallOutcome::NotImplemented, E_NOTIMPL, slot);
+        return E_NOTIMPL;
+    }
+
+    // Slot 44 (+0x160): CreatePlacedResourceX(VirtualAddress, pDesc, InitialState, pOptimizedClearValue, riid, ppvResource)
+    virtual HRESULT STDMETHODCALLTYPE CreatePlacedResourceX(
+        D3D12_GPU_VIRTUAL_ADDRESS VirtualAddress,
+        const D3D12_RESOURCE_DESC* pDesc,
+        D3D12_RESOURCE_STATES InitialState,
+        const D3D12_CLEAR_VALUE* pOptimizedClearValue,
+        REFIID riid,
+        void** ppvResource) {
+        const HRESULT hr = inner_->CreatePlacedResourceX(
+            VirtualAddress, pDesc, InitialState, pOptimizedClearValue, riid, ppvResource);
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailDevice::CreatePlacedResourceX",
+            SUCCEEDED(hr) ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr, 44);
+        return hr;
+    }
+    virtual HRESULT STDMETHODCALLTYPE Slot45() { return RecordUnimpl(45); }
+    virtual HRESULT STDMETHODCALLTYPE Slot46() { return RecordUnimpl(46); }
+    virtual HRESULT STDMETHODCALLTYPE Slot47() { return RecordUnimpl(47); }
+    // Slot 48 (+0x180): CreateCommandQueueX(pDesc, riid, ppCommandQueue)
+    // D3D12XBOX_COMMAND_QUEUE_DESC begins with D3D12_COMMAND_LIST_TYPE Type (uint32_t),
+    // followed by Xbox flags/priority/pipe/queue index fields.
+    virtual HRESULT STDMETHODCALLTYPE CreateCommandQueueX(
+        const void* pDesc, REFIID riid, void** ppCommandQueue) {
+        D3D12_COMMAND_QUEUE_DESC std_desc{};
+        std_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        std_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+        std_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+        std_desc.NodeMask = 0u;
+        if (pDesc) {
+            const auto* words = static_cast<const uint32_t*>(pDesc);
+            const uint32_t raw_type = words[0];
+            if (raw_type == D3D12_COMMAND_LIST_TYPE_DIRECT ||
+                raw_type == D3D12_COMMAND_LIST_TYPE_COMPUTE ||
+                raw_type == D3D12_COMMAND_LIST_TYPE_COPY) {
+                std_desc.Type = static_cast<D3D12_COMMAND_LIST_TYPE>(raw_type);
+            }
+        }
+        const HRESULT hr = CreateCommandQueue(&std_desc, riid, ppCommandQueue);
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailDevice::CreateCommandQueueX",
+            SUCCEEDED(hr) ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr, 48);
+        return hr;
+    }
+    virtual HRESULT STDMETHODCALLTYPE Slot49() { return RecordUnimpl(49); }
+    virtual HRESULT STDMETHODCALLTYPE Slot50() { return RecordUnimpl(50); }
+    virtual HRESULT STDMETHODCALLTYPE Slot51() { return RecordUnimpl(51); }
+    virtual HRESULT STDMETHODCALLTYPE Slot52() { return RecordUnimpl(52); }
+    virtual HRESULT STDMETHODCALLTYPE Slot53() { return RecordUnimpl(53); }
+    virtual HRESULT STDMETHODCALLTYPE Slot54() { return RecordUnimpl(54); }
+    virtual HRESULT STDMETHODCALLTYPE Slot55() { return RecordUnimpl(55); }
+    virtual HRESULT STDMETHODCALLTYPE Slot56() { return RecordUnimpl(56); }
+    virtual HRESULT STDMETHODCALLTYPE Slot57() { return RecordUnimpl(57); }
+    virtual HRESULT STDMETHODCALLTYPE Slot58() { return RecordUnimpl(58); }
+    virtual HRESULT STDMETHODCALLTYPE Slot59() { return RecordUnimpl(59); }
+    virtual HRESULT STDMETHODCALLTYPE Slot60() { return RecordUnimpl(60); }
+    virtual HRESULT STDMETHODCALLTYPE Slot61() { return RecordUnimpl(61); }
+    // Slot 62 (+0x1F0): CreateComputePipelineStateX(pDesc, pCache, pFlags, riid, ppv)
+    virtual HRESULT STDMETHODCALLTYPE CreateComputePipelineStateX(
+        const D3D12_COMPUTE_PIPELINE_STATE_DESC* pDesc,
+        void* /*pCache*/,
+        void* /*pFlags*/,
+        REFIID riid,
+        void** ppPipelineState) {
+        const HRESULT hr = inner_->CreateComputePipelineState(pDesc, riid, ppPipelineState);
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailDevice::CreateComputePipelineStateX",
+            SUCCEEDED(hr) ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr, 62);
+        return hr;
+    }
+    virtual HRESULT STDMETHODCALLTYPE Slot63() { return RecordUnimpl(63); }
+    virtual HRESULT STDMETHODCALLTYPE Slot64() { return RecordUnimpl(64); }
+    virtual HRESULT STDMETHODCALLTYPE Slot65() { return RecordUnimpl(65); }
+    virtual HRESULT STDMETHODCALLTYPE Slot66() { return RecordUnimpl(66); }
+    virtual HRESULT STDMETHODCALLTYPE Slot67() { return RecordUnimpl(67); }
+    virtual HRESULT STDMETHODCALLTYPE Slot68() { return RecordUnimpl(68); }
+    // Slot 69 (+0x228): SetDriverFlagX(uint32_t key, uint32_t value)
+    virtual HRESULT STDMETHODCALLTYPE SetDriverFlagX(uint32_t /*key*/, uint32_t /*value*/) {
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailDevice::SetDriverFlagX",
+            openscarlett::CallOutcome::Ok, S_OK, 69);
+        return S_OK;
+    }
+    virtual HRESULT STDMETHODCALLTYPE Slot70() { return RecordUnimpl(70); }
+    virtual HRESULT STDMETHODCALLTYPE Slot71() { return RecordUnimpl(71); }
+    virtual HRESULT STDMETHODCALLTYPE Slot72() { return RecordUnimpl(72); }
+    // Slot 73 (+0x248): CreateCommandListX(pDesc, pCommandAllocator, pInitialState, riid, ppCommandList)
+    virtual HRESULT STDMETHODCALLTYPE CreateCommandListX(
+        const void* pDesc,
+        ID3D12CommandAllocator* pCommandAllocator,
+        ID3D12PipelineState* pInitialState,
+        REFIID riid,
+        void** ppCommandList) {
+        D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        UINT node_mask = 0u;
+        if (pDesc) {
+            const auto* words = static_cast<const uint32_t*>(pDesc);
+            type = static_cast<D3D12_COMMAND_LIST_TYPE>(words[0]);
+            node_mask = words[1];
+        }
+        const HRESULT hr = WrapRetailCommandList(
+            node_mask, type, pCommandAllocator, pInitialState, riid, ppCommandList);
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailDevice::CreateCommandListX",
+            SUCCEEDED(hr) ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr, 73);
+        return hr;
+    }
+    virtual HRESULT STDMETHODCALLTYPE Slot74() { return RecordUnimpl(74); }
+    virtual HRESULT STDMETHODCALLTYPE Slot75() { return RecordUnimpl(75); }
+    virtual HRESULT STDMETHODCALLTYPE Slot76() { return RecordUnimpl(76); }
+    virtual HRESULT STDMETHODCALLTYPE Slot77() { return RecordUnimpl(77); }
+    // Slot 78 (+0x270): SetFrameIntervalX
+    virtual HRESULT STDMETHODCALLTYPE SetFrameIntervalX(
+        IDXGIOutput* pOutput, uint32_t PeriodMicroseconds,
+        uint32_t MaxFrameLatency, uint32_t Flags) {
+        return inner_->SetFrameIntervalX(pOutput, PeriodMicroseconds, MaxFrameLatency, Flags);
+    }
+    // Slot 79 (+0x278): ScheduleFrameEventX
+    virtual HRESULT STDMETHODCALLTYPE ScheduleFrameEventX(
+        D3D12XBOX_FRAME_EVENT Event, uint64_t DelayMicroseconds,
+        HANDLE hEvent, uint32_t Flags) {
+        return inner_->ScheduleFrameEventX(Event, DelayMicroseconds, hEvent, Flags);
+    }
+    // Slot 80 (+0x280): WaitFrameEventX
+    virtual HRESULT STDMETHODCALLTYPE WaitFrameEventX(
+        D3D12XBOX_FRAME_EVENT Event, uint32_t TimeoutMilliseconds,
+        void* pReserved, uint32_t Flags, D3D12XBOX_FRAME_PIPELINE_TOKEN* pOutToken) {
+        return inner_->WaitFrameEventX(Event, TimeoutMilliseconds, pReserved, Flags, pOutToken);
+    }
+    // Slot 81 (+0x288): GetFrameStatisticsX
+    virtual HRESULT STDMETHODCALLTYPE GetFrameStatisticsX(
+        D3D12XBOX_FRAME_PIPELINE_TOKEN /*Token*/,
+        uint32_t MaxNumStatistics,
+        uint32_t* pNumStatistics,
+        void* pStatistics) {
+        if (pNumStatistics) {
+            *pNumStatistics = (pStatistics && MaxNumStatistics > 0u) ? 1u : 0u;
+        }
+        if (pStatistics && MaxNumStatistics > 0u) {
+            std::memset(pStatistics, 0, 64u);
+            LARGE_INTEGER qpc{};
+            ::QueryPerformanceCounter(&qpc);
+            auto* qwords = static_cast<uint64_t*>(pStatistics);
+            qwords[3] = static_cast<uint64_t>(qpc.QuadPart);  // +0x18 OriginTimestamp
+            qwords[4] = static_cast<uint64_t>(qpc.QuadPart);  // +0x20 PresentTimestamp
+        }
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailDevice::GetFrameStatisticsX",
+            openscarlett::CallOutcome::Ok, S_OK, 81);
+        return S_OK;
+    }
+    virtual HRESULT STDMETHODCALLTYPE Slot82() { return RecordUnimpl(82); }
+    // Retail Scarlett ID3D12Device1..7 (slots 83..106 = PC slots 44..67 shifted by +39)
+    // Slot 83 (+0x298): ID3D12Device1::CreatePipelineLibrary
+    virtual HRESULT STDMETHODCALLTYPE CreatePipelineLibrary(
+        const void* pLibraryBlob, SIZE_T BlobLength, REFIID riid, void** ppPipelineLibrary) {
+        return inner_->CreatePipelineLibrary(pLibraryBlob, BlobLength, riid, ppPipelineLibrary);
+    }
+    // Slot 84 (+0x2A0): ID3D12Device1::SetEventOnMultipleFenceCompletion
+    virtual HRESULT STDMETHODCALLTYPE SetEventOnMultipleFenceCompletion(
+        ID3D12Fence* const* ppFences, const UINT64* pFenceValues, UINT NumFences,
+        D3D12_MULTIPLE_FENCE_WAIT_FLAGS Flags, HANDLE hEvent) {
+        return inner_->SetEventOnMultipleFenceCompletion(ppFences, pFenceValues, NumFences, Flags, hEvent);
+    }
+    // Slot 85 (+0x2A8): ID3D12Device1::SetResidencyPriority
+    virtual HRESULT STDMETHODCALLTYPE SetResidencyPriority(
+        UINT NumObjects, ID3D12Pageable* const* ppObjects, const D3D12_RESIDENCY_PRIORITY* pPriorities) {
+        return inner_->SetResidencyPriority(NumObjects, ppObjects, pPriorities);
+    }
+    // Slot 86 (+0x2B0): ID3D12Device2::CreatePipelineState
+    virtual HRESULT STDMETHODCALLTYPE CreatePipelineState(
+        const D3D12_PIPELINE_STATE_STREAM_DESC* pDesc, REFIID riid, void** ppPipelineState) {
+        return inner_->CreatePipelineState(pDesc, riid, ppPipelineState);
+    }
+    // Slot 87 (+0x2B8): ID3D12Device3::OpenExistingHeapFromAddress
+    virtual HRESULT STDMETHODCALLTYPE OpenExistingHeapFromAddress(
+        const void* pAddress, REFIID riid, void** ppvHeap) {
+        return inner_->OpenExistingHeapFromAddress(pAddress, riid, ppvHeap);
+    }
+    // Slot 88 (+0x2C0): ID3D12Device3::OpenExistingHeapFromFileMapping
+    virtual HRESULT STDMETHODCALLTYPE OpenExistingHeapFromFileMapping(
+        HANDLE hFileMapping, REFIID riid, void** ppvHeap) {
+        return inner_->OpenExistingHeapFromFileMapping(hFileMapping, riid, ppvHeap);
+    }
+    // Slot 89 (+0x2C8): ID3D12Device3::EnqueueMakeResident
+    virtual HRESULT STDMETHODCALLTYPE EnqueueMakeResident(
+        D3D12_RESIDENCY_FLAGS Flags, UINT NumObjects, ID3D12Pageable* const* ppObjects,
+        ID3D12Fence* pFenceToSignal, UINT64 FenceValueToSignal) {
+        return inner_->EnqueueMakeResident(Flags, NumObjects, ppObjects, pFenceToSignal, FenceValueToSignal);
+    }
+    // Slot 90 (+0x2D0): ID3D12Device4::CreateCommandList1
+    virtual HRESULT STDMETHODCALLTYPE CreateCommandList1(
+        UINT nodeMask, D3D12_COMMAND_LIST_TYPE type, D3D12_COMMAND_LIST_FLAGS flags,
+        REFIID riid, void** ppCommandList) {
+        if (!ppCommandList) return E_POINTER;
+        *ppCommandList = nullptr;
+        ID3D12GraphicsCommandList* raw_cl = nullptr;
+        const HRESULT hr = inner_->CreateCommandList1(
+            nodeMask, type, flags, __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void**>(&raw_cl));
+        if (FAILED(hr) || !raw_cl) return hr;
+        auto* clx = openscarlett::d3d12_xs::CommandListX::TryFromCommandList(raw_cl);
+        if (clx &&
+            (IsEqualIID(riid, __uuidof(ID3D12GraphicsCommandList)) ||
+             IsEqualIID(riid, __uuidof(ID3D12CommandList)) ||
+             IsEqualIID(riid, __uuidof(IUnknown)))) {
+            auto* retail_cl = new (std::nothrow) ScarlettRetailCommandListProxy(clx);
+            raw_cl->Release();
+            if (!retail_cl) return E_OUTOFMEMORY;
+            *ppCommandList = static_cast<void*>(retail_cl);
+            return S_OK;
+        }
+        const HRESULT qhr = raw_cl->QueryInterface(riid, ppCommandList);
+        raw_cl->Release();
+        return qhr;
+    }
+    // Slot 91 (+0x2D8): ID3D12Device4::CreateProtectedResourceSession
+    virtual HRESULT STDMETHODCALLTYPE CreateProtectedResourceSession(
+        const D3D12_PROTECTED_RESOURCE_SESSION_DESC* pDesc, REFIID riid, void** ppSession) {
+        return inner_->CreateProtectedResourceSession(pDesc, riid, ppSession);
+    }
+    // Slot 92 (+0x2E0): ID3D12Device4::CreateCommittedResource1
+    virtual HRESULT STDMETHODCALLTYPE CreateCommittedResource1(
+        const D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS HeapFlags,
+        const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialResourceState,
+        const D3D12_CLEAR_VALUE* pOptimizedClearValue,
+        ID3D12ProtectedResourceSession* pProtectedSession,
+        REFIID riidResource, void** ppvResource) {
+        return inner_->CreateCommittedResource1(
+            pHeapProperties, HeapFlags, pDesc, InitialResourceState, pOptimizedClearValue,
+            pProtectedSession, riidResource, ppvResource);
+    }
+    // Slot 93 (+0x2E8): ID3D12Device4::CreateHeap1
+    virtual HRESULT STDMETHODCALLTYPE CreateHeap1(
+        const D3D12_HEAP_DESC* pDesc, ID3D12ProtectedResourceSession* pProtectedSession,
+        REFIID riid, void** ppvHeap) {
+        return inner_->CreateHeap1(pDesc, pProtectedSession, riid, ppvHeap);
+    }
+    // Slot 94 (+0x2F0): ID3D12Device4::CreateReservedResource1
+    virtual HRESULT STDMETHODCALLTYPE CreateReservedResource1(
+        const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialState,
+        const D3D12_CLEAR_VALUE* pOptimizedClearValue,
+        ID3D12ProtectedResourceSession* pProtectedSession,
+        REFIID riid, void** ppvResource) {
+        return inner_->CreateReservedResource1(
+            pDesc, InitialState, pOptimizedClearValue, pProtectedSession, riid, ppvResource);
+    }
+    // Slot 95 (+0x2F8): ID3D12Device4::GetResourceAllocationInfo1 (patched via Thunk_GetResourceAllocationInfo1)
+    virtual D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo1(
+        UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) {
+        return inner_->GetResourceAllocationInfo1(
+            visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1);
+    }
+    // Slot 96 (+0x300): ID3D12Device5::CreateLifetimeTracker
+    virtual HRESULT STDMETHODCALLTYPE CreateLifetimeTracker(
+        ID3D12LifetimeOwner* pOwner, REFIID riid, void** ppvTracker) {
+        return inner_->CreateLifetimeTracker(pOwner, riid, ppvTracker);
+    }
+    // Slot 97 (+0x308): ID3D12Device5::RemoveDevice
+    virtual void STDMETHODCALLTYPE RemoveDevice() { inner_->RemoveDevice(); }
+    // Slot 98 (+0x310): ID3D12Device5::EnumerateMetaCommands
+    virtual HRESULT STDMETHODCALLTYPE EnumerateMetaCommands(
+        UINT* pNumMetaCommands, D3D12_META_COMMAND_DESC* pDescs) {
+        return inner_->EnumerateMetaCommands(pNumMetaCommands, pDescs);
+    }
+    // Slot 99 (+0x318): ID3D12Device5::EnumerateMetaCommandParameters
+    virtual HRESULT STDMETHODCALLTYPE EnumerateMetaCommandParameters(
+        REFGUID CommandId, D3D12_META_COMMAND_PARAMETER_STAGE Stage,
+        UINT* pTotalStructureSizeInBytes, UINT* pParameterCount,
+        D3D12_META_COMMAND_PARAMETER_DESC* pParameterDescs) {
+        return inner_->EnumerateMetaCommandParameters(
+            CommandId, Stage, pTotalStructureSizeInBytes, pParameterCount, pParameterDescs);
+    }
+    // Slot 100 (+0x320): ID3D12Device5::CreateMetaCommand
+    virtual HRESULT STDMETHODCALLTYPE CreateMetaCommand(
+        REFGUID CommandId, UINT NodeMask, const void* pCreationParametersData,
+        SIZE_T CreationParametersDataSizeInBytes, REFIID riid, void** ppMetaCommand) {
+        return inner_->CreateMetaCommand(
+            CommandId, NodeMask, pCreationParametersData, CreationParametersDataSizeInBytes, riid, ppMetaCommand);
+    }
+    // Slot 101 (+0x328): ID3D12Device5::CreateStateObject
+    virtual HRESULT STDMETHODCALLTYPE CreateStateObject(
+        const D3D12_STATE_OBJECT_DESC* pDesc, REFIID riid, void** ppStateObject) {
+        return inner_->CreateStateObject(pDesc, riid, ppStateObject);
+    }
+    // Slot 102 (+0x330): ID3D12Device5::GetRaytracingAccelerationStructurePrebuildInfo
+    virtual void STDMETHODCALLTYPE GetRaytracingAccelerationStructurePrebuildInfo(
+        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* pDesc,
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* pInfo) {
+        inner_->GetRaytracingAccelerationStructurePrebuildInfo(pDesc, pInfo);
+    }
+    // Slot 103 (+0x338): ID3D12Device5::CheckDriverMatchingIdentifier
+    virtual D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE CheckDriverMatchingIdentifier(
+        D3D12_SERIALIZED_DATA_TYPE SerializedDataType,
+        const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER* pIdentifierToCheck) {
+        return inner_->CheckDriverMatchingIdentifier(SerializedDataType, pIdentifierToCheck);
+    }
+    // Slot 104 (+0x340): ID3D12Device6::SetBackgroundProcessingMode
+    virtual HRESULT STDMETHODCALLTYPE SetBackgroundProcessingMode(
+        D3D12_BACKGROUND_PROCESSING_MODE Mode,
+        D3D12_MEASUREMENTS_ACTION MeasurementsAction,
+        HANDLE hEventToSignalUponCompletion,
+        BOOL* pbFurtherMeasurementsDesired) {
+        return inner_->SetBackgroundProcessingMode(
+            Mode, MeasurementsAction, hEventToSignalUponCompletion, pbFurtherMeasurementsDesired);
+    }
+    // Slot 105 (+0x348): ID3D12Device7::AddToStateObject
+    virtual HRESULT STDMETHODCALLTYPE AddToStateObject(
+        const D3D12_STATE_OBJECT_DESC* pAddition, ID3D12StateObject* pStateObjectToGrowFrom,
+        REFIID riid, void** ppNewStateObject) {
+        return inner_->AddToStateObject(pAddition, pStateObjectToGrowFrom, riid, ppNewStateObject);
+    }
+    // Slot 106 (+0x350): ID3D12Device7::CreateProtectedResourceSession1
+    virtual HRESULT STDMETHODCALLTYPE CreateProtectedResourceSession1(
+        const D3D12_PROTECTED_RESOURCE_SESSION_DESC1* pDesc, REFIID riid, void** ppSession) {
+        return inner_->CreateProtectedResourceSession1(pDesc, riid, ppSession);
+    }
+    virtual HRESULT STDMETHODCALLTYPE Slot107() { return RecordUnimpl(107); }
+    virtual HRESULT STDMETHODCALLTYPE Slot108() { return RecordUnimpl(108); }
+    virtual HRESULT STDMETHODCALLTYPE Slot109() { return RecordUnimpl(109); }
+    virtual HRESULT STDMETHODCALLTYPE Slot110() { return RecordUnimpl(110); }
+    virtual HRESULT STDMETHODCALLTYPE Slot111() { return RecordUnimpl(111); }
+    virtual HRESULT STDMETHODCALLTYPE Slot112() { return RecordUnimpl(112); }
+    virtual HRESULT STDMETHODCALLTYPE Slot113() { return RecordUnimpl(113); }
+    virtual HRESULT STDMETHODCALLTYPE Slot114() { return RecordUnimpl(114); }
+    // Slot 115 (+0x398): Xbox ID3D12Device8::DeserializeStateObjectX
+    virtual HRESULT STDMETHODCALLTYPE DeserializeStateObjectX(
+        const void* pBlob, SIZE_T blobSize, ID3D12RootSignature* pRootSignature,
+        UINT flags, REFIID riid, void** ppStateObject) {
+        return inner_->DeserializeStateObjectX(pBlob, blobSize, pRootSignature, flags, riid, ppStateObject);
+    }
+    virtual HRESULT STDMETHODCALLTYPE Slot116() { return RecordUnimpl(116); }
+    virtual HRESULT STDMETHODCALLTYPE Slot117() { return RecordUnimpl(117); }
+    virtual HRESULT STDMETHODCALLTYPE Slot118() { return RecordUnimpl(118); }
+    virtual HRESULT STDMETHODCALLTYPE Slot119() { return RecordUnimpl(119); }
+    virtual HRESULT STDMETHODCALLTYPE Slot120() { return RecordUnimpl(120); }
+    virtual HRESULT STDMETHODCALLTYPE Slot121() { return RecordUnimpl(121); }
+    virtual HRESULT STDMETHODCALLTYPE Slot122() { return RecordUnimpl(122); }
+    virtual HRESULT STDMETHODCALLTYPE Slot123() { return RecordUnimpl(123); }
+    virtual HRESULT STDMETHODCALLTYPE Slot124() { return RecordUnimpl(124); }
+    virtual HRESULT STDMETHODCALLTYPE Slot125() { return RecordUnimpl(125); }
+    virtual HRESULT STDMETHODCALLTYPE Slot126() { return RecordUnimpl(126); }
+    virtual HRESULT STDMETHODCALLTYPE Slot127() { return RecordUnimpl(127); }
+
+private:
+    static inline void* const* s_patched_vtbl_ptr_ = nullptr;
+    std::atomic<ULONG> ref_count_{1u};
+    openscarlett::d3d12_xs::DeviceX* inner_ = nullptr;
+};
+
 HRESULT CreateWrappedDeviceInternal(
     IUnknown* pAdapter,
     D3D_FEATURE_LEVEL min_level,
@@ -550,7 +1822,8 @@ HRESULT CreateWrappedDeviceInternal(
     bool enable_debug_layer,
     HWND default_hwnd,
     REFIID riid,
-    void** ppDevice) {
+    void** ppDevice,
+    bool retail_scarlett_vtable = false) {
     // Opt-in D3D12 Agility SDK discovery (graceful fallback to inbox d3d12.dll when absent).
     TryConfigureAgilitySdkOnce();
 
@@ -570,7 +1843,7 @@ HRESULT CreateWrappedDeviceInternal(
     IDXGIAdapter1* adapter1 = nullptr;
     openscarlett::D3D12AdapterInfo info{};
 
-    if (pAdapter) {
+    if (pAdapter && !retail_scarlett_vtable) {
         HRESULT hr = host_create(pAdapter, min_level, IID_PPV_ARGS(&host_dev));
         if (FAILED(hr) || !host_dev) {
             return hr;
@@ -591,11 +1864,35 @@ HRESULT CreateWrappedDeviceInternal(
             return DXGI_ERROR_UNSUPPORTED;
         }
     }
+    if (retail_scarlett_vtable) {
+        std::fprintf(stderr, "[OpenScarlett][d3d12_xs] Retail device created on '%s' (VRAM=%lluMB, FL=0x%X, SM=0x%X, RT=%u, Mesh=%u, pAdapter=%p)\n",
+            info.description.c_str(),
+            static_cast<unsigned long long>(info.dedicated_video_memory_mb),
+            info.feature_level, info.highest_shader_model,
+            info.raytracing_tier, info.mesh_shader_tier, static_cast<void*>(pAdapter));
+        std::fflush(stderr);
+    }
 
     auto* dev_x = new (std::nothrow) openscarlett::d3d12_xs::DeviceX(host_dev, info, default_hwnd);
     host_dev->Release();
     if (!dev_x) {
         return E_OUTOFMEMORY;
+    }
+
+    if (retail_scarlett_vtable) {
+        dev_x->SetRetailScarlettAbi(true);
+    }
+    if (retail_scarlett_vtable &&
+        (IsEqualIID(riid, __uuidof(ID3D12Device)) || IsEqualIID(riid, __uuidof(IUnknown)))) {
+        auto* retail = new (std::nothrow) ScarlettRetailDeviceProxy(dev_x);
+        if (!retail) {
+            dev_x->Release();
+            return E_OUTOFMEMORY;
+        }
+        StoreActiveDevice(dev_x);
+        dev_x->Release();
+        *ppDevice = static_cast<ID3D12Device*>(retail);
+        return S_OK;
     }
 
     const HRESULT hr = dev_x->QueryInterface(riid, ppDevice);
@@ -682,7 +1979,10 @@ OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxCreateDevice(
     const bool global_warp =
         (g_prefer_warp.load(std::memory_order_acquire) != 0) || EnvPrefersWarp();
     const bool debug_layer =
+        EnvEnablesD3D12Debug() ||
         (pParameters && (pParameters->ProcessDebugFlags & D3D12XBOX_PROCESS_DEBUG_FLAG_DEBUG) != 0);
+
+    const bool retail_scarlett = (pParameters && pParameters->Version >= 0x00020000u);
 
     const HRESULT hr = CreateWrappedDeviceInternal(
         pAdapter,
@@ -691,7 +1991,8 @@ OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxCreateDevice(
         debug_layer,
         nullptr,
         riid,
-        ppDevice);
+        ppDevice,
+        retail_scarlett);
     RecordExport("D3D12XboxCreateDevice", hr);
     return hr;
 }
@@ -703,7 +2004,32 @@ HRESULT WINAPI OS_D3D12SerializeRootSignature(
     ID3DBlob** ppErrorBlob) {
     auto fn = reinterpret_cast<PfnD3D12SerializeRootSignature>(
         openscarlett::ResolveHostD3D12Proc("D3D12SerializeRootSignature"));
-    const HRESULT hr = fn ? fn(pRootSignature, Version, ppBlob, ppErrorBlob) : E_FAIL;
+    if (!fn) {
+        RecordExport("D3D12SerializeRootSignature", E_FAIL);
+        return E_FAIL;
+    }
+    HRESULT hr = fn(pRootSignature, Version, ppBlob, ppErrorBlob);
+    if (FAILED(hr) && pRootSignature != nullptr &&
+        (static_cast<UINT>(pRootSignature->Flags) & ~0x00FFu) != 0u) {
+        static constexpr UINT kMasks[] = {0x0FFFu, 0x03FFu, 0x00FFu};
+        for (UINT mask : kMasks) {
+            D3D12_ROOT_SIGNATURE_DESC safe = *pRootSignature;
+            safe.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(
+                static_cast<UINT>(safe.Flags) & mask);
+            if (ppErrorBlob && *ppErrorBlob) {
+                (*ppErrorBlob)->Release();
+                *ppErrorBlob = nullptr;
+            }
+            if (ppBlob && *ppBlob) {
+                (*ppBlob)->Release();
+                *ppBlob = nullptr;
+            }
+            hr = fn(&safe, Version, ppBlob, ppErrorBlob);
+            if (SUCCEEDED(hr)) {
+                break;
+            }
+        }
+    }
     RecordExport("D3D12SerializeRootSignature", hr);
     return hr;
 }
@@ -714,7 +2040,38 @@ HRESULT WINAPI OS_D3D12SerializeVersionedRootSignature(
     ID3DBlob** ppErrorBlob) {
     auto fn = reinterpret_cast<PfnD3D12SerializeVersionedRootSignature>(
         openscarlett::ResolveHostD3D12Proc("D3D12SerializeVersionedRootSignature"));
-    const HRESULT hr = fn ? fn(pRootSignature, ppBlob, ppErrorBlob) : E_FAIL;
+    if (!fn) {
+        RecordExport("D3D12SerializeVersionedRootSignature", E_FAIL);
+        return E_FAIL;
+    }
+    HRESULT hr = fn(pRootSignature, ppBlob, ppErrorBlob);
+    if (FAILED(hr) && pRootSignature != nullptr) {
+        static constexpr UINT kMasks[] = {0x0FFFu, 0x03FFu, 0x00FFu};
+        for (UINT mask : kMasks) {
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC safe = *pRootSignature;
+            if (safe.Version == D3D_ROOT_SIGNATURE_VERSION_1_0) {
+                safe.Desc_1_0.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(
+                    static_cast<UINT>(safe.Desc_1_0.Flags) & mask);
+            } else if (safe.Version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
+                safe.Desc_1_1.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(
+                    static_cast<UINT>(safe.Desc_1_1.Flags) & mask);
+            } else {
+                break;
+            }
+            if (ppErrorBlob && *ppErrorBlob) {
+                (*ppErrorBlob)->Release();
+                *ppErrorBlob = nullptr;
+            }
+            if (ppBlob && *ppBlob) {
+                (*ppBlob)->Release();
+                *ppBlob = nullptr;
+            }
+            hr = fn(&safe, ppBlob, ppErrorBlob);
+            if (SUCCEEDED(hr)) {
+                break;
+            }
+        }
+    }
     RecordExport("D3D12SerializeVersionedRootSignature", hr);
     return hr;
 }
@@ -1471,6 +2828,14 @@ OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxReportError(
     OutputDebugStringA(diag);
 
     RecordExport("D3D12XboxReportError", S_OK);
+    return S_OK;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxSetProcessDebugFlags(
+    D3D12XBOX_PROCESS_DEBUG_FLAGS Flags) {
+    static std::atomic<uint32_t> s_process_debug_flags{D3D12XBOX_PROCESS_DEBUG_FLAG_NONE};
+    s_process_debug_flags.store(static_cast<uint32_t>(Flags), std::memory_order_release);
+    RecordExport("D3D12XboxSetProcessDebugFlags", S_OK);
     return S_OK;
 }
 

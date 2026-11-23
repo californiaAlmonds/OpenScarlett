@@ -16,6 +16,9 @@ EXPORTS
     XMemGetAllocationAttributes = XMemShim_XMemGetAllocationAttributes
     XMemMapPhysicalPages = XMemShim_XMemMapPhysicalPages
     XMemUnmapPhysicalPages = XMemShim_XMemUnmapPhysicalPages
+    XMemAllocatePhysicalPages = XMemShim_XMemAllocatePhysicalPages
+    XMemFreePhysicalPages = XMemShim_XMemFreePhysicalPages
+    XMemVirtualAlloc = XMemShim_XMemVirtualAlloc
     XMemGetWorkingSetStatistics = XMemShim_XMemGetWorkingSetStatistics
     XMemTransferMemory = XMemShim_XMemTransferMemory
     XMemGetTelemetryCallCountForTest = XMemShim_GetTelemetryCallCountForTest

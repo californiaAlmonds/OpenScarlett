@@ -348,6 +348,7 @@ CommandListX::CommandListX(DeviceX* parent_device, ID3D12GraphicsCommandList* ho
 
 CommandListX::~CommandListX() {
     ReleaseTiledTransientResources();
+    ReleaseAllAlignTransientResources();
     {
         auto& reg = GetCommandListRegistry();
         std::unique_lock<std::shared_mutex> lock(reg.mutex);
@@ -580,6 +581,33 @@ D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE CommandListX::GetType() {
 // ID3D12GraphicsCommandList (slots 9..59)
 HRESULT STDMETHODCALLTYPE CommandListX::Close() {
     const HRESULT hr = host_list_->Close();
+    if (FAILED(hr) && device_x_ && device_x_->IsRetailScarlettAbi() && device_x_->HostDevice()) {
+        std::fprintf(stderr, "[OpenScarlett][d3d12_xs] CommandListX::Close FAILED hr=0x%08lX type=%d\n",
+                     static_cast<unsigned long>(hr), static_cast<int>(list_type_));
+        ID3D12InfoQueue* iq = nullptr;
+        if (SUCCEEDED(device_x_->HostDevice()->QueryInterface(IID_PPV_ARGS(&iq))) && iq) {
+            const UINT64 n = iq->GetNumStoredMessages();
+            std::fprintf(stderr, "[OpenScarlett][d3d12_xs] InfoQueue messages=%llu\n",
+                         static_cast<unsigned long long>(n));
+            const UINT64 start = (n > 25ull) ? (n - 25ull) : 0ull;
+            for (UINT64 i = start; i < n; ++i) {
+                SIZE_T len = 0;
+                iq->GetMessage(i, nullptr, &len);
+                if (len > 0) {
+                    std::vector<uint8_t> buf(len);
+                    auto* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+                    if (SUCCEEDED(iq->GetMessage(i, msg, &len)) && msg->pDescription) {
+                        std::fprintf(stderr, "  [D3D12 sev=%d id=%d] %s\n",
+                                     static_cast<int>(msg->Severity),
+                                     static_cast<int>(msg->ID),
+                                     msg->pDescription);
+                    }
+                }
+            }
+            iq->Release();
+        }
+        std::fflush(stderr);
+    }
     RecordList("ID3D12GraphicsCommandListX::Close", 9, hr);
     return hr;
 }
@@ -587,6 +615,7 @@ HRESULT STDMETHODCALLTYPE CommandListX::Close() {
 HRESULT STDMETHODCALLTYPE CommandListX::Reset(
     ID3D12CommandAllocator* pAllocator, ID3D12PipelineState* pInitialState) {
     ReleaseTiledTransientResources();
+    RotateAlignTransientRing();
     depth_bias_.store(0.0f, std::memory_order_relaxed);
     depth_bias_clamp_.store(0.0f, std::memory_order_relaxed);
     slope_scaled_depth_bias_.store(0.0f, std::memory_order_relaxed);
@@ -804,6 +833,49 @@ void STDMETHODCALLTYPE CommandListX::CopyBufferRegion(
         vk_batch_.ops.push_back(std::move(op));
         vk_batch_.has_host_commands = true;
     }
+    if (NumBytes == 0ull || !host_dst || !host_src) {
+        RecordList("ID3D12GraphicsCommandListX::CopyBufferRegion", 15, S_OK);
+        return;
+    }
+    if (host_dst == host_src) {
+        if (DstOffset == SrcOffset) {
+            // No-op self-copy: Desktop D3D12 rejects overlapping CopyBufferRegion (error #550).
+            RecordList("ID3D12GraphicsCommandListX::CopyBufferRegion", 15, S_OK);
+            return;
+        }
+        const bool overlaps = (DstOffset < SrcOffset + NumBytes) && (SrcOffset < DstOffset + NumBytes);
+        if (overlaps && device_x_ && device_x_->HostDevice()) {
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC bd{};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = AlignUpPlaced64(NumBytes, 256ull);
+            bd.Height = 1u;
+            bd.DepthOrArraySize = 1u;
+            bd.MipLevels = 1u;
+            bd.Format = DXGI_FORMAT_UNKNOWN;
+            bd.SampleDesc.Count = 1u;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            ID3D12Resource* staging = nullptr;
+            if (SUCCEEDED(device_x_->HostDevice()->CreateCommittedResource(
+                    &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                    nullptr, IID_PPV_ARGS(&staging))) &&
+                staging) {
+                host_list_->CopyBufferRegion(staging, 0ull, host_src, SrcOffset, NumBytes);
+                D3D12_RESOURCE_BARRIER b{};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = staging;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                host_list_->ResourceBarrier(1u, &b);
+                host_list_->CopyBufferRegion(host_dst, DstOffset, staging, 0ull, NumBytes);
+                TrackAlignTransientResource(staging);
+                RecordList("ID3D12GraphicsCommandListX::CopyBufferRegion", 15, S_OK);
+                return;
+            }
+        }
+    }
     host_list_->CopyBufferRegion(host_dst, DstOffset, host_src, SrcOffset, NumBytes);
     RecordList("ID3D12GraphicsCommandListX::CopyBufferRegion", 15, S_OK);
 }
@@ -856,6 +928,122 @@ void STDMETHODCALLTYPE CommandListX::CopyTextureRegion(
                 if (last_host_compute_rs_) host_list_->SetComputeRootSignature(last_host_compute_rs_);
                 if (last_host_pso_) host_list_->SetPipelineState(last_host_pso_);
                 RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion[XgGpuUntile]", 16, S_OK);
+                RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion", 16, S_OK);
+                return;
+            }
+        }
+    }
+
+    // Xbox Series X D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT is 256 bytes, whereas desktop Windows
+    // D3D12 strictly requires 512-byte alignment for PLACED_FOOTPRINT.Offset (error #864).
+    // Re-align via a 512-byte-aligned transient DEFAULT staging buffer + CopyBufferRegion.
+    auto is_bc_format = [](DXGI_FORMAT fmt) noexcept -> bool {
+        switch (fmt) {
+            case DXGI_FORMAT_BC1_TYPELESS: case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB:
+            case DXGI_FORMAT_BC2_TYPELESS: case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_UNORM_SRGB:
+            case DXGI_FORMAT_BC3_TYPELESS: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB:
+            case DXGI_FORMAT_BC4_TYPELESS: case DXGI_FORMAT_BC4_UNORM: case DXGI_FORMAT_BC4_SNORM:
+            case DXGI_FORMAT_BC5_TYPELESS: case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC5_SNORM:
+            case DXGI_FORMAT_BC6H_TYPELESS: case DXGI_FORMAT_BC6H_UF16: case DXGI_FORMAT_BC6H_SF16:
+            case DXGI_FORMAT_BC7_TYPELESS: case DXGI_FORMAT_BC7_UNORM: case DXGI_FORMAT_BC7_UNORM_SRGB:
+                return true;
+            default:
+                return false;
+        }
+    };
+    auto compute_footprint_bytes = [&](const D3D12_SUBRESOURCE_FOOTPRINT& fp) noexcept -> uint64_t {
+        const uint64_t bh = is_bc_format(fp.Format) ? 4ull : 1ull;
+        const uint64_t rows = (std::max<uint64_t>(fp.Height, 1ull) + bh - 1ull) / bh;
+        const uint64_t depth = std::max<uint64_t>(fp.Depth, 1ull);
+        return static_cast<uint64_t>(fp.RowPitch) * rows * depth;
+    };
+
+    if (device_x_ && device_x_->HostDevice() && src_ptr &&
+        src_ptr->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT &&
+        src_loc.pResource != nullptr &&
+        (src_loc.PlacedFootprint.Offset % 512ull) != 0ull) {
+        const uint64_t fp_bytes = compute_footprint_bytes(src_loc.PlacedFootprint.Footprint);
+        const D3D12_RESOURCE_DESC src_desc = src_loc.pResource->GetDesc();
+        const uint64_t avail = (src_loc.PlacedFootprint.Offset < src_desc.Width)
+                                   ? (src_desc.Width - src_loc.PlacedFootprint.Offset)
+                                   : 0ull;
+        const uint64_t copy_bytes = std::min<uint64_t>(fp_bytes, avail);
+        const uint64_t staging_bytes = AlignUpPlaced64(std::max<uint64_t>(fp_bytes, 512ull), 512ull);
+        if (copy_bytes > 0ull) {
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC bd{};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = staging_bytes;
+            bd.Height = 1u;
+            bd.DepthOrArraySize = 1u;
+            bd.MipLevels = 1u;
+            bd.Format = DXGI_FORMAT_UNKNOWN;
+            bd.SampleDesc.Count = 1u;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            ID3D12Resource* staging = nullptr;
+            if (SUCCEEDED(device_x_->HostDevice()->CreateCommittedResource(
+                    &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                    nullptr, IID_PPV_ARGS(&staging))) &&
+                staging) {
+                host_list_->CopyBufferRegion(
+                    staging, 0ull, src_loc.pResource, src_loc.PlacedFootprint.Offset, copy_bytes);
+                D3D12_RESOURCE_BARRIER b{};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = staging;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                host_list_->ResourceBarrier(1u, &b);
+                src_loc.pResource = staging;
+                src_loc.PlacedFootprint.Offset = 0ull;
+                TrackAlignTransientResource(staging);
+            }
+        }
+    }
+
+    if (device_x_ && device_x_->HostDevice() && dst_ptr &&
+        dst_ptr->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT &&
+        dst_loc.pResource != nullptr &&
+        (dst_loc.PlacedFootprint.Offset % 512ull) != 0ull) {
+        const uint64_t fp_bytes = compute_footprint_bytes(dst_loc.PlacedFootprint.Footprint);
+        const D3D12_RESOURCE_DESC dst_desc = dst_loc.pResource->GetDesc();
+        const uint64_t avail = (dst_loc.PlacedFootprint.Offset < dst_desc.Width)
+                                   ? (dst_desc.Width - dst_loc.PlacedFootprint.Offset)
+                                   : 0ull;
+        const uint64_t copy_bytes = std::min<uint64_t>(fp_bytes, avail);
+        const uint64_t staging_bytes = AlignUpPlaced64(std::max<uint64_t>(fp_bytes, 512ull), 512ull);
+        if (copy_bytes > 0ull) {
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC bd{};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = staging_bytes;
+            bd.Height = 1u;
+            bd.DepthOrArraySize = 1u;
+            bd.MipLevels = 1u;
+            bd.Format = DXGI_FORMAT_UNKNOWN;
+            bd.SampleDesc.Count = 1u;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            ID3D12Resource* staging = nullptr;
+            if (SUCCEEDED(device_x_->HostDevice()->CreateCommittedResource(
+                    &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                    nullptr, IID_PPV_ARGS(&staging))) &&
+                staging) {
+                D3D12_TEXTURE_COPY_LOCATION aligned_dst = dst_loc;
+                aligned_dst.pResource = staging;
+                aligned_dst.PlacedFootprint.Offset = 0ull;
+                host_list_->CopyTextureRegion(&aligned_dst, DstX, DstY, DstZ, src_ptr, pSrcBox);
+                D3D12_RESOURCE_BARRIER b{};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = staging;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                host_list_->ResourceBarrier(1u, &b);
+                host_list_->CopyBufferRegion(
+                    dst_loc.pResource, dst_loc.PlacedFootprint.Offset, staging, 0ull, copy_bytes);
+                TrackAlignTransientResource(staging);
                 RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion", 16, S_OK);
                 return;
             }
@@ -1038,6 +1226,25 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
                         emit = false;
                         break;
                     }
+                    if (device_x_ && device_x_->IsRetailScarlettAbi() &&
+                        device_x_->AdapterInfo().raytracing_tier == 0u) {
+                        constexpr UINT kRtAsBit =
+                            static_cast<UINT>(D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+                        if ((static_cast<UINT>(b.Transition.StateBefore) & kRtAsBit) != 0u) {
+                            UINT sb = static_cast<UINT>(b.Transition.StateBefore) & ~kRtAsBit;
+                            if (sb == 0u) sb = static_cast<UINT>(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                            b.Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(sb);
+                        }
+                        if ((static_cast<UINT>(b.Transition.StateAfter) & kRtAsBit) != 0u) {
+                            UINT sa = static_cast<UINT>(b.Transition.StateAfter) & ~kRtAsBit;
+                            if (sa == 0u) sa = static_cast<UINT>(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                            b.Transition.StateAfter = static_cast<D3D12_RESOURCE_STATES>(sa);
+                        }
+                        if (b.Transition.StateBefore == b.Transition.StateAfter) {
+                            emit = false;
+                            break;
+                        }
+                    }
                     // Desktop D3D12 forbids buffer-only state bits on texture resources
                     // (Xbox titles sometimes pass GENERIC_READ or VB/IB bits on textures).
                     const D3D12_RESOURCE_DESC rdesc = b.Transition.pResource->GetDesc();
@@ -1056,6 +1263,11 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
                             break;
                         }
                     }
+                }
+                if (b.Transition.pResource == nullptr ||
+                    b.Transition.StateBefore == b.Transition.StateAfter) {
+                    emit = false;
+                    break;
                 }
                 if (device_x_ && b.Transition.pResource != nullptr) {
                     SamplerFeedbackMapInfo sf_info{};
@@ -2319,7 +2531,8 @@ void STDMETHODCALLTYPE CommandListX::BuildRaytracingAccelerationStructure(
     const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* pDesc,
     UINT NumPostbuildInfoDescs,
     const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* pPostbuildInfoDescs) {
-    if (host_list4_) {
+    const bool has_hw_rt = !device_x_ || device_x_->AdapterInfo().raytracing_tier > 0u;
+    if (host_list4_ && has_hw_rt) {
         host_list4_->BuildRaytracingAccelerationStructure(
             pDesc, NumPostbuildInfoDescs, pPostbuildInfoDescs);
     }
@@ -2331,7 +2544,8 @@ void STDMETHODCALLTYPE CommandListX::EmitRaytracingAccelerationStructurePostbuil
     const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* pDesc,
     UINT NumSourceAccelerationStructures,
     const D3D12_GPU_VIRTUAL_ADDRESS* pSourceAccelerationStructureData) {
-    if (host_list4_) {
+    const bool has_hw_rt = !device_x_ || device_x_->AdapterInfo().raytracing_tier > 0u;
+    if (host_list4_ && has_hw_rt) {
         host_list4_->EmitRaytracingAccelerationStructurePostbuildInfo(
             pDesc, NumSourceAccelerationStructures, pSourceAccelerationStructureData);
     }
@@ -2343,7 +2557,8 @@ void STDMETHODCALLTYPE CommandListX::CopyRaytracingAccelerationStructure(
     D3D12_GPU_VIRTUAL_ADDRESS DestAccelerationStructureData,
     D3D12_GPU_VIRTUAL_ADDRESS SourceAccelerationStructureData,
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE Mode) {
-    if (host_list4_) {
+    const bool has_hw_rt = !device_x_ || device_x_->AdapterInfo().raytracing_tier > 0u;
+    if (host_list4_ && has_hw_rt) {
         host_list4_->CopyRaytracingAccelerationStructure(
             DestAccelerationStructureData, SourceAccelerationStructureData, Mode);
     }
@@ -2354,7 +2569,8 @@ void STDMETHODCALLTYPE CommandListX::CopyRaytracingAccelerationStructure(
 void STDMETHODCALLTYPE CommandListX::SetPipelineState1(ID3D12StateObject* pStateObject) {
     ID3D12StateObject* host_so = UnwrapStateObject(pStateObject);
     const bool is_sw_proxy = (pStateObject != nullptr && host_so == nullptr);
-    if (host_list4_ && !is_sw_proxy) {
+    const bool has_hw_rt = !device_x_ || device_x_->AdapterInfo().raytracing_tier > 0u;
+    if (host_list4_ && !is_sw_proxy && has_hw_rt) {
         host_list4_->SetPipelineState1(host_so);
     }
     RecordList("ID3D12GraphicsCommandListX::SetPipelineState1",
@@ -2362,7 +2578,8 @@ void STDMETHODCALLTYPE CommandListX::SetPipelineState1(ID3D12StateObject* pState
 }
 
 void STDMETHODCALLTYPE CommandListX::DispatchRays(const D3D12_DISPATCH_RAYS_DESC* pDesc) {
-    if (host_list4_) host_list4_->DispatchRays(pDesc);
+    const bool has_hw_rt = !device_x_ || device_x_->AdapterInfo().raytracing_tier > 0u;
+    if (host_list4_ && has_hw_rt) host_list4_->DispatchRays(pDesc);
     RecordList("ID3D12GraphicsCommandListX::DispatchRays",
                76, host_list4_ ? S_OK : E_NOINTERFACE);
 }
@@ -2680,6 +2897,31 @@ void CommandListX::ReleaseTiledTransientResources() {
         if (r) r->Release();
     }
     tiled_transient_resources_.clear();
+}
+
+void CommandListX::TrackAlignTransientResource(ID3D12Resource* res) {
+    if (!res) return;
+    std::lock_guard<std::mutex> lock(tiled_transient_mutex_);
+    align_transient_ring_[align_transient_slot_].push_back(res);
+}
+
+void CommandListX::RotateAlignTransientRing() {
+    std::lock_guard<std::mutex> lock(tiled_transient_mutex_);
+    align_transient_slot_ = (align_transient_slot_ + 1u) % 6u;
+    for (ID3D12Resource* r : align_transient_ring_[align_transient_slot_]) {
+        if (r) r->Release();
+    }
+    align_transient_ring_[align_transient_slot_].clear();
+}
+
+void CommandListX::ReleaseAllAlignTransientResources() {
+    std::lock_guard<std::mutex> lock(tiled_transient_mutex_);
+    for (auto& slot : align_transient_ring_) {
+        for (ID3D12Resource* r : slot) {
+            if (r) r->Release();
+        }
+        slot.clear();
+    }
 }
 
 HRESULT STDMETHODCALLTYPE CommandListX::RegisterPlacedTiledTexture(

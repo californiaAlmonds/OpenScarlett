@@ -399,6 +399,7 @@ using PfnMFCreateMediaBufferWrapper = HRESULT(STDAPICALLTYPE*)(void*, DWORD, DWO
 using PfnMFCreateTempFile = HRESULT(STDAPICALLTYPE*)(uint32_t, uint32_t, uint32_t, void**);
 using PfnMFCreateFile = HRESULT(STDAPICALLTYPE*)(uint32_t, uint32_t, uint32_t, LPCWSTR, void**);
 using PfnMFCreateMFByteStreamOnStream = HRESULT(STDAPICALLTYPE*)(void*, void**);
+using PfnMFllMulDiv = int64_t(STDAPICALLTYPE*)(int64_t, int64_t, int64_t, int64_t);
 using PfnMFTEnumEx = HRESULT(STDAPICALLTYPE*)(
     GUID,
     UINT32,
@@ -460,6 +461,7 @@ struct HostMfPlat {
     PfnMFCreateTempFile mf_create_temp_file = nullptr;
     PfnMFCreateFile mf_create_file = nullptr;
     PfnMFCreateMFByteStreamOnStream mf_create_bytestream_on_stream = nullptr;
+    PfnMFllMulDiv mf_ll_mul_div = nullptr;
     PfnMFTEnumEx mft_enum_ex = nullptr;
 
     std::atomic<uint32_t> fallback_token_gen{0x5CA01000u};
@@ -553,6 +555,7 @@ struct HostMfPlat {
         mf_create_temp_file = reinterpret_cast<PfnMFCreateTempFile>(load("MFCreateTempFile"));
         mf_create_file = reinterpret_cast<PfnMFCreateFile>(load("MFCreateFile"));
         mf_create_bytestream_on_stream = reinterpret_cast<PfnMFCreateMFByteStreamOnStream>(load("MFCreateMFByteStreamOnStream"));
+        mf_ll_mul_div = reinterpret_cast<PfnMFllMulDiv>(load("MFllMulDiv"));
         mft_enum_ex = reinterpret_cast<PfnMFTEnumEx>(load("MFTEnumEx"));
     }
 };
@@ -3631,6 +3634,29 @@ OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCreateMFByteStreamOnStream(
     (void)pStream;
 #endif
     return RecordHr("MFCreateMFByteStreamOnStream", kHrNotImpl);
+}
+
+OS_MFPLAT_API int64_t OS_MFPLAT_CALL MFllMulDiv(
+    int64_t a,
+    int64_t b,
+    int64_t c,
+    int64_t d) {
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_ll_mul_div) {
+        const int64_t res = host.mf_ll_mul_div(a, b, c, d);
+        RecordOk("MFllMulDiv");
+        return res;
+    }
+#endif
+    RecordOk("MFllMulDiv");
+    if (c == 0) {
+        return (a >= 0) ? INT64_MAX : INT64_MIN;
+    }
+    const long double num = static_cast<long double>(a) * static_cast<long double>(b) +
+                            static_cast<long double>(d);
+    return static_cast<int64_t>(num / static_cast<long double>(c));
 }
 
 OS_MFPLAT_API int32_t OS_MFPLAT_CALL OpenScarlettMfPlatGetTelemetryCount(

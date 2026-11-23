@@ -447,19 +447,27 @@ public:
 
     void OPENSCARLETT_XAUDIO2_CALL DestroyVoice() override;
 
-    int32_t SetEffectChain(const void* pEffectChain) {
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetEffectChain(const void* pEffectChain) override {
         std::lock_guard<std::mutex> lk(mutex_);
         return ReplaceEffectSlots(effect_chain_, pEffectChain);
     }
 
-    int32_t EnableEffect(uint32_t index, bool enable) {
+    int32_t EnableEffectImpl(uint32_t index, bool enable) {
         std::lock_guard<std::mutex> lk(mutex_);
         if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
         effect_chain_[index].enabled = enable;
         return OS_XAUDIO2_S_OK;
     }
 
-    int32_t GetEffectState(uint32_t index, int32_t* out_enabled) {
+    int32_t OPENSCARLETT_XAUDIO2_CALL EnableEffect(uint32_t EffectIndex, uint32_t /*OperationSet*/) override {
+        return EnableEffectImpl(EffectIndex, true);
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL DisableEffect(uint32_t EffectIndex, uint32_t /*OperationSet*/) override {
+        return EnableEffectImpl(EffectIndex, false);
+    }
+
+    int32_t GetEffectStateImpl(uint32_t index, int32_t* out_enabled) {
         if (!out_enabled) return OS_XAUDIO2_E_POINTER;
         std::lock_guard<std::mutex> lk(mutex_);
         if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
@@ -467,7 +475,12 @@ public:
         return OS_XAUDIO2_S_OK;
     }
 
-    int32_t SetEffectParameters(uint32_t index, const void* params, uint32_t bytes) {
+    void OPENSCARLETT_XAUDIO2_CALL GetEffectState(uint32_t EffectIndex, int32_t* pEnabled) override {
+        (void)GetEffectStateImpl(EffectIndex, pEnabled);
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetEffectParameters(
+        uint32_t index, const void* params, uint32_t bytes, uint32_t /*OperationSet*/ = OS_XAUDIO2_COMMIT_NOW) override {
         if (!params || bytes == 0u) return OS_XAUDIO2_E_INVALIDARG;
         OS_IXAudio2Unknown* eff = nullptr;
         {
@@ -486,7 +499,8 @@ public:
         return OS_XAUDIO2_S_OK;
     }
 
-    int32_t GetEffectParameters(uint32_t index, void* params, uint32_t bytes) {
+    int32_t OPENSCARLETT_XAUDIO2_CALL GetEffectParameters(
+        uint32_t index, void* params, uint32_t bytes) override {
         if (!params || bytes == 0u) return OS_XAUDIO2_E_INVALIDARG;
         OS_IXAudio2Unknown* eff = nullptr;
         {
@@ -503,6 +517,34 @@ public:
         xapo->GetParameters(params, bytes);
         xapo->Release();
         return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetFilterParameters(
+        const void* /*pParameters*/, uint32_t /*OperationSet*/) override {
+        return OS_XAUDIO2_S_OK;
+    }
+    void OPENSCARLETT_XAUDIO2_CALL GetFilterParameters(void* pParameters) override {
+        if (pParameters) std::memset(pParameters, 0, 12u);
+    }
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetOutputFilterParameters(
+        IXAudio2Voice* /*pDestinationVoice*/, const void* /*pParameters*/, uint32_t /*OperationSet*/) override {
+        return OS_XAUDIO2_S_OK;
+    }
+    void OPENSCARLETT_XAUDIO2_CALL GetOutputFilterParameters(
+        IXAudio2Voice* /*pDestinationVoice*/, void* pParameters) override {
+        if (pParameters) std::memset(pParameters, 0, 12u);
+    }
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetOutputMatrix(
+        IXAudio2Voice* /*pDestinationVoice*/, uint32_t /*SourceChannels*/,
+        uint32_t /*DestinationChannels*/, const float* /*pLevelMatrix*/, uint32_t /*OperationSet*/) override {
+        return OS_XAUDIO2_S_OK;
+    }
+    void OPENSCARLETT_XAUDIO2_CALL GetOutputMatrix(
+        IXAudio2Voice* /*pDestinationVoice*/, uint32_t SourceChannels,
+        uint32_t DestinationChannels, float* pLevelMatrix) override {
+        if (pLevelMatrix && SourceChannels > 0u && DestinationChannels > 0u) {
+            std::memset(pLevelMatrix, 0, static_cast<size_t>(SourceChannels) * DestinationChannels * sizeof(float));
+        }
     }
 
     void PrepareBus(uint32_t frames, uint32_t channels) {
@@ -621,16 +663,24 @@ public:
         return RecordHr("IXAudio2MasteringVoice::GetChannelMask", OS_XAUDIO2_S_OK, 7);
     }
 
-    int32_t SetEffectChain(const void* pEffectChain);
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetEffectChain(const void* pEffectChain) override;
 
-    int32_t EnableEffect(uint32_t index, bool enable) {
+    int32_t EnableEffectImpl(uint32_t index, bool enable) {
         std::lock_guard<std::mutex> lk(mutex_);
         if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
         effect_chain_[index].enabled = enable;
         return OS_XAUDIO2_S_OK;
     }
 
-    int32_t GetEffectState(uint32_t index, int32_t* out_enabled) {
+    int32_t OPENSCARLETT_XAUDIO2_CALL EnableEffect(uint32_t EffectIndex, uint32_t /*OperationSet*/) override {
+        return EnableEffectImpl(EffectIndex, true);
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL DisableEffect(uint32_t EffectIndex, uint32_t /*OperationSet*/) override {
+        return EnableEffectImpl(EffectIndex, false);
+    }
+
+    int32_t GetEffectStateImpl(uint32_t index, int32_t* out_enabled) {
         if (!out_enabled) return OS_XAUDIO2_E_POINTER;
         std::lock_guard<std::mutex> lk(mutex_);
         if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
@@ -638,7 +688,12 @@ public:
         return OS_XAUDIO2_S_OK;
     }
 
-    int32_t SetEffectParameters(uint32_t index, const void* params, uint32_t bytes) {
+    void OPENSCARLETT_XAUDIO2_CALL GetEffectState(uint32_t EffectIndex, int32_t* pEnabled) override {
+        (void)GetEffectStateImpl(EffectIndex, pEnabled);
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetEffectParameters(
+        uint32_t index, const void* params, uint32_t bytes, uint32_t /*OperationSet*/ = OS_XAUDIO2_COMMIT_NOW) override {
         if (!params || bytes == 0u) return OS_XAUDIO2_E_INVALIDARG;
         OS_IXAudio2Unknown* eff = nullptr;
         {
@@ -657,7 +712,8 @@ public:
         return OS_XAUDIO2_S_OK;
     }
 
-    int32_t GetEffectParameters(uint32_t index, void* params, uint32_t bytes) {
+    int32_t OPENSCARLETT_XAUDIO2_CALL GetEffectParameters(
+        uint32_t index, void* params, uint32_t bytes) override {
         if (!params || bytes == 0u) return OS_XAUDIO2_E_INVALIDARG;
         OS_IXAudio2Unknown* eff = nullptr;
         {
@@ -674,6 +730,34 @@ public:
         xapo->GetParameters(params, bytes);
         xapo->Release();
         return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetFilterParameters(
+        const void* /*pParameters*/, uint32_t /*OperationSet*/) override {
+        return OS_XAUDIO2_S_OK;
+    }
+    void OPENSCARLETT_XAUDIO2_CALL GetFilterParameters(void* pParameters) override {
+        if (pParameters) std::memset(pParameters, 0, 12u);
+    }
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetOutputFilterParameters(
+        IXAudio2Voice* /*pDestinationVoice*/, const void* /*pParameters*/, uint32_t /*OperationSet*/) override {
+        return OS_XAUDIO2_S_OK;
+    }
+    void OPENSCARLETT_XAUDIO2_CALL GetOutputFilterParameters(
+        IXAudio2Voice* /*pDestinationVoice*/, void* pParameters) override {
+        if (pParameters) std::memset(pParameters, 0, 12u);
+    }
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetOutputMatrix(
+        IXAudio2Voice* /*pDestinationVoice*/, uint32_t /*SourceChannels*/,
+        uint32_t /*DestinationChannels*/, const float* /*pLevelMatrix*/, uint32_t /*OperationSet*/) override {
+        return OS_XAUDIO2_S_OK;
+    }
+    void OPENSCARLETT_XAUDIO2_CALL GetOutputMatrix(
+        IXAudio2Voice* /*pDestinationVoice*/, uint32_t SourceChannels,
+        uint32_t DestinationChannels, float* pLevelMatrix) override {
+        if (pLevelMatrix && SourceChannels > 0u && DestinationChannels > 0u) {
+            std::memset(pLevelMatrix, 0, static_cast<size_t>(SourceChannels) * DestinationChannels * sizeof(float));
+        }
     }
 
     void ProcessMasterEffects(float* interleaved, uint32_t frames, uint32_t channels, uint32_t sample_rate) {
@@ -824,21 +908,29 @@ public:
         return opus_mft_active_.load(std::memory_order_acquire);
     }
 
-    int32_t SetEffectChain(const void* pEffectChain) {
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetEffectChain(const void* pEffectChain) override {
         std::lock_guard<std::mutex> lk(config_mutex_);
         const int32_t hr = ReplaceEffectSlots(effect_chain_, pEffectChain);
         has_effects_.store(!effect_chain_.empty(), std::memory_order_release);
         return hr;
     }
 
-    int32_t EnableEffect(uint32_t index, bool enable) {
+    int32_t EnableEffectImpl(uint32_t index, bool enable) {
         std::lock_guard<std::mutex> lk(config_mutex_);
         if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
         effect_chain_[index].enabled = enable;
         return OS_XAUDIO2_S_OK;
     }
 
-    int32_t GetEffectState(uint32_t index, int32_t* out_enabled) {
+    int32_t OPENSCARLETT_XAUDIO2_CALL EnableEffect(uint32_t EffectIndex, uint32_t /*OperationSet*/) override {
+        return EnableEffectImpl(EffectIndex, true);
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL DisableEffect(uint32_t EffectIndex, uint32_t /*OperationSet*/) override {
+        return EnableEffectImpl(EffectIndex, false);
+    }
+
+    int32_t GetEffectStateImpl(uint32_t index, int32_t* out_enabled) {
         if (!out_enabled) return OS_XAUDIO2_E_POINTER;
         std::lock_guard<std::mutex> lk(config_mutex_);
         if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
@@ -846,7 +938,12 @@ public:
         return OS_XAUDIO2_S_OK;
     }
 
-    int32_t SetEffectParameters(uint32_t index, const void* params, uint32_t bytes) {
+    void OPENSCARLETT_XAUDIO2_CALL GetEffectState(uint32_t EffectIndex, int32_t* pEnabled) override {
+        (void)GetEffectStateImpl(EffectIndex, pEnabled);
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetEffectParameters(
+        uint32_t index, const void* params, uint32_t bytes, uint32_t /*OperationSet*/ = OS_XAUDIO2_COMMIT_NOW) override {
         if (!params || bytes == 0u) return OS_XAUDIO2_E_INVALIDARG;
         OS_IXAudio2Unknown* eff = nullptr;
         {
@@ -865,7 +962,8 @@ public:
         return OS_XAUDIO2_S_OK;
     }
 
-    int32_t GetEffectParameters(uint32_t index, void* params, uint32_t bytes) {
+    int32_t OPENSCARLETT_XAUDIO2_CALL GetEffectParameters(
+        uint32_t index, void* params, uint32_t bytes) override {
         if (!params || bytes == 0u) return OS_XAUDIO2_E_INVALIDARG;
         OS_IXAudio2Unknown* eff = nullptr;
         {
@@ -882,6 +980,34 @@ public:
         xapo->GetParameters(params, bytes);
         xapo->Release();
         return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetFilterParameters(
+        const void* /*pParameters*/, uint32_t /*OperationSet*/) override {
+        return OS_XAUDIO2_S_OK;
+    }
+    void OPENSCARLETT_XAUDIO2_CALL GetFilterParameters(void* pParameters) override {
+        if (pParameters) std::memset(pParameters, 0, 12u);
+    }
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetOutputFilterParameters(
+        IXAudio2Voice* /*pDestinationVoice*/, const void* /*pParameters*/, uint32_t /*OperationSet*/) override {
+        return OS_XAUDIO2_S_OK;
+    }
+    void OPENSCARLETT_XAUDIO2_CALL GetOutputFilterParameters(
+        IXAudio2Voice* /*pDestinationVoice*/, void* pParameters) override {
+        if (pParameters) std::memset(pParameters, 0, 12u);
+    }
+    int32_t OPENSCARLETT_XAUDIO2_CALL SetOutputMatrix(
+        IXAudio2Voice* /*pDestinationVoice*/, uint32_t /*SourceChannels*/,
+        uint32_t /*DestinationChannels*/, const float* /*pLevelMatrix*/, uint32_t /*OperationSet*/) override {
+        return OS_XAUDIO2_S_OK;
+    }
+    void OPENSCARLETT_XAUDIO2_CALL GetOutputMatrix(
+        IXAudio2Voice* /*pDestinationVoice*/, uint32_t SourceChannels,
+        uint32_t DestinationChannels, float* pLevelMatrix) override {
+        if (pLevelMatrix && SourceChannels > 0u && DestinationChannels > 0u) {
+            std::memset(pLevelMatrix, 0, static_cast<size_t>(SourceChannels) * DestinationChannels * sizeof(float));
+        }
     }
 
     void ClearSubmixReference(SubmixVoiceImpl* dead) {
@@ -2363,7 +2489,7 @@ void OPENSCARLETT_XAUDIO2_CALL SubmixVoiceImpl::DestroyVoice() {
     }
 }
 
-int32_t MasteringVoiceImpl::SetEffectChain(const void* pEffectChain) {
+int32_t OPENSCARLETT_XAUDIO2_CALL MasteringVoiceImpl::SetEffectChain(const void* pEffectChain) {
     int32_t hr = OS_XAUDIO2_S_OK;
     {
         std::lock_guard<std::mutex> lk(mutex_);
@@ -3839,11 +3965,11 @@ OpenScarlettXAudio2EnableEffect(IXAudio2Voice* pVoice, uint32_t EffectIndex, int
     if (!pVoice) return RecordHr("OpenScarlettXAudio2EnableEffect", OS_XAUDIO2_E_INVALIDARG);
     int32_t hr = OS_XAUDIO2_E_INVALIDARG;
     if (auto* sub = dynamic_cast<SubmixVoiceImpl*>(pVoice)) {
-        hr = sub->EnableEffect(EffectIndex, Enable != 0);
+        hr = sub->EnableEffectImpl(EffectIndex, Enable != 0);
     } else if (auto* src = dynamic_cast<SourceVoiceImpl*>(pVoice)) {
-        hr = src->EnableEffect(EffectIndex, Enable != 0);
+        hr = src->EnableEffectImpl(EffectIndex, Enable != 0);
     } else if (auto* mv = dynamic_cast<MasteringVoiceImpl*>(pVoice)) {
-        hr = mv->EnableEffect(EffectIndex, Enable != 0);
+        hr = mv->EnableEffectImpl(EffectIndex, Enable != 0);
     }
     return RecordHr("OpenScarlettXAudio2EnableEffect", hr);
 }
@@ -3853,11 +3979,11 @@ OpenScarlettXAudio2GetEffectState(IXAudio2Voice* pVoice, uint32_t EffectIndex, i
     if (!pVoice || !pEnabled) return RecordHr("OpenScarlettXAudio2GetEffectState", OS_XAUDIO2_E_INVALIDARG);
     int32_t hr = OS_XAUDIO2_E_INVALIDARG;
     if (auto* sub = dynamic_cast<SubmixVoiceImpl*>(pVoice)) {
-        hr = sub->GetEffectState(EffectIndex, pEnabled);
+        hr = sub->GetEffectStateImpl(EffectIndex, pEnabled);
     } else if (auto* src = dynamic_cast<SourceVoiceImpl*>(pVoice)) {
-        hr = src->GetEffectState(EffectIndex, pEnabled);
+        hr = src->GetEffectStateImpl(EffectIndex, pEnabled);
     } else if (auto* mv = dynamic_cast<MasteringVoiceImpl*>(pVoice)) {
-        hr = mv->GetEffectState(EffectIndex, pEnabled);
+        hr = mv->GetEffectStateImpl(EffectIndex, pEnabled);
     }
     return RecordHr("OpenScarlettXAudio2GetEffectState", hr);
 }

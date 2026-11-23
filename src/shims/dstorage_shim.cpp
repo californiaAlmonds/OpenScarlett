@@ -7,6 +7,7 @@
 #include "openscarlett/io/bcpack.h"
 #include "openscarlett/io/gdeflate.h"
 #include "openscarlett/kernel/title_va_mirror.h"
+#include "openscarlett/loader/vfs_mounts.h"
 
 #include <algorithm>
 #include <array>
@@ -931,7 +932,9 @@ public:
         if (!ppvObject) return RecordHr("IDStorageFileX::QueryInterface", OS_DSTORAGE_E_POINTER, 0);
         *ppvObject = nullptr;
         if (!riid) return RecordHr("IDStorageFileX::QueryInterface", OS_DSTORAGE_E_INVALIDARG, 0);
-        if (GuidEquals(riid, IID_OS_DStorage_IUnknown) || GuidEquals(riid, IID_IDStorageFileX)) {
+        if (GuidEquals(riid, IID_OS_DStorage_IUnknown) ||
+            GuidEquals(riid, IID_IDStorageFileX) ||
+            GuidEquals(riid, IID_IDStorageFileX_Xbox)) {
             AddRef();
             *ppvObject = static_cast<IDStorageFileX*>(this);
             return RecordHr("IDStorageFileX::QueryInterface", OS_DSTORAGE_S_OK, 0);
@@ -1135,7 +1138,8 @@ public:
             return RecordHr("IDStorageStatusArrayX::QueryInterface", OS_DSTORAGE_E_INVALIDARG, 0);
         }
         if (GuidEquals(riid, IID_OS_DStorage_IUnknown) ||
-            GuidEquals(riid, IID_IDStorageStatusArrayX)) {
+            GuidEquals(riid, IID_IDStorageStatusArrayX) ||
+            GuidEquals(riid, IID_IDStorageStatusArrayX_Xbox)) {
             AddRef();
             *ppvObject = static_cast<IDStorageStatusArrayX*>(this);
             return RecordHr("IDStorageStatusArrayX::QueryInterface", OS_DSTORAGE_S_OK, 0);
@@ -1463,7 +1467,8 @@ public:
         *ppvObject = nullptr;
         if (!riid) return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_E_INVALIDARG, 0);
         if (GuidEquals(riid, IID_OS_DStorage_IUnknown) ||
-            GuidEquals(riid, IID_IDStorageQueueX)) {
+            GuidEquals(riid, IID_IDStorageQueueX) ||
+            GuidEquals(riid, IID_IDStorageQueueX_Xbox)) {
             AddRef();
             *ppvObject = static_cast<IDStorageQueueX*>(this);
             return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_S_OK, 0);
@@ -3287,7 +3292,8 @@ public:
         *ppvObject = nullptr;
         if (!riid) return RecordHr("IDStorageFactoryX::QueryInterface", OS_DSTORAGE_E_INVALIDARG, 0);
         if (GuidEquals(riid, IID_OS_DStorage_IUnknown) ||
-            GuidEquals(riid, IID_IDStorageFactoryX)) {
+            GuidEquals(riid, IID_IDStorageFactoryX) ||
+            GuidEquals(riid, IID_IDStorageFactoryX_Xbox)) {
             AddRef();
             *ppvObject = static_cast<IDStorageFactoryX*>(this);
             return RecordHr("IDStorageFactoryX::QueryInterface", OS_DSTORAGE_S_OK, 0);
@@ -3327,6 +3333,7 @@ public:
         *ppv = nullptr;
         if (riid &&
             !GuidEquals(riid, IID_IDStorageQueueX) &&
+            !GuidEquals(riid, IID_IDStorageQueueX_Xbox) &&
             !GuidEquals(riid, IID_IDStorageQueueX1) &&
             !GuidEquals(riid, IID_IDStorageQueueX2) &&
             !GuidEquals(riid, IID_OS_DStorage_IUnknown)) {
@@ -3351,12 +3358,37 @@ public:
         }
         *ppv = nullptr;
         if (riid && !GuidEquals(riid, IID_IDStorageFileX) &&
+            !GuidEquals(riid, IID_IDStorageFileX_Xbox) &&
             !GuidEquals(riid, IID_OS_DStorage_IUnknown)) {
             return RecordHr("IDStorageFactoryX::OpenFile", OS_DSTORAGE_E_NOINTERFACE, 4);
         }
 #if defined(_WIN32)
+        std::wstring open_path(path);
+        if (openscarlett::VfsMounts::DetectVirtualDriveW(open_path) != openscarlett::VfsDrive::None) {
+            auto read_env = [](const wchar_t* name) -> std::wstring {
+                DWORD n = GetEnvironmentVariableW(name, nullptr, 0);
+                if (n == 0) return {};
+                std::wstring v(n, L'\0');
+                DWORD w = GetEnvironmentVariableW(name, v.data(), n);
+                v.resize(w);
+                return v;
+            };
+            openscarlett::VfsMounts vfs;
+            openscarlett::VfsMountConfig cfg{};
+            cfg.g_root = read_env(L"OPENSCARLETT_VFS_G");
+            cfg.g_overlay_root = read_env(L"OPENSCARLETT_VFS_G_OVERLAY");
+            cfg.t_root = read_env(L"OPENSCARLETT_VFS_T");
+            cfg.s_root = read_env(L"OPENSCARLETT_VFS_S");
+            vfs.Configure(cfg);
+            std::wstring translated;
+            if (vfs.TranslateForAccessW(open_path, openscarlett::VfsAccessMode::ReadOnly,
+                                        translated, nullptr, false) ==
+                openscarlett::VfsTranslateStatus::Translated) {
+                open_path = std::move(translated);
+            }
+        }
         HANDLE h = CreateFileW(
-            path,
+            open_path.c_str(),
             GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             nullptr,
@@ -3387,6 +3419,7 @@ public:
         }
         *ppv = nullptr;
         if (riid && !GuidEquals(riid, IID_IDStorageStatusArrayX) &&
+            !GuidEquals(riid, IID_IDStorageStatusArrayX_Xbox) &&
             !GuidEquals(riid, IID_OS_DStorage_IUnknown)) {
             return RecordHr("IDStorageFactoryX::CreateStatusArray", OS_DSTORAGE_E_NOINTERFACE, 5);
         }
@@ -3447,6 +3480,7 @@ public:
         *ppv = nullptr;
         if (riid &&
             !GuidEquals(riid, IID_IDStorageQueueX) &&
+            !GuidEquals(riid, IID_IDStorageQueueX_Xbox) &&
             !GuidEquals(riid, IID_IDStorageQueueX1) &&
             !GuidEquals(riid, IID_IDStorageQueueX2) &&
             !GuidEquals(riid, IID_OS_DStorage_IUnknown)) {
@@ -3505,6 +3539,7 @@ int32_t OPENSCARLETT_DSTORAGE_CALL DStorageGetFactory(const DStorageGuid* riid, 
     *ppv = nullptr;
     if (riid &&
         !GuidEquals(riid, IID_IDStorageFactoryX) &&
+        !GuidEquals(riid, IID_IDStorageFactoryX_Xbox) &&
         !GuidEquals(riid, IID_IDStorageFactoryX1) &&
         !GuidEquals(riid, IID_IDStorageFactoryX2) &&
         !GuidEquals(riid, IID_OS_DStorage_IUnknown)) {

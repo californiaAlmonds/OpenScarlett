@@ -749,8 +749,14 @@ XG_TILE_MODE ExtractXboxGfx10TileMode(D3D12_TEXTURE_LAYOUT layout) noexcept {
 D3D12_RESOURCE_DESC SanitizeXboxResourceDesc(const D3D12_RESOURCE_DESC& desc) noexcept {
     D3D12_RESOURCE_DESC out = desc;
     constexpr uint32_t kDesktopResourceFlagsMask = 0x000000FFu;
-    out.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
-        static_cast<uint32_t>(desc.Flags) & kDesktopResourceFlagsMask);
+    uint32_t flags = static_cast<uint32_t>(desc.Flags) & kDesktopResourceFlagsMask;
+    // Desktop D3D12 forbids combining ALLOW_DEPTH_STENCIL with ALLOW_UNORDERED_ACCESS or
+    // ALLOW_RENDER_TARGET (Xbox Series X permits DS+UAV for HTILE / UE5 Virtual Shadow Maps).
+    if ((flags & static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0u) {
+        flags &= ~(static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) |
+                   static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET));
+    }
+    out.Flags = static_cast<D3D12_RESOURCE_FLAGS>(flags);
     if (static_cast<uint32_t>(out.Layout) >= D3D12XBOX_TEXTURE_LAYOUT_GFX10_BASE) {
         out.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     }
@@ -760,8 +766,12 @@ D3D12_RESOURCE_DESC SanitizeXboxResourceDesc(const D3D12_RESOURCE_DESC& desc) no
 D3D12_RESOURCE_DESC1 SanitizeXboxResourceDesc1(const D3D12_RESOURCE_DESC1& desc) noexcept {
     D3D12_RESOURCE_DESC1 out = desc;
     constexpr uint32_t kDesktopResourceFlagsMask = 0x000000FFu;
-    out.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
-        static_cast<uint32_t>(desc.Flags) & kDesktopResourceFlagsMask);
+    uint32_t flags = static_cast<uint32_t>(desc.Flags) & kDesktopResourceFlagsMask;
+    if ((flags & static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0u) {
+        flags &= ~(static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) |
+                   static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET));
+    }
+    out.Flags = static_cast<D3D12_RESOURCE_FLAGS>(flags);
     if (static_cast<uint32_t>(out.Layout) >= D3D12XBOX_TEXTURE_LAYOUT_GFX10_BASE) {
         out.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     }
@@ -2353,6 +2363,118 @@ bool CompileHlslWithSm50Fallback(
     return true;
 }
 
+// Detects real retail Xbox Series X|S DXBC containers whose DXIL chunk carries
+// an XDAT/XBCH/FSSM precompiled AMD RDNA2 microcode payload (verified live against
+// UE5 Frosty-XSX-Shipping.exe / The Matrix Awakens cooked shader archives).
+bool IsXboxXdatDxbcBlob(const void* data, size_t size) noexcept {
+    if (!data || size < 32u) return false;
+    const auto* b = static_cast<const uint8_t*>(data);
+    if (std::memcmp(b, "DXBC", 4u) != 0) return false;
+    uint32_t total = 0u, nchunks = 0u;
+    std::memcpy(&total, b + 24u, 4u);
+    std::memcpy(&nchunks, b + 28u, 4u);
+    if (total < 32u || total > size || nchunks == 0u || nchunks > 128u) return false;
+    if (32ull + static_cast<uint64_t>(nchunks) * 4ull > total) return false;
+    for (uint32_t i = 0u; i < nchunks; ++i) {
+        uint32_t off = 0u;
+        std::memcpy(&off, b + 32u + static_cast<size_t>(i) * 4u, 4u);
+        if (static_cast<uint64_t>(off) + 36ull > total) continue;
+        if (std::memcmp(b + off, "DXIL", 4u) == 0) {
+            uint32_t csz = 0u;
+            std::memcpy(&csz, b + off + 4u, 4u);
+            if (csz >= 28u && static_cast<uint64_t>(off) + 8ull + 28ull <= total &&
+                std::memcmp(b + off + 8u + 24u, "XDAT", 4u) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Returns 0=float4, 1=uint4, 2=int4 for D3D12 RTV pixel-shader output matching.
+uint32_t ClassifyRtvOutputKind(DXGI_FORMAT fmt) noexcept {
+    switch (fmt) {
+        case DXGI_FORMAT_R32G32B32A32_UINT:
+        case DXGI_FORMAT_R32G32B32_UINT:
+        case DXGI_FORMAT_R16G16B16A16_UINT:
+        case DXGI_FORMAT_R32G32_UINT:
+        case DXGI_FORMAT_R10G10B10A2_UINT:
+        case DXGI_FORMAT_R8G8B8A8_UINT:
+        case DXGI_FORMAT_R16G16_UINT:
+        case DXGI_FORMAT_R32_UINT:
+        case DXGI_FORMAT_R8G8_UINT:
+        case DXGI_FORMAT_R16_UINT:
+        case DXGI_FORMAT_R8_UINT:
+            return 1u;
+        case DXGI_FORMAT_R32G32B32A32_SINT:
+        case DXGI_FORMAT_R32G32B32_SINT:
+        case DXGI_FORMAT_R16G16B16A16_SINT:
+        case DXGI_FORMAT_R32G32_SINT:
+        case DXGI_FORMAT_R8G8B8A8_SINT:
+        case DXGI_FORMAT_R16G16_SINT:
+        case DXGI_FORMAT_R32_SINT:
+        case DXGI_FORMAT_R8G8_SINT:
+        case DXGI_FORMAT_R16_SINT:
+        case DXGI_FORMAT_R8_SINT:
+            return 2u;
+        default:
+            return 0u;
+    }
+}
+
+const std::vector<uint8_t>& GetCachedMinimalCs50() {
+    static std::vector<uint8_t> s_bc;
+    static std::once_flag s_once;
+    std::call_once(s_once, []() {
+        (void)CompileHlslWithSm50Fallback(
+            "[numthreads(1,1,1)] void main() {}", "cs_5_0", s_bc);
+    });
+    return s_bc;
+}
+
+const std::vector<uint8_t>& GetCachedMinimalVs50() {
+    static std::vector<uint8_t> s_bc;
+    static std::once_flag s_once;
+    std::call_once(s_once, []() {
+        (void)CompileHlslWithSm50Fallback(
+            "float4 main() : SV_Position { return float4(0.0, 0.0, 0.0, 1.0); }", "vs_5_0", s_bc);
+    });
+    return s_bc;
+}
+
+const std::vector<uint8_t>& GetCachedMinimalPs50(UINT num_rts, const DXGI_FORMAT rtv_formats[8]) {
+    const UINT clamped_rts = std::min<UINT>(num_rts, 8u);
+    uint32_t key = clamped_rts;
+    for (UINT i = 0u; i < clamped_rts; ++i) {
+        key |= (ClassifyRtvOutputKind(rtv_formats[i]) << (4u + i * 2u));
+    }
+    static std::mutex s_mu;
+    static std::unordered_map<uint32_t, std::vector<uint8_t>> s_cache;
+    std::lock_guard<std::mutex> lock(s_mu);
+    auto it = s_cache.find(key);
+    if (it != s_cache.end()) {
+        return it->second;
+    }
+    std::string hlsl;
+    if (clamped_rts == 0u) {
+        hlsl = "void main(float4 pos : SV_Position) {}";
+    } else {
+        hlsl = "struct PSOut {\n";
+        for (UINT i = 0u; i < clamped_rts; ++i) {
+            const uint32_t k = (key >> (4u + i * 2u)) & 3u;
+            const char* ty = (k == 1u) ? "uint4" : ((k == 2u) ? "int4" : "float4");
+            hlsl += "  ";
+            hlsl += ty;
+            hlsl += " c" + std::to_string(i) + " : SV_Target" + std::to_string(i) + ";\n";
+        }
+        hlsl += "};\nPSOut main(float4 pos : SV_Position) {\n  PSOut o = (PSOut)0;\n  return o;\n}\n";
+    }
+    std::vector<uint8_t> bc;
+    (void)CompileHlslWithSm50Fallback(hlsl, "ps_5_0", bc);
+    auto [ins, _] = s_cache.emplace(key, std::move(bc));
+    return ins->second;
+}
+
 bool ContainerHasNonDefaultInterp(const openscarlett::XboxParsedShaderContainer& c) noexcept {
     for (const auto& s : c.input_signature) {
         if (s.interp_mode != openscarlett::Rdna2InterpMode::Perspective) return true;
@@ -2935,8 +3057,51 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateGraphicsPipelineState(
     }
     *ppPipelineState = nullptr;
     ID3D12PipelineState* host_pso = nullptr;
-    HRESULT hr = host_dev_->CreateGraphicsPipelineState(
-        &lifted_desc, OS_D3D12_IID(ID3D12PipelineState), reinterpret_cast<void**>(&host_pso));
+    HRESULT hr = E_FAIL;
+    const bool gfx_has_xdat =
+        retail_scarlett_abi_ &&
+        (IsXboxXdatDxbcBlob(lifted_desc.VS.pShaderBytecode, lifted_desc.VS.BytecodeLength) ||
+         IsXboxXdatDxbcBlob(lifted_desc.PS.pShaderBytecode, lifted_desc.PS.BytecodeLength) ||
+         IsXboxXdatDxbcBlob(lifted_desc.DS.pShaderBytecode, lifted_desc.DS.BytecodeLength) ||
+         IsXboxXdatDxbcBlob(lifted_desc.HS.pShaderBytecode, lifted_desc.HS.BytecodeLength) ||
+         IsXboxXdatDxbcBlob(lifted_desc.GS.pShaderBytecode, lifted_desc.GS.BytecodeLength));
+    if (!gfx_has_xdat) {
+        hr = host_dev_->CreateGraphicsPipelineState(
+            &lifted_desc, OS_D3D12_IID(ID3D12PipelineState), reinterpret_cast<void**>(&host_pso));
+    }
+    if ((FAILED(hr) || !host_pso) && retail_scarlett_abi_) {
+        const auto& vs_bc = GetCachedMinimalVs50();
+        const auto& ps_bc = GetCachedMinimalPs50(lifted_desc.NumRenderTargets, lifted_desc.RTVFormats);
+        if (!vs_bc.empty() && !ps_bc.empty()) {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC safe = lifted_desc;
+            safe.VS = {vs_bc.data(), vs_bc.size()};
+            safe.PS = (lifted_desc.PS.pShaderBytecode && lifted_desc.PS.BytecodeLength > 0u)
+                          ? D3D12_SHADER_BYTECODE{ps_bc.data(), ps_bc.size()}
+                          : D3D12_SHADER_BYTECODE{nullptr, 0u};
+            safe.DS = {nullptr, 0u};
+            safe.HS = {nullptr, 0u};
+            safe.GS = {nullptr, 0u};
+            safe.StreamOutput = {};
+            safe.CachedPSO = {};
+            safe.NodeMask = 0u;
+            safe.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+            if (safe.SampleDesc.Count == 0u) safe.SampleDesc.Count = 1u;
+            if (safe.SampleMask == 0u) safe.SampleMask = UINT_MAX;
+            if (safe.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED ||
+                safe.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH) {
+                safe.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            }
+            if (!safe.pRootSignature) {
+                openscarlett::XboxRootSignatureDesc empty_rs{};
+                safe.pRootSignature = SynthesizeHostRootSignatureFromXboxDesc(empty_rs);
+            }
+            hr = host_dev_->CreateGraphicsPipelineState(
+                &safe, OS_D3D12_IID(ID3D12PipelineState), reinterpret_cast<void**>(&host_pso));
+            if (SUCCEEDED(hr) && host_pso) {
+                RecordDev("ID3D12DeviceX::XdatShaderStandinPso", 10, S_OK);
+            }
+        }
+    }
     if (FAILED(hr) || !host_pso) {
         RecordDev("ID3D12DeviceX::CreateGraphicsPipelineState", 10, hr);
         return hr;
@@ -3048,8 +3213,32 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateComputePipelineState(
     }
     *ppPipelineState = nullptr;
     ID3D12PipelineState* host_pso = nullptr;
-    HRESULT hr = host_dev_->CreateComputePipelineState(
-        &lifted_desc, OS_D3D12_IID(ID3D12PipelineState), reinterpret_cast<void**>(&host_pso));
+    HRESULT hr = E_FAIL;
+    const bool cs_is_xdat = retail_scarlett_abi_ &&
+                            IsXboxXdatDxbcBlob(lifted_desc.CS.pShaderBytecode, lifted_desc.CS.BytecodeLength);
+    if (!cs_is_xdat) {
+        hr = host_dev_->CreateComputePipelineState(
+            &lifted_desc, OS_D3D12_IID(ID3D12PipelineState), reinterpret_cast<void**>(&host_pso));
+    }
+    if ((FAILED(hr) || !host_pso) && retail_scarlett_abi_) {
+        const auto& cs_bc = GetCachedMinimalCs50();
+        if (!cs_bc.empty()) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC safe = lifted_desc;
+            safe.CS = {cs_bc.data(), cs_bc.size()};
+            safe.CachedPSO = {};
+            safe.NodeMask = 0u;
+            safe.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+            if (!safe.pRootSignature) {
+                openscarlett::XboxRootSignatureDesc empty_rs{};
+                safe.pRootSignature = SynthesizeHostRootSignatureFromXboxDesc(empty_rs);
+            }
+            hr = host_dev_->CreateComputePipelineState(
+                &safe, OS_D3D12_IID(ID3D12PipelineState), reinterpret_cast<void**>(&host_pso));
+            if (SUCCEEDED(hr) && host_pso) {
+                RecordDev("ID3D12DeviceX::XdatShaderStandinPso", 11, S_OK);
+            }
+        }
+    }
     if (FAILED(hr) || !host_pso) {
         RecordDev("ID3D12DeviceX::CreateComputePipelineState", 11, hr);
         return hr;
@@ -3113,8 +3302,117 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommandList(
 
 HRESULT STDMETHODCALLTYPE DeviceX::CheckFeatureSupport(
     D3D12_FEATURE Feature, void* pFeatureSupportData, UINT FeatureSupportDataSize) {
-    const HRESULT hr = host_dev_->CheckFeatureSupport(
+    HRESULT hr = host_dev_->CheckFeatureSupport(
         Feature, pFeatureSupportData, FeatureSupportDataSize);
+
+    // Xbox Series X|S d3d12_xs.h feature-data structs (notably D3D12_FEATURE_DATA_D3D12_OPTIONS
+    // and OPTIONS1..12) can differ in size from desktop Windows 10 SDK structs, causing host
+    // CheckFeatureSupport to return E_INVALIDARG. Bridge cleanly via a host-sized struct copy.
+    if (hr == E_INVALIDARG && pFeatureSupportData != nullptr && FeatureSupportDataSize > 0u) {
+        auto bridge_struct = [&](auto& host_data) -> HRESULT {
+            std::memset(&host_data, 0, sizeof(host_data));
+            const size_t in_copy = std::min<size_t>(FeatureSupportDataSize, sizeof(host_data));
+            std::memcpy(&host_data, pFeatureSupportData, in_copy);
+            HRESULT bhr = host_dev_->CheckFeatureSupport(
+                Feature, &host_data, static_cast<UINT>(sizeof(host_data)));
+            if (SUCCEEDED(bhr)) {
+                std::memset(pFeatureSupportData, 0, FeatureSupportDataSize);
+                std::memcpy(pFeatureSupportData, &host_data, in_copy);
+            }
+            return bhr;
+        };
+
+        switch (Feature) {
+            case D3D12_FEATURE_D3D12_OPTIONS: {
+                D3D12_FEATURE_DATA_D3D12_OPTIONS d{};
+                hr = bridge_struct(d);
+                break;
+            }
+            case D3D12_FEATURE_ARCHITECTURE: {
+                D3D12_FEATURE_DATA_ARCHITECTURE d{};
+                hr = bridge_struct(d);
+                break;
+            }
+            case D3D12_FEATURE_FORMAT_SUPPORT: {
+                D3D12_FEATURE_DATA_FORMAT_SUPPORT d{};
+                hr = bridge_struct(d);
+                break;
+            }
+            case D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS: {
+                D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS d{};
+                hr = bridge_struct(d);
+                break;
+            }
+            case D3D12_FEATURE_FORMAT_INFO: {
+                D3D12_FEATURE_DATA_FORMAT_INFO d{};
+                hr = bridge_struct(d);
+                break;
+            }
+            case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {
+                D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT d{};
+                hr = bridge_struct(d);
+                break;
+            }
+            case D3D12_FEATURE_SHADER_MODEL: {
+                D3D12_FEATURE_DATA_SHADER_MODEL d{};
+                hr = bridge_struct(d);
+                break;
+            }
+            case D3D12_FEATURE_D3D12_OPTIONS1: {
+                D3D12_FEATURE_DATA_D3D12_OPTIONS1 d{};
+                hr = bridge_struct(d);
+                break;
+            }
+            case D3D12_FEATURE_ROOT_SIGNATURE: {
+                D3D12_FEATURE_DATA_ROOT_SIGNATURE d{};
+                hr = bridge_struct(d);
+                break;
+            }
+            case D3D12_FEATURE_ARCHITECTURE1: {
+                D3D12_FEATURE_DATA_ARCHITECTURE1 d{};
+                hr = bridge_struct(d);
+                break;
+            }
+            case D3D12_FEATURE_D3D12_OPTIONS2: {
+                D3D12_FEATURE_DATA_D3D12_OPTIONS2 d{};
+                hr = bridge_struct(d);
+                break;
+            }
+            case D3D12_FEATURE_SHADER_CACHE: {
+                D3D12_FEATURE_DATA_SHADER_CACHE d{};
+                hr = bridge_struct(d);
+                break;
+            }
+            case D3D12_FEATURE_D3D12_OPTIONS3: {
+                D3D12_FEATURE_DATA_D3D12_OPTIONS3 d{};
+                hr = bridge_struct(d);
+                break;
+            }
+            case D3D12_FEATURE_D3D12_OPTIONS4: {
+                D3D12_FEATURE_DATA_D3D12_OPTIONS4 d{};
+                hr = bridge_struct(d);
+                break;
+            }
+            case D3D12_FEATURE_D3D12_OPTIONS5: {
+                D3D12_FEATURE_DATA_D3D12_OPTIONS5 d{};
+                hr = bridge_struct(d);
+                break;
+            }
+            case D3D12_FEATURE_D3D12_OPTIONS6: {
+                D3D12_FEATURE_DATA_D3D12_OPTIONS6 d{};
+                hr = bridge_struct(d);
+                break;
+            }
+            case D3D12_FEATURE_D3D12_OPTIONS7: {
+                D3D12_FEATURE_DATA_D3D12_OPTIONS7 d{};
+                hr = bridge_struct(d);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
     RecordDev("ID3D12DeviceX::CheckFeatureSupport", 13, hr);
     return hr;
 }
@@ -3130,6 +3428,32 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateDescriptorHeap(
     ID3D12DescriptorHeap* host_heap = nullptr;
     HRESULT hr = host_dev_->CreateDescriptorHeap(
         pDescriptorHeapDesc, OS_D3D12_IID(ID3D12DescriptorHeap), reinterpret_cast<void**>(&host_heap));
+    if ((FAILED(hr) || !host_heap) && pDescriptorHeapDesc != nullptr) {
+        D3D12_DESCRIPTOR_HEAP_DESC safe = *pDescriptorHeapDesc;
+        safe.NodeMask = 0u;
+        if (safe.Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV ||
+            safe.Type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV) {
+            safe.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        } else {
+            safe.Flags = static_cast<D3D12_DESCRIPTOR_HEAP_FLAGS>(
+                static_cast<UINT>(safe.Flags) & static_cast<UINT>(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE));
+        }
+        if (safe.NumDescriptors == 0u) {
+            safe.NumDescriptors = 1u;
+        }
+        if (safe.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER &&
+            (safe.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0 &&
+            safe.NumDescriptors > 2048u) {
+            safe.NumDescriptors = 2048u;
+        }
+        if (safe.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+            (safe.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0 &&
+            safe.NumDescriptors > 1000000u) {
+            safe.NumDescriptors = 1000000u;
+        }
+        hr = host_dev_->CreateDescriptorHeap(
+            &safe, OS_D3D12_IID(ID3D12DescriptorHeap), reinterpret_cast<void**>(&host_heap));
+    }
     if (FAILED(hr) || !host_heap) {
         RecordDev("ID3D12DeviceX::CreateDescriptorHeap", 14, hr);
         return hr;
@@ -3176,6 +3500,75 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateRootSignature(
     HRESULT hr = host_dev_->CreateRootSignature(
         nodeMask, pBlobWithRootSignature, blobLengthInBytes,
         OS_D3D12_IID(ID3D12RootSignature), reinterpret_cast<void**>(&host_rs));
+    if ((FAILED(hr) || !host_rs) && nodeMask != 0u) {
+        hr = host_dev_->CreateRootSignature(
+            0u, pBlobWithRootSignature, blobLengthInBytes,
+            OS_D3D12_IID(ID3D12RootSignature), reinterpret_cast<void**>(&host_rs));
+    }
+    if ((FAILED(hr) || !host_rs) && pBlobWithRootSignature != nullptr && blobLengthInBytes > 0u) {
+        using PfnCreateVrsDeser = HRESULT(WINAPI*)(LPCVOID, SIZE_T, REFIID, void**);
+        using PfnSerVrs = HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
+        auto fn_deser = reinterpret_cast<PfnCreateVrsDeser>(
+            openscarlett::ResolveHostD3D12Proc("D3D12CreateVersionedRootSignatureDeserializer"));
+        auto fn_ser = reinterpret_cast<PfnSerVrs>(
+            openscarlett::ResolveHostD3D12Proc("D3D12SerializeVersionedRootSignature"));
+        if (fn_deser && fn_ser) {
+            ID3D12VersionedRootSignatureDeserializer* deser = nullptr;
+            if (SUCCEEDED(fn_deser(
+                    pBlobWithRootSignature, blobLengthInBytes,
+                    OS_D3D12_IID(ID3D12VersionedRootSignatureDeserializer),
+                    reinterpret_cast<void**>(&deser))) && deser) {
+                const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* orig = deser->GetUnconvertedRootSignatureDesc();
+                if (orig) {
+                    D3D12_VERSIONED_ROOT_SIGNATURE_DESC safe = *orig;
+                    auto sanitize_flags = [&](D3D12_ROOT_SIGNATURE_FLAGS& f) {
+                        UINT bits = static_cast<UINT>(f);
+                        // Strip Xbox-only extended high flag bits above standard desktop flags.
+                        bits &= 0x0FFFu;
+                        if (adapter_info_.raytracing_tier == 0u) {
+                            bits &= ~static_cast<UINT>(D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE);
+                        }
+                        if (adapter_info_.highest_shader_model < 0x66u) {
+                            bits &= ~(0x400u | 0x800u);  // CBV_SRV_UAV / SAMPLER_HEAP_DIRECTLY_INDEXED
+                        }
+                        f = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(bits);
+                    };
+                    if (safe.Version == D3D_ROOT_SIGNATURE_VERSION_1_0) {
+                        sanitize_flags(safe.Desc_1_0.Flags);
+                    } else if (safe.Version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
+                        sanitize_flags(safe.Desc_1_1.Flags);
+                    }
+                    ID3DBlob* safe_blob = nullptr;
+                    ID3DBlob* err_blob = nullptr;
+                    if (SUCCEEDED(fn_ser(&safe, &safe_blob, &err_blob)) && safe_blob) {
+                        hr = host_dev_->CreateRootSignature(
+                            0u, safe_blob->GetBufferPointer(), safe_blob->GetBufferSize(),
+                            OS_D3D12_IID(ID3D12RootSignature), reinterpret_cast<void**>(&host_rs));
+                        safe_blob->Release();
+                    }
+                    if (err_blob) err_blob->Release();
+                }
+                deser->Release();
+            }
+        }
+        // Final fallback for retail Scarlett on non-DXR/SM6.5 desktop GPUs (e.g. DXR local root
+        // signatures or Xbox-only root signature blobs): create a valid empty root signature so
+        // non-fatal subsystem init (like InitRayTracing on GTX 1650 Ti) can proceed cleanly.
+        if ((FAILED(hr) || !host_rs) && retail_scarlett_abi_ && fn_ser) {
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC empty_desc{};
+            empty_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+            empty_desc.Desc_1_0.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+            ID3DBlob* empty_blob = nullptr;
+            ID3DBlob* err_blob = nullptr;
+            if (SUCCEEDED(fn_ser(&empty_desc, &empty_blob, &err_blob)) && empty_blob) {
+                hr = host_dev_->CreateRootSignature(
+                    0u, empty_blob->GetBufferPointer(), empty_blob->GetBufferSize(),
+                    OS_D3D12_IID(ID3D12RootSignature), reinterpret_cast<void**>(&host_rs));
+                empty_blob->Release();
+            }
+            if (err_blob) err_blob->Release();
+        }
+    }
     if (FAILED(hr) || !host_rs) {
         RecordDev("ID3D12DeviceX::CreateRootSignature", 16, hr);
         return hr;
@@ -3234,6 +3627,26 @@ void STDMETHODCALLTYPE DeviceX::CreateShaderResourceView(
                  descriptor_create_ctx_.load(std::memory_order_acquire));
         }
     };
+    // Non-DXR desktop GPUs (e.g. GTX 1650 Ti, raytracing_tier == 0) immediately remove the device
+    // with DXGI_ERROR_INVALID_CALL on D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.
+    // Substitute a valid null raw-buffer SRV so titles with RT enabled can run cleanly.
+    if (pDesc != nullptr &&
+        pDesc->ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE &&
+        adapter_info_.raytracing_tier == 0u) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC fallback_desc{};
+        fallback_desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        fallback_desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        fallback_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        fallback_desc.Buffer.FirstElement = 0ull;
+        fallback_desc.Buffer.NumElements = 1u;
+        fallback_desc.Buffer.StructureByteStride = 0u;
+        fallback_desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        host_dev_->CreateShaderResourceView(nullptr, &fallback_desc, DestDescriptor);
+        notify_hook();
+        RecordDev("ID3D12DeviceX::CreateShaderResourceView[NonDxrAsFallback]", 18, S_OK);
+        RecordDev("ID3D12DeviceX::CreateShaderResourceView", 18, S_OK);
+        return;
+    }
     // R9G9B9E5_SHAREDEXP UAV fallback: rewrite explicit R9G9B9E5 SRV views to R16G16B16A16_FLOAT
     // when the backing resource was promoted to RGBA16F.
     if (pDesc != nullptr && pDesc->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP &&
@@ -3317,6 +3730,22 @@ void STDMETHODCALLTYPE DeviceX::CreateUnorderedAccessView(
         rw_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         desc_ptr = &rw_desc;
         RecordDev("ID3D12DeviceX::CreateUnorderedAccessView[R9G9B9E5Fallback]", 19, S_OK);
+    }
+    if (retail_scarlett_abi_ && host_res != nullptr &&
+        (host_res->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
+        // Xbox allows UAVs on depth-stencil/non-UAV textures (e.g. HTILE/VSM); substitute a valid
+        // null raw-buffer UAV so Desktop D3D12 does not trigger DXGI_ERROR_INVALID_CALL.
+        D3D12_UNORDERED_ACCESS_VIEW_DESC null_uav{};
+        null_uav.Format = DXGI_FORMAT_R32_TYPELESS;
+        null_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        null_uav.Buffer.FirstElement = 0ull;
+        null_uav.Buffer.NumElements = 1u;
+        null_uav.Buffer.StructureByteStride = 0u;
+        null_uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        host_dev_->CreateUnorderedAccessView(nullptr, nullptr, &null_uav, DestDescriptor);
+        RecordDev("ID3D12DeviceX::CreateUnorderedAccessView[NonUavFallback]", 19, S_OK);
+        RecordDev("ID3D12DeviceX::CreateUnorderedAccessView", 19, S_OK);
+        return;
     }
     host_dev_->CreateUnorderedAccessView(host_res, host_counter, desc_ptr, DestDescriptor);
     if (const auto hook = descriptor_create_hook_.load(std::memory_order_acquire)) {
@@ -3543,16 +3972,43 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
         desc_ptr = &clean_desc;
     }
     const D3D12_HEAP_FLAGS clean_heap_flags = SanitizeXboxHeapFlags(HeapFlags);
+    D3D12_HEAP_PROPERTIES clean_heap_props{};
+    const D3D12_HEAP_PROPERTIES* clean_heap_ptr = pHeapProperties;
     if (pHeapProperties) {
-        if (pHeapProperties->Type == D3D12_HEAP_TYPE_UPLOAD) {
+        clean_heap_props = *pHeapProperties;
+        if (clean_heap_props.Type == D3D12_HEAP_TYPE_DEFAULT ||
+            clean_heap_props.Type == D3D12_HEAP_TYPE_UPLOAD ||
+            clean_heap_props.Type == D3D12_HEAP_TYPE_READBACK) {
+            clean_heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+            clean_heap_props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        }
+        clean_heap_props.CreationNodeMask = 1u;
+        clean_heap_props.VisibleNodeMask = 1u;
+        clean_heap_ptr = &clean_heap_props;
+        if (clean_heap_props.Type == D3D12_HEAP_TYPE_UPLOAD) {
             InitialResourceState = D3D12_RESOURCE_STATE_GENERIC_READ;
-        } else if (pHeapProperties->Type == D3D12_HEAP_TYPE_READBACK) {
+        } else if (clean_heap_props.Type == D3D12_HEAP_TYPE_READBACK) {
             InitialResourceState = D3D12_RESOURCE_STATE_COPY_DEST;
+        }
+    }
+    if (retail_scarlett_abi_) {
+        if (adapter_info_.raytracing_tier == 0u &&
+            (static_cast<UINT>(InitialResourceState) &
+             static_cast<UINT>(D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)) != 0u) {
+            UINT st = static_cast<UINT>(InitialResourceState) &
+                      ~static_cast<UINT>(D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+            if (st == 0u) {
+                st = static_cast<UINT>(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
+            InitialResourceState = static_cast<D3D12_RESOURCE_STATES>(st);
+        }
+        if (desc_ptr && desc_ptr->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            clear_ptr = nullptr;
         }
     }
     if (!ppvResource) {
         const HRESULT hr = host_dev_->CreateCommittedResource(
-            pHeapProperties, clean_heap_flags, desc_ptr, InitialResourceState,
+            clean_heap_ptr, clean_heap_flags, desc_ptr, InitialResourceState,
             clear_ptr, riidResource, nullptr);
         RecordDev("ID3D12DeviceX::CreateCommittedResource", 27, hr);
         return hr;
@@ -3562,20 +4018,20 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
     // Sprint 14: Live VramResidencyManager budget enforcement + LRU eviction + L0 system-RAM spill fallback.
     const uint64_t est_bytes = desc_ptr ? EstimateResourceVramBytes(*desc_ptr) : 0ull;
     const bool allow_l0_spill =
-        (pHeapProperties != nullptr) &&
-        (pHeapProperties->Type == D3D12_HEAP_TYPE_DEFAULT) &&
+        (clean_heap_ptr != nullptr) &&
+        (clean_heap_ptr->Type == D3D12_HEAP_TYPE_DEFAULT) &&
         (desc_ptr != nullptr) &&
         ((desc_ptr->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) == 0);
     bool should_spill_l0 = false;
-    if (est_bytes > 0ull && pHeapProperties && pHeapProperties->Type == D3D12_HEAP_TYPE_DEFAULT) {
+    if (est_bytes > 0ull && clean_heap_ptr && clean_heap_ptr->Type == D3D12_HEAP_TYPE_DEFAULT) {
         PrepareResidencyBudgetForAllocation(est_bytes, allow_l0_spill, should_spill_l0);
     }
 
     D3D12_HEAP_PROPERTIES eff_heap_props{};
-    const D3D12_HEAP_PROPERTIES* eff_heap_ptr = pHeapProperties;
+    const D3D12_HEAP_PROPERTIES* eff_heap_ptr = clean_heap_ptr;
     bool did_l0_spill = false;
-    if (should_spill_l0 && pHeapProperties) {
-        eff_heap_props = *pHeapProperties;
+    if (should_spill_l0 && clean_heap_ptr) {
+        eff_heap_props = *clean_heap_ptr;
         eff_heap_props.Type = D3D12_HEAP_TYPE_CUSTOM;
         eff_heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
         eff_heap_props.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
@@ -3591,7 +4047,14 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
     } else if (should_spill_l0 && (FAILED(hr) || !host_res)) {
         // Adapter rejected L0 custom pool for this resource; fall back cleanly to original heap props.
         hr = host_dev_->CreateCommittedResource(
-            pHeapProperties, clean_heap_flags, desc_ptr, InitialResourceState,
+            clean_heap_ptr, clean_heap_flags, desc_ptr, InitialResourceState,
+            clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+    }
+    if (FAILED(hr) && retail_scarlett_abi_ && InitialResourceState != D3D12_RESOURCE_STATE_COMMON &&
+        clean_heap_ptr && clean_heap_ptr->Type == D3D12_HEAP_TYPE_DEFAULT) {
+        // Fallback: retry with COMMON initial state if desktop driver rejects an Xbox-only state mask.
+        hr = host_dev_->CreateCommittedResource(
+            clean_heap_ptr, clean_heap_flags, desc_ptr, D3D12_RESOURCE_STATE_COMMON,
             clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
     }
     if (FAILED(hr) || !host_res) {
@@ -3754,6 +4217,15 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResource(
         }
         desc_ptr = &clean_desc;
     }
+    if (adapter_info_.raytracing_tier == 0u &&
+        (InitialState & D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) != 0) {
+        InitialState = static_cast<D3D12_RESOURCE_STATES>(
+            (InitialState & ~D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) |
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    if (pDesc && pDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        clear_ptr = nullptr;
+    }
     if (!ppvResource) {
         const HRESULT hr = host_dev_->CreatePlacedResource(
             host_heap, HeapOffset, desc_ptr, InitialState, clear_ptr, riid, nullptr);
@@ -3888,6 +4360,15 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateReservedResource(
             }
         }
         desc_ptr = &clean_desc;
+    }
+    if (adapter_info_.raytracing_tier == 0u &&
+        (InitialState & D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) != 0) {
+        InitialState = static_cast<D3D12_RESOURCE_STATES>(
+            (InitialState & ~D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) |
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    if (pDesc && pDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        clear_ptr = nullptr;
     }
     if (!ppvResource) {
         const HRESULT hr = host_dev_->CreateReservedResource(
@@ -4090,6 +4571,30 @@ HRESULT STDMETHODCALLTYPE DeviceX::GetDeviceRemovedReason() {
     if (FAILED(host_hr)) {
         const HRESULT prev = device_removed_reason_.exchange(host_hr, std::memory_order_acq_rel);
         if (SUCCEEDED(prev)) {
+            if (retail_scarlett_abi_ && host_dev_) {
+                std::fprintf(stderr,
+                    "[OpenScarlett][d3d12_xs] DEVICE_REMOVED reason=0x%08lX\n",
+                    static_cast<unsigned long>(host_hr));
+                ID3D12InfoQueue* iq = nullptr;
+                if (SUCCEEDED(host_dev_->QueryInterface(OS_D3D12_IID(ID3D12InfoQueue), reinterpret_cast<void**>(&iq))) && iq) {
+                    const UINT64 n = iq->GetNumStoredMessages();
+                    const UINT64 start = (n > 20) ? (n - 20) : 0;
+                    for (UINT64 i = start; i < n; ++i) {
+                        SIZE_T mlen = 0;
+                        iq->GetMessage(i, nullptr, &mlen);
+                        if (mlen > 0 && mlen < 4096) {
+                            std::vector<uint8_t> mbuf(mlen);
+                            auto* msg = reinterpret_cast<D3D12_MESSAGE*>(mbuf.data());
+                            if (SUCCEEDED(iq->GetMessage(i, msg, &mlen)) && msg->pDescription) {
+                                std::fprintf(stderr, "  [D3D12Msg #%d sev=%d] %s\n",
+                                    static_cast<int>(msg->ID), static_cast<int>(msg->Severity), msg->pDescription);
+                            }
+                        }
+                    }
+                    iq->Release();
+                }
+                std::fflush(stderr);
+            }
             CommandQueueX::NotifyDeviceRemovedForDevice(this, host_hr);
         }
         RecordDev("ID3D12DeviceX::GetDeviceRemovedReason", 37, host_hr);
@@ -4197,6 +4702,56 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommandSignature(
     ID3D12CommandSignature* host_sig = nullptr;
     HRESULT hr = host_dev_->CreateCommandSignature(
         pDesc, host_rs, OS_D3D12_IID(ID3D12CommandSignature), reinterpret_cast<void**>(&host_sig));
+
+    // Xbox Series X|S d3d12_xs.h defines Xbox-extended D3D12_INDIRECT_ARGUMENT_TYPE values
+    // >= 100 (e.g., 0x69 = Xbox compute dispatch indirect, 0x6B = Xbox extended dispatch/draw).
+    // Translate Xbox-extended argument types to desktop equivalents when host rejects pDesc.
+    if ((FAILED(hr) || !host_sig) && pDesc && pDesc->pArgumentDescs && pDesc->NumArgumentDescs > 0u) {
+        std::vector<D3D12_INDIRECT_ARGUMENT_DESC> mapped_args(
+            pDesc->pArgumentDescs, pDesc->pArgumentDescs + pDesc->NumArgumentDescs);
+        bool modified = false;
+        for (auto& arg : mapped_args) {
+            const uint32_t raw_type = static_cast<uint32_t>(arg.Type);
+            if (raw_type >= 100u) {
+                modified = true;
+                if (raw_type == 0x69u || pDesc->ByteStride == 12u) {
+                    arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+                } else if (pDesc->ByteStride == 20u) {
+                    arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+                } else if (pDesc->ByteStride == 16u) {
+                    arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+                } else {
+                    arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+                }
+            } else if (raw_type == 9u && adapter_info_.raytracing_tier == 0u) {
+                // D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS on non-DXR GPU (e.g. GTX 1650 Ti)
+                modified = true;
+                arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+            } else if (raw_type == 10u && adapter_info_.mesh_shader_tier == 0u) {
+                // D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH on non-mesh-shader GPU
+                modified = true;
+                arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+            }
+        }
+        if (modified) {
+            D3D12_COMMAND_SIGNATURE_DESC mapped_desc = *pDesc;
+            mapped_desc.pArgumentDescs = mapped_args.data();
+            if (mapped_desc.ByteStride < 12u) {
+                mapped_desc.ByteStride = 12u;
+            }
+            hr = host_dev_->CreateCommandSignature(
+                &mapped_desc,
+                (mapped_desc.NumArgumentDescs == 1u &&
+                 (mapped_args[0].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW ||
+                  mapped_args[0].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED ||
+                  mapped_args[0].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH))
+                    ? nullptr
+                    : host_rs,
+                OS_D3D12_IID(ID3D12CommandSignature),
+                reinterpret_cast<void**>(&host_sig));
+        }
+    }
+
     if (FAILED(hr) || !host_sig) {
         RecordDev("ID3D12DeviceX::CreateCommandSignature", 41, hr);
         return hr;
@@ -4889,8 +5444,165 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
     }
     *ppPipelineState = nullptr;
     ID3D12PipelineState* host_pso = nullptr;
-    HRESULT hr = host_dev2_->CreatePipelineState(
-        final_stream_desc, OS_D3D12_IID(ID3D12PipelineState), reinterpret_cast<void**>(&host_pso));
+    HRESULT hr = E_FAIL;
+    bool stream_has_xdat = false;
+    if (retail_scarlett_abi_) {
+        for (const auto& ent : entries) {
+            if (ent.drop_subobject || !IsShaderSubobjectType(ent.desktop_type)) continue;
+            D3D12_SHADER_BYTECODE bc{};
+            std::memcpy(&bc, raw_stream + ent.src_offset + kBytecodeOffset, sizeof(bc));
+            if (IsXboxXdatDxbcBlob(bc.pShaderBytecode, bc.BytecodeLength)) {
+                stream_has_xdat = true;
+                break;
+            }
+        }
+    }
+    if (!stream_has_xdat) {
+        hr = host_dev2_->CreatePipelineState(
+            final_stream_desc, OS_D3D12_IID(ID3D12PipelineState), reinterpret_cast<void**>(&host_pso));
+    }
+    if ((FAILED(hr) || !host_pso) && retail_scarlett_abi_) {
+        bool stream_has_cs = false;
+        bool stream_has_ps = false;
+        ID3D12RootSignature* stream_rs = nullptr;
+        D3D12_RT_FORMAT_ARRAY rt_fmts{};
+        DXGI_FORMAT dsv_fmt = DXGI_FORMAT_UNKNOWN;
+        DXGI_SAMPLE_DESC samp_desc{1u, 0u};
+        D3D12_PRIMITIVE_TOPOLOGY_TYPE topo = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        for (const auto& ent : entries) {
+            if (ent.drop_subobject) continue;
+            if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) {
+                stream_has_cs = true;
+            } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
+                D3D12_SHADER_BYTECODE bc{};
+                std::memcpy(&bc, raw_stream + ent.src_offset + kBytecodeOffset, sizeof(bc));
+                if (bc.pShaderBytecode && bc.BytecodeLength > 0u) stream_has_ps = true;
+            } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) {
+                ID3D12RootSignature* rs = nullptr;
+                std::memcpy(&rs, raw_stream + ent.src_offset + kRootSigOffset, sizeof(rs));
+                if (rs != nullptr && IsKnownProxyPointer(rs)) {
+                    stream_rs = UnwrapRootSignature(rs);
+                }
+            } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS) {
+                if (ent.src_offset + sizeof(StreamSubobjLayout<D3D12_RT_FORMAT_ARRAY>) <= total_bytes) {
+                    std::memcpy(&rt_fmts,
+                        raw_stream + ent.src_offset + offsetof(StreamSubobjLayout<D3D12_RT_FORMAT_ARRAY>, value),
+                        sizeof(rt_fmts));
+                    if (rt_fmts.NumRenderTargets > 8u) {
+                        rt_fmts = {};
+                    }
+                    for (UINT i = 0u; i < rt_fmts.NumRenderTargets; ++i) {
+                        if (static_cast<uint32_t>(rt_fmts.RTFormats[i]) > 132u) {
+                            rt_fmts.RTFormats[i] = DXGI_FORMAT_R8G8B8A8_UNORM;
+                        }
+                    }
+                }
+            } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT) {
+                if (ent.src_offset + sizeof(StreamSubobjLayout<DXGI_FORMAT>) <= total_bytes) {
+                    std::memcpy(&dsv_fmt,
+                        raw_stream + ent.src_offset + offsetof(StreamSubobjLayout<DXGI_FORMAT>, value),
+                        sizeof(dsv_fmt));
+                    if (static_cast<uint32_t>(dsv_fmt) > 132u) {
+                        dsv_fmt = DXGI_FORMAT_UNKNOWN;
+                    }
+                }
+            } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC) {
+                if (ent.src_offset + sizeof(StreamSubobjLayout<DXGI_SAMPLE_DESC>) <= total_bytes) {
+                    std::memcpy(&samp_desc,
+                        raw_stream + ent.src_offset + offsetof(StreamSubobjLayout<DXGI_SAMPLE_DESC>, value),
+                        sizeof(samp_desc));
+                    if (samp_desc.Count == 0u || samp_desc.Count > 8u) {
+                        samp_desc = {1u, 0u};
+                    }
+                }
+            } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY) {
+                if (ent.src_offset + sizeof(StreamSubobjLayout<D3D12_PRIMITIVE_TOPOLOGY_TYPE>) <= total_bytes) {
+                    std::memcpy(&topo,
+                        raw_stream + ent.src_offset + offsetof(StreamSubobjLayout<D3D12_PRIMITIVE_TOPOLOGY_TYPE>, value),
+                        sizeof(topo));
+                    if (static_cast<uint32_t>(topo) > static_cast<uint32_t>(D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH)) {
+                        topo = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+                    }
+                }
+            }
+        }
+        if (!stream_rs) {
+            // Scan raw_stream aligned 8-byte slots for any known wrapped RootSignature proxy as backup.
+            for (size_t off = 0u; off + sizeof(void*) <= total_bytes; off += sizeof(void*)) {
+                void* cand = nullptr;
+                std::memcpy(&cand, raw_stream + off, sizeof(cand));
+                if (cand && IsKnownProxyPointer(cand)) {
+                    ID3D12RootSignature* unwrapped = UnwrapRootSignature(static_cast<ID3D12RootSignature*>(cand));
+                    if (unwrapped && unwrapped != cand) {
+                        stream_rs = unwrapped;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!stream_rs) {
+            openscarlett::XboxRootSignatureDesc empty_rs{};
+            stream_rs = SynthesizeHostRootSignatureFromXboxDesc(empty_rs);
+        }
+        if (stream_has_cs) {
+            const auto& cs_bc = GetCachedMinimalCs50();
+            if (!cs_bc.empty()) {
+                D3D12_COMPUTE_PIPELINE_STATE_DESC safe{};
+                safe.pRootSignature = stream_rs;
+                safe.CS = {cs_bc.data(), cs_bc.size()};
+                hr = host_dev_->CreateComputePipelineState(
+                    &safe, OS_D3D12_IID(ID3D12PipelineState), reinterpret_cast<void**>(&host_pso));
+                if (SUCCEEDED(hr) && host_pso) {
+                    RecordDev("ID3D12DeviceX::XdatShaderStandinPso", 47, S_OK);
+                }
+            }
+        } else {
+            const auto& vs_bc = GetCachedMinimalVs50();
+            const auto& ps_bc = GetCachedMinimalPs50(rt_fmts.NumRenderTargets, rt_fmts.RTFormats);
+            if (!vs_bc.empty() && !ps_bc.empty()) {
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC safe{};
+                safe.pRootSignature = stream_rs;
+                safe.VS = {vs_bc.data(), vs_bc.size()};
+                if (stream_has_ps) {
+                    safe.PS = {ps_bc.data(), ps_bc.size()};
+                }
+                safe.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+                safe.SampleMask = UINT_MAX;
+                safe.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+                safe.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+                safe.RasterizerState.DepthClipEnable = TRUE;
+                safe.PrimitiveTopologyType =
+                    (topo == D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED ||
+                     topo == D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH)
+                        ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+                        : topo;
+                safe.NumRenderTargets = std::min<UINT>(rt_fmts.NumRenderTargets, 8u);
+                for (UINT i = 0u; i < safe.NumRenderTargets; ++i) {
+                    safe.RTVFormats[i] = rt_fmts.RTFormats[i];
+                }
+                safe.DSVFormat = dsv_fmt;
+                safe.SampleDesc.Count = (samp_desc.Count > 0u) ? samp_desc.Count : 1u;
+                safe.SampleDesc.Quality = samp_desc.Quality;
+                hr = host_dev_->CreateGraphicsPipelineState(
+                    &safe, OS_D3D12_IID(ID3D12PipelineState), reinterpret_cast<void**>(&host_pso));
+                if (FAILED(hr) || !host_pso) {
+                    // Retry with sanitized default RT/DSV formats if stream subobject alignment differed.
+                    safe.NumRenderTargets = 1u;
+                    safe.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    for (UINT i = 1u; i < 8u; ++i) safe.RTVFormats[i] = DXGI_FORMAT_UNKNOWN;
+                    safe.DSVFormat = DXGI_FORMAT_UNKNOWN;
+                    safe.SampleDesc = {1u, 0u};
+                    const auto& ps1_bc = GetCachedMinimalPs50(1u, safe.RTVFormats);
+                    safe.PS = {ps1_bc.data(), ps1_bc.size()};
+                    hr = host_dev_->CreateGraphicsPipelineState(
+                        &safe, OS_D3D12_IID(ID3D12PipelineState), reinterpret_cast<void**>(&host_pso));
+                }
+                if (SUCCEEDED(hr) && host_pso) {
+                    RecordDev("ID3D12DeviceX::XdatShaderStandinPso", 47, S_OK);
+                }
+            }
+        }
+    }
     if (FAILED(hr) || !host_pso) {
         RecordDev("ID3D12DeviceX::CreatePipelineState", 47, hr);
         return hr;
@@ -5171,6 +5883,15 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource1(
             InitialResourceState = D3D12_RESOURCE_STATE_COPY_DEST;
         }
     }
+    if (adapter_info_.raytracing_tier == 0u &&
+        (InitialResourceState & D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) != 0) {
+        InitialResourceState = static_cast<D3D12_RESOURCE_STATES>(
+            (InitialResourceState & ~D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) |
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    if (pDesc && pDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        clear_ptr = nullptr;
+    }
     if (!ppvResource) {
         const HRESULT hr = host_dev4_->CreateCommittedResource1(
             pHeapProperties, clean_heap_flags, desc_ptr, InitialResourceState,
@@ -5308,6 +6029,15 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateReservedResource1(
             }
         }
         desc_ptr = &clean_desc;
+    }
+    if (adapter_info_.raytracing_tier == 0u &&
+        (InitialState & D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) != 0) {
+        InitialState = static_cast<D3D12_RESOURCE_STATES>(
+            (InitialState & ~D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) |
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    if (pDesc && pDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        clear_ptr = nullptr;
     }
     if (!ppvResource) {
         const HRESULT hr = host_dev4_->CreateReservedResource1(
@@ -5650,11 +6380,21 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateStateObject(
 void STDMETHODCALLTYPE DeviceX::GetRaytracingAccelerationStructurePrebuildInfo(
     const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* pDesc,
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* pInfo) {
-    if (host_dev5_) {
+    if (pInfo) {
+        std::memset(pInfo, 0, sizeof(*pInfo));
+    }
+    if (host_dev5_ && adapter_info_.raytracing_tier > 0u) {
         host_dev5_->GetRaytracingAccelerationStructurePrebuildInfo(pDesc, pInfo);
+    } else if (pInfo && pDesc) {
+        // Non-DXR adapter (e.g. GTX 1650 Ti): provide conservative 256B-aligned software AS sizes.
+        const uint64_t num_descs = std::max<uint64_t>(1ull, static_cast<uint64_t>(pDesc->NumDescs));
+        const uint64_t est = std::min<uint64_t>(64ull * 1024ull * 1024ull, (num_descs * 256ull + 4095ull) & ~4095ull);
+        pInfo->ResultDataMaxSizeInBytes = est;
+        pInfo->ScratchDataSizeInBytes = est;
+        pInfo->UpdateScratchDataSizeInBytes = std::max<uint64_t>(4096ull, est / 2ull);
     }
     RecordDev("ID3D12DeviceX::GetRaytracingAccelerationStructurePrebuildInfo",
-              63, host_dev5_ ? S_OK : E_NOINTERFACE);
+              63, (host_dev5_ || adapter_info_.raytracing_tier == 0u) ? S_OK : E_NOINTERFACE);
 }
 
 D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE DeviceX::CheckDriverMatchingIdentifier(
@@ -5704,16 +6444,32 @@ HRESULT STDMETHODCALLTYPE DeviceX::AddToStateObject(
     ID3D12StateObject* pStateObjectToGrowFrom,
     REFIID riid,
     void** ppNewStateObject) {
-    if (!host_dev7_) {
-        RecordDev("ID3D12DeviceX::AddToStateObject", 66, E_NOINTERFACE);
-        return E_NOINTERFACE;
+    if (!ppNewStateObject) {
+        RecordDev("ID3D12DeviceX::AddToStateObject", 66, E_POINTER);
+        return E_POINTER;
     }
+    *ppNewStateObject = nullptr;
     ID3D12StateObject* host_so = nullptr;
-    HRESULT hr = host_dev7_->AddToStateObject(
-        pAddition, UnwrapStateObject(pStateObjectToGrowFrom),
-        OS_D3D12_IID(ID3D12StateObject), reinterpret_cast<void**>(&host_so));
-    if (SUCCEEDED(hr) && host_so && ppNewStateObject) {
-        auto* proxy = new (std::nothrow) StateObjectXProxy(this, host_so);
+    HRESULT hr = E_NOINTERFACE;
+    if (host_dev7_ && adapter_info_.raytracing_tier > 0u) {
+        hr = host_dev7_->AddToStateObject(
+            pAddition, UnwrapStateObject(pStateObjectToGrowFrom),
+            OS_D3D12_IID(ID3D12StateObject), reinterpret_cast<void**>(&host_so));
+    }
+    if ((FAILED(hr) || !host_so) &&
+        (adapter_info_.raytracing_tier == 0u || retail_scarlett_abi_)) {
+        auto* sw_proxy = new (std::nothrow) StateObjectXProxy(this, nullptr, pAddition, true);
+        if (!sw_proxy) {
+            RecordDev("ID3D12DeviceX::AddToStateObject", 66, E_OUTOFMEMORY);
+            return E_OUTOFMEMORY;
+        }
+        hr = sw_proxy->QueryInterface(riid, ppNewStateObject);
+        sw_proxy->Release();
+        RecordDev("ID3D12DeviceX::AddToStateObject", 66, hr);
+        return hr;
+    }
+    if (SUCCEEDED(hr) && host_so) {
+        auto* proxy = new (std::nothrow) StateObjectXProxy(this, host_so, pAddition);
         host_so->Release();
         if (!proxy) {
             RecordDev("ID3D12DeviceX::AddToStateObject", 66, E_OUTOFMEMORY);
@@ -5725,6 +6481,33 @@ HRESULT STDMETHODCALLTYPE DeviceX::AddToStateObject(
         host_so->Release();
     }
     RecordDev("ID3D12DeviceX::AddToStateObject", 66, hr);
+    return hr;
+}
+
+HRESULT DeviceX::DeserializeStateObjectX(
+    const void* pBlob,
+    SIZE_T blobSize,
+    ID3D12RootSignature* pRootSignature,
+    UINT flags,
+    REFIID riid,
+    void** ppStateObject) {
+    (void)pBlob;
+    (void)blobSize;
+    (void)pRootSignature;
+    (void)flags;
+    if (!ppStateObject) {
+        RecordDev("ID3D12DeviceX::DeserializeStateObjectX", 115, E_POINTER);
+        return E_POINTER;
+    }
+    *ppStateObject = nullptr;
+    auto* sw_proxy = new (std::nothrow) StateObjectXProxy(this, nullptr, nullptr, true);
+    if (!sw_proxy) {
+        RecordDev("ID3D12DeviceX::DeserializeStateObjectX", 115, E_OUTOFMEMORY);
+        return E_OUTOFMEMORY;
+    }
+    const HRESULT hr = sw_proxy->QueryInterface(riid, ppStateObject);
+    sw_proxy->Release();
+    RecordDev("ID3D12DeviceX::DeserializeStateObjectX", 115, hr);
     return hr;
 }
 

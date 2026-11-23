@@ -3,12 +3,28 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 
 #include "openscarlett/core/telemetry.h"
 
 namespace {
+
+bool TraceXgEnabled() noexcept {
+    static const bool enabled = []() {
+#if defined(_WIN32)
+        char buf[16] = {};
+        const DWORD n = GetEnvironmentVariableA("OPENSCARLETT_TRACE_XG", buf, static_cast<DWORD>(sizeof(buf)));
+        return n > 0u && buf[0] != '0';
+#else
+        const char* v = std::getenv("OPENSCARLETT_TRACE_XG");
+        return v && v[0] != '\0' && v[0] != '0';
+#endif
+    }();
+    return enabled;
+}
 
 constexpr const char* kXgModule = "xg_xs.dll";
 constexpr int32_t kHrOk = 0;
@@ -83,11 +99,69 @@ struct XG_SUBRESOURCE_TILING {
     uint32_t StartTileIndexInOverallResource;
 };
 
+// Real Microsoft Xbox Series X|S xg_xs.h resource layout structures
+// (verified byte-exact against UE5 Frosty-XSX-Shipping.exe HandleSpecialLock:
+//  Planes at +0x14, Plane[4] at +0x18 with stride 0x6C8, Plane[0].Slice2DSizeBytes at +0x28,
+//  Plane[0].MipLayout[0] at +0x50 with stride 0x70, MipLayout.OffsetBytes at +0x08 (+0x58),
+//  MipLayout.TileMode at +0x64 (+0xB4)).
+struct XG_MIPLEVEL_LAYOUT_XBOX {
+    uint64_t SizeBytes;               // +0x00 (Layout +0x50)
+    uint64_t OffsetBytes;             // +0x08 (Layout +0x58)
+    uint64_t Slice2DSizeBytes;        // +0x10 (Layout +0x60)
+    uint32_t PitchPixels;             // +0x18 (Layout +0x68)
+    uint32_t PitchBytes;              // +0x1C (Layout +0x6C)
+    uint32_t AlignmentBytes;          // +0x20 (Layout +0x70)
+    uint32_t PaddedWidthElements;     // +0x24 (Layout +0x74)
+    uint32_t PaddedHeightElements;    // +0x28 (Layout +0x78)
+    uint32_t PaddedDepthOrArraySize;  // +0x2C (Layout +0x7C)
+    uint32_t WidthElements;           // +0x30 (Layout +0x80)
+    uint32_t HeightElements;          // +0x34 (Layout +0x84)
+    uint32_t DepthOrArraySize;        // +0x38 (Layout +0x88)
+    uint32_t SampleCount;             // +0x3C (Layout +0x8C)
+    uint64_t MipTailOffsetBytes;      // +0x40 (Layout +0x90)
+    uint32_t BankRotation;            // +0x48 (Layout +0x98)
+    uint32_t PipeSwizzle;             // +0x4C (Layout +0x9C)
+    uint32_t Flags;                   // +0x50 (Layout +0xA0)
+    uint32_t ReservedMid[4];          // +0x54..+0x63
+    uint32_t TileMode;                // +0x64 (Layout +0xB4)
+    uint32_t ReservedEnd[2];          // +0x68..+0x6F
+};
+static_assert(sizeof(XG_MIPLEVEL_LAYOUT_XBOX) == 0x70u, "XG_MIPLEVEL_LAYOUT_XBOX must be 0x70 bytes");
+
+struct XG_PLANE_LAYOUT_XBOX {
+    uint32_t Usage;                   // +0x000 (Layout +0x18)
+    uint32_t Reserved0;               // +0x004 (Layout +0x1C)
+    uint64_t SizeBytes;               // +0x008 (Layout +0x20)
+    uint64_t Slice2DSizeBytes;        // +0x010 (Layout +0x28)
+    uint64_t BaseOffsetBytes;         // +0x018 (Layout +0x30)
+    uint64_t BaseAlignmentBytes;      // +0x020 (Layout +0x38)
+    uint32_t BytesPerElement;         // +0x028 (Layout +0x40)
+    uint32_t Reserved1;               // +0x02C (Layout +0x44)
+    uint32_t MipTailStartLevel;       // +0x030 (Layout +0x48)
+    uint32_t Reserved2;               // +0x034 (Layout +0x4C)
+    XG_MIPLEVEL_LAYOUT_XBOX MipLayout[15];  // +0x038..+0x6C7 (Layout +0x50..+0x6DF)
+};
+static_assert(sizeof(XG_PLANE_LAYOUT_XBOX) == 0x6C8u, "XG_PLANE_LAYOUT_XBOX must be 0x6C8 bytes");
+
+struct XG_RESOURCE_LAYOUT_XBOX {
+    uint64_t SizeBytes;               // +0x0000
+    uint64_t BaseAlignmentBytes;      // +0x0008
+    uint32_t MipLevels;               // +0x0010
+    uint32_t Planes;                  // +0x0014
+    XG_PLANE_LAYOUT_XBOX Plane[4];    // +0x0018..+0x1B37
+    uint32_t Dimension;               // +0x1B38
+    uint32_t Flags;                   // +0x1B3C
+};
+static_assert(sizeof(XG_RESOURCE_LAYOUT_XBOX) == 0x1B40u, "XG_RESOURCE_LAYOUT_XBOX must be 0x1B40 bytes");
+
+// Real Xbox Series X|S xg_xs.h XGTextureAddressComputer vtable:
+//   Slot 0 (+0x00): AddRef (NO QueryInterface!)
+//   Slot 1 (+0x08): Release
+//   Slot 2 (+0x10): GetResourceLayout
 struct XGTextureAddressComputer {
-    virtual int32_t __stdcall QueryInterface(const XG_GUID* riid, void** ppvObject) = 0;
     virtual uint32_t __stdcall AddRef() = 0;
     virtual uint32_t __stdcall Release() = 0;
-    virtual int32_t __stdcall GetResourceLayout(XG_RESOURCE_LAYOUT* pLayout) const = 0;
+    virtual int32_t __stdcall GetResourceLayout(XG_RESOURCE_LAYOUT_XBOX* pLayout) const = 0;
     virtual uint64_t __stdcall GetResourceSizeBytes() const = 0;
     virtual uint64_t __stdcall GetResourceBaseAlignmentBytes() const = 0;
     virtual uint64_t __stdcall GetMipLevelOffsetBytes(uint32_t plane, uint32_t mipLevel) const = 0;
@@ -151,10 +225,110 @@ inline uint32_t TranslateD3D12ResourceFlagsToXgBind(uint32_t flags) noexcept {
     return bind;
 }
 
+// Maps real Xbox Series X|S D3D12_TEXTURE_LAYOUT (0x100 | AMD GFX10 ADDR_SW_*)
+// onto OpenScarlett's internal XG_TILE_MODE enum.
+inline bool MapXboxSwizzleModeToXgTileMode(
+    uint32_t xbox_sw,
+    bool is_3d,
+    XG_TILE_MODE& out_mode) noexcept {
+    switch (xbox_sw) {
+        case 0u:   // SW_LINEAR
+            out_mode = XG_TILE_MODE_LINEAR;
+            return true;
+        case 1u:   // SW_256B_S
+            if (is_3d) return false;
+            out_mode = XG_TILE_MODE_2D_THIN_256B_S;
+            return true;
+        case 2u:   // SW_256B_D
+            if (is_3d) return false;
+            out_mode = XG_TILE_MODE_2D_THIN_256B_D;
+            return true;
+        case 3u:   // SW_256B_R
+            if (is_3d) return false;
+            out_mode = XG_TILE_MODE_2D_THIN_256B_R;
+            return true;
+        case 4u:   // SW_4KB_Z
+        case 20u:  // SW_4KB_Z_X
+            out_mode = is_3d ? XG_TILE_MODE_3D_THICK_4KB_S : XG_TILE_MODE_2D_THIN_4KB_Z;
+            return true;
+        case 5u:   // SW_4KB_S
+        case 21u:  // SW_4KB_S_X
+            out_mode = is_3d ? XG_TILE_MODE_3D_THICK_4KB_S : XG_TILE_MODE_2D_THIN_4KB_S;
+            return true;
+        case 6u:   // SW_4KB_D
+        case 22u:  // SW_4KB_D_X
+            out_mode = is_3d ? XG_TILE_MODE_3D_THICK_4KB_S : XG_TILE_MODE_2D_THIN_4KB_D;
+            return true;
+        case 7u:   // SW_4KB_R
+        case 23u:  // SW_4KB_R_X
+            out_mode = is_3d ? XG_TILE_MODE_3D_THICK_4KB_S : XG_TILE_MODE_2D_THIN_4KB_R;
+            return true;
+        case 8u:   // SW_64KB_Z
+        case 16u:  // SW_64KB_Z_T
+            out_mode = is_3d ? XG_TILE_MODE_3D_THICK_64KB_Z : XG_TILE_MODE_2D_THIN_64KB_Z;
+            return true;
+        case 9u:   // SW_64KB_S
+        case 17u:  // SW_64KB_S_T
+            out_mode = is_3d ? XG_TILE_MODE_3D_THICK_64KB_S : XG_TILE_MODE_2D_THIN_64KB_S;
+            return true;
+        case 10u:  // SW_64KB_D
+        case 18u:  // SW_64KB_D_T
+            out_mode = is_3d ? XG_TILE_MODE_3D_THICK_64KB_S : XG_TILE_MODE_2D_THIN_64KB_D;
+            return true;
+        case 11u:  // SW_64KB_R
+        case 19u:  // SW_64KB_R_T
+            out_mode = is_3d ? XG_TILE_MODE_3D_THICK_64KB_S : XG_TILE_MODE_2D_THIN_64KB_R;
+            return true;
+        case 24u:  // SW_64KB_Z_X
+            out_mode = is_3d ? XG_TILE_MODE_3D_THICK_64KB_Z_X : XG_TILE_MODE_2D_THIN_64KB_Z_X;
+            return true;
+        case 25u:  // SW_64KB_S_X
+            out_mode = is_3d ? XG_TILE_MODE_3D_THICK_64KB_S_X : XG_TILE_MODE_2D_THIN_64KB_S_X;
+            return true;
+        case 26u:  // SW_64KB_D_X
+            out_mode = is_3d ? XG_TILE_MODE_3D_THICK_64KB_S_X : XG_TILE_MODE_2D_THIN_64KB_D_X;
+            return true;
+        case 27u:  // SW_64KB_R_X
+            out_mode = is_3d ? XG_TILE_MODE_3D_THICK_64KB_R_X : XG_TILE_MODE_2D_THIN_64KB_R_X;
+            return true;
+        default:
+            return false;
+    }
+}
+
+inline uint32_t MapXgTileModeToXboxSwizzleMode(XG_TILE_MODE mode) noexcept {
+    switch (mode) {
+        case XG_TILE_MODE_LINEAR:           return 0u;
+        case XG_TILE_MODE_2D_THIN_256B_S:   return 1u;
+        case XG_TILE_MODE_2D_THIN_256B_D:   return 2u;
+        case XG_TILE_MODE_2D_THIN_256B_R:   return 3u;
+        case XG_TILE_MODE_2D_THIN_4KB_Z:    return 4u;
+        case XG_TILE_MODE_2D_THIN_4KB_S:
+        case XG_TILE_MODE_3D_THICK_4KB_S:   return 5u;
+        case XG_TILE_MODE_2D_THIN_4KB_D:    return 6u;
+        case XG_TILE_MODE_2D_THIN_4KB_R:    return 7u;
+        case XG_TILE_MODE_2D_THIN_64KB_Z:
+        case XG_TILE_MODE_3D_THICK_64KB_Z:  return 8u;
+        case XG_TILE_MODE_2D_THIN_64KB_S:
+        case XG_TILE_MODE_3D_THICK_64KB_S:  return 9u;
+        case XG_TILE_MODE_2D_THIN_64KB_D:   return 10u;
+        case XG_TILE_MODE_2D_THIN_64KB_R:   return 11u;
+        case XG_TILE_MODE_2D_THIN_64KB_Z_X:
+        case XG_TILE_MODE_3D_THICK_64KB_Z_X: return 24u;
+        case XG_TILE_MODE_2D_THIN_64KB_S_X:
+        case XG_TILE_MODE_3D_THICK_64KB_S_X: return 25u;
+        case XG_TILE_MODE_2D_THIN_64KB_D_X:  return 26u;
+        case XG_TILE_MODE_2D_THIN_64KB_R_X:
+        case XG_TILE_MODE_3D_THICK_64KB_R_X: return 27u;
+        default:                             return 9u;
+    }
+}
+
 inline bool ResolveTileModeFromResourceDesc(
     const XG_RESOURCE_DESC& desc,
     uint32_t bind_flags,
-    XG_TILE_MODE& out_mode) noexcept {
+    XG_TILE_MODE& out_mode,
+    uint32_t& out_xbox_sw) noexcept {
     const bool is_3d = (desc.Dimension == kD3D12DimTexture3D);
     if (desc.Layout == kD3D12LayoutUnknown) {
         if (is_3d) {
@@ -164,25 +338,36 @@ inline bool ResolveTileModeFromResourceDesc(
             out_mode = openscarlett::xg::ComputeOptimalTileMode(
                 desc.Format, static_cast<uint32_t>(desc.Width), h, bind_flags);
         }
+        out_xbox_sw = MapXgTileModeToXboxSwizzleMode(out_mode);
         return true;
     }
     if (desc.Layout == kD3D12LayoutRowMajor) {
         out_mode = XG_TILE_MODE_LINEAR;
+        out_xbox_sw = 0u;
         return true;
     }
     if (desc.Layout == kD3D12Layout64KBUndefinedSwizzle ||
         desc.Layout == kD3D12Layout64KBStandardSwizzle) {
         out_mode = is_3d ? XG_TILE_MODE_3D_THICK_64KB_S : XG_TILE_MODE_2D_THIN_64KB_S;
+        out_xbox_sw = 9u;
         return true;
     }
 
-    // Xbox extended D3D12_TEXTURE_LAYOUT (0x100 + XG_TILE_MODE) or direct XG_TILE_MODE enum.
-    const uint32_t raw_mode =
-        ((desc.Layout & 0x100u) != 0u) ? (desc.Layout & 0xFFu) : desc.Layout;
-    if (raw_mode > static_cast<uint32_t>(XG_TILE_MODE_3D_THICK_64KB_R_X)) {
+    // Xbox extended D3D12_TEXTURE_LAYOUT (0x100 | AMD GFX10 ADDR_SW_*).
+    if ((desc.Layout & 0x100u) != 0u) {
+        const uint32_t sw = desc.Layout & 0xFFu;
+        if (!MapXboxSwizzleModeToXgTileMode(sw, is_3d, out_mode)) {
+            return false;
+        }
+        out_xbox_sw = sw;
+        return true;
+    }
+
+    // Direct OpenScarlett XG_TILE_MODE fallback (for synthetic/unit-test callers).
+    if (desc.Layout > static_cast<uint32_t>(XG_TILE_MODE_3D_THICK_64KB_R_X)) {
         return false;
     }
-    const auto candidate = static_cast<XG_TILE_MODE>(raw_mode);
+    const auto candidate = static_cast<XG_TILE_MODE>(desc.Layout);
     if (is_3d) {
         if (candidate != XG_TILE_MODE_LINEAR && !openscarlett::xg::IsTileMode3D(candidate)) {
             return false;
@@ -193,6 +378,7 @@ inline bool ResolveTileModeFromResourceDesc(
         }
     }
     out_mode = candidate;
+    out_xbox_sw = MapXgTileModeToXboxSwizzleMode(candidate);
     return true;
 }
 
@@ -200,54 +386,28 @@ class XGResourceAddressComputerImpl final : public XGTextureAddressComputer {
 public:
     XGResourceAddressComputerImpl(
         const XG_TEXTURE2D_DESC& desc,
-        const XG_RESOURCE_LAYOUT& layout)
-        : is_3d_(false), desc2d_(desc), layout_(layout) {}
+        const XG_RESOURCE_LAYOUT& layout,
+        uint32_t xbox_swizzle_mode)
+        : is_3d_(false), desc2d_(desc), layout_(layout), xbox_swizzle_mode_(xbox_swizzle_mode) {}
 
     XGResourceAddressComputerImpl(
         const XG_TEXTURE3D_DESC& desc,
-        const XG_RESOURCE_LAYOUT& layout)
-        : is_3d_(true), desc3d_(desc), layout_(layout) {}
-
-    int32_t __stdcall QueryInterface(const XG_GUID* riid, void** ppvObject) override {
-        if (!ppvObject) {
-            openscarlett::CallTelemetry::Global().Record(
-                kXgModule, "XGTextureAddressComputer::QueryInterface",
-                openscarlett::CallOutcome::Error, kHrPointer, 0);
-            return kHrPointer;
-        }
-        *ppvObject = nullptr;
-        if (!riid) {
-            openscarlett::CallTelemetry::Global().Record(
-                kXgModule, "XGTextureAddressComputer::QueryInterface",
-                openscarlett::CallOutcome::Error, kHrInvalidArg, 0);
-            return kHrInvalidArg;
-        }
-        if (XgGuidEquals(riid, kIidIUnknown) || XgGuidEquals(riid, kIidXGTextureAddressComputer)) {
-            AddRef();
-            *ppvObject = static_cast<XGTextureAddressComputer*>(this);
-            openscarlett::CallTelemetry::Global().Record(
-                kXgModule, "XGTextureAddressComputer::QueryInterface",
-                openscarlett::CallOutcome::Ok, kHrOk, 0);
-            return kHrOk;
-        }
-        openscarlett::CallTelemetry::Global().Record(
-            kXgModule, "XGTextureAddressComputer::QueryInterface",
-            openscarlett::CallOutcome::Error, kHrNoInterface, 0);
-        return kHrNoInterface;
-    }
+        const XG_RESOURCE_LAYOUT& layout,
+        uint32_t xbox_swizzle_mode)
+        : is_3d_(true), desc3d_(desc), layout_(layout), xbox_swizzle_mode_(xbox_swizzle_mode) {}
 
     uint32_t __stdcall AddRef() override {
         const uint32_t ref = ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
         openscarlett::CallTelemetry::Global().Record(
             kXgModule, "XGTextureAddressComputer::AddRef",
-            openscarlett::CallOutcome::Ok, kHrOk, 1);
+            openscarlett::CallOutcome::Ok, kHrOk, 0);
         return ref;
     }
 
     uint32_t __stdcall Release() override {
         openscarlett::CallTelemetry::Global().Record(
             kXgModule, "XGTextureAddressComputer::Release",
-            openscarlett::CallOutcome::Ok, kHrOk, 2);
+            openscarlett::CallOutcome::Ok, kHrOk, 1);
         const uint32_t rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
         if (rem == 0u) {
             delete this;
@@ -255,17 +415,70 @@ public:
         return rem;
     }
 
-    int32_t __stdcall GetResourceLayout(XG_RESOURCE_LAYOUT* pLayout) const override {
+    int32_t __stdcall GetResourceLayout(XG_RESOURCE_LAYOUT_XBOX* pLayout) const override {
         if (!pLayout) {
             openscarlett::CallTelemetry::Global().Record(
                 kXgModule, "XGTextureAddressComputer::GetResourceLayout",
-                openscarlett::CallOutcome::Error, kHrPointer, 3);
+                openscarlett::CallOutcome::Error, kHrPointer, 2);
             return kHrPointer;
         }
-        *pLayout = layout_;
+        std::memset(pLayout, 0, sizeof(XG_RESOURCE_LAYOUT_XBOX));
+        pLayout->SizeBytes = layout_.SizeBytes;
+        pLayout->BaseAlignmentBytes = std::max<uint64_t>(layout_.BaseAlignmentBytes, 256ull);
+        pLayout->MipLevels = std::min<uint32_t>(layout_.MipLevels, 15u);
+        const uint32_t planes = std::clamp<uint32_t>(
+            (layout_.PlaneCount == 0u) ? 1u : layout_.PlaneCount, 1u, 4u);
+        pLayout->Planes = planes;
+        pLayout->Dimension = layout_.Dimension;
+        pLayout->Flags = 0u;
+
+        for (uint32_t p = 0u; p < planes; ++p) {
+            XG_PLANE_LAYOUT_XBOX& dst_p = pLayout->Plane[p];
+            dst_p.Usage = (p == 0u) ? 0u : 3u;
+            dst_p.SizeBytes = (p < XG_MAX_PLANES && layout_.PlaneSizes[p] > 0u)
+                                  ? layout_.PlaneSizes[p]
+                                  : layout_.SizeBytes;
+            dst_p.Slice2DSizeBytes = dst_p.SizeBytes / std::max<uint64_t>(layout_.ArraySize, 1ull);
+            dst_p.BaseOffsetBytes = (p < XG_MAX_PLANES) ? layout_.PlaneOffsets[p] : 0ull;
+            dst_p.BaseAlignmentBytes = pLayout->BaseAlignmentBytes;
+            const XG_FORMAT_BLOCK_INFO& fi =
+                (p < XG_MAX_PLANES && layout_.PlaneFormatInfo[p].bytes_per_block > 0u)
+                    ? layout_.PlaneFormatInfo[p]
+                    : layout_.FormatInfo;
+            dst_p.BytesPerElement = std::max<uint32_t>(fi.bytes_per_block, 1u);
+            dst_p.MipTailStartLevel =
+                (p == 0u) ? layout_.MipTailStartLevel : layout_.Plane1MipTailStartLevel;
+            const XG_MIPLEVEL_LAYOUT* src_mips = (p == 0u) ? layout_.Mips : layout_.Plane1Mips;
+            for (uint32_t m = 0u; m < pLayout->MipLevels; ++m) {
+                const XG_MIPLEVEL_LAYOUT& sm = src_mips[m];
+                XG_MIPLEVEL_LAYOUT_XBOX& dm = dst_p.MipLayout[m];
+                dm.SizeBytes = sm.SizeBytes;
+                dm.OffsetBytes = sm.OffsetBytes;
+                dm.Slice2DSizeBytes = sm.SlicePitchBytes;
+                dm.PitchPixels = sm.PaddedWidthElements * std::max<uint32_t>(fi.block_width, 1u);
+                dm.PitchBytes = (sm.RowPitchBytes > 0u)
+                                    ? sm.RowPitchBytes
+                                    : (sm.PaddedWidthElements * dst_p.BytesPerElement);
+                dm.AlignmentBytes = std::max<uint32_t>(sm.TileSizeBytes, 256u);
+                dm.PaddedWidthElements = sm.PaddedWidthElements;
+                dm.PaddedHeightElements = sm.PaddedHeightElements;
+                dm.PaddedDepthOrArraySize =
+                    is_3d_ ? std::max<uint32_t>(sm.PaddedDepthElements, 1u)
+                           : std::max<uint32_t>(layout_.ArraySize, 1u);
+                dm.WidthElements = sm.WidthElements;
+                dm.HeightElements = sm.HeightElements;
+                dm.DepthOrArraySize =
+                    is_3d_ ? std::max<uint32_t>(sm.DepthElements, 1u)
+                           : std::max<uint32_t>(layout_.ArraySize, 1u);
+                dm.SampleCount = is_3d_ ? 1u : std::max<uint32_t>(desc2d_.SampleCount, 1u);
+                dm.TileMode = xbox_swizzle_mode_;
+                dm.MipTailOffsetBytes =
+                    (p == 0u) ? layout_.MipTailOffsetBytes : layout_.Plane1MipTailOffsetBytes;
+            }
+        }
         openscarlett::CallTelemetry::Global().Record(
             kXgModule, "XGTextureAddressComputer::GetResourceLayout",
-            openscarlett::CallOutcome::Ok, kHrOk, 3);
+            openscarlett::CallOutcome::Ok, kHrOk, 2);
         return kHrOk;
     }
 
@@ -688,6 +901,7 @@ private:
     XG_TEXTURE2D_DESC desc2d_{};
     XG_TEXTURE3D_DESC desc3d_{};
     XG_RESOURCE_LAYOUT layout_{};
+    uint32_t xbox_swizzle_mode_ = 0u;
 };
 
 class XGTextureAddressComputerImpl final : public IXGTextureAddressComputer {
@@ -822,6 +1036,7 @@ private:
     XG_TEXTURE2D_DESC desc2d_{};
     XG_TEXTURE3D_DESC desc3d_{};
     XG_RESOURCE_LAYOUT layout_{};
+    uint32_t xbox_swizzle_mode_ = 0u;
 };
 
 }  // namespace
@@ -845,7 +1060,8 @@ OPENSCARLETT_XG_API int32_t __stdcall XGCreateTextureComputer(
 
     const uint32_t bind_flags = TranslateD3D12ResourceFlagsToXgBind(pDesc->Flags);
     XG_TILE_MODE tile_mode = XG_TILE_MODE_LINEAR;
-    if (!ResolveTileModeFromResourceDesc(*pDesc, bind_flags, tile_mode)) {
+    uint32_t xbox_sw = 0u;
+    if (!ResolveTileModeFromResourceDesc(*pDesc, bind_flags, tile_mode, xbox_sw)) {
         openscarlett::CallTelemetry::Global().Record(
             kXgModule, "XGCreateTextureComputer", openscarlett::CallOutcome::Error, kHrInvalidArg);
         return kHrInvalidArg;
@@ -868,7 +1084,7 @@ OPENSCARLETT_XG_API int32_t __stdcall XGCreateTextureComputer(
                 kXgModule, "XGCreateTextureComputer", openscarlett::CallOutcome::Error, kHrInvalidArg);
             return kHrInvalidArg;
         }
-        comp = new (std::nothrow) XGResourceAddressComputerImpl(d3d, layout);
+        comp = new (std::nothrow) XGResourceAddressComputerImpl(d3d, layout, xbox_sw);
     } else if (pDesc->Dimension == kD3D12DimTexture1D || pDesc->Dimension == kD3D12DimTexture2D) {
         XG_TEXTURE2D_DESC d2d{};
         d2d.Width = static_cast<uint32_t>(pDesc->Width);
@@ -884,7 +1100,7 @@ OPENSCARLETT_XG_API int32_t __stdcall XGCreateTextureComputer(
                 kXgModule, "XGCreateTextureComputer", openscarlett::CallOutcome::Error, kHrInvalidArg);
             return kHrInvalidArg;
         }
-        comp = new (std::nothrow) XGResourceAddressComputerImpl(d2d, layout);
+        comp = new (std::nothrow) XGResourceAddressComputerImpl(d2d, layout, xbox_sw);
     } else {
         openscarlett::CallTelemetry::Global().Record(
             kXgModule, "XGCreateTextureComputer", openscarlett::CallOutcome::Error, kHrInvalidArg);
@@ -898,6 +1114,26 @@ OPENSCARLETT_XG_API int32_t __stdcall XGCreateTextureComputer(
     }
 
     *ppComputer = comp;
+    if (TraceXgEnabled()) {
+        std::fprintf(stderr,
+            "[OpenScarlett][xg_xs] XGCreateTextureComputer dim=%u W=%llu H=%u D=%u mips=%u fmt=%u sc=%u layout=0x%X flags=0x%X -> tileMode=%u size=0x%llX align=0x%llX mip0Off=0x%llX mip0Sz=0x%llX tailStart=%u\n",
+            pDesc->Dimension,
+            static_cast<unsigned long long>(pDesc->Width),
+            pDesc->Height,
+            static_cast<unsigned>(pDesc->DepthOrArraySize),
+            static_cast<unsigned>(pDesc->MipLevels),
+            pDesc->Format,
+            pDesc->SampleCount,
+            pDesc->Layout,
+            pDesc->Flags,
+            static_cast<unsigned>(tile_mode),
+            static_cast<unsigned long long>(layout.SizeBytes),
+            static_cast<unsigned long long>(layout.BaseAlignmentBytes),
+            static_cast<unsigned long long>(layout.Mips[0].OffsetBytes),
+            static_cast<unsigned long long>(layout.Mips[0].SizeBytes),
+            layout.MipTailStartLevel);
+        std::fflush(stderr);
+    }
     openscarlett::CallTelemetry::Global().Record(
         kXgModule, "XGCreateTextureComputer", openscarlett::CallOutcome::Ok, kHrOk);
     return kHrOk;

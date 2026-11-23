@@ -148,6 +148,7 @@ using PfnCreateProcessW = BOOL(WINAPI*)(LPCWSTR,
                                         LPPROCESS_INFORMATION);
 using PfnExitProcess = VOID(WINAPI*)(UINT);
 using PfnOutputDebugStringA = VOID(WINAPI*)(LPCSTR);
+using PfnCreateFile2 = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, DWORD, LPCREATEFILE2_EXTENDED_PARAMETERS);
 
 PfnLoadLibraryA g_real_LoadLibraryA = nullptr;
 PfnLoadLibraryW g_real_LoadLibraryW = nullptr;
@@ -160,6 +161,8 @@ PfnGetModuleHandleExW g_real_GetModuleHandleExW = nullptr;
 PfnGetProcAddress g_real_GetProcAddress = nullptr;
 PfnCreateFileA g_real_CreateFileA = nullptr;
 PfnCreateFileW g_real_CreateFileW = nullptr;
+PfnCreateFile2 g_real_CreateFile2 = nullptr;
+PfnCreateFile2 g_kernelbase_CreateFile2 = nullptr;
 PfnGetFileAttributesA g_real_GetFileAttributesA = nullptr;
 PfnGetFileAttributesW g_real_GetFileAttributesW = nullptr;
 PfnGetFileAttributesExW g_real_GetFileAttributesExW = nullptr;
@@ -1616,6 +1619,58 @@ HANDLE WINAPI Hook_CreateFileW(LPCWSTR lpFileName,
                               hTemplateFile);
 }
 
+HANDLE WINAPI Hook_CreateFile2(LPCWSTR lpFileName,
+                               DWORD dwDesiredAccess,
+                               DWORD dwShareMode,
+                               DWORD dwCreationDisposition,
+                               LPCREATEFILE2_EXTENDED_PARAMETERS pCreateExParams) {
+    LPSECURITY_ATTRIBUTES sec_attrs = nullptr;
+    HANDLE h_template = nullptr;
+    DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
+    if (pCreateExParams != nullptr &&
+        pCreateExParams->dwSize >= sizeof(CREATEFILE2_EXTENDED_PARAMETERS)) {
+        sec_attrs = pCreateExParams->lpSecurityAttributes;
+        h_template = pCreateExParams->hTemplateFile;
+        flags_and_attrs =
+            pCreateExParams->dwFileAttributes |
+            pCreateExParams->dwFileFlags |
+            pCreateExParams->dwSecurityQosFlags;
+    }
+
+    if (!g_shutting_down.load(std::memory_order_acquire) &&
+        lpFileName != nullptr &&
+        openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None &&
+        !ShouldPassThroughHostDDriveW(lpFileName)) {
+        return CreateVirtualFileW(lpFileName,
+                                  "CreateFile2",
+                                  dwDesiredAccess,
+                                  dwShareMode,
+                                  sec_attrs,
+                                  dwCreationDisposition,
+                                  flags_and_attrs,
+                                  h_template);
+    }
+
+    HANDLE h = g_real_CreateFile2
+                   ? g_real_CreateFile2(lpFileName, dwDesiredAccess, dwShareMode,
+                                        dwCreationDisposition, pCreateExParams)
+                   : g_real_CreateFileW(lpFileName, dwDesiredAccess, dwShareMode,
+                                        sec_attrs, dwCreationDisposition, flags_and_attrs,
+                                        h_template);
+    if (h == INVALID_HANDLE_VALUE && g_trace_ods && lpFileName != nullptr) {
+        const DWORD err = ::GetLastError();
+        std::fwprintf(stderr, L"[guest:CreateFile2 FAIL err=%lu access=0x%lX disp=%lu flags=0x%lX] %ls\n",
+                      static_cast<unsigned long>(err),
+                      static_cast<unsigned long>(dwDesiredAccess),
+                      static_cast<unsigned long>(dwCreationDisposition),
+                      static_cast<unsigned long>(flags_and_attrs),
+                      lpFileName);
+        std::fflush(stderr);
+        ::SetLastError(err);
+    }
+    return h;
+}
+
 HANDLE WINAPI Hook_CreateFileA(LPCSTR lpFileName,
                                DWORD dwDesiredAccess,
                                DWORD dwShareMode,
@@ -2590,6 +2645,8 @@ void* ResolveHookForSymbol(const char* name) {
          reinterpret_cast<void**>(&g_real_CreateFileA)},
         {"CreateFileW", reinterpret_cast<void*>(&Hook_CreateFileW),
          reinterpret_cast<void**>(&g_real_CreateFileW)},
+        {"CreateFile2", reinterpret_cast<void*>(&Hook_CreateFile2),
+         reinterpret_cast<void**>(&g_real_CreateFile2)},
         {"GetFileAttributesA", reinterpret_cast<void*>(&Hook_GetFileAttributesA),
          reinterpret_cast<void**>(&g_real_GetFileAttributesA)},
         {"GetFileAttributesW", reinterpret_cast<void*>(&Hook_GetFileAttributesW),
@@ -2662,6 +2719,8 @@ void* ResolveHookForRealAddress(ULONGLONG addr) {
     if (void* p = match(g_real_GetProcAddress, &Hook_GetProcAddress)) return p;
     if (void* p = match(g_real_CreateFileA, &Hook_CreateFileA)) return p;
     if (void* p = match(g_real_CreateFileW, &Hook_CreateFileW)) return p;
+    if (void* p = match(g_real_CreateFile2, &Hook_CreateFile2)) return p;
+    if (void* p = match(g_kernelbase_CreateFile2, &Hook_CreateFile2)) return p;
     if (void* p = match(g_real_GetFileAttributesA, &Hook_GetFileAttributesA)) return p;
     if (void* p = match(g_real_GetFileAttributesW, &Hook_GetFileAttributesW)) return p;
     if (void* p = match(g_real_GetFileAttributesExW, &Hook_GetFileAttributesExW)) return p;
@@ -3134,6 +3193,14 @@ bool InitializeHookRuntime(HMODULE self_mod) {
     g_real_GetProcAddress = reinterpret_cast<PfnGetProcAddress>(::GetProcAddress(k32, "GetProcAddress"));
     g_real_CreateFileA = reinterpret_cast<PfnCreateFileA>(::GetProcAddress(k32, "CreateFileA"));
     g_real_CreateFileW = reinterpret_cast<PfnCreateFileW>(::GetProcAddress(k32, "CreateFileW"));
+    g_real_CreateFile2 = reinterpret_cast<PfnCreateFile2>(::GetProcAddress(k32, "CreateFile2"));
+    if (g_kernelbase_mod != nullptr) {
+        g_kernelbase_CreateFile2 =
+            reinterpret_cast<PfnCreateFile2>(::GetProcAddress(g_kernelbase_mod, "CreateFile2"));
+        if (g_real_CreateFile2 == nullptr) {
+            g_real_CreateFile2 = g_kernelbase_CreateFile2;
+        }
+    }
     g_real_GetFileAttributesA = reinterpret_cast<PfnGetFileAttributesA>(::GetProcAddress(k32, "GetFileAttributesA"));
     g_real_GetFileAttributesW = reinterpret_cast<PfnGetFileAttributesW>(::GetProcAddress(k32, "GetFileAttributesW"));
     g_real_GetFileAttributesExW = reinterpret_cast<PfnGetFileAttributesExW>(::GetProcAddress(k32, "GetFileAttributesExW"));

@@ -543,7 +543,9 @@ public:
             initialized_ = true;
         }
 
-        ApuHeapPool& pool = is_non_cached ? non_cached_ : cached_;
+        const bool use_non_cached =
+            is_non_cached && (non_cached_.capacity > 0u || cached_.capacity == 0u);
+        ApuHeapPool& pool = use_non_cached ? non_cached_ : cached_;
         const uint64_t used_after =
             static_cast<uint64_t>(pool.bytes_allocated) + pool.bytes_lost + span64;
         if (used_after > pool.capacity) {
@@ -569,7 +571,7 @@ public:
         rec.requested_size = size_in_bytes;
         rec.pad_bytes = pad_bytes;
         rec.apu_span = apu_span;
-        rec.non_cached = is_non_cached;
+        rec.non_cached = use_non_cached;
 
         by_va_[va_key] = rec;
         by_apu_[apu_addr] = va_key;

@@ -618,15 +618,29 @@ private:
 // ---------------------------------------------------------------------------
 // 10. StateObjectXProxy (ID3D12StateObject / ID3D12StateObjectX + ID3D12StateObjectProperties)
 // ---------------------------------------------------------------------------
+struct ID3D12StateObjectXbox : public ID3D12StateObject {
+    // Xbox Series X ID3D12StateObject Slot 8 (+0x40) & reflection Slot 9 (+0x48)
+    // (verified live against UE5 FD3D12Device::GetRayTracingPipelineInfo).
+    virtual HRESULT STDMETHODCALLTYPE GetPipelineReflectionX(void** ppOutReflection) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetReflectionBlobX(UINT kind, UINT flags, ID3DBlob** ppOutBlob) = 0;
+};
+
+struct ID3D12StateObjectPropertiesXbox : public ID3D12StateObjectProperties {
+    // Xbox Series X ID3D12StateObjectProperties Slot 7 (+0x38)
+    // (verified live against UE5 FD3D12Device::GetRayTracingPipelineInfo).
+    virtual HRESULT STDMETHODCALLTYPE GetPropertyX(UINT propertyId, void* pOut16Bytes) = 0;
+};
+
 class StateObjectXProxy final
-    : public ID3D12StateObject,
-      public ID3D12StateObjectProperties,
+    : public ID3D12StateObjectXbox,
+      public ID3D12StateObjectPropertiesXbox,
       public IOpenScarlettProxyInspect {
 public:
     StateObjectXProxy(
         DeviceX* parent_device,
         ID3D12StateObject* host_so,
-        const D3D12_STATE_OBJECT_DESC* desc_hint = nullptr);
+        const D3D12_STATE_OBJECT_DESC* desc_hint = nullptr,
+        bool allow_dynamic_exports = false);
     ~StateObjectXProxy();
 
     StateObjectXProxy(const StateObjectXProxy&) = delete;
@@ -648,11 +662,18 @@ public:
     // ID3D12DeviceChild
     HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** ppvDevice) override;
 
+    // ID3D12StateObjectXbox
+    HRESULT STDMETHODCALLTYPE GetPipelineReflectionX(void** ppOutReflection) override;
+    HRESULT STDMETHODCALLTYPE GetReflectionBlobX(UINT kind, UINT flags, ID3DBlob** ppOutBlob) override;
+
     // ID3D12StateObjectProperties
     void* STDMETHODCALLTYPE GetShaderIdentifier(LPCWSTR pExportName) override;
     UINT64 STDMETHODCALLTYPE GetShaderStackSize(LPCWSTR pExportName) override;
     UINT64 STDMETHODCALLTYPE GetPipelineStackSize() override;
     void STDMETHODCALLTYPE SetPipelineStackSize(UINT64 PipelineStackSizeInBytes) override;
+
+    // ID3D12StateObjectPropertiesXbox
+    HRESULT STDMETHODCALLTYPE GetPropertyX(UINT propertyId, void* pOut16Bytes) override;
 
     // IOpenScarlettProxyInspect
     D3D12XProxyKind STDMETHODCALLTYPE GetProxyKind() const noexcept override {
@@ -690,6 +711,7 @@ private:
     std::wstring sw_name_;
     std::unordered_map<GuidKey, std::vector<uint8_t>, GuidKeyHash> sw_private_data_;
     std::unordered_map<std::wstring, std::array<uint8_t, 32>> sw_shader_ids_;
+    bool sw_allow_dynamic_exports_ = false;
 };
 
 // ---------------------------------------------------------------------------

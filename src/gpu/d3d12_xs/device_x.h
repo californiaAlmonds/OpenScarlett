@@ -617,6 +617,13 @@ public:
         ID3D12StateObject* pStateObjectToGrowFrom,
         REFIID riid,
         void** ppNewStateObject) override;
+    HRESULT DeserializeStateObjectX(
+        const void* pBlob,
+        SIZE_T blobSize,
+        ID3D12RootSignature* pRootSignature,
+        UINT flags,
+        REFIID riid,
+        void** ppStateObject);
     HRESULT STDMETHODCALLTYPE CreateProtectedResourceSession1(
         const D3D12_PROTECTED_RESOURCE_SESSION_DESC1* pDesc,
         REFIID riid,

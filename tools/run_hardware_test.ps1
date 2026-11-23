@@ -1,4 +1,4 @@
-﻿# OpenScarlett — 1-Click Portable Hardware & Self-Test Runner
+# OpenScarlett — 1-Click Portable Hardware & Self-Test Runner
 # Runs host GPU/OS probes + all OpenScarlett live tests, shows clear live results,
 # saves a privacy-sanitized Markdown report, and optionally opens a pre-filled GitHub Issue.
 
