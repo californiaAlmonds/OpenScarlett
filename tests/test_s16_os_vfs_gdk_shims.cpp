@@ -554,7 +554,11 @@ void TestVfsTruncateAndNtHooks(const fs::path& bin_dir, const fs::path& work_roo
     {
         const std::wstring work_dir = openscarlett::ResolveDefaultWorkDirW(bin_dir.wstring());
         OS_REQUIRE(!work_dir.empty());
-        if (work_dir.size() >= 2u && work_dir[1] == L':') {
+        // A build or bundle that itself lives on C:\ has no off-C:\ anchor, so the resolver
+        // falls back to %TEMP%\openscarlett there. Only require "no C:\" when the binaries are off C:\.
+        const std::wstring bin_w = bin_dir.wstring();
+        const bool bin_on_c = bin_w.size() >= 2u && bin_w[1] == L':' && (bin_w[0] == L'C' || bin_w[0] == L'c');
+        if (!bin_on_c && work_dir.size() >= 2u && work_dir[1] == L':') {
             OS_REQUIRE(work_dir[0] != L'C' && work_dir[0] != L'c');
         }
     }
