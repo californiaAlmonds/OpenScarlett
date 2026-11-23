@@ -2089,6 +2089,19 @@ float EvalDivFixupF32(float s0, float s1, float s2) noexcept {
     return signed_val(std::fabs(s0));
 }
 
+double EvalDivFixupF64(double s0, double s1, double s2) noexcept {
+    // True IEEE-754 double-precision v_div_fixup_f64 (accurate past f32/i64 ranges)
+    const bool sign_out = std::signbit(s1) != std::signbit(s2);
+    auto signed_val = [&](double mag) noexcept { return sign_out ? -std::fabs(mag) : std::fabs(mag); };
+    if (std::isnan(s1) || std::isnan(s2)) return std::numeric_limits<double>::quiet_NaN();
+    if (std::isinf(s2) && std::isinf(s1)) return std::numeric_limits<double>::quiet_NaN();
+    if (s2 == 0.0 && s1 == 0.0) return std::numeric_limits<double>::quiet_NaN();
+    if (std::isinf(s2) || s1 == 0.0) return signed_val(std::numeric_limits<double>::infinity());
+    if (s2 == 0.0 || std::isinf(s1)) return signed_val(0.0);
+    if (std::isnan(s0)) return signed_val(std::numeric_limits<double>::infinity());
+    return signed_val(std::fabs(s0));
+}
+
 bool EvalFloatClassBits32(uint32_t bits, uint32_t mask) noexcept {
     const bool neg = (bits >> 31u) != 0u;
     const uint32_t exp = (bits >> 23u) & 0xFFu;
@@ -2590,12 +2603,15 @@ Status ExecuteScalarVectorCpu(
         } else if (enc == Rdna2Encoding::SMEM) {
             const uint32_t soff = (inst.soffset < 106u) ? wave.ReadSgpr(inst.soffset) : 0u;
             const int64_t byte_addr = static_cast<int64_t>(soff) + static_cast<int64_t>(inst.mem_offset);
-            const uint32_t dw = (byte_addr >= 0) ? static_cast<uint32_t>(byte_addr >> 2) : 0u;
+            const bool valid_addr = (byte_addr >= 0 && byte_addr <= 0xFFFFFFFFll);
+            const uint32_t dw = valid_addr ? static_cast<uint32_t>(byte_addr >> 2) : 0u;
             auto& src_buf = (inst.sbase == 0u && !wave.root_constants.empty()) ? wave.root_constants : wave.uav0;
             auto load_n = [&](uint32_t count) {
                 const uint8_t dst_reg = static_cast<uint8_t>(inst.dst.reg_index);
                 for (uint32_t k = 0u; k < count; ++k) {
-                    const uint32_t v = (dw + k < src_buf.size()) ? src_buf[dw + k] : 0u;
+                    const uint32_t v = (valid_addr && (static_cast<size_t>(dw) + k) < src_buf.size())
+                                           ? src_buf[static_cast<size_t>(dw) + k]
+                                           : 0u;
                     wave.WriteSgpr(static_cast<uint8_t>(dst_reg + k), v);
                 }
             };
@@ -2684,12 +2700,13 @@ Status ExecuteScalarVectorCpu(
                     uint64_t res64 = 0ull;
                     bool write64 = false;
                     const float f0 = BitsToFloat(s0);
-                    const double d0 = (e->bit_width == 64u) ? BitsToDouble(ReadVecOp64(wave, l, inst.src[0], true)) : 0.0;
+                    const bool src0_is_f64 = (e->bit_width == 64u || v1op == 0x03u || v1op == 0x0Fu || v1op == 0x15u || v1op == 0x3Cu);
+                    const double d0 = src0_is_f64 ? BitsToDouble(ReadVecOp64(wave, l, inst.src[0], true)) : 0.0;
                     const float h0 = F16ToF32(static_cast<uint16_t>(s0 & 0xFFFFu));
 
                     switch (v1op) {
                         case 0x01: res = s0; break;
-                        case 0x03: res = static_cast<uint32_t>(static_cast<int32_t>(d0)); break;
+                        case 0x03: res = std::isnan(d0) ? 0u : ((d0 >= 2147483647.0) ? 0x7FFFFFFFu : ((d0 <= -2147483648.0) ? 0x80000000u : static_cast<uint32_t>(static_cast<int32_t>(d0)))); break;
                         case 0x04: res64 = DoubleToBits(static_cast<double>(static_cast<int32_t>(s0))); write64 = true; break;
                         case 0x05: res = FloatToBits(static_cast<float>(static_cast<int32_t>(s0))); break;
                         case 0x06: res = FloatToBits(static_cast<float>(s0)); break;
@@ -2706,13 +2723,13 @@ Status ExecuteScalarVectorCpu(
                         case 0x12: res = FloatToBits(static_cast<float>((s0 >> 8u) & 0xFFu)); break;
                         case 0x13: res = FloatToBits(static_cast<float>((s0 >> 16u) & 0xFFu)); break;
                         case 0x14: res = FloatToBits(static_cast<float>((s0 >> 24u) & 0xFFu)); break;
-                        case 0x15: res = (std::isnan(d0) || d0 <= 0.0) ? 0u : static_cast<uint32_t>(d0); break;
+                        case 0x15: res = (std::isnan(d0) || d0 <= 0.0) ? 0u : ((d0 >= 4294967295.0) ? 0xFFFFFFFFu : static_cast<uint32_t>(d0)); break;
                         case 0x16: res64 = DoubleToBits(static_cast<double>(s0)); write64 = true; break;
                         case 0x17: res64 = DoubleToBits(std::trunc(d0)); write64 = true; break;
                         case 0x18: res64 = DoubleToBits(std::ceil(d0)); write64 = true; break;
                         case 0x19: res64 = DoubleToBits(std::nearbyint(d0)); write64 = true; break;
                         case 0x1A: res64 = DoubleToBits(std::floor(d0)); write64 = true; break;
-                        case 0x20: res = FloatToBits(f0 - std::floor(f0)); break;
+                        case 0x20: res = std::isfinite(f0) ? FloatToBits(f0 - std::floor(f0)) : 0x7FC00000u; break;
                         case 0x21: res = FloatToBits(std::trunc(f0)); break;
                         case 0x22: res = FloatToBits(std::ceil(f0)); break;
                         case 0x23: res = FloatToBits(std::nearbyint(f0)); break;
@@ -2734,7 +2751,7 @@ Status ExecuteScalarVectorCpu(
                         case 0x3B: res = static_cast<uint32_t>(FirstBitHighI32(static_cast<int32_t>(s0))); break;
                         case 0x3C: { int ex = 0; (void)std::frexp(d0, &ex); res = static_cast<uint32_t>(ex); break; }
                         case 0x3D: { int ex = 0; res64 = DoubleToBits(std::frexp(d0, &ex)); write64 = true; break; }
-                        case 0x3E: res64 = DoubleToBits(d0 - std::floor(d0)); write64 = true; break;
+                        case 0x3E: res64 = std::isfinite(d0) ? DoubleToBits(d0 - std::floor(d0)) : 0x7FF8000000000000ull; write64 = true; break;
                         case 0x3F: { int ex = 0; (void)std::frexp(f0, &ex); res = static_cast<uint32_t>(ex); break; }
                         case 0x40: { int ex = 0; res = FloatToBits(std::frexp(f0, &ex)); break; }
                         case 0x42: wave.WriteVgpr(l, static_cast<uint8_t>((inst.dst.reg_index + wave.m0) & 63u), s0); continue;
@@ -2755,7 +2772,7 @@ Status ExecuteScalarVectorCpu(
                         case 0x5C: res = F32ToF16(std::ceil(h0)); break;
                         case 0x5D: res = F32ToF16(std::trunc(h0)); break;
                         case 0x5E: res = F32ToF16(std::nearbyint(h0)); break;
-                        case 0x5F: res = F32ToF16(h0 - std::floor(h0)); break;
+                        case 0x5F: res = std::isfinite(h0) ? F32ToF16(h0 - std::floor(h0)) : 0x7E00u; break;
                         case 0x60: res = F32ToF16(EvalSinTurnsF32(h0)); break;
                         case 0x61: res = F32ToF16(EvalCosTurnsF32(h0)); break;
                         case 0x62: {
@@ -3089,9 +3106,17 @@ Status ExecuteScalarVectorCpu(
                             break;
                         }
                         case 0x15F: res = FloatToBits(EvalDivFixupF32(f0, f1, f2)); break;
-                        case 0x160: res64 = DoubleToBits(static_cast<double>(EvalDivFixupF32(static_cast<float>(d0), static_cast<float>(d1), static_cast<float>(d2)))); write64 = true; break;
+                        case 0x160: res64 = DoubleToBits(EvalDivFixupF64(d0, d1, d2)); write64 = true; break;
                         case 0x161: res = FloatToBits(std::ldexp(f0, static_cast<int32_t>(s1))); break;
-                        case 0x162: res = FloatToBits(std::fma(f0, f1, f2)); break;
+                        case 0x162: {
+                            float r = std::fma(f0, f1, f2);
+                            if (((wave.vcc >> l) & 1ull) != 0ull) {
+                                const uint32_t exp_c = (FloatToBits(f2) >> 23u) & 0xFFu;
+                                r = std::ldexp(r, (exp_c > 127u) ? 64 : -64);
+                            }
+                            res = FloatToBits(r);
+                            break;
+                        }
                         case 0x163: res64 = DoubleToBits(std::fma(d0, d1, d2)); write64 = true; break;
                         case 0x164: res = EvalMsadU8(s0, s1, s2); break;
                         case 0x165: case 0x166: res64 = u2_64 + static_cast<uint64_t>(EvalSadU8(static_cast<uint32_t>(u0_64), s1, 0u)); write64 = true; break;
@@ -3410,7 +3435,7 @@ Status EmitSvHlsl(
     if (usage.uses_uav1) os << "RWByteAddressBuffer _uav1 : register(u1);\n";
     if (usage.uses_root_const) {
         os << "cbuffer _cb0 : register(b0) { uint4 _rc4[4]; };\n";
-        os << "uint _sv_rc(uint idx) { uint4 v = _rc4[(idx >> 2u) & 3u]; uint c = idx & 3u; return (c==0u)?v.x:((c==1u)?v.y:((c==2u)?v.z:v.w)); }\n";
+        os << "uint _sv_rc(uint idx) { if (idx >= 16u) return 0u; uint4 v = _rc4[idx >> 2u]; uint c = idx & 3u; return (c==0u)?v.x:((c==1u)?v.y:((c==2u)?v.z:v.w)); }\n";
     }
     if (usage.uses_cross_lane && (container.stage == ShaderStage::Compute || container.stage == ShaderStage::Mesh || container.stage == ShaderStage::Amplification)) {
         os << "groupshared uint _lane_xchg[" << tg_total << "];\n";
@@ -4080,13 +4105,15 @@ Status EmitSvHlsl(
                     os << "        s[" << inst.dst.reg_index << "] = (_gw_base / " << wave_n << "u);\n";
                 }
             } else {
-                const uint32_t dw = static_cast<uint32_t>(std::max(0, inst.mem_offset) >> 2);
+                const std::string soff_expr = (inst.soffset < usage.max_sgpr) ? ("s[" + std::to_string(inst.soffset) + "]") : "0u";
                 const uint32_t cnt = (raw <= 0x04u) ? (1u << raw)
                                    : ((raw >= 0x08u && raw <= 0x0Cu) ? (1u << (raw - 0x08u))
                                    : ((raw >= 0x10u && raw <= 0x12u) ? (1u << (raw - 0x10u)) : 0u));
+                os << "        { int _sm_b = int(" << soff_expr << ") + (" << inst.mem_offset << ");\n";
                 for (uint32_t k = 0u; k < cnt && (inst.dst.reg_index + k) < usage.max_sgpr; ++k) {
-                    os << "        s[" << (inst.dst.reg_index + k) << "] = _sv_rc(" << (dw + k) << "u);\n";
+                    os << "          s[" << (inst.dst.reg_index + k) << "] = (_sm_b < 0) ? 0u : _sv_rc((uint(_sm_b) >> 2u) + " << k << "u);\n";
                 }
+                os << "        }\n";
             }
         } else if (enc == Rdna2Encoding::VOP1 || (enc == Rdna2Encoding::VOP3 && raw >= 0x180u && raw < 0x200u)) {
             const uint16_t v1op = (enc == Rdna2Encoding::VOP3) ? static_cast<uint16_t>(raw - 0x180u) : raw;
@@ -4146,7 +4173,7 @@ Status EmitSvHlsl(
                     case 0x12: os << "        _r = asuint(float((_a >> 8u) & 0xFFu));\n"; break;
                     case 0x13: os << "        _r = asuint(float((_a >> 16u) & 0xFFu));\n"; break;
                     case 0x14: os << "        _r = asuint(float((_a >> 24u) & 0xFFu));\n"; break;
-                    case 0x20: os << "        _r = asuint(asfloat(_a) - floor(asfloat(_a)));\n"; break;
+                    case 0x20: os << "        _r = (_sv_isnan_u32(_a) || _sv_isinf_u32(_a)) ? 0x7FC00000u : asuint(asfloat(_a) - floor(asfloat(_a)));\n"; break;
                     case 0x21: os << "        _r = asuint(trunc(asfloat(_a)));\n"; break;
                     case 0x22: os << "        _r = asuint(ceil(asfloat(_a)));\n"; break;
                     case 0x23: os << "        _r = asuint(round(asfloat(_a)));\n"; break;
@@ -4180,12 +4207,19 @@ Status EmitSvHlsl(
                     case 0x5C: os << "        _r = _sv_f32_to_f16(ceil(_sv_f16_to_f32(_a)));\n"; break;
                     case 0x5D: os << "        _r = _sv_f32_to_f16(trunc(_sv_f16_to_f32(_a)));\n"; break;
                     case 0x5E: os << "        _r = _sv_f32_to_f16(round(_sv_f16_to_f32(_a)));\n"; break;
-                    case 0x5F: os << "        { float _hf = _sv_f16_to_f32(_a); _r = _sv_f32_to_f16(_hf - floor(_hf)); }\n"; break;
+                    case 0x5F: os << "        { uint _ha = _a & 0x7FFFu; float _hf = _sv_f16_to_f32(_a); _r = (_ha >= 0x7C00u) ? 0x7E00u : _sv_f32_to_f16(_hf - floor(_hf)); }\n"; break;
                     case 0x60: os << "        _r = _sv_f32_to_f16(_sv_sin_turns_f32(_sv_f16_to_f32(_a)));\n"; break;
                     case 0x61: os << "        _r = _sv_f32_to_f16(_sv_cos_turns_f32(_sv_f16_to_f32(_a)));\n"; break;
                     case 0x62: os << "        _r = uint(clamp(asint(_sv_sext16(_a)), 0, 255)) | (uint(clamp(asint(_sv_sext16(_a >> 16u)), 0, 255)) << 8u);\n"; break;
                     case 0x63: os << "        { float _hf = _sv_f16_to_f32(_a); float _cl = _sv_isnan_u16(_a) ? 0.0 : clamp(_hf, -1.0, 1.0); _r = asuint(int(round(_cl * 32767.0))) & 0xFFFFu; }\n"; break;
                     case 0x64: os << "        { float _hf = _sv_f16_to_f32(_a); float _cl = _sv_isnan_u16(_a) ? 0.0 : clamp(_hf, 0.0, 1.0); _r = uint(round(_cl * 65535.0)) & 0xFFFFu; }\n"; break;
+                    case 0x65:
+                        if (inst.src[0].kind == Rdna2OperandKind::Vgpr && inst.src[0].reg_index < usage.max_vgpr) {
+                            os << "        { uint _swp_old = " << dst << "; v[" << inst.src[0].reg_index << "] = _swp_old; _r = _a; }\n";
+                        } else {
+                            os << "        _r = _a;\n";
+                        }
+                        break;
                     default: break;
                 }
                 if (mod.kind == SvModifierKind::Sdwa) {
@@ -4236,7 +4270,7 @@ Status EmitSvHlsl(
             }
             os << "        uint _r = 0u;\n";
             switch (v2op) {
-                case 0x01: os << "        _r = _vcc_bit ? _b : _a;\n"; break;
+                case 0x01: os << "        { uint _bw_t = _b; uint _bw_f = _a; _r = _vcc_bit ? _bw_t : _bw_f; }\n"; break;
                 case 0x02: os << "        _r = asuint(_sv_f16_to_f32(_a)*_sv_f16_to_f32(_b) + _sv_f16_to_f32(_a>>16u)*_sv_f16_to_f32(_b>>16u) + asfloat(" << dst << "));\n"; break;
                 case 0x03: os << "        _r = asuint(asfloat(_a) + asfloat(_b));\n"; break;
                 case 0x04: os << "        _r = asuint(asfloat(_a) - asfloat(_b));\n"; break;
@@ -4402,7 +4436,8 @@ Status EmitSvHlsl(
                     case 0x148: os << "        _r = _sv_bfe_u32(_a, _b, _c);\n"; break;
                     case 0x149: os << "        _r = _sv_bfe_i32(_a, _b, _c);\n"; break;
                     case 0x14A: os << "        _r = (_a & _b) | (~_a & _c);\n"; break;
-                    case 0x14B: case 0x162: os << "        _r = asuint(_sv_fma_f32(asfloat(_a), asfloat(_b), asfloat(_c)));\n"; break;
+                    case 0x14B: os << "        _r = asuint(_sv_fma_f32(asfloat(_a), asfloat(_b), asfloat(_c)));\n"; break;
+                    case 0x162: os << "        { float _fm = _sv_fma_f32(asfloat(_a), asfloat(_b), asfloat(_c)); if (_vcc_bit) { uint _ec = (_c >> 23u) & 0xFFu; _fm = ldexp(_fm, (_ec > 127u) ? 64.0 : -64.0); } _r = asuint(_fm); }\n"; break;
                     case 0x14C: os << "        _r = _sv_alignbyte(_a, _b, _c);\n"; break;
                     case 0x14E: os << "        _r = _sv_lerp_u8(_a, _b, _c);\n"; break;
                     case 0x14F: os << "        _r = _sv_alignbit(_a, _b, _c);\n"; break;
@@ -5265,6 +5300,8 @@ public:
         const uint32_t var_exec_lo = AllocId(); Emit(sec_fn_, 59u, {t_ptr_fn_u32_, var_exec_lo, 7u});
         const uint32_t var_exec_hi = AllocId(); Emit(sec_fn_, 59u, {t_ptr_fn_u32_, var_exec_hi, 7u});
         const uint32_t var_m0 = AllocId(); Emit(sec_fn_, 59u, {t_ptr_fn_u32_, var_m0, 7u});
+        const uint32_t var_bw_t = AllocId(); Emit(sec_fn_, 59u, {t_ptr_fn_u32_, var_bw_t, 7u});
+        const uint32_t var_bw_f = AllocId(); Emit(sec_fn_, 59u, {t_ptr_fn_u32_, var_bw_f, 7u});
 
         // Zero-init registers
         const uint32_t c0 = ConstU32(0u);
@@ -5717,16 +5754,44 @@ public:
                         Emit(sec_fn_, 62u, {s_vars[inst.dst.reg_index], BinU32(194u, gw_base_id_, ConstU32(wave_n == 64u ? 6u : 5u))});
                     }
                 } else if (var_rc != 0u) {
-                    const uint32_t dw = static_cast<uint32_t>(std::max(0, inst.mem_offset) >> 2);
                     const uint32_t cnt = (raw <= 0x04u) ? (1u << raw)
                                        : ((raw >= 0x08u && raw <= 0x0Cu) ? (1u << (raw - 0x08u))
                                        : ((raw >= 0x10u && raw <= 0x12u) ? (1u << (raw - 0x10u)) : 0u));
-                    for (uint32_t k = 0u; k < cnt && (inst.dst.reg_index + k) < s_vars.size() && (dw + k) < 16u; ++k) {
-                        const uint32_t ptr = AllocId();
-                        Emit(sec_fn_, 65u, {t_ptr_unif_u32, ptr, var_rc, ConstI32(static_cast<int32_t>(dw + k))});
-                        const uint32_t lv = AllocId();
-                        Emit(sec_fn_, 61u, {t_u32_, lv, ptr});
-                        Emit(sec_fn_, 62u, {s_vars[inst.dst.reg_index + k], lv});
+                    if (inst.soffset < s_vars.size()) {
+                        // Signed 21-bit offset + dynamic soffset with safe OOB clamping to 0
+                        const uint32_t soff_v = load_var(s_vars[inst.soffset]);
+                        const uint32_t off_i = ConstI32(inst.mem_offset);
+                        const uint32_t byte_i = Bitcast(t_i32_, BinU32(128u /*IAdd*/, soff_v, Bitcast(t_u32_, off_i)));
+                        const uint32_t is_neg = BinBool(177u /*SLessThan*/, byte_i, ConstI32(0));
+                        const uint32_t base_dw = BinU32(194u /*Shr*/, Bitcast(t_u32_, byte_i), ConstU32(2u));
+                        uint32_t rc_vals[16]{};
+                        for (uint32_t ri = 0u; ri < 16u; ++ri) {
+                            const uint32_t ptr = AllocId();
+                            Emit(sec_fn_, 65u, {t_ptr_unif_u32, ptr, var_rc, ConstI32(static_cast<int32_t>(ri))});
+                            rc_vals[ri] = AllocId();
+                            Emit(sec_fn_, 61u, {t_u32_, rc_vals[ri], ptr});
+                        }
+                        for (uint32_t k = 0u; k < cnt && (inst.dst.reg_index + k) < s_vars.size(); ++k) {
+                            const uint32_t dw_k = BinU32(128u, base_dw, ConstU32(k));
+                            uint32_t acc = c0;
+                            for (uint32_t ri = 0u; ri < 16u; ++ri) {
+                                acc = SelU32(BinBool(170u /*IEqual*/, dw_k, ConstU32(ri)), rc_vals[ri], acc);
+                            }
+                            Emit(sec_fn_, 62u, {s_vars[inst.dst.reg_index + k], SelU32(is_neg, c0, acc)});
+                        }
+                    } else {
+                        for (uint32_t k = 0u; k < cnt && (inst.dst.reg_index + k) < s_vars.size(); ++k) {
+                            const int64_t eff = static_cast<int64_t>(inst.mem_offset) + static_cast<int64_t>(k) * 4ll;
+                            if (eff < 0 || (eff >> 2) >= 16ll) {
+                                Emit(sec_fn_, 62u, {s_vars[inst.dst.reg_index + k], c0});
+                            } else {
+                                const uint32_t ptr = AllocId();
+                                Emit(sec_fn_, 65u, {t_ptr_unif_u32, ptr, var_rc, ConstI32(static_cast<int32_t>(eff >> 2))});
+                                const uint32_t lv = AllocId();
+                                Emit(sec_fn_, 61u, {t_u32_, lv, ptr});
+                                Emit(sec_fn_, 62u, {s_vars[inst.dst.reg_index + k], lv});
+                            }
+                        }
                     }
                 }
             } else if (enc == Rdna2Encoding::VOP1 || (enc == Rdna2Encoding::VOP3 && raw >= 0x180u && raw < 0x200u)) {
@@ -5757,7 +5822,11 @@ public:
                         case 0x12: { uint32_t f = AllocId(); Emit(sec_fn_, 112u, {t_f32_, f, BinU32(199u, BinU32(194u, a, ConstU32(8u)), ConstU32(0xFFu))}); r = Bitcast(t_u32_, f); break; }
                         case 0x13: { uint32_t f = AllocId(); Emit(sec_fn_, 112u, {t_f32_, f, BinU32(199u, BinU32(194u, a, ConstU32(16u)), ConstU32(0xFFu))}); r = Bitcast(t_u32_, f); break; }
                         case 0x14: { uint32_t f = AllocId(); Emit(sec_fn_, 112u, {t_f32_, f, BinU32(199u, BinU32(194u, a, ConstU32(24u)), ConstU32(0xFFu))}); r = Bitcast(t_u32_, f); break; }
-                        case 0x20: r = Bitcast(t_u32_, Glsl1(t_f32_, 10u /*Fract*/, fa)); break;
+                        case 0x20: {
+                            const uint32_t nonfin = BinBool(174u /*UGe*/, BinU32(199u, a, ConstU32(0x7FFFFFFFu)), ConstU32(0x7F800000u));
+                            r = SelU32(nonfin, ConstU32(0x7FC00000u), Bitcast(t_u32_, Glsl1(t_f32_, 10u /*Fract*/, fa)));
+                            break;
+                        }
                         case 0x21: r = Bitcast(t_u32_, Glsl1(t_f32_, 3u /*Trunc*/, fa)); break;
                         case 0x22: r = Bitcast(t_u32_, Glsl1(t_f32_, 9u /*Ceil*/, fa)); break;
                         case 0x23: r = Bitcast(t_u32_, Glsl1(t_f32_, 2u /*RoundEven*/, fa)); break;
@@ -5803,7 +5872,11 @@ public:
                         case 0x5C: r = PackF16Lo(Glsl1(t_f32_, 9u, UnpackF16Lo(a))); break;
                         case 0x5D: r = PackF16Lo(Glsl1(t_f32_, 3u, UnpackF16Lo(a))); break;
                         case 0x5E: r = PackF16Lo(Glsl1(t_f32_, 2u, UnpackF16Lo(a))); break;
-                        case 0x5F: r = PackF16Lo(Glsl1(t_f32_, 10u, UnpackF16Lo(a))); break;
+                        case 0x5F: {
+                            const uint32_t nonfin = BinBool(174u /*UGe*/, BinU32(199u, a, ConstU32(0x7FFFu)), ConstU32(0x7C00u));
+                            r = SelU32(nonfin, ConstU32(0x7E00u), PackF16Lo(Glsl1(t_f32_, 10u, UnpackF16Lo(a))));
+                            break;
+                        }
                         case 0x60: r = PackF16Lo(EmitTrigTurnsF32(UnpackF16Lo(a), false)); break;
                         case 0x61: r = PackF16Lo(EmitTrigTurnsF32(UnpackF16Lo(a), true)); break;
                         case 0x62: {
@@ -5828,6 +5901,13 @@ public:
                             r = BinU32(199u, q, ConstU32(0xFFFFu));
                             break;
                         }
+                        case 0x65: {
+                            if (inst.src[0].kind == Rdna2OperandKind::Vgpr && inst.src[0].reg_index < v_vars.size()) {
+                                Emit(sec_fn_, 62u, {v_vars[inst.src[0].reg_index], old_d});
+                            }
+                            r = a;
+                            break;
+                        }
                         default: break;
                     }
                     if (mod.kind == SvModifierKind::Sdwa) {
@@ -5849,7 +5929,13 @@ public:
                 const uint32_t fa = Bitcast(t_f32_, a), fb = Bitcast(t_f32_, b), fd = Bitcast(t_f32_, old_d);
                 uint32_t r = c0;
                 switch (v2op) {
-                    case 0x01: r = SelU32(load_bool(var_vcc_bit), b, a); break;
+                    case 0x01: {
+                        // Blackwell select-after-shuffle guard: spill through distinct Function temps
+                        Emit(sec_fn_, 62u, {var_bw_t, b});
+                        Emit(sec_fn_, 62u, {var_bw_f, a});
+                        r = SelU32(load_bool(var_vcc_bit), load_var(var_bw_t), load_var(var_bw_f));
+                        break;
+                    }
                     case 0x02: r = Bitcast(t_u32_, BinF32(129u, BinF32(129u, BinF32(133u, UnpackF16Lo(a), UnpackF16Lo(b)), BinF32(133u, UnpackF16Hi(a), UnpackF16Hi(b))), fd)); break;
                     case 0x03: r = Bitcast(t_u32_, BinF32(129u, fa, fb)); break;
                     case 0x04: r = Bitcast(t_u32_, BinF32(131u, fa, fb)); break;
@@ -6061,7 +6147,16 @@ public:
                         case 0x148: r = EmitBfeU32(a, b, c); break;
                         case 0x149: r = EmitBfeI32(a, b, c); break;
                         case 0x14A: { uint32_t na = AllocId(); Emit(sec_fn_, 200u, {t_u32_, na, a}); r = BinU32(197u, BinU32(199u, a, b), BinU32(199u, na, c)); break; }
-                        case 0x14B: case 0x162: r = Bitcast(t_u32_, Glsl3(t_f32_, 50u, fa, fb, fc)); break;
+                        case 0x14B: r = Bitcast(t_u32_, Glsl3(t_f32_, 50u, fa, fb, fc)); break;
+                        case 0x162: {
+                            const uint32_t fma_v = Glsl3(t_f32_, 50u, fa, fb, fc);
+                            const uint32_t exp_c = BinU32(199u, BinU32(194u, c, ConstU32(23u)), ConstU32(0xFFu));
+                            const uint32_t hi_exp = BinBool(172u /*UGreaterThan*/, exp_c, ConstU32(127u));
+                            const uint32_t scale = SelF32(hi_exp, ConstF32(18446744073709551616.0f), ConstF32(5.421010862427522e-20f));
+                            const uint32_t scaled = BinF32(133u /*FMul*/, fma_v, scale);
+                            r = Bitcast(t_u32_, SelF32(load_bool(var_vcc_bit), scaled, fma_v));
+                            break;
+                        }
                         case 0x14C: { uint32_t sh = BinU32(196u, BinU32(199u, c, ConstU32(3u)), ConstU32(3u)); uint32_t z = BinBool(170u, sh, c0); r = SelU32(z, b, BinU32(197u, BinU32(194u, b, sh), BinU32(196u, a, BinU32(199u, BinU32(130u, ConstU32(32u), sh), ConstU32(31u))))); break; }
                         case 0x14E: {
                             uint32_t acc = c0;

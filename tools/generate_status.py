@@ -170,6 +170,7 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
         ("amd_fidelityfx_upscaler_xbox.dll", "partial", 6, "Live GPU FSR 1.0 EASU+RCAS (FSR 2/3 temporal pending)"),
         ("amd_fidelityfx_loader_xbox.dll", "partial", 5, "FidelityFX context loader & version dispatch"),
         ("AcpHal.dll", "partial", 3, "Shape/audio DSP queue forwarding to software XMA2"),
+        ("xapu.dll", "high", 13, "Retail Xbox XApu audio/APU connection & command queue ABI for FMOD"),
         ("pixevt.dll", "stub", 13, "PIX begin/end event & marker telemetry stubs"),
         ("hix_xs.dll", "stub", 11, "Hang-dump & debug telemetry forward stubs"),
         ("KernelTraceControl.dll", "stub", 9, "ETW kernel trace control fixed-return stubs"),
@@ -188,6 +189,9 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
     has_s14_ffx = has("tests/test_s14_p0_shims_ffx_config.cpp")
     has_s14_bvh = has("tests/test_s14_xbox_bvh_builder_abi.cpp")
     has_s14_ds = has("tests/test_s14_dstorage_x2_iocp.cpp")
+    has_s15_shims = has("tests/test_s15_loader_vfs_gdk_shims.cpp")
+    has_s15_gfx = has("tests/test_s15_graphics_xg_bc6h.cpp")
+    has_mine_xapu = has("tests/test_mine_xapu_acphal.cpp")
     has_ue5 = has("tests/test_ue5_matrix_import_bringup.cpp")
 
     out: list[DllInfo] = []
@@ -201,10 +205,19 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
         if name == "d3d12_xs.dll" and has_proxies:
             tier = "high"
             note = (
-                "Full Xbox COM proxies (incl. Resource1/2, Heap1), 42 IID_ID3D12* GUID exports, D3D12Xbox* helpers, Agility SDK, Enhanced Barriers, HDR10 PresentX & Vulkan routing"
-                if has_ue5
+                "Full Xbox COM proxies (incl. retail Scarlett ABI & Resource1/2/Heap1), 42 IID_ID3D12* GUID exports, D3D12Xbox* helpers, Agility SDK, Enhanced Barriers, oversized placed-tex promotion, live MSAA clamp, DXGIX vline/frame notifications, live VRAM residency, HDR10 PresentX & Vulkan routing"
+                if (has_s15_gfx and has_ue5)
                 else "Full Xbox COM proxies (incl. Resource1/2, Heap1), Agility SDK, Enhanced Barriers, live VRAM residency, HDR10 PresentX & Vulkan routing"
             )
+        if name == "AcpHal.dll" and has_mine_xapu:
+            tier = "high"
+            note = "Retail Xbox AcpHal APU heap, shape/audio DSP queue & FMOD audio middleware ABI"
+        if name == "KernelTraceControl.dll" and has_s15_shims:
+            tier = "partial"
+            note = "Non-admin in-memory ETW trace session controller (StartTrace/ControlTrace/EnableTraceEx2/rundown)"
+        if name == "pixevt.dll" and has_s15_shims:
+            tier = "partial"
+            note = "PIX begin/end event markers & in-memory ETW capture session controller"
         if name == "mfplat_xs.dll" and has_mf_hw:
             tier = "high"
             note = (
@@ -302,7 +315,7 @@ def collect_components(
     media_pct = 68 + (25 if has_media else 0)
     loader_pct = 85 + (12 if has_probe_veh else 0)
     launcher_pct = (90 + (8 if has_probe_veh else 0)) if has_launcher else 40
-    compat_pct = 20
+    compat_pct = 40 if has("tests/test_gdkx_untouched_samples.cpp") else 20
 
     corpus_note = f", {corpus_passed}/{corpus_total} corpus shaders validated" if corpus_total else ""
     winrt_exports = count_exports("include/openscarlett/winrt/winrt_abi.h", "OPENSCARLETT_WINRT_API")
@@ -326,7 +339,7 @@ def collect_components(
                 else f"`{opcodes_decoded}/{opcodes_total}` GFX10.3 opcodes decoded & lifted to SPIR-V (`spirv-val`) + DXIL SM 6.5 (`dxc` + MD5 re-signed), lockstep 1-wave LDS barriers, `PSV0` wave bounds, Wave32-on-64 isolation, mesh `merged_wave_info`/`CullPrimitiveEXT`, FSSM/vfetch, CPU interpreter & disk cache{corpus_note}. Still expanding `MIMG`/`DS`/`SMEM`/`FLAT` & HS/DS/GS stages."
             ),
             verified_on=(
-                "`spirv-val` + `dxc` SM 6.5/6.6 + 11 PCs + WARP (`test_rdna2_corpus_bench`, `test_rdna2_isa_scalar_vector`, `test_rdna2_isa_mem_img`, `test_xg_gpu_untile_and_stages`, `test_rdna2_lockstep_isa`, `test_d3d12_xs_autolift`, `test_s14_shader_sm66_779`)"
+                "`spirv-val` + `dxc` SM 6.5/6.6 + 11 PCs + WARP (`test_rdna2_corpus_bench`, `test_rdna2_isa_scalar_vector`, `test_rdna2_isa_mem_img`, `test_xg_gpu_untile_and_stages`, `test_rdna2_lockstep_isa`, `test_d3d12_xs_autolift`, `test_s14_shader_sm66_779`, `test_s15_rdna2_bench_trap_harness`, `test_s15_shader_peer_parity`)"
                 if has_stages_ext
                 else "`spirv-val` + `dxc` SM 6.5/6.6 + 11 PCs + WARP (`test_rdna2_lockstep_isa`, `test_rdna2_corpus_parity`, `test_rdna2_lifter_live`, `test_d3d12_xs_autolift`)"
             ),
@@ -467,16 +480,16 @@ def collect_components(
         ),
         Component(
             short_name="Real-World Game Compatibility",
-            plain_summary="Freedoom 60 FPS, 3D GDK scene & samples work — retail games: 0 so far",
-            tech_name="Real-World Title Compatibility (Playable Demos, GDK Samples & Commercial Bring-Up)",
+            plain_summary="6/6 untouched GDKX samples & Freedoom live · Minecraft & UE5 in bring-up",
+            tech_name="Real-World Title Compatibility (Untouched GDKX Samples, Playable Demos & Active Bring-Up)",
             area="Compatibility",
-            stage="Early Alpha",
-            pill_label="Early Alpha",
+            stage="Partial",
+            pill_label="Active Bring-Up",
             pct=compat_pct,
             what_works=(
-                "Live 60 FPS **Freedoom: Phase 1**, `ScarlettArena`, shadowed/skinned BC1+BC3 3D dual-API GDK scene (`gdk_3d_scene`), official MIT `Xbox-GDK-Samples`, and commercial shipping GDK thunks (`Alexandria IV DEMO`). **Commercial retail Xbox Series games are not playable yet** — join Discord to help test real unpacked GDKs!"
+                "Live **6/6 untouched MIT `_GAMING_XBOX_SCARLETT` samples** at 4K, 60 FPS **Freedoom: Phase 1**, `ScarlettArena`, shadowed/skinned BC1+BC3 3D dual-API GDK scene (`gdk_3d_scene`), shipping commercial GDK thunks (`Alexandria IV DEMO`, `0 E_NOINTERFACE`), and next-gen flagship open-world AAA gap audit closed on `main`. Active commercial bring-up underway on **Minecraft (Xbox Series Preview)** and **UE5 (*The Matrix Awakens*)** — join Discord to help test real unpacked GDKs!"
             ),
-            verified_on="GTX 1650 Ti + WARP + 10 community NVIDIA/AMD PCs (`test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_dxr_live`)",
+            verified_on="GTX 1650 Ti + WARP + 10 community NVIDIA/AMD PCs (`test_gdkx_untouched_samples`, `test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_real_gdk_thunks_live`, `test_mine_xapu_acphal`)",
         ),
     ]
 
@@ -585,8 +598,9 @@ def render_matrix_svg(
     # Header: 76
     # Panel A (RDNA2 8 families in 2 cols x 4 rows): 168
     # Panel B (D3D12/Vulkan 12 items in 3 cols x 4 rows): 178
-    # Panel C (30 DLLs in 5 cols x 6 rows): 276
-    H = 716
+    # Panel C (all DLLs in 5 cols x dynamic rows)
+    dll_rows = (len(dlls) + 4) // 5
+    H = 468 + dll_rows * 38 + 20
 
     rdna_pct = int(round(100.0 * opcodes_decoded / max(1, opcodes_total)))
     live_t = sum(1 for t in trans_items if t.status == "live")
@@ -596,7 +610,7 @@ def render_matrix_svg(
     stub_d = sum(1 for d in dlls if d.tier == "stub")
 
     lines = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img" aria-label="OpenScarlett RDNA2, D3D12/Vulkan and 30-DLL Coverage Matrix">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img" aria-label="OpenScarlett RDNA2, D3D12/Vulkan and {len(dlls)}-DLL Coverage Matrix">',
         "  <defs>",
         '    <linearGradient id="mAccent" x1="0%" y1="0%" x2="100%" y2="0%">',
         '      <stop offset="0%" stop-color="#e11d48"/>',
@@ -616,7 +630,7 @@ def render_matrix_svg(
         '  <g clip-path="url(#mClip)">',
         f'    <rect width="{W}" height="{H}" fill="#0d1117"/>',
         f'    <rect x="0" y="0" width="{W}" height="3" fill="url(#mAccent)"/>',
-        '    <text class="h1" x="26" y="36">Coverage Visualizer — RDNA2 Shaders, D3D12 / Vulkan &amp; All 30 DLLs</text>',
+        f'    <text class="h1" x="26" y="36">Coverage Visualizer — RDNA2 Shaders, D3D12 / Vulkan &amp; All {len(dlls)} DLLs</text>',
         '    <text class="sub" x="26" y="56">Honest breakdown of what works vs what is still behind · Green = Live / High · Amber = Partial · Red / Grey = Behind or Stub</text>',
         '    <line x1="26" y1="70" x2="874" y2="70" stroke="#21262d" stroke-width="1"/>',
     ]
@@ -686,7 +700,7 @@ def render_matrix_svg(
         "gamecoreclient.dll": "gamecorecli",
         "advapi32legacy.dll": "advapi32leg",
     }
-    for idx, d in enumerate(dlls[:30]):
+    for idx, d in enumerate(dlls):
         col_i = idx % 5
         row_i = idx // 5
         dx = 26 + col_i * 171

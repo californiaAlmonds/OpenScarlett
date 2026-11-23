@@ -1,6 +1,7 @@
 #include "command_list_x.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <shared_mutex>
 #include <unordered_map>
@@ -268,36 +269,46 @@ public:
     void STDMETHODCALLTYPE OMSetFrontAndBackStencilRef(UINT FrontStencilRef, UINT BackStencilRef) override {
         if (parent_->host_list8_) {
             parent_->host_list8_->OMSetFrontAndBackStencilRef(FrontStencilRef, BackStencilRef);
+            RecordList("ID3D12GraphicsCommandListX::OMSetFrontAndBackStencilRef", 81, S_OK);
+        } else {
+            parent_->RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::OMSetFrontAndBackStencilRef", 81);
         }
-        RecordList("ID3D12GraphicsCommandListX::OMSetFrontAndBackStencilRef", 81, parent_->host_list8_ ? S_OK : E_NOINTERFACE);
     }
 #endif
 #ifdef __ID3D12GraphicsCommandList9_INTERFACE_DEFINED__
     void STDMETHODCALLTYPE RSSetDepthBias(FLOAT DepthBias, FLOAT DepthBiasClamp, FLOAT SlopeScaledDepthBias) override {
         if (parent_->host_list9_) {
             parent_->host_list9_->RSSetDepthBias(DepthBias, DepthBiasClamp, SlopeScaledDepthBias);
+            RecordList("ID3D12GraphicsCommandListX::RSSetDepthBias", 82, S_OK);
+        } else {
+            parent_->RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::RSSetDepthBias", 82);
         }
-        RecordList("ID3D12GraphicsCommandListX::RSSetDepthBias", 82, parent_->host_list9_ ? S_OK : E_NOINTERFACE);
     }
     void STDMETHODCALLTYPE IASetIndexBufferStripCutValue(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE IBStripCutValue) override {
         if (parent_->host_list9_) {
             parent_->host_list9_->IASetIndexBufferStripCutValue(IBStripCutValue);
+            RecordList("ID3D12GraphicsCommandListX::IASetIndexBufferStripCutValue", 83, S_OK);
+        } else {
+            parent_->RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::IASetIndexBufferStripCutValue", 83);
         }
-        RecordList("ID3D12GraphicsCommandListX::IASetIndexBufferStripCutValue", 83, parent_->host_list9_ ? S_OK : E_NOINTERFACE);
     }
 #endif
 #ifdef __ID3D12GraphicsCommandList10_INTERFACE_DEFINED__
     void STDMETHODCALLTYPE SetProgram(const D3D12_SET_PROGRAM_DESC* pDesc) override {
         if (parent_->host_list10_) {
             parent_->host_list10_->SetProgram(pDesc);
+            RecordList("ID3D12GraphicsCommandListX::SetProgram", 84, S_OK);
+        } else {
+            parent_->RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::SetProgram", 84);
         }
-        RecordList("ID3D12GraphicsCommandListX::SetProgram", 84, parent_->host_list10_ ? S_OK : E_NOINTERFACE);
     }
     void STDMETHODCALLTYPE DispatchGraph(const D3D12_DISPATCH_GRAPH_DESC* pDesc) override {
         if (parent_->host_list10_) {
             parent_->host_list10_->DispatchGraph(pDesc);
+            RecordList("ID3D12GraphicsCommandListX::DispatchGraph", 85, S_OK);
+        } else {
+            parent_->RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::DispatchGraph", 85);
         }
-        RecordList("ID3D12GraphicsCommandListX::DispatchGraph", 85, parent_->host_list10_ ? S_OK : E_NOINTERFACE);
     }
 #endif
 
@@ -581,14 +592,11 @@ D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE CommandListX::GetType() {
 // ID3D12GraphicsCommandList (slots 9..59)
 HRESULT STDMETHODCALLTYPE CommandListX::Close() {
     const HRESULT hr = host_list_->Close();
-    if (FAILED(hr) && device_x_ && device_x_->IsRetailScarlettAbi() && device_x_->HostDevice()) {
-        std::fprintf(stderr, "[OpenScarlett][d3d12_xs] CommandListX::Close FAILED hr=0x%08lX type=%d\n",
-                     static_cast<unsigned long>(hr), static_cast<int>(list_type_));
+    last_close_failed_.store(FAILED(hr), std::memory_order_release);
+    if (FAILED(hr) && device_x_ && device_x_->HostDevice() && IsDiagTraceEnabled()) {
         ID3D12InfoQueue* iq = nullptr;
         if (SUCCEEDED(device_x_->HostDevice()->QueryInterface(IID_PPV_ARGS(&iq))) && iq) {
             const UINT64 n = iq->GetNumStoredMessages();
-            std::fprintf(stderr, "[OpenScarlett][d3d12_xs] InfoQueue messages=%llu\n",
-                         static_cast<unsigned long long>(n));
             const UINT64 start = (n > 25ull) ? (n - 25ull) : 0ull;
             for (UINT64 i = start; i < n; ++i) {
                 SIZE_T len = 0;
@@ -597,23 +605,58 @@ HRESULT STDMETHODCALLTYPE CommandListX::Close() {
                     std::vector<uint8_t> buf(len);
                     auto* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
                     if (SUCCEEDED(iq->GetMessage(i, msg, &len)) && msg->pDescription) {
-                        std::fprintf(stderr, "  [D3D12 sev=%d id=%d] %s\n",
-                                     static_cast<int>(msg->Severity),
-                                     static_cast<int>(msg->ID),
-                                     msg->pDescription);
+                        AppendDiagOp(msg->pDescription);
                     }
                 }
             }
             iq->Release();
         }
-        std::fflush(stderr);
+    }
+    if (IsDiagTraceEnabled()) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "Close() -> hr=0x%08X", static_cast<unsigned>(hr));
+        AppendDiagOp(buf);
     }
     RecordList("ID3D12GraphicsCommandListX::Close", 9, hr);
     return hr;
 }
 
+bool CommandListX::IsDiagTraceEnabled() noexcept {
+    static const bool enabled = (DiagTraceLogPath()[0] != '\0');
+    return enabled;
+}
+
+const char* CommandListX::DiagTraceLogPath() noexcept {
+    static const std::string path = []() {
+        char buf[512]{};
+        const DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_D3D12_LOG", buf, sizeof(buf));
+        if (n > 0 && n < sizeof(buf)) {
+            return std::string(buf, n);
+        }
+        return std::string{};
+    }();
+    return path.c_str();
+}
+
+void CommandListX::AppendDiagOp(std::string op) {
+    std::lock_guard<std::mutex> lk(diag_ops_mutex_);
+    if (diag_ops_.size() < 512u) {
+        diag_ops_.push_back(std::move(op));
+    }
+}
+
+std::vector<std::string> CommandListX::CopyDiagOps() const {
+    std::lock_guard<std::mutex> lk(diag_ops_mutex_);
+    return diag_ops_;
+}
+
 HRESULT STDMETHODCALLTYPE CommandListX::Reset(
     ID3D12CommandAllocator* pAllocator, ID3D12PipelineState* pInitialState) {
+    last_close_failed_.store(false, std::memory_order_release);
+    if (IsDiagTraceEnabled()) {
+        std::lock_guard<std::mutex> lk(diag_ops_mutex_);
+        diag_ops_.clear();
+    }
     ReleaseTiledTransientResources();
     RotateAlignTransientRing();
     depth_bias_.store(0.0f, std::memory_order_relaxed);
@@ -714,6 +757,11 @@ void STDMETHODCALLTYPE CommandListX::ClearState(ID3D12PipelineState* pPipelineSt
 void STDMETHODCALLTYPE CommandListX::DrawInstanced(
     UINT VertexCountPerInstance, UINT InstanceCount,
     UINT StartVertexLocation, UINT StartInstanceLocation) {
+    if (VertexCountPerInstance == 0u || InstanceCount == 0u) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::DrawInstanced[ZeroNoop]", 12, S_OK);
+        return;
+    }
     bool skip_host = false;
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
@@ -751,6 +799,11 @@ void STDMETHODCALLTYPE CommandListX::DrawInstanced(
 void STDMETHODCALLTYPE CommandListX::DrawIndexedInstanced(
     UINT IndexCountPerInstance, UINT InstanceCount, UINT StartIndexLocation,
     INT BaseVertexLocation, UINT StartInstanceLocation) {
+    if (IndexCountPerInstance == 0u || InstanceCount == 0u) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::DrawIndexedInstanced[ZeroNoop]", 13, S_OK);
+        return;
+    }
     bool skip_host = false;
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
@@ -791,6 +844,11 @@ void STDMETHODCALLTYPE CommandListX::DrawIndexedInstanced(
 
 void STDMETHODCALLTYPE CommandListX::Dispatch(
     UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ) {
+    if (ThreadGroupCountX == 0u || ThreadGroupCountY == 0u || ThreadGroupCountZ == 0u) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::Dispatch[ZeroNoop]", 14, S_OK);
+        return;
+    }
     bool skip_host = false;
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
@@ -877,46 +935,197 @@ void STDMETHODCALLTYPE CommandListX::CopyBufferRegion(
         }
     }
     host_list_->CopyBufferRegion(host_dst, DstOffset, host_src, SrcOffset, NumBytes);
+    if (IsDiagTraceEnabled()) {
+        const D3D12_RESOURCE_DESC dd = host_dst ? host_dst->GetDesc() : D3D12_RESOURCE_DESC{};
+        const D3D12_RESOURCE_DESC sd = host_src ? host_src->GetDesc() : D3D12_RESOURCE_DESC{};
+        char buf[220];
+        std::snprintf(buf, sizeof(buf),
+                      "CopyBufferRegion dst=%p(w=%llu)@%llu src=%p(w=%llu)@%llu bytes=%llu",
+                      static_cast<void*>(host_dst), static_cast<unsigned long long>(dd.Width),
+                      static_cast<unsigned long long>(DstOffset),
+                      static_cast<void*>(host_src), static_cast<unsigned long long>(sd.Width),
+                      static_cast<unsigned long long>(SrcOffset),
+                      static_cast<unsigned long long>(NumBytes));
+        AppendDiagOp(buf);
+    }
     RecordList("ID3D12GraphicsCommandListX::CopyBufferRegion", 15, S_OK);
 }
+
+namespace {
+
+bool IsPlanarDepthStencilTextureFormat(DXGI_FORMAT fmt) noexcept {
+    switch (fmt) {
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool IsAnyDepthStencilTextureFormat(DXGI_FORMAT fmt) noexcept {
+    switch (fmt) {
+        case DXGI_FORMAT_D16_UNORM:
+        case DXGI_FORMAT_D32_FLOAT:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+        case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+        case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+DXGI_FORMAT NormalizePlanarDepthStencilFootprintFormat(
+    ID3D12Device* host_dev,
+    const D3D12_RESOURCE_DESC& tdesc,
+    uint32_t subresource_index,
+    uint32_t plane_slice,
+    DXGI_FORMAT cur_fp_fmt) noexcept {
+    // Query host D3D12 runtime's exact canonical copyable footprint format for this planar subresource
+    // (e.g. R32_TYPELESS for D24S8/D32S8 plane 0, R8_TYPELESS for stencil plane 1).
+    DXGI_FORMAT canonical = DXGI_FORMAT_UNKNOWN;
+    if (host_dev) {
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        host_dev->GetCopyableFootprints(&tdesc, subresource_index, 1u, 0ull, &fp, nullptr, nullptr, nullptr);
+        canonical = fp.Footprint.Format;
+    }
+    if (canonical == DXGI_FORMAT_UNKNOWN) {
+        canonical = (plane_slice == 0u) ? DXGI_FORMAT_R32_TYPELESS : DXGI_FORMAT_R8_TYPELESS;
+    }
+    switch (cur_fp_fmt) {
+        case DXGI_FORMAT_UNKNOWN:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+        case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+            return canonical;
+        default:
+            return cur_fp_fmt;
+    }
+}
+
+uint64_t ComputePlacedFootprintByteSize(const D3D12_SUBRESOURCE_FOOTPRINT& fp) noexcept {
+    const uint32_t block_h =
+        (fp.Format >= DXGI_FORMAT_BC1_TYPELESS && fp.Format <= DXGI_FORMAT_BC7_UNORM_SRGB) ? 4u : 1u;
+    const uint64_t rows = std::max<uint64_t>(1ull, (static_cast<uint64_t>(fp.Height) + block_h - 1ull) / block_h);
+    const uint64_t depth = std::max<uint64_t>(1ull, static_cast<uint64_t>(fp.Depth));
+    return static_cast<uint64_t>(fp.RowPitch) * rows * depth;
+}
+
+}  // namespace
 
 void STDMETHODCALLTYPE CommandListX::CopyTextureRegion(
     const D3D12_TEXTURE_COPY_LOCATION* pDst, UINT DstX, UINT DstY, UINT DstZ,
     const D3D12_TEXTURE_COPY_LOCATION* pSrc, const D3D12_BOX* pSrcBox) {
-    D3D12_TEXTURE_COPY_LOCATION dst_loc{};
-    D3D12_TEXTURE_COPY_LOCATION src_loc{};
-    const D3D12_TEXTURE_COPY_LOCATION* dst_ptr = pDst;
-    const D3D12_TEXTURE_COPY_LOCATION* src_ptr = pSrc;
-    if (pDst) {
-        dst_loc = *pDst;
-        dst_loc.pResource = UnwrapResource(pDst->pResource);
-        dst_ptr = &dst_loc;
+    if (!pDst || !pSrc) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion[NullNoop]", 16, S_OK);
+        return;
     }
-    if (pSrc) {
-        src_loc = *pSrc;
-        src_loc.pResource = UnwrapResource(pSrc->pResource);
-        src_ptr = &src_loc;
+    if (pSrcBox &&
+        (pSrcBox->left >= pSrcBox->right ||
+         pSrcBox->top >= pSrcBox->bottom ||
+         pSrcBox->front >= pSrcBox->back)) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion[EmptyBoxNoop]", 16, S_OK);
+        return;
     }
+
+    D3D12_TEXTURE_COPY_LOCATION dst_loc = *pDst;
+    D3D12_TEXTURE_COPY_LOCATION src_loc = *pSrc;
+    dst_loc.pResource = UnwrapResource(pDst->pResource);
+    src_loc.pResource = UnwrapResource(pSrc->pResource);
+    if (!dst_loc.pResource || !src_loc.pResource) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion[NullResNoop]", 16, S_OK);
+        return;
+    }
+    D3D12_TEXTURE_COPY_LOCATION* dst_ptr = &dst_loc;
+    D3D12_TEXTURE_COPY_LOCATION* src_ptr = &src_loc;
+
+    // Normalize depth/stencil planar footprint formats and track depth/stencil plane + footprint-offset copies (AnyBox #54/#57/#67).
+    bool is_depth_stencil_copy = false;
+    bool has_footprint_offset = false;
+    auto inspect_tex_and_normalize_fp = [&](const D3D12_TEXTURE_COPY_LOCATION& tex_loc,
+                                            D3D12_TEXTURE_COPY_LOCATION& fp_loc) {
+        if (tex_loc.Type != D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX || !tex_loc.pResource) return;
+        const D3D12_RESOURCE_DESC tdesc = tex_loc.pResource->GetDesc();
+        if (IsAnyDepthStencilTextureFormat(tdesc.Format)) {
+            is_depth_stencil_copy = true;
+        }
+        if (fp_loc.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+            if (fp_loc.PlacedFootprint.Offset != 0ull) {
+                has_footprint_offset = true;
+            }
+            if (IsPlanarDepthStencilTextureFormat(tdesc.Format)) {
+                const uint32_t mips = std::max<uint32_t>(1u, tdesc.MipLevels);
+                const uint32_t arr =
+                    (tdesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+                        ? 1u
+                        : std::max<uint32_t>(1u, tdesc.DepthOrArraySize);
+                const uint32_t plane_slice = tex_loc.SubresourceIndex / (mips * arr);
+                fp_loc.PlacedFootprint.Footprint.Format = NormalizePlanarDepthStencilFootprintFormat(
+                    device_x_ ? device_x_->HostDevice() : nullptr,
+                    tdesc, tex_loc.SubresourceIndex, plane_slice,
+                    fp_loc.PlacedFootprint.Footprint.Format);
+            }
+        }
+    };
+    inspect_tex_and_normalize_fp(dst_loc, src_loc);
+    inspect_tex_and_normalize_fp(src_loc, dst_loc);
+    if (dst_loc.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+        src_loc.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+        if (IsAnyDepthStencilTextureFormat(dst_loc.pResource->GetDesc().Format) ||
+            IsAnyDepthStencilTextureFormat(src_loc.pResource->GetDesc().Format)) {
+            is_depth_stencil_copy = true;
+        }
+    }
+    if (is_depth_stencil_copy && device_x_) {
+        device_x_->RecordDepthStencilPlaneCopy();
+    }
+    if (has_footprint_offset && device_x_) {
+        device_x_->RecordFootprintOffsetCopy();
+    }
+
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
         VulkanRecordedOp op{};
         op.kind = VulkanRecordedOpKind::CopyTexture;
-        op.dst_resource = dst_ptr ? dst_ptr->pResource : nullptr;
-        op.src_resource = src_ptr ? src_ptr->pResource : nullptr;
+        op.dst_resource = dst_ptr->pResource;
+        op.src_resource = src_ptr->pResource;
+        op.copy_dst_x = DstX;
+        op.copy_dst_y = DstY;
+        op.copy_dst_z = DstZ;
+        if (src_loc.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+            op.copy_footprint_offset = src_loc.PlacedFootprint.Offset;
+        } else if (dst_loc.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+            op.copy_footprint_offset = dst_loc.PlacedFootprint.Offset;
+        }
         vk_batch_.ops.push_back(std::move(op));
         vk_batch_.has_host_commands = true;
     }
 
     // Sprint 13 placed tiled texture bridge (64KB tile-pool mapping, subresource pitch, untile/retile).
-    if (dst_ptr && src_ptr &&
-        TryBridgePlacedTiledCopyTextureRegion(*dst_ptr, DstX, DstY, DstZ, *src_ptr, pSrcBox)) {
+    if (TryBridgePlacedTiledCopyTextureRegion(*dst_ptr, DstX, DstY, DstZ, *src_ptr, pSrcBox)) {
         RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion[PlacedTiled]", 16, S_OK);
         RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion", 16, S_OK);
         return;
     }
 
     // Live XgGpuUntiler intercept when source or destination uses a GFX10 swizzle layout.
-    if (device_x_ && dst_ptr && src_ptr &&
+    if (device_x_ &&
         dst_ptr->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
         src_ptr->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
         const XG_TILE_MODE src_mode = device_x_->GetTrackedResourceTileMode(src_ptr->pResource);
@@ -934,116 +1143,123 @@ void STDMETHODCALLTYPE CommandListX::CopyTextureRegion(
         }
     }
 
-    // Xbox Series X D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT is 256 bytes, whereas desktop Windows
-    // D3D12 strictly requires 512-byte alignment for PLACED_FOOTPRINT.Offset (error #864).
-    // Re-align via a 512-byte-aligned transient DEFAULT staging buffer + CopyBufferRegion.
-    auto is_bc_format = [](DXGI_FORMAT fmt) noexcept -> bool {
-        switch (fmt) {
-            case DXGI_FORMAT_BC1_TYPELESS: case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB:
-            case DXGI_FORMAT_BC2_TYPELESS: case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_UNORM_SRGB:
-            case DXGI_FORMAT_BC3_TYPELESS: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB:
-            case DXGI_FORMAT_BC4_TYPELESS: case DXGI_FORMAT_BC4_UNORM: case DXGI_FORMAT_BC4_SNORM:
-            case DXGI_FORMAT_BC5_TYPELESS: case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC5_SNORM:
-            case DXGI_FORMAT_BC6H_TYPELESS: case DXGI_FORMAT_BC6H_UF16: case DXGI_FORMAT_BC6H_SF16:
-            case DXGI_FORMAT_BC7_TYPELESS: case DXGI_FORMAT_BC7_UNORM: case DXGI_FORMAT_BC7_UNORM_SRGB:
-                return true;
-            default:
-                return false;
-        }
-    };
-    auto compute_footprint_bytes = [&](const D3D12_SUBRESOURCE_FOOTPRINT& fp) noexcept -> uint64_t {
-        const uint64_t bh = is_bc_format(fp.Format) ? 4ull : 1ull;
-        const uint64_t rows = (std::max<uint64_t>(fp.Height, 1ull) + bh - 1ull) / bh;
-        const uint64_t depth = std::max<uint64_t>(fp.Depth, 1ull);
-        return static_cast<uint64_t>(fp.RowPitch) * rows * depth;
-    };
+    // Xbox Series X allows 64/256-byte PlacedFootprint.Offset alignment (smaller than desktop PC
+    // D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT = 512) and smaller RowPitch alignment (desktop requires 256).
+    // Stage any unaligned buffer-to-texture upload through a 512-byte-aligned transient DEFAULT buffer
+    // using CopyBufferRegion (which has 1-byte offset alignment) so desktop CopyTextureRegion succeeds!
+    D3D12_TEXTURE_COPY_LOCATION aligned_src_loc{};
+    if (device_x_ && device_x_->HostDevice() && dst_ptr && src_ptr &&
+        src_ptr->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT && src_ptr->pResource != nullptr) {
+        const UINT64 src_off = src_ptr->PlacedFootprint.Offset;
+        const auto& fp = src_ptr->PlacedFootprint.Footprint;
+        const bool bad_offset = (src_off & 511ull) != 0ull;
+        const bool bad_pitch = (fp.RowPitch & 255u) != 0u;
+        if (bad_offset || bad_pitch) {
+            const bool is_bc =
+                (fp.Format >= DXGI_FORMAT_BC1_TYPELESS && fp.Format <= DXGI_FORMAT_BC5_SNORM) ||
+                (fp.Format >= DXGI_FORMAT_BC6H_TYPELESS && fp.Format <= DXGI_FORMAT_BC7_UNORM_SRGB);
+            const UINT block_h = is_bc ? 4u : 1u;
+            const UINT64 num_rows = std::max<UINT64>(1ull, (static_cast<UINT64>(fp.Height) + block_h - 1ull) / block_h);
+            const UINT64 num_slices = std::max<UINT64>(1ull, static_cast<UINT64>(fp.Depth));
+            const UINT64 total_rows = num_rows * num_slices;
+            const UINT aligned_pitch = (fp.RowPitch + 255u) & ~255u;
+            const UINT64 src_buf_width = src_ptr->pResource->GetDesc().Width;
+            const UINT64 src_avail = (src_buf_width > src_off) ? (src_buf_width - src_off) : 0ull;
+            const UINT64 staging_bytes = std::max<UINT64>(
+                65536ull, ((total_rows * static_cast<UINT64>(aligned_pitch)) + 65535ull) & ~65535ull);
 
-    if (device_x_ && device_x_->HostDevice() && src_ptr &&
-        src_ptr->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT &&
-        src_loc.pResource != nullptr &&
-        (src_loc.PlacedFootprint.Offset % 512ull) != 0ull) {
-        const uint64_t fp_bytes = compute_footprint_bytes(src_loc.PlacedFootprint.Footprint);
-        const D3D12_RESOURCE_DESC src_desc = src_loc.pResource->GetDesc();
-        const uint64_t avail = (src_loc.PlacedFootprint.Offset < src_desc.Width)
-                                   ? (src_desc.Width - src_loc.PlacedFootprint.Offset)
-                                   : 0ull;
-        const uint64_t copy_bytes = std::min<uint64_t>(fp_bytes, avail);
-        const uint64_t staging_bytes = AlignUpPlaced64(std::max<uint64_t>(fp_bytes, 512ull), 512ull);
-        if (copy_bytes > 0ull) {
-            D3D12_HEAP_PROPERTIES hp{};
-            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-            D3D12_RESOURCE_DESC bd{};
-            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            bd.Width = staging_bytes;
-            bd.Height = 1u;
-            bd.DepthOrArraySize = 1u;
-            bd.MipLevels = 1u;
-            bd.Format = DXGI_FORMAT_UNKNOWN;
-            bd.SampleDesc.Count = 1u;
-            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            ID3D12Resource* staging = nullptr;
-            if (SUCCEEDED(device_x_->HostDevice()->CreateCommittedResource(
-                    &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
-                    nullptr, IID_PPV_ARGS(&staging))) &&
-                staging) {
-                host_list_->CopyBufferRegion(
-                    staging, 0ull, src_loc.pResource, src_loc.PlacedFootprint.Offset, copy_bytes);
-                D3D12_RESOURCE_BARRIER b{};
-                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                b.Transition.pResource = staging;
-                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-                b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-                host_list_->ResourceBarrier(1u, &b);
-                src_loc.pResource = staging;
-                src_loc.PlacedFootprint.Offset = 0ull;
-                TrackAlignTransientResource(staging);
+            D3D12_HEAP_PROPERTIES def_hp{};
+            def_hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC tmp_desc{};
+            tmp_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            tmp_desc.Alignment = 0ull;
+            tmp_desc.Width = staging_bytes;
+            tmp_desc.Height = 1u;
+            tmp_desc.DepthOrArraySize = 1u;
+            tmp_desc.MipLevels = 1u;
+            tmp_desc.Format = DXGI_FORMAT_UNKNOWN;
+            tmp_desc.SampleDesc.Count = 1u;
+            tmp_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            tmp_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+            ID3D12Resource* tmp_buf = nullptr;
+            if (src_avail > 0ull &&
+                SUCCEEDED(device_x_->HostDevice()->CreateCommittedResource(
+                    &def_hp, D3D12_HEAP_FLAG_NONE, &tmp_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                    IID_PPV_ARGS(&tmp_buf))) && tmp_buf) {
+                TrackTiledTransientResource(tmp_buf);
+                if (!bad_pitch) {
+                    const UINT64 raw_bytes = total_rows * static_cast<UINT64>(fp.RowPitch);
+                    const UINT64 copy_bytes = std::min<UINT64>(raw_bytes, src_avail);
+                    host_list_->CopyBufferRegion(tmp_buf, 0ull, src_ptr->pResource, src_off, copy_bytes);
+                } else {
+                    for (UINT64 r = 0ull; r < total_rows; ++r) {
+                        const UINT64 r_src = src_off + r * static_cast<UINT64>(fp.RowPitch);
+                        if (r_src >= src_buf_width) break;
+                        const UINT64 r_len = std::min<UINT64>(fp.RowPitch, src_buf_width - r_src);
+                        host_list_->CopyBufferRegion(tmp_buf, r * static_cast<UINT64>(aligned_pitch),
+                                                     src_ptr->pResource, r_src, r_len);
+                    }
+                }
+                D3D12_RESOURCE_BARRIER to_src{};
+                to_src.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                to_src.Transition.pResource = tmp_buf;
+                to_src.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                to_src.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                to_src.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                host_list_->ResourceBarrier(1u, &to_src);
+
+                aligned_src_loc = *src_ptr;
+                aligned_src_loc.pResource = tmp_buf;
+                aligned_src_loc.PlacedFootprint.Offset = 0ull;
+                aligned_src_loc.PlacedFootprint.Footprint.RowPitch = aligned_pitch;
+                src_ptr = &aligned_src_loc;
             }
         }
     }
 
-    if (device_x_ && device_x_->HostDevice() && dst_ptr &&
-        dst_ptr->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT &&
+    if (device_x_ && device_x_->HostDevice() && dst_ptr && src_ptr &&
+        dst_loc.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT &&
         dst_loc.pResource != nullptr &&
-        (dst_loc.PlacedFootprint.Offset % 512ull) != 0ull) {
-        const uint64_t fp_bytes = compute_footprint_bytes(dst_loc.PlacedFootprint.Footprint);
-        const D3D12_RESOURCE_DESC dst_desc = dst_loc.pResource->GetDesc();
-        const uint64_t avail = (dst_loc.PlacedFootprint.Offset < dst_desc.Width)
-                                   ? (dst_desc.Width - dst_loc.PlacedFootprint.Offset)
-                                   : 0ull;
-        const uint64_t copy_bytes = std::min<uint64_t>(fp_bytes, avail);
-        const uint64_t staging_bytes = AlignUpPlaced64(std::max<uint64_t>(fp_bytes, 512ull), 512ull);
+        (dst_loc.PlacedFootprint.Offset & (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1ull)) != 0ull) {
+        const uint64_t fp_bytes = ComputePlacedFootprintByteSize(dst_loc.PlacedFootprint.Footprint);
+        const uint64_t dst_width = dst_loc.pResource->GetDesc().Width;
+        const uint64_t dst_avail = (dst_loc.PlacedFootprint.Offset < dst_width)
+                                       ? (dst_width - dst_loc.PlacedFootprint.Offset)
+                                       : 0ull;
+        const uint64_t copy_bytes = std::min<uint64_t>(fp_bytes, dst_avail);
         if (copy_bytes > 0ull) {
-            D3D12_HEAP_PROPERTIES hp{};
-            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-            D3D12_RESOURCE_DESC bd{};
-            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            bd.Width = staging_bytes;
-            bd.Height = 1u;
-            bd.DepthOrArraySize = 1u;
-            bd.MipLevels = 1u;
-            bd.Format = DXGI_FORMAT_UNKNOWN;
-            bd.SampleDesc.Count = 1u;
-            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            ID3D12Resource* staging = nullptr;
+            D3D12_HEAP_PROPERTIES def_hp{};
+            def_hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC stage_desc{};
+            stage_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            stage_desc.Width = (std::max<uint64_t>(fp_bytes, 512ull) + 511ull) & ~511ull;
+            stage_desc.Height = 1u;
+            stage_desc.DepthOrArraySize = 1u;
+            stage_desc.MipLevels = 1u;
+            stage_desc.SampleDesc.Count = 1u;
+            stage_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            ID3D12Resource* stage_buf = nullptr;
             if (SUCCEEDED(device_x_->HostDevice()->CreateCommittedResource(
-                    &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
-                    nullptr, IID_PPV_ARGS(&staging))) &&
-                staging) {
+                    &def_hp, D3D12_HEAP_FLAG_NONE, &stage_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                    OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&stage_buf))) &&
+                stage_buf) {
+                TrackTiledTransientResource(stage_buf);
                 D3D12_TEXTURE_COPY_LOCATION aligned_dst = dst_loc;
-                aligned_dst.pResource = staging;
+                aligned_dst.pResource = stage_buf;
                 aligned_dst.PlacedFootprint.Offset = 0ull;
                 host_list_->CopyTextureRegion(&aligned_dst, DstX, DstY, DstZ, src_ptr, pSrcBox);
-                D3D12_RESOURCE_BARRIER b{};
-                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                b.Transition.pResource = staging;
-                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-                b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-                host_list_->ResourceBarrier(1u, &b);
-                host_list_->CopyBufferRegion(
-                    dst_loc.pResource, dst_loc.PlacedFootprint.Offset, staging, 0ull, copy_bytes);
-                TrackAlignTransientResource(staging);
+                D3D12_RESOURCE_BARRIER tb{};
+                tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                tb.Transition.pResource = stage_buf;
+                tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                tb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                host_list_->ResourceBarrier(1u, &tb);
+                host_list_->CopyBufferRegion(dst_loc.pResource, dst_loc.PlacedFootprint.Offset, stage_buf, 0ull, copy_bytes);
+                RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion[AlignedFootprintStage]", 16, S_OK);
                 RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion", 16, S_OK);
                 return;
             }
@@ -1051,6 +1267,24 @@ void STDMETHODCALLTYPE CommandListX::CopyTextureRegion(
     }
 
     host_list_->CopyTextureRegion(dst_ptr, DstX, DstY, DstZ, src_ptr, pSrcBox);
+    if (IsDiagTraceEnabled() && dst_ptr && src_ptr) {
+        const D3D12_RESOURCE_DESC dd = dst_ptr->pResource ? dst_ptr->pResource->GetDesc() : D3D12_RESOURCE_DESC{};
+        const D3D12_RESOURCE_DESC sd = src_ptr->pResource ? src_ptr->pResource->GetDesc() : D3D12_RESOURCE_DESC{};
+        char buf[300];
+        std::snprintf(buf, sizeof(buf),
+                      "CopyTextureRegion dst=%p(t=%d,fmt=%d,w=%llu,h=%u)@(%u,%u,%u) src=%p(t=%d,fmt=%d,w=%llu,off=%llu,fp_fmt=%d,fp_w=%u,fp_h=%u,rp=%u)",
+                      static_cast<void*>(dst_ptr->pResource), static_cast<int>(dst_ptr->Type),
+                      static_cast<int>(dd.Format), static_cast<unsigned long long>(dd.Width), dd.Height,
+                      DstX, DstY, DstZ,
+                      static_cast<void*>(src_ptr->pResource), static_cast<int>(src_ptr->Type),
+                      static_cast<int>(sd.Format), static_cast<unsigned long long>(sd.Width),
+                      src_ptr->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ? static_cast<unsigned long long>(src_ptr->PlacedFootprint.Offset) : 0ull,
+                      src_ptr->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ? static_cast<int>(src_ptr->PlacedFootprint.Footprint.Format) : -1,
+                      src_ptr->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ? src_ptr->PlacedFootprint.Footprint.Width : 0u,
+                      src_ptr->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ? src_ptr->PlacedFootprint.Footprint.Height : 0u,
+                      src_ptr->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ? src_ptr->PlacedFootprint.Footprint.RowPitch : 0u);
+        AppendDiagOp(buf);
+    }
     RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion", 16, S_OK);
 }
 
@@ -1139,7 +1373,12 @@ void STDMETHODCALLTYPE CommandListX::IASetPrimitiveTopology(
 
 void STDMETHODCALLTYPE CommandListX::RSSetViewports(
     UINT NumViewports, const D3D12_VIEWPORT* pViewports) {
-    if (device_x_ && device_x_->IsVulkanRoutingActive() && NumViewports > 0u && pViewports) {
+    if (NumViewports == 0u || !pViewports) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::RSSetViewports[ZeroNoop]", 21, S_OK);
+        return;
+    }
+    if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
         vk_vp_width_ = static_cast<uint32_t>(std::max(0.0f, pViewports[0].Width));
         vk_vp_height_ = static_cast<uint32_t>(std::max(0.0f, pViewports[0].Height));
@@ -1150,6 +1389,11 @@ void STDMETHODCALLTYPE CommandListX::RSSetViewports(
 
 void STDMETHODCALLTYPE CommandListX::RSSetScissorRects(
     UINT NumRects, const D3D12_RECT* pRects) {
+    if (NumRects == 0u || !pRects) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::RSSetScissorRects[ZeroNoop]", 22, S_OK);
+        return;
+    }
     host_list_->RSSetScissorRects(NumRects, pRects);
     RecordList("ID3D12GraphicsCommandListX::RSSetScissorRects", 22, S_OK);
 }
@@ -1184,8 +1428,8 @@ void STDMETHODCALLTYPE CommandListX::SetPipelineState(ID3D12PipelineState* pPipe
 void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
     UINT NumBarriers, const D3D12_RESOURCE_BARRIER* pBarriers) {
     if (!pBarriers || NumBarriers == 0u) {
-        host_list_->ResourceBarrier(NumBarriers, pBarriers);
-        RecordList("ID3D12GraphicsCommandListX::ResourceBarrier", 26, S_OK);
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::ResourceBarrier[ZeroNoop]", 26, S_OK);
         return;
     }
 
@@ -1212,6 +1456,7 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
     };
 
     UINT out_count = 0u;
+    uint32_t global_uav_barriers = 0u;
     for (UINT i = 0u; i < NumBarriers; ++i) {
         D3D12_RESOURCE_BARRIER b = pBarriers[i];
         bool emit = true;
@@ -1310,12 +1555,35 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
                 b.UAV.pResource = UnwrapResource(pBarriers[i].UAV.pResource);
                 if (b.UAV.pResource != nullptr) {
                     RecordMirroredResourceGpuWrite(b.UAV.pResource);
+                } else {
+                    // Console global UAV barrier (UAV.pResource == nullptr, xcl #68):
+                    // valid on DIRECT/COMPUTE lists in D3D12 and maps conservatively to a full
+                    // VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT barrier on Vulkan.
+                    ++global_uav_barriers;
+                    if (device_x_) device_x_->RecordGlobalUavBarrier();
+                    if (list_type_ == D3D12_COMMAND_LIST_TYPE_COPY) {
+                        emit = false;
+                    }
                 }
                 break;
             default:
                 break;
         }
         if (emit) {
+            if (IsDiagTraceEnabled() && b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+                char buf[200];
+                const D3D12_RESOURCE_DESC rdesc = b.Transition.pResource ? b.Transition.pResource->GetDesc() : D3D12_RESOURCE_DESC{};
+                std::snprintf(buf, sizeof(buf),
+                              "Barrier res=%p dim=%d fmt=%d w=%llu h=%u sub=%u 0x%X->0x%X flg=0x%X",
+                              static_cast<void*>(b.Transition.pResource),
+                              static_cast<int>(rdesc.Dimension), static_cast<int>(rdesc.Format),
+                              static_cast<unsigned long long>(rdesc.Width), rdesc.Height,
+                              b.Transition.Subresource,
+                              static_cast<unsigned>(b.Transition.StateBefore),
+                              static_cast<unsigned>(b.Transition.StateAfter),
+                              static_cast<unsigned>(b.Flags));
+                AppendDiagOp(buf);
+            }
             unwrapped[out_count++] = b;
         }
     }
@@ -1329,7 +1597,10 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
         VulkanRecordedOp op{};
         op.kind = VulkanRecordedOpKind::Barrier;
-        op.barrier_count = out_count + static_cast<uint32_t>(extra_tiled_barriers.size());
+        op.barrier_count = std::max<uint32_t>(
+            out_count + static_cast<uint32_t>(extra_tiled_barriers.size()),
+            global_uav_barriers);
+        op.global_uav_barrier_count = global_uav_barriers;
         vk_batch_.ops.push_back(std::move(op));
         vk_batch_.has_host_commands = true;
     }
@@ -1989,7 +2260,12 @@ void STDMETHODCALLTYPE CommandListX::IASetIndexBuffer(const D3D12_INDEX_BUFFER_V
 
 void STDMETHODCALLTYPE CommandListX::IASetVertexBuffers(
     UINT StartSlot, UINT NumViews, const D3D12_VERTEX_BUFFER_VIEW* pViews) {
-    if (device_x_ && device_x_->IsVulkanRoutingActive() && StartSlot == 0u && NumViews > 0u && pViews) {
+    if (NumViews == 0u) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::IASetVertexBuffers[ZeroNoop]", 44, S_OK);
+        return;
+    }
+    if (device_x_ && device_x_->IsVulkanRoutingActive() && StartSlot == 0u && pViews) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
         vk_cur_vbv_ = pViews[0];
         vk_has_vbv_ = true;
@@ -2261,9 +2537,10 @@ void STDMETHODCALLTYPE CommandListX::AtomicCopyBufferUINT(
         host_list1_->AtomicCopyBufferUINT(
             UnwrapResource(pDstBuffer), DstOffset, UnwrapResource(pSrcBuffer), SrcOffset,
             Dependencies, dep_ptr, pDependentSubresourceRanges);
+        RecordList("ID3D12GraphicsCommandListX::AtomicCopyBufferUINT", 60, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::AtomicCopyBufferUINT", 60);
     }
-    RecordList("ID3D12GraphicsCommandListX::AtomicCopyBufferUINT",
-               60, host_list1_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::AtomicCopyBufferUINT64(
@@ -2284,9 +2561,10 @@ void STDMETHODCALLTYPE CommandListX::AtomicCopyBufferUINT64(
         host_list1_->AtomicCopyBufferUINT64(
             UnwrapResource(pDstBuffer), DstOffset, UnwrapResource(pSrcBuffer), SrcOffset,
             Dependencies, dep_ptr, pDependentSubresourceRanges);
+        RecordList("ID3D12GraphicsCommandListX::AtomicCopyBufferUINT64", 61, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::AtomicCopyBufferUINT64", 61);
     }
-    RecordList("ID3D12GraphicsCommandListX::AtomicCopyBufferUINT64",
-               61, host_list1_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::OMSetDepthBounds(FLOAT Min, FLOAT Max) {
@@ -2382,9 +2660,10 @@ void STDMETHODCALLTYPE CommandListX::ResolveSubresourceRegion(
         host_list1_->ResolveSubresourceRegion(
             host_dst, DstSubresource, DstX, DstY,
             host_src, SrcSubresource, pSrcRect, Format, ResolveMode);
+        RecordList("ID3D12GraphicsCommandListX::ResolveSubresourceRegion", 64, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::ResolveSubresourceRegion", 64);
     }
-    RecordList("ID3D12GraphicsCommandListX::ResolveSubresourceRegion",
-               64, host_list1_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::SetViewInstanceMask(UINT Mask) {
@@ -2401,6 +2680,7 @@ void STDMETHODCALLTYPE CommandListX::WriteBufferImmediate(
     UINT Count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER* pParams,
     const D3D12_WRITEBUFFERIMMEDIATE_MODE* pModes) {
     if (Count == 0u || !pParams) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
         RecordList("ID3D12GraphicsCommandListX::WriteBufferImmediate", 66, S_OK);
         return;
     }
@@ -2461,9 +2741,12 @@ void STDMETHODCALLTYPE CommandListX::WriteBufferImmediate(
 // ID3D12GraphicsCommandList3 (slot 67)
 void STDMETHODCALLTYPE CommandListX::SetProtectedResourceSession(
     ID3D12ProtectedResourceSession* pProtectedResourceSession) {
-    if (host_list3_) host_list3_->SetProtectedResourceSession(pProtectedResourceSession);
-    RecordList("ID3D12GraphicsCommandListX::SetProtectedResourceSession",
-               67, host_list3_ ? S_OK : E_NOINTERFACE);
+    if (host_list3_) {
+        host_list3_->SetProtectedResourceSession(pProtectedResourceSession);
+        RecordList("ID3D12GraphicsCommandListX::SetProtectedResourceSession", 67, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::SetProtectedResourceSession", 67);
+    }
 }
 
 // ID3D12GraphicsCommandList4 (slots 68..76)
@@ -2494,109 +2777,130 @@ void STDMETHODCALLTYPE CommandListX::BeginRenderPass(
             }
         }
         host_list4_->BeginRenderPass(NumRenderTargets, rt_ptr, pDepthStencil, Flags);
+        RecordList("ID3D12GraphicsCommandListX::BeginRenderPass", 68, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::BeginRenderPass", 68);
     }
-    RecordList("ID3D12GraphicsCommandListX::BeginRenderPass",
-               68, host_list4_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::EndRenderPass() {
-    if (host_list4_) host_list4_->EndRenderPass();
-    RecordList("ID3D12GraphicsCommandListX::EndRenderPass",
-               69, host_list4_ ? S_OK : E_NOINTERFACE);
+    if (host_list4_) {
+        host_list4_->EndRenderPass();
+        RecordList("ID3D12GraphicsCommandListX::EndRenderPass", 69, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::EndRenderPass", 69);
+    }
 }
 
 void STDMETHODCALLTYPE CommandListX::InitializeMetaCommand(
     ID3D12MetaCommand* pMetaCommand, const void* pInitializationParametersData,
     SIZE_T InitializationParametersDataSizeInBytes) {
-    if (host_list4_) {
+    if (host_list4_ && pMetaCommand) {
         host_list4_->InitializeMetaCommand(
             pMetaCommand, pInitializationParametersData, InitializationParametersDataSizeInBytes);
+        RecordList("ID3D12GraphicsCommandListX::InitializeMetaCommand", 70, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::InitializeMetaCommand", 70);
     }
-    RecordList("ID3D12GraphicsCommandListX::InitializeMetaCommand",
-               70, host_list4_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::ExecuteMetaCommand(
     ID3D12MetaCommand* pMetaCommand, const void* pExecutionParametersData,
     SIZE_T ExecutionParametersDataSizeInBytes) {
-    if (host_list4_) {
+    if (host_list4_ && pMetaCommand) {
         host_list4_->ExecuteMetaCommand(
             pMetaCommand, pExecutionParametersData, ExecutionParametersDataSizeInBytes);
+        RecordList("ID3D12GraphicsCommandListX::ExecuteMetaCommand", 71, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::ExecuteMetaCommand", 71);
     }
-    RecordList("ID3D12GraphicsCommandListX::ExecuteMetaCommand",
-               71, host_list4_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::BuildRaytracingAccelerationStructure(
     const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* pDesc,
     UINT NumPostbuildInfoDescs,
     const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* pPostbuildInfoDescs) {
-    const bool has_hw_rt = !device_x_ || device_x_->AdapterInfo().raytracing_tier > 0u;
-    if (host_list4_ && has_hw_rt) {
+    const bool rt_supported = !device_x_ || device_x_->AdapterInfo().raytracing_tier >= 10u;
+    if (host_list4_ && rt_supported && pDesc) {
         host_list4_->BuildRaytracingAccelerationStructure(
             pDesc, NumPostbuildInfoDescs, pPostbuildInfoDescs);
+        RecordList("ID3D12GraphicsCommandListX::BuildRaytracingAccelerationStructure", 72, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::BuildRaytracingAccelerationStructure", 72);
     }
-    RecordList("ID3D12GraphicsCommandListX::BuildRaytracingAccelerationStructure",
-               72, host_list4_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::EmitRaytracingAccelerationStructurePostbuildInfo(
     const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* pDesc,
     UINT NumSourceAccelerationStructures,
     const D3D12_GPU_VIRTUAL_ADDRESS* pSourceAccelerationStructureData) {
-    const bool has_hw_rt = !device_x_ || device_x_->AdapterInfo().raytracing_tier > 0u;
-    if (host_list4_ && has_hw_rt) {
+    const bool rt_supported = !device_x_ || device_x_->AdapterInfo().raytracing_tier >= 10u;
+    if (host_list4_ && rt_supported && pDesc && NumSourceAccelerationStructures > 0u) {
         host_list4_->EmitRaytracingAccelerationStructurePostbuildInfo(
             pDesc, NumSourceAccelerationStructures, pSourceAccelerationStructureData);
+        RecordList("ID3D12GraphicsCommandListX::EmitRaytracingAccelerationStructurePostbuildInfo", 73, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::EmitRaytracingAccelerationStructurePostbuildInfo", 73);
     }
-    RecordList("ID3D12GraphicsCommandListX::EmitRaytracingAccelerationStructurePostbuildInfo",
-               73, host_list4_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::CopyRaytracingAccelerationStructure(
     D3D12_GPU_VIRTUAL_ADDRESS DestAccelerationStructureData,
     D3D12_GPU_VIRTUAL_ADDRESS SourceAccelerationStructureData,
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE Mode) {
-    const bool has_hw_rt = !device_x_ || device_x_->AdapterInfo().raytracing_tier > 0u;
-    if (host_list4_ && has_hw_rt) {
+    const bool rt_supported = !device_x_ || device_x_->AdapterInfo().raytracing_tier >= 10u;
+    if (host_list4_ && rt_supported && DestAccelerationStructureData != 0ull && SourceAccelerationStructureData != 0ull) {
         host_list4_->CopyRaytracingAccelerationStructure(
             DestAccelerationStructureData, SourceAccelerationStructureData, Mode);
+        RecordList("ID3D12GraphicsCommandListX::CopyRaytracingAccelerationStructure", 74, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::CopyRaytracingAccelerationStructure", 74);
     }
-    RecordList("ID3D12GraphicsCommandListX::CopyRaytracingAccelerationStructure",
-               74, host_list4_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::SetPipelineState1(ID3D12StateObject* pStateObject) {
     ID3D12StateObject* host_so = UnwrapStateObject(pStateObject);
     const bool is_sw_proxy = (pStateObject != nullptr && host_so == nullptr);
-    const bool has_hw_rt = !device_x_ || device_x_->AdapterInfo().raytracing_tier > 0u;
-    if (host_list4_ && !is_sw_proxy && has_hw_rt) {
+    const bool rt_supported = !device_x_ || device_x_->AdapterInfo().raytracing_tier >= 10u;
+    if (host_list4_ && !is_sw_proxy && host_so && rt_supported) {
         host_list4_->SetPipelineState1(host_so);
+        RecordList("ID3D12GraphicsCommandListX::SetPipelineState1", 75, S_OK);
+    } else if (is_sw_proxy) {
+        RecordList("ID3D12GraphicsCommandListX::SetPipelineState1", 75, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::SetPipelineState1", 75);
     }
-    RecordList("ID3D12GraphicsCommandListX::SetPipelineState1",
-               75, (host_list4_ || is_sw_proxy) ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::DispatchRays(const D3D12_DISPATCH_RAYS_DESC* pDesc) {
-    const bool has_hw_rt = !device_x_ || device_x_->AdapterInfo().raytracing_tier > 0u;
-    if (host_list4_ && has_hw_rt) host_list4_->DispatchRays(pDesc);
-    RecordList("ID3D12GraphicsCommandListX::DispatchRays",
-               76, host_list4_ ? S_OK : E_NOINTERFACE);
+    const bool rt_supported = !device_x_ || device_x_->AdapterInfo().raytracing_tier >= 10u;
+    if (host_list4_ && rt_supported && pDesc) {
+        host_list4_->DispatchRays(pDesc);
+        RecordList("ID3D12GraphicsCommandListX::DispatchRays", 76, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::DispatchRays", 76);
+    }
 }
 
 // ID3D12GraphicsCommandList5 (slots 77..78)
 void STDMETHODCALLTYPE CommandListX::RSSetShadingRate(
     D3D12_SHADING_RATE baseShadingRate,
     const D3D12_SHADING_RATE_COMBINER* combiners) {
-    if (host_list5_) host_list5_->RSSetShadingRate(baseShadingRate, combiners);
-    RecordList("ID3D12GraphicsCommandListX::RSSetShadingRate",
-               77, host_list5_ ? S_OK : E_NOINTERFACE);
+    if (host_list5_) {
+        host_list5_->RSSetShadingRate(baseShadingRate, combiners);
+        RecordList("ID3D12GraphicsCommandListX::RSSetShadingRate", 77, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::RSSetShadingRate", 77);
+    }
 }
 
 void STDMETHODCALLTYPE CommandListX::RSSetShadingRateImage(ID3D12Resource* shadingRateImage) {
-    if (host_list5_) host_list5_->RSSetShadingRateImage(UnwrapResource(shadingRateImage));
-    RecordList("ID3D12GraphicsCommandListX::RSSetShadingRateImage",
-               78, host_list5_ ? S_OK : E_NOINTERFACE);
+    if (host_list5_) {
+        host_list5_->RSSetShadingRateImage(UnwrapResource(shadingRateImage));
+        RecordList("ID3D12GraphicsCommandListX::RSSetShadingRateImage", 78, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::RSSetShadingRateImage", 78);
+    }
 }
 
 // ID3D12GraphicsCommandList6 (slot 79)
@@ -2607,7 +2911,8 @@ void STDMETHODCALLTYPE CommandListX::DispatchMesh(
             ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
     }
     if (ThreadGroupCountX == 0u || ThreadGroupCountY == 0u || ThreadGroupCountZ == 0u) {
-        RecordList("ID3D12GraphicsCommandListX::DispatchMesh", 79, S_OK);
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::DispatchMesh[ZeroNoop]", 79, S_OK);
         return;
     }
     bool skip_host = false;
@@ -2644,9 +2949,26 @@ void STDMETHODCALLTYPE CommandListX::DispatchMesh(
         const UINT gy = std::min<UINT>(ThreadGroupCountY, kMaxDim);
         const UINT gz = std::min<UINT>(ThreadGroupCountZ, kMaxDim);
         host_list6_->DispatchMesh(gx, gy, gz);
+        RecordList("ID3D12GraphicsCommandListX::DispatchMesh", 79, S_OK);
+    } else if (skip_host) {
+        RecordList("ID3D12GraphicsCommandListX::DispatchMesh", 79, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::DispatchMesh", 79);
     }
-    RecordList("ID3D12GraphicsCommandListX::DispatchMesh",
-               79, (skip_host || host_list6_) ? S_OK : E_NOINTERFACE);
+}
+
+void CommandListX::RecordUnsupportedExtensionIgnored(const char* ext_name, int32_t slot) {
+    // Leonida #3958: Log telemetry cleanly for unsupported/unrecognized console command-list
+    // extensions WITHOUT poisoning or aborting subsequent supported Draw/Dispatch/Copy/Barrier commands.
+    if (device_x_) {
+        device_x_->RecordUnsupportedCmdListExtensionIgnored();
+    }
+    openscarlett::CallTelemetry::Global().Record(
+        "d3d12_xs.dll",
+        (ext_name && ext_name[0] != '\0') ? ext_name : "ID3D12GraphicsCommandListX::UnsupportedExtension",
+        openscarlett::CallOutcome::NotImplemented,
+        E_NOTIMPL,
+        slot);
 }
 
 // ID3D12GraphicsCommandListX (slots 80..88)

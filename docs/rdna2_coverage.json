@@ -6,7 +6,7 @@
   "opcodes_lifted_spirv": 779,
   "opcodes_lifted_dxil": 779,
   "opcodes_cpu_ref": 779,
-  "opcodes_gpu_verified": 769,
+  "opcodes_gpu_verified": 775,
   "corpus_shaders_total": 3120,
   "corpus_shaders_passed": 3120,
   "corpus_unique_hashes": 3120,
@@ -15,10 +15,10 @@
   "corpus_dxil_compiled": 432,
   "corpus_dxil_resigned_verified": 432,
   "corpus_cpu_ref_executed": 48,
-  "corpus_gpu_executed": 49,
-  "corpus_gpu_hw_executed": 49,
-  "corpus_gpu_warp_executed": 48,
-  "corpus_vulkan_executed": 32,
+  "corpus_gpu_executed": 53,
+  "corpus_gpu_hw_executed": 53,
+  "corpus_gpu_warp_executed": 52,
+  "corpus_vulkan_executed": 33,
   "has_sv_isa_extension": true,
   "has_mem_isa_extension": true,
   "has_spirv_val_tool": true,
@@ -28,13 +28,13 @@
   "has_vulkan_hw": true,
   "d3d12_hw_adapter": "NVIDIA GeForce GTX 1650 Ti",
   "vulkan_adapter": "NVIDIA GeForce GTX 1650 Ti",
-  "elapsed_seconds": 243.441,
+  "elapsed_seconds": 8.680,
   "families": {
-    "SOP1": {"total": 58, "decoded": 58, "lifted_spirv": 58, "lifted_dxil": 58, "cpu_ref": 58, "gpu_verified": 55},
+    "SOP1": {"total": 58, "decoded": 58, "lifted_spirv": 58, "lifted_dxil": 58, "cpu_ref": 58, "gpu_verified": 57},
     "SOP2": {"total": 43, "decoded": 43, "lifted_spirv": 43, "lifted_dxil": 43, "cpu_ref": 43, "gpu_verified": 43},
-    "SOPK": {"total": 27, "decoded": 27, "lifted_spirv": 27, "lifted_dxil": 27, "cpu_ref": 27, "gpu_verified": 26},
+    "SOPK": {"total": 27, "decoded": 27, "lifted_spirv": 27, "lifted_dxil": 27, "cpu_ref": 27, "gpu_verified": 27},
     "SOPC": {"total": 18, "decoded": 18, "lifted_spirv": 18, "lifted_dxil": 18, "cpu_ref": 18, "gpu_verified": 18},
-    "SOPP": {"total": 39, "decoded": 39, "lifted_spirv": 39, "lifted_dxil": 39, "cpu_ref": 39, "gpu_verified": 33},
+    "SOPP": {"total": 39, "decoded": 39, "lifted_spirv": 39, "lifted_dxil": 39, "cpu_ref": 39, "gpu_verified": 36},
     "SMEM": {"total": 20, "decoded": 20, "lifted_spirv": 20, "lifted_dxil": 20, "cpu_ref": 20, "gpu_verified": 20},
     "VOP1": {"total": 74, "decoded": 74, "lifted_spirv": 74, "lifted_dxil": 74, "cpu_ref": 74, "gpu_verified": 74},
     "VOP2": {"total": 50, "decoded": 50, "lifted_spirv": 50, "lifted_dxil": 50, "cpu_ref": 50, "gpu_verified": 50},
@@ -52,14 +52,14 @@
     "EXP": {"total": 1, "decoded": 1, "lifted_spirv": 1, "lifted_dxil": 1, "cpu_ref": 1, "gpu_verified": 1}
   },
   "stages": {
-    "CS": {"total": 2080, "passed": 2080, "disasm_passed": 2080, "spirv_passed": 2080, "dxil_passed": 288, "cpu_ref_passed": 32, "gpu_passed": 47},
+    "CS": {"total": 2080, "passed": 2080, "disasm_passed": 2080, "spirv_passed": 2080, "dxil_passed": 288, "cpu_ref_passed": 32, "gpu_passed": 50},
     "VS": {"total": 260, "passed": 260, "disasm_passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 1},
-    "PS": {"total": 520, "passed": 520, "disasm_passed": 520, "spirv_passed": 520, "dxil_passed": 72, "cpu_ref_passed": 8, "gpu_passed": 1},
+    "PS": {"total": 520, "passed": 520, "disasm_passed": 520, "spirv_passed": 520, "dxil_passed": 72, "cpu_ref_passed": 8, "gpu_passed": 2},
     "MS": {"total": 130, "passed": 130, "disasm_passed": 130, "spirv_passed": 130, "dxil_passed": 18, "cpu_ref_passed": 2, "gpu_passed": 1},
     "AS": {"total": 130, "passed": 130, "disasm_passed": 130, "spirv_passed": 130, "dxil_passed": 18, "cpu_ref_passed": 2, "gpu_passed": 1}
   },
   "workloads": {
-    "pbr_ibl": {"description": "PBR/IBL microfacet shading (GGX/Fresnel, PS VINTRP + CS)", "total": 260, "passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 11},
+    "pbr_ibl": {"description": "PBR/IBL microfacet shading (GGX/Fresnel, PS VINTRP + CS)", "total": 260, "passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 12},
     "cascaded_shadows": {"description": "Cascaded shadow maps & PCF depth filtering (PS + CS)", "total": 260, "passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 7},
     "deferred_gbuffer": {"description": "Deferred G-buffer f16/snorm16/unorm16 pack & unpack (CS + PS)", "total": 260, "passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 6},
     "skeletal_skinning": {"description": "Bone matrix palette skinning & MTBUF D16 vertex fetch (VS + CS)", "total": 260, "passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 3},
@@ -70,6 +70,6 @@
     "lds_prefix_sum_radix_sort": {"description": "LDS workgroup prefix-sum & radix sort with lockstep barriers (CS)", "total": 260, "passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 4},
     "wave32_wave64_ballot_permlane": {"description": "Wave32/Wave64 ballot, mbcnt, readfirstlane & permlane16/x16 (CS)", "total": 260, "passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 2},
     "texture_2d_3d_cube_mip_gather_atomics": {"description": "2D/3D/Cube mip load, explicit LOD sample, store & cmpswap (CS)", "total": 260, "passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 2},
-    "scratch_register_spilling": {"description": "SCRATCH spilling, scalar loops, GLOBAL/FLAT & 16-bit int ALU (CS + VS)", "total": 260, "passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 9}
+    "scratch_register_spilling": {"description": "SCRATCH spilling, scalar loops, GLOBAL/FLAT & 16-bit int ALU (CS + VS)", "total": 260, "passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 12}
   }
 }

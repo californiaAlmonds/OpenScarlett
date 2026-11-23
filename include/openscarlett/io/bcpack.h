@@ -247,4 +247,90 @@ bool BcPackHwIsValidBitstreamHeader(
     size_t src_size,
     uint32_t* out_block_count = nullptr) noexcept;
 
+// ---------------------------------------------------------------------------
+// Sprint 15: Spec-Correct Bit-Exact BC6H Decoder (UF16/SF16), Signed-Zero Rule,
+// BC6H BCPack Preset/Region Transition Helpers, 64-bit TTPF Bounds & rANS Codec
+// (SixNG #15/#20/#21/#23/#24, bcpack-rs c51ec52)
+// ---------------------------------------------------------------------------
+struct Bc6hBlockInfo {
+    uint8_t mode_index = 0xFFu;      // 0..13 for valid BC6H modes, 0xFF for reserved
+    uint8_t region_count = 0u;       // 1 (modes 10..13) or 2 (modes 0..9), 0 if reserved
+    uint8_t partition_index = 0u;    // 0..31 for 2-region modes, 0 for 1-region
+    uint8_t endpoint_bits = 0u;      // Endpoint quantized bit precision (6..16)
+    bool is_transformed = false;     // True for delta-encoded endpoints
+    bool is_reserved_mode = true;
+};
+
+struct Bc6hBcpPresetInfo {
+    uint32_t preset_index = 0u;      // Canonical preset table index [0..14] (14 = reserved/raw)
+    uint8_t mode_index = 0xFFu;      // 0..13 or 0xFF
+    uint8_t region_count = 0u;       // 1 or 2 (0 if reserved)
+    bool is_valid = false;
+};
+
+// Exact DXGI BC6H FinishUnquantize integer final-scaling rule:
+//   UF16: (comp * 31) >> 6
+//   SF16: scale signed comp by 31/32, THEN select signed-zero sign bit AFTER final scaling
+//         (so small negative values scaling to 0 emit +0.0 == 0x0000, NEVER -0.0 == 0x8000).
+uint16_t Bc6hFinishUnquantize(int32_t comp, bool is_signed) noexcept;
+
+// Inspects a 16-byte BC6H block's mode prefix, region count, partition shape, and transform flag.
+bool Bc6hInspectBlockMode(const uint8_t block[16], Bc6hBlockInfo& out_info) noexcept;
+
+// Resolves canonical BCPack BC6H preset metadata (handling 1-region <-> 2-region transitions safely).
+bool Bc6hResolveBcpPreset(const uint8_t block[16], Bc6hBcpPresetInfo& out_preset) noexcept;
+
+// Decodes a single 16-byte BC6H block (UF16 or SF16) using strict bit-exact integer
+// unquantization, weight interpolation, and post-scaling signed-zero selection into
+// 16 RGB half-floats (48 IEEE-754 binary16 uint16_t values, row-major 4x4).
+void Bc6hDecodeBlock(
+    const uint8_t block[16],
+    bool is_signed,
+    uint16_t out_rgb_f16[48]) noexcept;
+
+// Decodes an entire BC6H surface into RGBA16F (width * height * 4 uint16_t values, A = 0x3C00).
+Status Bc6hDecodeSurface(
+    const uint8_t* blocks,
+    size_t blocks_size,
+    uint32_t width,
+    uint32_t height,
+    bool is_signed,
+    std::vector<uint16_t>& out_rgba_f16);
+
+// 64-bit TTPF (Tile/Texture Payload Format) codec-mask & >4 GiB bounds helpers (bcpack-rs c51ec52).
+static constexpr uint32_t kTtpfMagic = 0x46505454u;  // 'TTPF'
+static constexpr uint32_t kTtpfMaxCodecBits = 64u;
+
+struct TtpfCodecMaskInfo {
+    uint64_t codec_mask = 0ull;
+    uint64_t logical_size_bytes = 0ull;
+    uint64_t tile_offset_bytes = 0ull;
+    uint64_t tile_size_bytes = 0ull;
+    uint32_t active_codec_count = 0u;
+    bool exceeds_4gib = false;
+};
+
+// Computes 64-bit codec mask bit safely without 32-bit shift UB/truncation (returns 0 if codec_index >= 64).
+uint64_t TtpfComputeCodecBitMask(uint32_t codec_index) noexcept;
+
+// Validates 64-bit TTPF payload/tile ranges and codec bitmasks safely above 4 GiB.
+bool TtpfValidatePayloadBounds(
+    uint64_t logical_size_bytes,
+    uint64_t tile_offset_bytes,
+    uint64_t tile_size_bytes,
+    uint64_t codec_mask,
+    TtpfCodecMaskInfo* out_info = nullptr) noexcept;
+
+// Strict bounds-checked 32-bit rANS entropy codec (12-bit probability scale, 0 OOB reads on malformed input).
+Status BcPackRansEncode(
+    const uint8_t* src,
+    size_t src_size,
+    std::vector<uint8_t>& out_encoded);
+
+Status BcPackRansDecode(
+    const uint8_t* src,
+    size_t src_size,
+    uint64_t expected_output_size,
+    std::vector<uint8_t>& out_decoded);
+
 }  // namespace openscarlett

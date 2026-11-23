@@ -907,6 +907,17 @@ OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12GetVulkanRoutingStats(
     ID3D12Device* device,
     D3D12XBOX_VULKAN_ROUTING_STATS* out_stats);
 
+// Xbox display scanline (VLine) and frame completion notification registration (xvalkyrie a252811).
+// Pass a valid Win32 event HANDLE to register (signaled on PresentX completion), or nullptr to unregister.
+OPENSCARLETT_D3D12_API HRESULT WINAPI DXGIXSetVLineNotification(
+    UINT VLineCounter,
+    UINT VLine,
+    HANDLE hEvent);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI DXGIXSetFrameNotification(
+    UINT FrameCounter,
+    HANDLE hEvent);
+
 // Xbox GDKX process priority, active device lookup, frame pacing & error reporting helpers.
 OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxSetProcessDebugFlags(
     D3D12XBOX_PROCESS_DEBUG_FLAGS Flags);
@@ -955,6 +966,34 @@ OPENSCARLETT_D3D12_API uint64_t WINAPI OpenScarlettD3D12GetReportedErrorCount(
 OPENSCARLETT_D3D12_API void WINAPI OpenScarlettD3D12ResetTrackedDevice();
 
 }  // extern "C"
+
+// Sprint 15 Graphics / D3D12X Parity diagnostics interface.
+// {4F534431-3258-5331-3500-000000000035}
+inline constexpr GUID IID_IOpenScarlettGraphicsParity = {
+    0x4F534431u, 0x3258u, 0x5331u,
+    {0x35u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x35u}
+};
+
+struct D3D12XBOX_GRAPHICS_PARITY_STATS {
+    uint64_t promoted_oversized_placed_resources = 0ull;
+    uint64_t msaa_quality_clamps = 0ull;
+    uint64_t console_flags_stripped = 0ull;
+    uint64_t reserved_cross_adapter_preserved = 0ull;
+    uint64_t reserved_cross_adapter_stripped_fallback = 0ull;
+    uint64_t global_uav_barriers_recorded = 0ull;
+    uint64_t unsupported_cmdlist_extensions_ignored = 0ull;
+    uint64_t zero_count_noop_calls = 0ull;
+    uint64_t readonly_dsv_creations = 0ull;
+    uint64_t depth_stencil_plane_copies = 0ull;
+    uint64_t footprint_offset_copies = 0ull;
+    uint64_t vline_notifications_signaled = 0ull;
+    uint64_t frame_notifications_signaled = 0ull;
+};
+
+struct IOpenScarlettGraphicsParity : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetGraphicsParityStats(
+        D3D12XBOX_GRAPHICS_PARITY_STATS* out_stats) = 0;
+};
 
 namespace openscarlett::d3d12_xs {
 

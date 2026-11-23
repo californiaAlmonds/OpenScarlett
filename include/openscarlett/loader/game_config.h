@@ -67,6 +67,10 @@ struct ResolvedPackageTarget {
     GameConfig config;
 };
 
+// Decodes XML 1.0 character references (&amp;, &lt;, &gt;, &quot;, &apos;,
+// decimal &#NNN;, hex &#xHHH; -> UTF-8).
+Status DecodeXmlEntities(std::string_view raw, std::string& out);
+
 // Parser for MicrosoftGame.Config / .mgc XML text in memory.
 Status ParseGameConfigXml(std::string_view xml_text,
                           const std::string& label,

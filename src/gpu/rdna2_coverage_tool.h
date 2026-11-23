@@ -123,4 +123,34 @@ Status WriteRdna2CoverageJsonFile(const std::string& path, const Rdna2CoverageRe
 //                            [--no-gpu] [--no-external] [--quiet]
 int RunRdna2BenchCli(int argc, char** argv);
 
+// ---------------------------------------------------------------------------
+// Privileged Trap / Halt / Return-From-Exception CPU-Ref Verification Harness
+// (s_rfe_b64, s_sethalt, s_sendmsghalt, s_trap — never falsely GPU-verified)
+// ---------------------------------------------------------------------------
+enum class Rdna2TrapTerminationKind : uint8_t {
+    NormalEnd = 0,
+    Halted = 1,       // s_sethalt
+    SendMsgHalt = 2,  // s_sendmsghalt
+    TrapRaised = 3,   // s_trap
+    RfeReturned = 4,  // s_rfe_b64
+};
+
+struct Rdna2PrivilegedTrapResult {
+    Rdna2TrapTerminationKind termination = Rdna2TrapTerminationKind::NormalEnd;
+    uint32_t trap_id = 0u;
+    uint64_t saved_pc_bytes = 0u;
+    uint64_t rfe_target_pc_bytes = 0u;
+    uint64_t instructions_executed = 0u;
+    std::vector<uint32_t> uav1;
+};
+
+// Executes a decoded GFX10.3 instruction stream with deterministic privileged trap/halt/RFE
+// CPU-reference termination semantics, confirming instructions after halt/trap/RFE do not
+// mutate UAV1.
+Status ExecuteRdna2PrivilegedTrapHarness(
+    const std::vector<uint32_t>& code_words,
+    const std::vector<uint32_t>& uav0,
+    size_t uav1_dwords,
+    Rdna2PrivilegedTrapResult& out_result);
+
 }  // namespace openscarlett

@@ -821,6 +821,13 @@ void ShaderCache::ResetStats() {
     async_queued_.store(0, std::memory_order_relaxed);
     async_completed_.store(0, std::memory_order_relaxed);
     async_failed_.store(0, std::memory_order_relaxed);
+    sync_succeeded_.store(0, std::memory_order_relaxed);
+    sync_failed_.store(0, std::memory_order_relaxed);
+    standins_served_.store(0, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        last_compile_error_.clear();
+    }
 }
 
 ShaderCacheStats ShaderCache::Stats() const noexcept {
@@ -832,7 +839,37 @@ ShaderCacheStats ShaderCache::Stats() const noexcept {
     s.async_compiles_queued = async_queued_.load(std::memory_order_relaxed);
     s.async_compiles_completed = async_completed_.load(std::memory_order_relaxed);
     s.async_compiles_failed = async_failed_.load(std::memory_order_relaxed);
+    s.sync_compiles_succeeded = sync_succeeded_.load(std::memory_order_relaxed);
+    s.sync_compiles_failed = sync_failed_.load(std::memory_order_relaxed);
+    s.total_compile_failures = s.sync_compiles_failed + s.async_compiles_failed;
+    s.standins_served = standins_served_.load(std::memory_order_relaxed);
     return s;
+}
+
+std::string ShaderCache::LastCompileError() const {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    return last_compile_error_;
+}
+
+std::string ShaderCache::FormatDiagnosticsSummary() const {
+    const ShaderCacheStats s = Stats();
+    const std::string last_err = LastCompileError();
+    std::ostringstream oss;
+    oss << "ShaderCache[hits=" << (s.memory_hits + s.disk_hits)
+        << " (mem=" << s.memory_hits << ", disk=" << s.disk_hits << ")"
+        << ", misses=" << s.cache_misses
+        << ", sync_ok=" << s.sync_compiles_succeeded
+        << ", sync_fail=" << s.sync_compiles_failed
+        << ", async_queued=" << s.async_compiles_queued
+        << ", async_ok=" << s.async_compiles_completed
+        << ", async_fail=" << s.async_compiles_failed
+        << ", total_fail=" << s.total_compile_failures
+        << ", corrupt=" << s.corrupt_entries
+        << ", standins=" << s.standins_served << "]";
+    if (!last_err.empty()) {
+        oss << " last_error=\"" << last_err << "\"";
+    }
+    return oss.str();
 }
 
 bool ShaderCache::TryLoadFromDisk(const ShaderCacheKey& key, MemoryEntry& out_entry) {
@@ -989,6 +1026,7 @@ bool ShaderCache::TryGet(const ShaderCacheKey& key, CachedShaderResult& out_resu
             out_result.target_profile = it->second.target_profile;
             out_result.dxil = it->second.dxil;
             out_result.from_memory_cache = true;
+            out_result.diagnostics = "ShaderCache HIT (memory) key=" + key.ToHex() + " target=" + out_result.target_profile;
             mem_hits_.fetch_add(1, std::memory_order_relaxed);
             CallTelemetry::Global().Record(kCacheTelemetryModule, "MemoryHit", CallOutcome::Ok, 0);
             return true;
@@ -1001,6 +1039,7 @@ bool ShaderCache::TryGet(const ShaderCacheKey& key, CachedShaderResult& out_resu
         out_result.target_profile = disk_entry.target_profile;
         out_result.dxil = disk_entry.dxil;
         out_result.from_disk_cache = true;
+        out_result.diagnostics = "ShaderCache HIT (disk) key=" + key.ToHex() + " target=" + out_result.target_profile;
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
             memory_cache_[key] = std::move(disk_entry);
@@ -1260,6 +1299,12 @@ void ShaderCache::WorkerLoop() {
             CallTelemetry::Global().Record(kCacheTelemetryModule, "AsyncCompileCompleted", CallOutcome::Ok, 0);
         } else {
             async_failed_.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                last_compile_error_ = "Async DXIL compile failed (key=" + job.key.ToHex() +
+                                      ", target=" + job.target_profile + "): " +
+                                      (diag.empty() ? st.message : diag);
+            }
             CallTelemetry::Global().Record(kCacheTelemetryModule, "AsyncCompileCompleted", CallOutcome::Error, -1);
         }
 
@@ -1307,16 +1352,38 @@ Status ShaderCache::GetOrLiftXboxShader(
     std::string* out_diagnostics) {
     out_result = CachedShaderResult{};
     if (!blob || blob_size < 4u) {
-        return Status::Error(StatusCode::InvalidArgument, "Empty Xbox shader bytecode");
+        const std::string err = "Empty Xbox shader bytecode";
+        sync_failed_.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            last_compile_error_ = err;
+        }
+        out_result.diagnostics = "ShaderCache FAIL: " + err;
+        if (out_diagnostics) *out_diagnostics = out_result.diagnostics;
+        return Status::Error(StatusCode::InvalidArgument, err);
     }
 
     XboxParsedShaderContainer full_container{};
     if (auto st = ParseFullXboxShaderContainer(blob, blob_size, full_container); !st.ok()) {
-        if (out_diagnostics) *out_diagnostics = st.message;
+        sync_failed_.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            last_compile_error_ = "Xbox shader container parse failed: " + st.message;
+        }
+        out_result.diagnostics = "ShaderCache FAIL: " + st.message;
+        if (out_diagnostics) *out_diagnostics = out_result.diagnostics;
         return st;
     }
     if (!full_container.has_xs2) {
-        return Status::Error(StatusCode::UnsupportedFormat, "Input blob does not carry Xbox XS2/RDNA2 microcode");
+        const std::string err = "Input blob does not carry Xbox XS2/RDNA2 microcode";
+        sync_failed_.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            last_compile_error_ = err;
+        }
+        out_result.diagnostics = "ShaderCache FAIL: " + err;
+        if (out_diagnostics) *out_diagnostics = out_result.diagnostics;
+        return Status::Error(StatusCode::UnsupportedFormat, err);
     }
 
     const ShaderStage stage = full_container.xs2.stage;
@@ -1332,6 +1399,7 @@ Status ShaderCache::GetOrLiftXboxShader(
 
     // 1. Check memory + disk cache
     if (TryGet(key, out_result)) {
+        if (out_diagnostics) *out_diagnostics = out_result.diagnostics;
         return Status::Ok();
     }
 
@@ -1345,10 +1413,20 @@ Status ShaderCache::GetOrLiftXboxShader(
     // 3. Optional async background compilation mode
     if (IsAsyncPsoCompilationEnabled()) {
         std::vector<uint8_t> standin_bc;
+        std::string standin_diag;
         Status st = CompileStandInShader(
             stage, target_profile, request.mesh_has_payload,
-            request.prefer_dxil_standin, request.dxc_path, standin_bc, out_diagnostics);
+            request.prefer_dxil_standin, request.dxc_path, standin_bc, &standin_diag);
         if (!st.ok()) {
+            sync_failed_.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                last_compile_error_ = "Stand-in shader compile failed (target=" + target_profile + "): " +
+                                      (standin_diag.empty() ? st.message : standin_diag);
+            }
+            out_result.diagnostics = "ShaderCache MISS -> stand-in FAIL: " +
+                                     (standin_diag.empty() ? st.message : standin_diag);
+            if (out_diagnostics) *out_diagnostics = out_result.diagnostics;
             return st;
         }
 
@@ -1359,28 +1437,50 @@ Status ShaderCache::GetOrLiftXboxShader(
         job.target_profile = target_profile;
         job.request = request;
         EnqueueAsyncJob(std::move(job));
+        standins_served_.fetch_add(1, std::memory_order_relaxed);
 
         out_result.key = key;
         out_result.stage = stage;
         out_result.target_profile = target_profile;
         out_result.dxil = std::move(standin_bc);
         out_result.is_standin_async = true;
+        out_result.diagnostics = "ShaderCache MISS (async queued, stand-in served) key=" + key.ToHex() +
+                                 " target=" + target_profile;
+        if (out_diagnostics) *out_diagnostics = out_result.diagnostics;
         return Status::Ok();
     }
 
     // 4. Synchronous lift + compile (in-process dxcompiler.dll preferred) + atomic disk cache store
     std::vector<uint8_t> dxil;
-    Status st = CompileRealXboxShaderSync(blob_copy, stage, target_profile, request, dxil, out_diagnostics);
+    std::string sync_diag;
+    Status st = CompileRealXboxShaderSync(blob_copy, stage, target_profile, request, dxil, &sync_diag);
     if (!st.ok()) {
+        sync_failed_.fetch_add(1, std::memory_order_relaxed);
+        const std::string detail = sync_diag.empty() ? st.message : sync_diag;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            last_compile_error_ = "Sync DXIL compile failed (key=" + key.ToHex() +
+                                  ", target=" + target_profile + "): " + detail;
+        }
+        out_result.diagnostics = "ShaderCache MISS -> compile FAIL (key=" + key.ToHex() +
+                                 ", target=" + target_profile + "): " + detail;
+        if (out_diagnostics) *out_diagnostics = out_result.diagnostics;
         return st;
     }
 
+    sync_succeeded_.fetch_add(1, std::memory_order_relaxed);
     (void)Put(key, stage, target_profile, dxil);
 
     out_result.key = key;
     out_result.stage = stage;
     out_result.target_profile = target_profile;
     out_result.dxil = std::move(dxil);
+    out_result.diagnostics = "ShaderCache MISS -> compiled & cached (key=" + key.ToHex() +
+                             ", target=" + target_profile + ", bytes=" + std::to_string(out_result.dxil.size()) + ")";
+    if (!sync_diag.empty()) {
+        out_result.diagnostics += " | " + sync_diag;
+    }
+    if (out_diagnostics) *out_diagnostics = out_result.diagnostics;
     return Status::Ok();
 }
 

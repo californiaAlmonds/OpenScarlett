@@ -63,6 +63,8 @@
 // without clashing with <windows.h> in host C++ translation units.
 #pragma comment(linker, "/export:VirtualAllocFromApp=KernelXVirtualAllocFromApp")
 #pragma comment(linker, "/export:VirtualProtectFromApp=KernelXVirtualProtectFromApp")
+#pragma comment(linker, "/export:VirtualFree=KernelXVirtualFree")
+#pragma comment(linker, "/export:VirtualFreeEx=KernelXVirtualFreeEx")
 #pragma comment(linker, "/export:CreateWaitableTimerExW=KernelXCreateWaitableTimerExW")
 #pragma comment(linker, "/export:QueryUnbiasedInterruptTime=KernelXQueryUnbiasedInterruptTime")
 #pragma comment(linker, "/export:SetThreadAffinityMask=KernelXSetThreadAffinityMask")
@@ -474,12 +476,13 @@ public:
         const size_t attr_align = DecodeXAllocAlignment(dwAllocAttributes);
         const size_t alignment = std::max(attr_align, explicitAlignment);
         const size_t pad_granule = std::min<size_t>(alignment, kPage64KB);
-        if (dwSize > (SIZE_MAX - pad_granule)) {
+        if (pad_granule > 1u && dwSize > (SIZE_MAX - (pad_granule - 1u))) {
             SetHostLastError(8u);
             return nullptr;
         }
         const size_t alloc_size = AlignUp(dwSize, pad_granule);
-        if (CurrentTitleUsedBytes() + alloc_size > budget) {
+        const uint64_t used = CurrentTitleUsedBytes();
+        if (alloc_size > budget || used > budget - alloc_size) {
             SetHostLastError(8u);  // ERROR_NOT_ENOUGH_MEMORY
             return nullptr;
         }
@@ -835,8 +838,17 @@ public:
 
     void* GetAuxTitleMemory(size_t requestedSize, size_t* outActualSize) {
         const size_t raw_size = (requestedSize == 0) ? kDefaultAuxTitleMemoryBytes : requestedSize;
+        if (raw_size > (SIZE_MAX - (kPage64KB - 1u))) {
+            if (outActualSize) {
+                *outActualSize = 0;
+            }
+            SetHostLastError(8u);
+            return nullptr;
+        }
         const size_t aligned_size = AlignUp(raw_size, kPage64KB);
-        if (CurrentTitleUsedBytes() + aligned_size > GetTitleBudgetBytes()) {
+        const uint64_t budget = GetTitleBudgetBytes();
+        const uint64_t used = CurrentTitleUsedBytes();
+        if (aligned_size > budget || used > budget - aligned_size) {
             if (outActualSize) {
                 *outActualSize = 0;
             }
@@ -923,7 +935,8 @@ public:
 
         const uint64_t total_bytes_64 = req_pages * static_cast<uint64_t>(page_bytes);
         const uint64_t budget = GetTitleBudgetBytes();
-        if (CurrentTitleUsedBytes() + total_bytes_64 > budget) {
+        const uint64_t used = CurrentTitleUsedBytes();
+        if (total_bytes_64 > budget || used > budget - total_bytes_64) {
             *pNumberOfPages = 0;
             SetHostLastError(8u);  // ERROR_NOT_ENOUGH_MEMORY
             return 0;
@@ -1341,7 +1354,15 @@ public:
             UnifiedMemoryManager::SupportsOsPlaceholders()) {
             const MemoryPageSize granule = is_large ? MemoryPageSize::Page4MB : MemoryPageSize::Page64KB;
             const size_t gran_bytes = is_large ? kPage4MB : kPage64KB;
+            if (size > (SIZE_MAX - (gran_bytes - 1u))) {
+                SetHostLastError(8u);
+                return nullptr;
+            }
             const size_t aligned = AlignUp(size, gran_bytes);
+            if (aligned > GetTitleBudgetBytes()) {
+                SetHostLastError(8u);
+                return nullptr;
+            }
             void* base = nullptr;
             Status st = memory_.ReserveVirtualPlaceholder(aligned, base, granule);
             if (!st.ok()) {
@@ -1361,10 +1382,16 @@ public:
         }
 
         const size_t align = is_large ? kPage4MB : ((is_graphics || is_physical) ? kPage64KB : kPage4KB);
+        if (size > (SIZE_MAX - (align - 1u))) {
+            SetHostLastError(8u);
+            return nullptr;
+        }
         const size_t aligned_size = AlignUp(size, align);
+        const uint64_t budget = GetTitleBudgetBytes();
+        const uint64_t used = CurrentTitleUsedBytes();
 
         if ((allocationType & MEM_COMMIT) != 0u &&
-            CurrentTitleUsedBytes() + aligned_size > GetTitleBudgetBytes()) {
+            (aligned_size > budget || used > budget - aligned_size)) {
             SetHostLastError(8u);
             return nullptr;
         }
@@ -1534,8 +1561,26 @@ public:
     }
 
     int32_t VirtualFreeApp(void* address, size_t size, uint32_t freeType) {
-        if (!address || freeType == 0) {
-            SetHostLastError(87u);
+        constexpr uint32_t kMemCoalescePlaceholders = 0x00000001u;
+        constexpr uint32_t kMemPreservePlaceholder = 0x00000002u;
+        constexpr uint32_t kAllowedFreeMask =
+            MEM_DECOMMIT | MEM_RELEASE | kMemCoalescePlaceholders | kMemPreservePlaceholder;
+
+        if (!address || freeType == 0u || (freeType & ~kAllowedFreeMask) != 0u) {
+            SetHostLastError(87u);  // ERROR_INVALID_PARAMETER
+            return 0;
+        }
+        const bool is_release = (freeType & MEM_RELEASE) != 0u;
+        const bool is_decommit = (freeType & MEM_DECOMMIT) != 0u;
+        if ((!is_release && !is_decommit) || (is_release && is_decommit)) {
+            SetHostLastError(87u);  // ERROR_INVALID_PARAMETER
+            return 0;
+        }
+        // Per Win32 / Xbox VirtualFree[Ex] contract (xcl #87):
+        // MEM_RELEASE MUST have dwSize == 0 (unless placeholder preserve/coalesce flags are set).
+        if (is_release && size != 0u &&
+            (freeType & (kMemCoalescePlaceholders | kMemPreservePlaceholder)) == 0u) {
+            SetHostLastError(87u);  // ERROR_INVALID_PARAMETER
             return 0;
         }
 
@@ -1557,22 +1602,25 @@ public:
         auto it = app_allocs_.find(key);
         if (it != app_allocs_.end()) {
             if (it->second.is_placeholder) {
+                if (!is_release) {
+                    SetHostLastError(87u);
+                    return 0;
+                }
                 Status st = memory_.ReleaseVirtualPlaceholder(address);
                 if (!st.ok()) {
                     SetHostLastError(87u);
                     return 0;
                 }
                 app_allocs_.erase(it);
+                SetHostLastError(0u);
                 return 1;
             }
 
-            const bool is_release = (freeType & MEM_RELEASE) != 0u;
 #if defined(_WIN32)
-            if (!VirtualFree(address, is_release ? 0 : size, static_cast<DWORD>(freeType))) {
+            if (!VirtualFree(address, size, static_cast<DWORD>(freeType))) {
                 return 0;
             }
 #else
-            (void)size;
             if (is_release) {
                 std::free(address);
             }
@@ -1582,20 +1630,50 @@ public:
                     app_committed_bytes_.fetch_sub(it->second.committed_bytes, std::memory_order_acq_rel);
                 }
                 app_allocs_.erase(it);
-            } else if (freeType & MEM_DECOMMIT) {
+            } else if (is_decommit) {
                 const size_t decommit = (size == 0 || size >= it->second.committed_bytes)
                                             ? it->second.committed_bytes
                                             : size;
                 it->second.committed_bytes -= decommit;
                 app_committed_bytes_.fetch_sub(decommit, std::memory_order_acq_rel);
             }
+            SetHostLastError(0u);
             return 1;
         }
 
 #if defined(_WIN32)
         return VirtualFree(address, size, static_cast<DWORD>(freeType)) ? 1 : 0;
 #else
+        SetHostLastError(487u);  // ERROR_INVALID_ADDRESS
         return 0;
+#endif
+    }
+
+    int32_t VirtualFreeExApp(void* hProcess, void* address, size_t size, uint32_t freeType) {
+        if (!hProcess) {
+            SetHostLastError(6u);  // ERROR_INVALID_HANDLE
+            return 0;
+        }
+#if defined(_WIN32)
+        HANDLE proc = static_cast<HANDLE>(hProcess);
+        const bool is_current_proc =
+            (proc == GetCurrentProcess()) ||
+            (GetProcessId(proc) == GetCurrentProcessId() && GetProcessId(proc) != 0u);
+        if (is_current_proc) {
+            return VirtualFreeApp(address, size, freeType);
+        }
+        if (!address || freeType == 0u) {
+            SetHostLastError(87u);
+            return 0;
+        }
+        if ((freeType & MEM_RELEASE) != 0u && size != 0u &&
+            (freeType & (0x00000001u | 0x00000002u)) == 0u) {
+            SetHostLastError(87u);
+            return 0;
+        }
+        return VirtualFreeEx(proc, address, size, static_cast<DWORD>(freeType)) ? 1 : 0;
+#else
+        return VirtualFreeApp(address, size, freeType);
 #endif
     }
 
@@ -1609,6 +1687,10 @@ public:
         }
 
         const uintptr_t req_start = reinterpret_cast<uintptr_t>(address);
+        if (size > (static_cast<uintptr_t>(~uintptr_t{0}) - req_start)) {
+            SetHostLastError(87u);
+            return 0;
+        }
         const uintptr_t req_end = req_start + size;
 
         {
@@ -1695,6 +1777,17 @@ public:
 
     int32_t SetThreadNameImpl(void* hThread, const wchar_t* lpThreadName) {
         if (!lpThreadName) {
+            SetHostLastError(87u);
+            return kHrInvalidArg;
+        }
+        // Guard against excessively long / malformed thread name strings (> 32767 chars).
+        constexpr size_t kMaxThreadNameChars = 32767u;
+        size_t name_len = 0u;
+        while (name_len <= kMaxThreadNameChars && lpThreadName[name_len] != L'\0') {
+            ++name_len;
+        }
+        if (name_len > kMaxThreadNameChars) {
+            SetHostLastError(87u);
             return kHrInvalidArg;
         }
 #if defined(_WIN32)
@@ -1710,7 +1803,7 @@ public:
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            thread_names_[tid] = lpThreadName;
+            thread_names_[tid].assign(lpThreadName, name_len);
         }
         if (ThreadDescApi().set_desc != nullptr) {
             const HRESULT hr = ThreadDescApi().set_desc(target, lpThreadName);
@@ -1722,7 +1815,7 @@ public:
 #else
         (void)hThread;
         std::lock_guard<std::mutex> lock(mutex_);
-        thread_names_[0] = lpThreadName;
+        thread_names_[0].assign(lpThreadName, name_len);
         return kHrOk;
 #endif
     }
@@ -1731,6 +1824,10 @@ public:
                               wchar_t* lpThreadName,
                               size_t nBufferLength,
                               size_t* pnRequiredLength) {
+        if ((!lpThreadName && nBufferLength > 0u) || (!lpThreadName && !pnRequiredLength)) {
+            SetHostLastError(87u);
+            return kHrInvalidArg;
+        }
         std::wstring resolved;
 #if defined(_WIN32)
         if (hThread == INVALID_HANDLE_VALUE) {
@@ -1774,9 +1871,18 @@ public:
             *pnRequiredLength = required;
         }
         if (!lpThreadName || nBufferLength < required) {
+            if (lpThreadName && nBufferLength > 0u) {
+                const size_t copy_chars = nBufferLength - 1u;
+                if (copy_chars > 0u) {
+                    std::memcpy(lpThreadName, resolved.c_str(), copy_chars * sizeof(wchar_t));
+                }
+                lpThreadName[copy_chars] = L'\0';
+            }
+            SetHostLastError(122u);  // ERROR_INSUFFICIENT_BUFFER
             return kHrInsufficientBuffer;
         }
         std::memcpy(lpThreadName, resolved.c_str(), required * sizeof(wchar_t));
+        SetHostLastError(0u);
         return kHrOk;
     }
 
@@ -2583,6 +2689,15 @@ int32_t OPENSCARLETT_KERNELX_CALL KernelXVirtualFree(void* address,
                                                      uint32_t freeType) {
     const int32_t ok = KernelXState::Instance().VirtualFreeApp(address, size, freeType);
     RecordTelemetry(__func__, ok ? CallOutcome::Ok : CallOutcome::Error, ok ? kHrOk : kHrInvalidArg);
+    return ok;
+}
+
+int32_t OPENSCARLETT_KERNELX_CALL KernelXVirtualFreeEx(void* hProcess,
+                                                       void* address,
+                                                       size_t size,
+                                                       uint32_t freeType) {
+    const int32_t ok = KernelXState::Instance().VirtualFreeExApp(hProcess, address, size, freeType);
+    RecordTelemetry("VirtualFreeEx", ok ? CallOutcome::Ok : CallOutcome::Error, ok ? kHrOk : kHrInvalidArg);
     return ok;
 }
 

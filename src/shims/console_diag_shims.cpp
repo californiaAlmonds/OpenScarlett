@@ -52,6 +52,17 @@
 #  define EventUnregister _os_win_EventUnregister
 #  define StartKernelTrace _os_win_StartKernelTrace
 #  define StopKernelTrace _os_win_StopKernelTrace
+#  define StartTraceW _os_win_StartTraceW
+#  define StartTraceA _os_win_StartTraceA
+#  define ControlTraceW _os_win_ControlTraceW
+#  define ControlTraceA _os_win_ControlTraceA
+#  define StopTraceW _os_win_StopTraceW
+#  define StopTraceA _os_win_StopTraceA
+#  define QueryTraceW _os_win_QueryTraceW
+#  define QueryTraceA _os_win_QueryTraceA
+#  define FlushTraceW _os_win_FlushTraceW
+#  define FlushTraceA _os_win_FlushTraceA
+#  define EnableTraceEx _os_win_EnableTraceEx
 #  define EnableTraceEx2 _os_win_EnableTraceEx2
 #  define TraceQueryInformation _os_win_TraceQueryInformation
 #  define TraceSetInformation _os_win_TraceSetInformation
@@ -84,6 +95,17 @@
 #  undef EventUnregister
 #  undef StartKernelTrace
 #  undef StopKernelTrace
+#  undef StartTraceW
+#  undef StartTraceA
+#  undef ControlTraceW
+#  undef ControlTraceA
+#  undef StopTraceW
+#  undef StopTraceA
+#  undef QueryTraceW
+#  undef QueryTraceA
+#  undef FlushTraceW
+#  undef FlushTraceA
+#  undef EnableTraceEx
 #  undef EnableTraceEx2
 #  undef TraceQueryInformation
 #  undef TraceSetInformation
@@ -153,6 +175,469 @@ int32_t QueryModuleTelemetry(
     return LoadLibraryW(dll_name);
 }
 #endif
+
+#if defined(OPENSCARLETT_DIAG_TARGET_ADVAPI32LEGACY) || defined(OPENSCARLETT_DIAG_TARGET_KERNELTRACECONTROL)
+
+// ---------------------------------------------------------------------------
+// Shared In-Memory ETW Controller Layer (xbox-emulator c4b7607)
+// Supports StartTraceW/A, ControlTraceW/A (Query/Stop/Update/Flush),
+// StopTraceW, QueryTraceW, FlushTraceW, EnableTraceEx2/EnableTraceEx, and
+// provider enable/disable/capture-state (rundown) callbacks without admin rights.
+// ---------------------------------------------------------------------------
+constexpr uint32_t kEtwErrSuccess = 0u;
+constexpr uint32_t kEtwErrInvalidHandle = 6u;
+constexpr uint32_t kEtwErrBadLength = 24u;
+constexpr uint32_t kEtwErrInvalidParam = 87u;
+constexpr uint32_t kEtwErrAlreadyExists = 183u;
+constexpr uint32_t kEtwErrWmiNotFound = 4201u;
+
+constexpr uint32_t kEtwControlQuery = 0u;
+constexpr uint32_t kEtwControlStop = 1u;
+constexpr uint32_t kEtwControlUpdate = 2u;
+constexpr uint32_t kEtwControlFlush = 3u;
+
+constexpr uint32_t kEtwEventControlDisable = 0u;
+constexpr uint32_t kEtwEventControlEnable = 1u;
+constexpr uint32_t kEtwEventControlCaptureState = 2u;
+
+struct OsEtwGuid {
+    uint32_t Data1;
+    uint16_t Data2;
+    uint16_t Data3;
+    uint8_t Data4[8];
+};
+static_assert(sizeof(OsEtwGuid) == 16u, "OsEtwGuid must be 16 bytes");
+
+struct OsWnodeHeader {
+    uint32_t BufferSize;
+    uint32_t ProviderId;
+    uint64_t HistoricalContext;
+    int64_t TimeStamp;
+    OsEtwGuid Guid;
+    uint32_t ClientContext;
+    uint32_t Flags;
+};
+static_assert(sizeof(OsWnodeHeader) == 48u, "WNODE_HEADER size mismatch");
+
+struct OsEventTraceProperties {
+    OsWnodeHeader Wnode;
+    uint32_t BufferSize;
+    uint32_t MinimumBuffers;
+    uint32_t MaximumBuffers;
+    uint32_t MaximumFileSize;
+    uint32_t LogFileMode;
+    uint32_t FlushTimer;
+    uint32_t EnableFlags;
+    int32_t AgeLimit;
+    uint32_t NumberOfBuffers;
+    uint32_t FreeBuffers;
+    uint32_t EventsLost;
+    uint32_t BuffersWritten;
+    uint32_t LogBuffersLost;
+    uint32_t RealTimeBuffersLost;
+    void* LoggerThreadId;
+    uint32_t LogFileNameOffset;
+    uint32_t LoggerNameOffset;
+};
+static_assert(sizeof(OsEventTraceProperties) == 120u, "EVENT_TRACE_PROPERTIES size mismatch");
+
+using PfnOsEtwEnableCallback = void(OS_DIAG_CALL*)(
+    const void* SourceId,
+    uint32_t IsEnabled,
+    uint8_t Level,
+    uint64_t MatchAnyKeyword,
+    uint64_t MatchAllKeyword,
+    void* FilterData,
+    void* CallbackContext);
+
+struct EtwGuidKey {
+    uint8_t bytes[16];
+    bool operator==(const EtwGuidKey& o) const noexcept {
+        return std::memcmp(bytes, o.bytes, 16u) == 0;
+    }
+};
+
+struct EtwGuidKeyHash {
+    size_t operator()(const EtwGuidKey& k) const noexcept {
+        uint64_t a = 0u;
+        uint64_t b = 0u;
+        std::memcpy(&a, k.bytes, 8u);
+        std::memcpy(&b, k.bytes + 8u, 8u);
+        return static_cast<size_t>(a ^ (b * 0x9E3779B97F4A7C15ull));
+    }
+};
+
+inline EtwGuidKey MakeGuidKey(const void* guid_ptr) {
+    EtwGuidKey k{};
+    if (guid_ptr) {
+        std::memcpy(k.bytes, guid_ptr, 16u);
+    }
+    return k;
+}
+
+std::wstring ToLowerWStr(const std::wstring& in) {
+    std::wstring out;
+    out.reserve(in.size());
+    for (wchar_t ch : in) {
+        out.push_back(static_cast<wchar_t>(std::towlower(static_cast<wint_t>(ch))));
+    }
+    return out;
+}
+
+std::wstring AnsiToWideSimple(const char* s) {
+    if (!s || !*s) {
+        return {};
+    }
+    std::wstring out;
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(s); *p != '\0'; ++p) {
+        out.push_back(static_cast<wchar_t>(*p));
+    }
+    return out;
+}
+
+struct EtwEnabledProviderState {
+    OsEtwGuid guid{};
+    uint8_t level = 0u;
+    uint64_t match_any = 0ull;
+    uint64_t match_all = 0ull;
+};
+
+struct EtwRegisteredProvider {
+    uint64_t reg_handle = 0ull;
+    OsEtwGuid guid{};
+    PfnOsEtwEnableCallback callback = nullptr;
+    void* context = nullptr;
+};
+
+struct EtwControllerSession {
+    uint64_t handle = 0ull;
+    std::wstring name;
+    std::wstring name_lower;
+    uint32_t process_id = 0u;
+    bool active = true;
+    uint32_t buffer_size_kb = 64u;
+    uint32_t min_buffers = 4u;
+    uint32_t max_buffers = 32u;
+    uint32_t log_file_mode = 0u;
+    uint32_t enable_flags = 0u;
+    uint32_t flush_count = 0u;
+    uint32_t update_count = 0u;
+    uint32_t rundown_count = 0u;
+    uint32_t buffers_written = 0u;
+    OsEtwGuid session_guid{};
+    std::unordered_map<EtwGuidKey, EtwEnabledProviderState, EtwGuidKeyHash> enabled_providers;
+};
+
+class EtwController {
+public:
+    static EtwController& Global() {
+        static EtwController* inst = new EtwController();
+        return *inst;
+    }
+
+    void RegisterProviderCallback(uint64_t reg_handle,
+                                  const void* provider_guid,
+                                  void* enable_callback,
+                                  void* callback_context) {
+        if (reg_handle == 0ull || !provider_guid) {
+            return;
+        }
+        std::vector<EtwEnabledProviderState> active_enables;
+        EtwRegisteredProvider reg{};
+        reg.reg_handle = reg_handle;
+        std::memcpy(&reg.guid, provider_guid, sizeof(OsEtwGuid));
+        reg.callback = reinterpret_cast<PfnOsEtwEnableCallback>(enable_callback);
+        reg.context = callback_context;
+
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            registered_providers_[reg_handle] = reg;
+            if (reg.callback) {
+                const EtwGuidKey key = MakeGuidKey(provider_guid);
+                for (const auto& [h, sess] : sessions_) {
+                    if (!sess.active) continue;
+                    auto pit = sess.enabled_providers.find(key);
+                    if (pit != sess.enabled_providers.end()) {
+                        active_enables.push_back(pit->second);
+                    }
+                }
+            }
+        }
+        for (const auto& en : active_enables) {
+            reg.callback(&en.guid, kEtwEventControlEnable, en.level,
+                         en.match_any, en.match_all, nullptr, reg.context);
+        }
+    }
+
+    void UnregisterProviderCallback(uint64_t reg_handle) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        registered_providers_.erase(reg_handle);
+    }
+
+    uint32_t StartSession(uint64_t* out_handle,
+                          const wchar_t* instance_name,
+                          void* properties,
+                          uint32_t process_id,
+                          bool allow_null_properties) {
+        if (!out_handle) {
+            return kEtwErrInvalidParam;
+        }
+        *out_handle = 0ull;
+        if (!allow_null_properties) {
+            if (!instance_name || !*instance_name || !properties) {
+                return kEtwErrInvalidParam;
+            }
+            const auto* props = reinterpret_cast<const OsEventTraceProperties*>(properties);
+            if (props->Wnode.BufferSize < sizeof(OsEventTraceProperties)) {
+                return kEtwErrBadLength;
+            }
+        }
+
+        std::wstring sess_name = (instance_name && *instance_name)
+                                     ? std::wstring(instance_name)
+                                     : std::wstring();
+        std::wstring sess_name_lo = ToLowerWStr(sess_name);
+
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (!sess_name_lo.empty()) {
+            for (const auto& [h, existing] : sessions_) {
+                if (existing.active && existing.name_lower == sess_name_lo) {
+                    return kEtwErrAlreadyExists;
+                }
+            }
+        }
+
+        const uint64_t handle = next_handle_++;
+        EtwControllerSession sess{};
+        sess.handle = handle;
+        sess.name = sess_name.empty() ? (L"OpenScarlettKernelTrace_" + std::to_wstring(handle)) : sess_name;
+        sess.name_lower = ToLowerWStr(sess.name);
+        sess.process_id = process_id;
+        sess.active = true;
+        if (properties) {
+            auto* props = reinterpret_cast<OsEventTraceProperties*>(properties);
+            if (props->Wnode.BufferSize >= sizeof(OsEventTraceProperties)) {
+                sess.buffer_size_kb = props->BufferSize ? props->BufferSize : 64u;
+                sess.min_buffers = props->MinimumBuffers ? props->MinimumBuffers : 4u;
+                sess.max_buffers = props->MaximumBuffers ? props->MaximumBuffers : 32u;
+                sess.log_file_mode = props->LogFileMode;
+                sess.enable_flags = props->EnableFlags;
+                sess.session_guid = props->Wnode.Guid;
+                props->Wnode.HistoricalContext = handle;
+                props->NumberOfBuffers = sess.min_buffers;
+                props->FreeBuffers = sess.min_buffers;
+                props->BuffersWritten = 0u;
+            }
+        }
+        sessions_.emplace(handle, std::move(sess));
+        *out_handle = handle;
+        return kEtwErrSuccess;
+    }
+
+    uint32_t ControlSession(uint64_t trace_handle,
+                            const wchar_t* instance_name,
+                            void* properties,
+                            uint32_t control_code,
+                            bool allow_null_properties) {
+        if (!allow_null_properties && !properties) {
+            return kEtwErrInvalidParam;
+        }
+        if (properties) {
+            const auto* props = reinterpret_cast<const OsEventTraceProperties*>(properties);
+            if (props->Wnode.BufferSize < sizeof(OsEventTraceProperties)) {
+                return kEtwErrBadLength;
+            }
+        }
+        if (trace_handle == 0ull && (!instance_name || !*instance_name)) {
+            return kEtwErrInvalidParam;
+        }
+
+        struct PendingDisableNotify {
+            PfnOsEtwEnableCallback cb;
+            void* ctx;
+            OsEtwGuid guid;
+        };
+        std::vector<PendingDisableNotify> disable_notifies;
+        uint32_t result = kEtwErrSuccess;
+
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            EtwControllerSession* target = FindActiveSessionLocked(trace_handle, instance_name);
+            if (!target) {
+                return kEtwErrWmiNotFound;
+            }
+
+            switch (control_code) {
+                case kEtwControlQuery:
+                    FillPropertiesLocked(*target, properties);
+                    break;
+                case kEtwControlFlush:
+                    ++target->flush_count;
+                    ++target->buffers_written;
+                    FillPropertiesLocked(*target, properties);
+                    break;
+                case kEtwControlUpdate:
+                    ++target->update_count;
+                    if (properties) {
+                        const auto* props = reinterpret_cast<const OsEventTraceProperties*>(properties);
+                        if (props->Wnode.BufferSize >= sizeof(OsEventTraceProperties)) {
+                            target->enable_flags = props->EnableFlags;
+                            if (props->MaximumBuffers > 0u) {
+                                target->max_buffers = props->MaximumBuffers;
+                            }
+                        }
+                    }
+                    FillPropertiesLocked(*target, properties);
+                    break;
+                case kEtwControlStop: {
+                    ++target->rundown_count;
+                    for (const auto& [gkey, pstate] : target->enabled_providers) {
+                        for (const auto& [rh, reg] : registered_providers_) {
+                            if (reg.callback && MakeGuidKey(&reg.guid) == gkey) {
+                                disable_notifies.push_back(
+                                    PendingDisableNotify{reg.callback, reg.context, pstate.guid});
+                            }
+                        }
+                    }
+                    FillPropertiesLocked(*target, properties);
+                    target->enabled_providers.clear();
+                    target->active = false;
+                    break;
+                }
+                default:
+                    result = kEtwErrInvalidParam;
+                    break;
+            }
+        }
+
+        for (const auto& n : disable_notifies) {
+            n.cb(&n.guid, kEtwEventControlDisable, 0u, 0ull, 0ull, nullptr, n.ctx);
+        }
+        return result;
+    }
+
+    uint32_t EnableProvider(uint64_t trace_handle,
+                            const void* provider_id,
+                            uint32_t control_code,
+                            uint8_t level,
+                            uint64_t match_any_keyword,
+                            uint64_t match_all_keyword,
+                            bool strict_session_lookup) {
+        if (trace_handle == 0ull || !provider_id) {
+            return kEtwErrInvalidParam;
+        }
+        if (control_code != kEtwEventControlDisable &&
+            control_code != kEtwEventControlEnable &&
+            control_code != kEtwEventControlCaptureState) {
+            return kEtwErrInvalidParam;
+        }
+
+        const EtwGuidKey gkey = MakeGuidKey(provider_id);
+        OsEtwGuid guid{};
+        std::memcpy(&guid, provider_id, sizeof(OsEtwGuid));
+
+        struct NotifyTarget {
+            PfnOsEtwEnableCallback cb;
+            void* ctx;
+        };
+        std::vector<NotifyTarget> notifies;
+
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            EtwControllerSession* sess = FindActiveSessionLocked(trace_handle, nullptr);
+            if (!sess) {
+                return strict_session_lookup ? kEtwErrInvalidHandle : kEtwErrSuccess;
+            }
+            if (control_code == kEtwEventControlEnable) {
+                sess->enabled_providers[gkey] =
+                    EtwEnabledProviderState{guid, level, match_any_keyword, match_all_keyword};
+            } else if (control_code == kEtwEventControlDisable) {
+                sess->enabled_providers.erase(gkey);
+            } else if (control_code == kEtwEventControlCaptureState) {
+                ++sess->rundown_count;
+            }
+            for (const auto& [rh, reg] : registered_providers_) {
+                if (reg.callback && MakeGuidKey(&reg.guid) == gkey) {
+                    notifies.push_back(NotifyTarget{reg.callback, reg.context});
+                }
+            }
+        }
+
+        for (const auto& n : notifies) {
+            n.cb(&guid, control_code, level, match_any_keyword, match_all_keyword, nullptr, n.ctx);
+        }
+        return kEtwErrSuccess;
+    }
+
+    int32_t GetSessionStats(uint64_t trace_handle,
+                            uint32_t* out_active,
+                            uint32_t* out_enabled_providers,
+                            uint32_t* out_flush_count,
+                            uint32_t* out_rundown_count) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        auto it = sessions_.find(trace_handle);
+        if (it == sessions_.end()) {
+            return 0;
+        }
+        if (out_active) *out_active = it->second.active ? 1u : 0u;
+        if (out_enabled_providers) {
+            *out_enabled_providers = static_cast<uint32_t>(it->second.enabled_providers.size());
+        }
+        if (out_flush_count) *out_flush_count = it->second.flush_count;
+        if (out_rundown_count) *out_rundown_count = it->second.rundown_count;
+        return 1;
+    }
+
+private:
+    EtwControllerSession* FindActiveSessionLocked(uint64_t trace_handle,
+                                                  const wchar_t* instance_name) {
+        if (trace_handle != 0ull) {
+            auto it = sessions_.find(trace_handle);
+            if (it != sessions_.end() && it->second.active) {
+                return &it->second;
+            }
+        }
+        if (instance_name && *instance_name) {
+            const std::wstring target_lo = ToLowerWStr(std::wstring(instance_name));
+            for (auto& [h, sess] : sessions_) {
+                if (sess.active && sess.name_lower == target_lo) {
+                    return &sess;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    static void FillPropertiesLocked(const EtwControllerSession& sess, void* properties) {
+        if (!properties) {
+            return;
+        }
+        auto* props = reinterpret_cast<OsEventTraceProperties*>(properties);
+        if (props->Wnode.BufferSize < sizeof(OsEventTraceProperties)) {
+            return;
+        }
+        props->Wnode.HistoricalContext = sess.handle;
+        props->Wnode.Guid = sess.session_guid;
+        props->BufferSize = sess.buffer_size_kb;
+        props->MinimumBuffers = sess.min_buffers;
+        props->MaximumBuffers = sess.max_buffers;
+        props->LogFileMode = sess.log_file_mode;
+        props->EnableFlags = sess.enable_flags;
+        props->NumberOfBuffers = sess.min_buffers;
+        props->FreeBuffers = sess.min_buffers;
+        props->EventsLost = 0u;
+        props->BuffersWritten = sess.buffers_written;
+        props->LogBuffersLost = 0u;
+        props->RealTimeBuffersLost = 0u;
+    }
+
+    std::mutex mutex_;
+    uint64_t next_handle_ = 0x77AC0001ull;
+    std::unordered_map<uint64_t, EtwControllerSession> sessions_;
+    std::unordered_map<uint64_t, EtwRegisteredProvider> registered_providers_;
+};
+
+#endif  // ADVAPI32LEGACY || KERNELTRACECONTROL
 
 }  // namespace
 
@@ -586,6 +1071,8 @@ OS_DIAG_API uint32_t OS_DIAG_CALL EventRegister(
     if (host.event_reg) {
         const uint32_t st = host.event_reg(ProviderId, EnableCallback, CallbackContext, RegHandle);
         if (st == kErrSuccess) {
+            EtwController::Global().RegisterProviderCallback(
+                *RegHandle, ProviderId, EnableCallback, CallbackContext);
             RecordAdvapi("EventRegister", true, 0);
             return kErrSuccess;
         }
@@ -596,11 +1083,12 @@ OS_DIAG_API uint32_t OS_DIAG_CALL EventRegister(
         host.local_etw_handles.insert(h);
     }
     *RegHandle = h;
+    EtwController::Global().RegisterProviderCallback(h, ProviderId, EnableCallback, CallbackContext);
     RecordAdvapi("EventRegister", true, 0);
     return kErrSuccess;
 #else
-    (void)EnableCallback; (void)CallbackContext;
     *RegHandle = 1ull;
+    EtwController::Global().RegisterProviderCallback(*RegHandle, ProviderId, EnableCallback, CallbackContext);
     RecordAdvapi("EventRegister", true, 0);
     return kErrSuccess;
 #endif
@@ -640,6 +1128,7 @@ OS_DIAG_API uint32_t OS_DIAG_CALL EventUnregister(uint64_t RegHandle) {
         RecordAdvapi("EventUnregister", false, static_cast<int32_t>(kErrInvalidParam));
         return kErrInvalidParam;
     }
+    EtwController::Global().UnregisterProviderCallback(RegHandle);
 #if defined(_WIN32)
     auto& host = GetHostAdvapi();
     host.EnsureLoaded();
@@ -660,6 +1149,115 @@ OS_DIAG_API uint32_t OS_DIAG_CALL EventUnregister(uint64_t RegHandle) {
     return kErrSuccess;
 }
 
+OS_DIAG_API uint32_t OS_DIAG_CALL StartTraceW(
+    uint64_t* TraceHandle,
+    const wchar_t* InstanceName,
+    void* Properties) {
+    const uint32_t err = EtwController::Global().StartSession(
+        TraceHandle, InstanceName, Properties, 0u, false);
+    RecordAdvapi("StartTraceW", err == kErrSuccess, static_cast<int32_t>(err));
+    return err;
+}
+
+OS_DIAG_API uint32_t OS_DIAG_CALL StartTraceA(
+    uint64_t* TraceHandle,
+    const char* InstanceName,
+    void* Properties) {
+    const std::wstring wname = AnsiToWideSimple(InstanceName);
+    const uint32_t err = EtwController::Global().StartSession(
+        TraceHandle, wname.empty() ? nullptr : wname.c_str(), Properties, 0u, false);
+    RecordAdvapi("StartTraceA", err == kErrSuccess, static_cast<int32_t>(err));
+    return err;
+}
+
+OS_DIAG_API uint32_t OS_DIAG_CALL ControlTraceW(
+    uint64_t TraceHandle,
+    const wchar_t* InstanceName,
+    void* Properties,
+    uint32_t ControlCode) {
+    const uint32_t err = EtwController::Global().ControlSession(
+        TraceHandle, InstanceName, Properties, ControlCode, false);
+    RecordAdvapi("ControlTraceW", err == kErrSuccess, static_cast<int32_t>(err));
+    return err;
+}
+
+OS_DIAG_API uint32_t OS_DIAG_CALL ControlTraceA(
+    uint64_t TraceHandle,
+    const char* InstanceName,
+    void* Properties,
+    uint32_t ControlCode) {
+    const std::wstring wname = AnsiToWideSimple(InstanceName);
+    const uint32_t err = EtwController::Global().ControlSession(
+        TraceHandle, wname.empty() ? nullptr : wname.c_str(), Properties, ControlCode, false);
+    RecordAdvapi("ControlTraceA", err == kErrSuccess, static_cast<int32_t>(err));
+    return err;
+}
+
+OS_DIAG_API uint32_t OS_DIAG_CALL StopTraceW(
+    uint64_t TraceHandle,
+    const wchar_t* InstanceName,
+    void* Properties) {
+    return ControlTraceW(TraceHandle, InstanceName, Properties, kEtwControlStop);
+}
+
+OS_DIAG_API uint32_t OS_DIAG_CALL QueryTraceW(
+    uint64_t TraceHandle,
+    const wchar_t* InstanceName,
+    void* Properties) {
+    return ControlTraceW(TraceHandle, InstanceName, Properties, kEtwControlQuery);
+}
+
+OS_DIAG_API uint32_t OS_DIAG_CALL FlushTraceW(
+    uint64_t TraceHandle,
+    const wchar_t* InstanceName,
+    void* Properties) {
+    return ControlTraceW(TraceHandle, InstanceName, Properties, kEtwControlFlush);
+}
+
+OS_DIAG_API uint32_t OS_DIAG_CALL EnableTraceEx2(
+    uint64_t TraceHandle,
+    const void* ProviderId,
+    uint32_t ControlCode,
+    uint8_t Level,
+    uint64_t MatchAnyKeyword,
+    uint64_t MatchAllKeyword,
+    uint32_t Timeout,
+    void* EnableParameters) {
+    (void)Timeout;
+    (void)EnableParameters;
+    const uint32_t err = EtwController::Global().EnableProvider(
+        TraceHandle, ProviderId, ControlCode, Level, MatchAnyKeyword, MatchAllKeyword, true);
+    RecordAdvapi("EnableTraceEx2", err == kErrSuccess, static_cast<int32_t>(err));
+    return err;
+}
+
+OS_DIAG_API uint32_t OS_DIAG_CALL EnableTraceEx(
+    const void* ProviderId,
+    const void* SourceId,
+    uint64_t TraceHandle,
+    uint32_t IsEnabled,
+    uint8_t Level,
+    uint64_t MatchAnyKeyword,
+    uint64_t MatchAllKeyword,
+    uint32_t EnableProperty,
+    void* EnableFilterDesc) {
+    (void)SourceId;
+    (void)EnableProperty;
+    (void)EnableFilterDesc;
+    return EnableTraceEx2(
+        TraceHandle, ProviderId, IsEnabled, Level, MatchAnyKeyword, MatchAllKeyword, 0u, nullptr);
+}
+
+OS_DIAG_API int32_t OS_DIAG_CALL OpenScarlettEtwGetSessionStatsForTest(
+    uint64_t TraceHandle,
+    uint32_t* outActive,
+    uint32_t* outEnabledProviders,
+    uint32_t* outFlushCount,
+    uint32_t* outRundownCount) {
+    return EtwController::Global().GetSessionStats(
+        TraceHandle, outActive, outEnabledProviders, outFlushCount, outRundownCount);
+}
+
 OS_DIAG_API int32_t OS_DIAG_CALL OpenScarlettAdvapiLegacyGetTelemetryCount(
     const char* symbolName,
     uint64_t* outTotalCalls,
@@ -670,7 +1268,7 @@ OS_DIAG_API int32_t OS_DIAG_CALL OpenScarlettAdvapiLegacyGetTelemetryCount(
 }  // extern "C"
 
 // ===========================================================================
-// TARGET 2: KernelTraceControl.dll (ETW / kernel trace session clean stubs)
+// TARGET 2: KernelTraceControl.dll (ETW / kernel trace controller)
 // ===========================================================================
 #elif defined(OPENSCARLETT_DIAG_TARGET_KERNELTRACECONTROL)
 
@@ -680,24 +1278,6 @@ constexpr const char* kKtcMod = "KernelTraceControl.dll";
 constexpr uint32_t kErrSuccess = 0u;
 constexpr uint32_t kErrInvalidHandle = 6u;
 constexpr uint32_t kErrInvalidParam = 87u;
-
-struct TraceSession {
-    uint64_t handle = 0u;
-    uint32_t process_id = 0u;
-    uint32_t enabled_providers = 0u;
-    uint32_t update_count = 0u;
-};
-
-struct KtcState {
-    std::mutex mutex;
-    uint64_t next_handle = 0x77AC0001ull;
-    std::unordered_map<uint64_t, TraceSession> sessions;
-};
-
-KtcState& GetKtc() {
-    static KtcState* s = new KtcState();
-    return *s;
-}
 
 inline uint32_t RecordKtc(const char* sym, uint32_t err) {
     openscarlett::CallTelemetry::Global().Record(
@@ -718,64 +1298,109 @@ OS_DIAG_API uint32_t OS_DIAG_CALL StartKernelTrace(
     void* Properties,
     const void* StackTracingEventIds,
     uint32_t cStackTracingEventIds) {
-    (void)Properties;
     if (!TraceHandle || (cStackTracingEventIds > 0u && !StackTracingEventIds)) {
         return RecordKtc("StartKernelTrace", kErrInvalidParam);
     }
-    auto& st = GetKtc();
-    std::lock_guard<std::mutex> lk(st.mutex);
-    const uint64_t h = st.next_handle++;
-    st.sessions[h] = TraceSession{h, 0u, 0u, 0u};
-    *TraceHandle = h;
-    return RecordKtc("StartKernelTrace", kErrSuccess);
+    const uint32_t err = EtwController::Global().StartSession(
+        TraceHandle, nullptr, Properties, 0u, true);
+    return RecordKtc("StartKernelTrace", err);
 }
 
 OS_DIAG_API uint32_t OS_DIAG_CALL StartKernelTraceForProcess(
     uint64_t* TraceHandle,
     void* Properties,
     uint32_t ProcessId) {
-    (void)Properties;
     if (!TraceHandle) {
         return RecordKtc("StartKernelTraceForProcess", kErrInvalidParam);
     }
-    auto& st = GetKtc();
-    std::lock_guard<std::mutex> lk(st.mutex);
-    const uint64_t h = st.next_handle++;
-    st.sessions[h] = TraceSession{h, ProcessId, 0u, 0u};
-    *TraceHandle = h;
-    return RecordKtc("StartKernelTraceForProcess", kErrSuccess);
+    const uint32_t err = EtwController::Global().StartSession(
+        TraceHandle, nullptr, Properties, ProcessId, true);
+    return RecordKtc("StartKernelTraceForProcess", err);
 }
 
 OS_DIAG_API uint32_t OS_DIAG_CALL StopKernelTrace(
     uint64_t TraceHandle,
     void* Properties) {
-    (void)Properties;
     if (TraceHandle == 0ull) {
         return RecordKtc("StopKernelTrace", kErrInvalidHandle);
     }
-    auto& st = GetKtc();
-    std::lock_guard<std::mutex> lk(st.mutex);
-    if (st.sessions.erase(TraceHandle) == 0u) {
-        return RecordKtc("StopKernelTrace", kErrInvalidHandle);
-    }
-    return RecordKtc("StopKernelTrace", kErrSuccess);
+    const uint32_t err = EtwController::Global().ControlSession(
+        TraceHandle, nullptr, Properties, kEtwControlStop, true);
+    return RecordKtc("StopKernelTrace",
+                     err == kEtwErrWmiNotFound ? kErrInvalidHandle : err);
 }
 
 OS_DIAG_API uint32_t OS_DIAG_CALL UpdateKernelTrace(
     uint64_t TraceHandle,
     void* Properties) {
-    (void)Properties;
     if (TraceHandle == 0ull) {
         return RecordKtc("UpdateKernelTrace", kErrInvalidHandle);
     }
-    auto& st = GetKtc();
-    std::lock_guard<std::mutex> lk(st.mutex);
-    auto it = st.sessions.find(TraceHandle);
-    if (it == st.sessions.end()) {
-        return RecordKtc("UpdateKernelTrace", kErrInvalidHandle);
-    }
-    ++it->second.update_count;
-    return RecordKtc("UpdateKernelTrace", kErrSuccess);
+    const uint32_t err = EtwController::Global().ControlSession(
+        TraceHandle, nullptr, Properties, kEtwControlUpdate, true);
+    return RecordKtc("UpdateKernelTrace",
+                     err == kEtwErrWmiNotFound ? kErrInvalidHandle : err);
+}
+
+OS_DIAG_API uint32_t OS_DIAG_CALL StartTraceW(
+    uint64_t* TraceHandle,
+    const wchar_t* InstanceName,
+    void* Properties) {
+    const uint32_t err = EtwController::Global().StartSession(
+        TraceHandle, InstanceName, Properties, 0u, false);
+    return RecordKtc("StartTraceW", err);
+}
+
+OS_DIAG_API uint32_t OS_DIAG_CALL StartTraceA(
+    uint64_t* TraceHandle,
+    const char* InstanceName,
+    void* Properties) {
+    const std::wstring wname = AnsiToWideSimple(InstanceName);
+    const uint32_t err = EtwController::Global().StartSession(
+        TraceHandle, wname.empty() ? nullptr : wname.c_str(), Properties, 0u, false);
+    return RecordKtc("StartTraceA", err);
+}
+
+OS_DIAG_API uint32_t OS_DIAG_CALL ControlTraceW(
+    uint64_t TraceHandle,
+    const wchar_t* InstanceName,
+    void* Properties,
+    uint32_t ControlCode) {
+    const uint32_t err = EtwController::Global().ControlSession(
+        TraceHandle, InstanceName, Properties, ControlCode, false);
+    return RecordKtc("ControlTraceW", err);
+}
+
+OS_DIAG_API uint32_t OS_DIAG_CALL ControlTraceA(
+    uint64_t TraceHandle,
+    const char* InstanceName,
+    void* Properties,
+    uint32_t ControlCode) {
+    const std::wstring wname = AnsiToWideSimple(InstanceName);
+    const uint32_t err = EtwController::Global().ControlSession(
+        TraceHandle, wname.empty() ? nullptr : wname.c_str(), Properties, ControlCode, false);
+    return RecordKtc("ControlTraceA", err);
+}
+
+OS_DIAG_API uint32_t OS_DIAG_CALL StopTraceW(
+    uint64_t TraceHandle,
+    const wchar_t* InstanceName,
+    void* Properties) {
+    return ControlTraceW(TraceHandle, InstanceName, Properties, kEtwControlStop);
+}
+
+OS_DIAG_API uint32_t OS_DIAG_CALL QueryTraceW(
+    uint64_t TraceHandle,
+    const wchar_t* InstanceName,
+    void* Properties) {
+    return ControlTraceW(TraceHandle, InstanceName, Properties, kEtwControlQuery);
+}
+
+OS_DIAG_API uint32_t OS_DIAG_CALL FlushTraceW(
+    uint64_t TraceHandle,
+    const wchar_t* InstanceName,
+    void* Properties) {
+    return ControlTraceW(TraceHandle, InstanceName, Properties, kEtwControlFlush);
 }
 
 OS_DIAG_API uint32_t OS_DIAG_CALL EnableTraceEx2(
@@ -787,18 +1412,41 @@ OS_DIAG_API uint32_t OS_DIAG_CALL EnableTraceEx2(
     uint64_t MatchAllKeyword,
     uint32_t Timeout,
     void* EnableParameters) {
-    (void)ControlCode; (void)Level; (void)MatchAnyKeyword;
-    (void)MatchAllKeyword; (void)Timeout; (void)EnableParameters;
+    (void)Timeout;
+    (void)EnableParameters;
     if (TraceHandle == 0ull || !ProviderId) {
         return RecordKtc("EnableTraceEx2", kErrInvalidParam);
     }
-    auto& st = GetKtc();
-    std::lock_guard<std::mutex> lk(st.mutex);
-    auto it = st.sessions.find(TraceHandle);
-    if (it != st.sessions.end()) {
-        ++it->second.enabled_providers;
-    }
-    return RecordKtc("EnableTraceEx2", kErrSuccess);
+    const uint32_t err = EtwController::Global().EnableProvider(
+        TraceHandle, ProviderId, ControlCode, Level, MatchAnyKeyword, MatchAllKeyword, false);
+    return RecordKtc("EnableTraceEx2", err);
+}
+
+OS_DIAG_API uint32_t OS_DIAG_CALL EnableTraceEx(
+    const void* ProviderId,
+    const void* SourceId,
+    uint64_t TraceHandle,
+    uint32_t IsEnabled,
+    uint8_t Level,
+    uint64_t MatchAnyKeyword,
+    uint64_t MatchAllKeyword,
+    uint32_t EnableProperty,
+    void* EnableFilterDesc) {
+    (void)SourceId;
+    (void)EnableProperty;
+    (void)EnableFilterDesc;
+    return EnableTraceEx2(
+        TraceHandle, ProviderId, IsEnabled, Level, MatchAnyKeyword, MatchAllKeyword, 0u, nullptr);
+}
+
+OS_DIAG_API int32_t OS_DIAG_CALL OpenScarlettEtwGetSessionStatsForTest(
+    uint64_t TraceHandle,
+    uint32_t* outActive,
+    uint32_t* outEnabledProviders,
+    uint32_t* outFlushCount,
+    uint32_t* outRundownCount) {
+    return EtwController::Global().GetSessionStats(
+        TraceHandle, outActive, outEnabledProviders, outFlushCount, outRundownCount);
 }
 
 OS_DIAG_API uint32_t OS_DIAG_CALL TraceQueryInformation(

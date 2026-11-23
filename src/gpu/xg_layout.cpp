@@ -1,7 +1,8 @@
-#include "openscarlett/gpu/xg_xs_abi.h"
+#include "openscarlett/gpu/xg_layout.h"
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 namespace openscarlett::xg {
 
@@ -994,8 +995,15 @@ bool ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT& o
     return true;
 }
 
-bool ComputeTexture3DLayout(const XG_TEXTURE3D_DESC& desc, XG_RESOURCE_LAYOUT& out_layout) noexcept {
+bool ComputeTexture3DLayoutEx(
+    const XG_TEXTURE3D_DESC& desc,
+    Xg3dMipTailMode mip_tail_mode,
+    XG_RESOURCE_LAYOUT& out_layout,
+    Xg3dMipChainSummary* out_summary) noexcept {
     std::memset(&out_layout, 0, sizeof(out_layout));
+    if (out_summary) {
+        *out_summary = Xg3dMipChainSummary{};
+    }
     if (desc.Width == 0u || desc.Height == 0u || desc.Depth == 0u) {
         return false;
     }
@@ -1014,7 +1022,12 @@ bool ComputeTexture3DLayout(const XG_TEXTURE3D_DESC& desc, XG_RESOURCE_LAYOUT& o
     }
 
     const uint32_t max_mips = ComputeMaxMips3D(desc.Width, desc.Height, desc.Depth);
-    const uint32_t mip_levels = (desc.MipLevels == 0u) ? max_mips : std::min(desc.MipLevels, max_mips);
+    const uint32_t mip_levels =
+        std::min<uint32_t>((desc.MipLevels == 0u) ? max_mips : std::min(desc.MipLevels, max_mips),
+                           XG_MAX_MIP_LEVELS);
+    if (mip_levels == 0u) {
+        return false;
+    }
 
     out_layout.Dimension = XG_RESOURCE_DIMENSION_TEXTURE3D;
     out_layout.Depth = desc.Depth;
@@ -1030,9 +1043,14 @@ bool ComputeTexture3DLayout(const XG_TEXTURE3D_DESC& desc, XG_RESOURCE_LAYOUT& o
     out_layout.Plane1MipTailStartLevel = mip_levels;
     out_layout.PlaneOffsets[0] = 0ull;
 
+    const bool allow_packed_mip_tail =
+        (mip_tail_mode == Xg3dMipTailMode::PackedMipTail) && geom.supports_mip_tail && (mip_levels > 1u);
+
     uint64_t cursor = 0ull;
     bool in_mip_tail = false;
     uint32_t mip_tail_sub_cursor = 0u;
+    uint32_t packed_mip_count = 0u;
+    uint32_t unpacked_mip_count = 0u;
 
     for (uint32_t m = 0u; m < mip_levels; ++m) {
         const uint32_t mip_w = std::max(1u, desc.Width >> m);
@@ -1053,8 +1071,16 @@ bool ComputeTexture3DLayout(const XG_TEXTURE3D_DESC& desc, XG_RESOURCE_LAYOUT& o
 
         if (desc.TileMode == XG_TILE_MODE_LINEAR) {
             cursor = AlignUpU64(cursor, 256ull);
-            const uint32_t row_pitch = AlignUpU32(elems_x * fmt.bytes_per_block, 256u);
+            const uint64_t row_bytes_64 = static_cast<uint64_t>(elems_x) * fmt.bytes_per_block;
+            if (row_bytes_64 > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max() - 256u)) {
+                return false;
+            }
+            const uint32_t row_pitch = AlignUpU32(static_cast<uint32_t>(row_bytes_64), 256u);
             const uint64_t depth_pitch = AlignUpU64(static_cast<uint64_t>(row_pitch) * elems_y, 256ull);
+            if (depth_pitch != 0ull &&
+                static_cast<uint64_t>(elems_z) > (std::numeric_limits<uint64_t>::max() - cursor) / depth_pitch) {
+                return false;
+            }
             const uint64_t vol_bytes = depth_pitch * elems_z;
             ml.PaddedWidthElements = row_pitch / fmt.bytes_per_block;
             ml.PaddedHeightElements = elems_y;
@@ -1068,22 +1094,25 @@ bool ComputeTexture3DLayout(const XG_TEXTURE3D_DESC& desc, XG_RESOURCE_LAYOUT& o
             ml.SlicePitchBytes = vol_bytes;
             ml.SizeBytes = vol_bytes;
             cursor += vol_bytes;
+            ++unpacked_mip_count;
             continue;
         }
 
         const uint32_t sub_w = NextPow2(elems_x);
         const uint32_t sub_h = NextPow2(elems_y);
         const uint32_t sub_d = NextPow2(elems_z);
-        const uint32_t raw_sub_bytes = sub_w * sub_h * sub_d * fmt.bytes_per_block;
-        const uint32_t aligned_sub_bytes = AlignUpU32(raw_sub_bytes, geom.mip_tail_sub_align);
+        const uint64_t raw_sub_bytes_64 =
+            static_cast<uint64_t>(sub_w) * static_cast<uint64_t>(sub_h) *
+            static_cast<uint64_t>(sub_d) * static_cast<uint64_t>(fmt.bytes_per_block);
+        const uint64_t aligned_sub_bytes_64 =
+            AlignUpU64(raw_sub_bytes_64, static_cast<uint64_t>(geom.mip_tail_sub_align));
 
-        if (!in_mip_tail &&
-            geom.supports_mip_tail &&
-            mip_levels > 1u &&
-            elems_x <= (geom.tile_w_elems / 2u) &&
-            elems_y <= (geom.tile_h_elems / 2u) &&
-            elems_z <= (geom.tile_d_elems / 2u) &&
-            aligned_sub_bytes <= geom.tile_size_bytes) {
+        if (allow_packed_mip_tail &&
+            !in_mip_tail &&
+            elems_x <= std::max<uint32_t>(1u, geom.tile_w_elems / 2u) &&
+            elems_y <= std::max<uint32_t>(1u, geom.tile_h_elems / 2u) &&
+            elems_z <= std::max<uint32_t>(1u, geom.tile_d_elems / 2u) &&
+            aligned_sub_bytes_64 <= static_cast<uint64_t>(geom.tile_size_bytes)) {
             in_mip_tail = true;
             cursor = AlignUpU64(cursor, geom.tile_size_bytes);
             out_layout.MipTailStartLevel = m;
@@ -1092,7 +1121,11 @@ bool ComputeTexture3DLayout(const XG_TEXTURE3D_DESC& desc, XG_RESOURCE_LAYOUT& o
             mip_tail_sub_cursor = 0u;
         }
 
-        if (in_mip_tail && (mip_tail_sub_cursor + aligned_sub_bytes) <= geom.tile_size_bytes) {
+        if (in_mip_tail &&
+            aligned_sub_bytes_64 <= static_cast<uint64_t>(geom.tile_size_bytes) &&
+            (static_cast<uint64_t>(mip_tail_sub_cursor) + aligned_sub_bytes_64) <=
+                static_cast<uint64_t>(geom.tile_size_bytes)) {
+            const uint32_t aligned_sub_bytes = static_cast<uint32_t>(aligned_sub_bytes_64);
             ml.InMipTail = 1u;
             ml.MipTailSubTileOffsetBytes = mip_tail_sub_cursor;
             ml.MipTailSubBlockBytes = aligned_sub_bytes;
@@ -1105,10 +1138,14 @@ bool ComputeTexture3DLayout(const XG_TEXTURE3D_DESC& desc, XG_RESOURCE_LAYOUT& o
             ml.TilesX = 1u;
             ml.TilesY = 1u;
             ml.TilesZ = 1u;
+            ml.RowPitchBytes = sub_w * fmt.bytes_per_block;
+            ml.DepthPitchBytes =
+                static_cast<uint64_t>(sub_w) * static_cast<uint64_t>(sub_h) * fmt.bytes_per_block;
             ml.OffsetBytes = out_layout.MipTailOffsetBytes + mip_tail_sub_cursor;
             ml.SlicePitchBytes = out_layout.MipTailSlicePitchBytes;
             ml.SizeBytes = aligned_sub_bytes;
             mip_tail_sub_cursor += aligned_sub_bytes;
+            ++packed_mip_count;
             continue;
         }
 
@@ -1124,8 +1161,14 @@ bool ComputeTexture3DLayout(const XG_TEXTURE3D_DESC& desc, XG_RESOURCE_LAYOUT& o
         const uint32_t tiles_x = padded_x / geom.tile_w_elems;
         const uint32_t tiles_y = padded_y / geom.tile_h_elems;
         const uint32_t tiles_z = padded_z / geom.tile_d_elems;
-        const uint64_t vol_bytes =
-            static_cast<uint64_t>(tiles_x) * tiles_y * tiles_z * geom.tile_size_bytes;
+        const uint64_t tiles_xy = static_cast<uint64_t>(tiles_x) * static_cast<uint64_t>(tiles_y);
+        const uint64_t depth_tile_layer_bytes = tiles_xy * static_cast<uint64_t>(geom.tile_size_bytes);
+        if (depth_tile_layer_bytes == 0ull ||
+            static_cast<uint64_t>(tiles_z) >
+                (std::numeric_limits<uint64_t>::max() - cursor) / depth_tile_layer_bytes) {
+            return false;
+        }
+        const uint64_t vol_bytes = depth_tile_layer_bytes * static_cast<uint64_t>(tiles_z);
 
         ml.PaddedWidthElements = padded_x;
         ml.PaddedHeightElements = padded_y;
@@ -1133,10 +1176,13 @@ bool ComputeTexture3DLayout(const XG_TEXTURE3D_DESC& desc, XG_RESOURCE_LAYOUT& o
         ml.TilesX = tiles_x;
         ml.TilesY = tiles_y;
         ml.TilesZ = tiles_z;
+        ml.RowPitchBytes = tiles_x * geom.tile_size_bytes;
+        ml.DepthPitchBytes = depth_tile_layer_bytes;
         ml.OffsetBytes = cursor;
         ml.SlicePitchBytes = vol_bytes;
         ml.SizeBytes = vol_bytes;
         cursor += vol_bytes;
+        ++unpacked_mip_count;
     }
 
     if (in_mip_tail) {
@@ -1145,7 +1191,79 @@ bool ComputeTexture3DLayout(const XG_TEXTURE3D_DESC& desc, XG_RESOURCE_LAYOUT& o
 
     out_layout.PlaneSizes[0] = AlignUpU64(cursor, out_layout.BaseAlignmentBytes);
     out_layout.SizeBytes = out_layout.PlaneSizes[0];
+
+    if (out_summary) {
+        out_summary->mip_levels = mip_levels;
+        out_summary->packed_mip_tail_start_level = out_layout.MipTailStartLevel;
+        out_summary->packed_mip_count = packed_mip_count;
+        out_summary->unpacked_mip_count = unpacked_mip_count;
+        out_summary->base_alignment_bytes = static_cast<uint32_t>(out_layout.BaseAlignmentBytes);
+        out_summary->mip_tail_offset_bytes = out_layout.MipTailOffsetBytes;
+        out_summary->mip_tail_size_bytes =
+            (packed_mip_count > 0u) ? out_layout.MipTailSlicePitchBytes : 0ull;
+        out_summary->total_size_bytes = out_layout.SizeBytes;
+    }
+    return ValidateTexture3DLayoutBounds(out_layout);
+}
+
+bool ValidateTexture3DLayoutBounds(const XG_RESOURCE_LAYOUT& layout) noexcept {
+    if (layout.Dimension != XG_RESOURCE_DIMENSION_TEXTURE3D ||
+        layout.MipLevels == 0u ||
+        layout.MipLevels > XG_MAX_MIP_LEVELS ||
+        layout.SizeBytes == 0ull ||
+        layout.FormatInfo.bytes_per_block == 0u) {
+        return false;
+    }
+    if (layout.MipTailStartLevel < layout.MipLevels) {
+        if (layout.MipTailSlicePitchBytes == 0ull ||
+            layout.MipTailOffsetBytes > layout.SizeBytes ||
+            layout.MipTailSlicePitchBytes > layout.SizeBytes - layout.MipTailOffsetBytes) {
+            return false;
+        }
+    }
+    uint64_t prev_tail_end = 0ull;
+    for (uint32_t m = 0u; m < layout.MipLevels; ++m) {
+        const XG_MIPLEVEL_LAYOUT& ml = layout.Mips[m];
+        if (ml.WidthElements == 0u || ml.HeightElements == 0u || ml.DepthElements == 0u ||
+            ml.PaddedWidthElements < ml.WidthElements ||
+            ml.PaddedHeightElements < ml.HeightElements ||
+            ml.PaddedDepthElements < ml.DepthElements) {
+            return false;
+        }
+        if (ml.InMipTail != 0u) {
+            if (layout.MipTailStartLevel >= layout.MipLevels) return false;
+            if (ml.MipTailSubBlockBytes == 0u ||
+                ml.MipTailPaddedWidthElements < ml.WidthElements ||
+                ml.MipTailPaddedHeightElements < ml.HeightElements ||
+                ml.MipTailPaddedDepthElements < ml.DepthElements) {
+                return false;
+            }
+            const uint64_t sub_start = ml.MipTailSubTileOffsetBytes;
+            const uint64_t sub_end = sub_start + ml.MipTailSubBlockBytes;
+            if (sub_end < sub_start || sub_end > layout.MipTailSlicePitchBytes) {
+                return false;
+            }
+            if (sub_start < prev_tail_end) {
+                return false;  // Overlapping packed 3D mip-tail sub-blocks
+            }
+            prev_tail_end = sub_end;
+            const uint64_t abs_end = layout.MipTailOffsetBytes + sub_end;
+            if (abs_end < layout.MipTailOffsetBytes || abs_end > layout.SizeBytes) {
+                return false;
+            }
+        } else {
+            if (ml.SizeBytes == 0ull ||
+                ml.OffsetBytes > layout.SizeBytes ||
+                ml.SizeBytes > layout.SizeBytes - ml.OffsetBytes) {
+                return false;
+            }
+        }
+    }
     return true;
+}
+
+bool ComputeTexture3DLayout(const XG_TEXTURE3D_DESC& desc, XG_RESOURCE_LAYOUT& out_layout) noexcept {
+    return ComputeTexture3DLayoutEx(desc, Xg3dMipTailMode::PackedMipTail, out_layout, nullptr);
 }
 
 uint64_t ComputeElementByteOffsetPlane(
@@ -1229,23 +1347,31 @@ uint64_t ComputeElementByteOffset3D(
     uint32_t element_x,
     uint32_t element_y,
     uint32_t element_z) noexcept {
-    if (layout.Dimension != XG_RESOURCE_DIMENSION_TEXTURE3D || mip_level >= layout.MipLevels) {
+    if (layout.Dimension != XG_RESOURCE_DIMENSION_TEXTURE3D ||
+        mip_level >= layout.MipLevels ||
+        layout.SizeBytes == 0ull) {
         return UINT64_MAX;
     }
 
     const XG_MIPLEVEL_LAYOUT& ml = layout.Mips[mip_level];
     const uint32_t bpe = layout.FormatInfo.bytes_per_block;
-    if (element_x >= ml.PaddedWidthElements ||
+    if (bpe == 0u ||
+        element_x >= ml.PaddedWidthElements ||
         element_y >= ml.PaddedHeightElements ||
         element_z >= ml.PaddedDepthElements) {
         return UINT64_MAX;
     }
 
     if (layout.TileMode == XG_TILE_MODE_LINEAR) {
-        return ml.OffsetBytes +
-               static_cast<uint64_t>(element_z) * ml.DepthPitchBytes +
-               static_cast<uint64_t>(element_y) * ml.RowPitchBytes +
-               static_cast<uint64_t>(element_x) * bpe;
+        const uint64_t off =
+            ml.OffsetBytes +
+            static_cast<uint64_t>(element_z) * ml.DepthPitchBytes +
+            static_cast<uint64_t>(element_y) * ml.RowPitchBytes +
+            static_cast<uint64_t>(element_x) * bpe;
+        if (off > layout.SizeBytes || bpe > layout.SizeBytes - off) {
+            return UINT64_MAX;
+        }
+        return off;
     }
 
     TileGeometry geom{};
@@ -1254,6 +1380,15 @@ uint64_t ComputeElementByteOffset3D(
     }
 
     if (ml.InMipTail != 0u) {
+        if (ml.MipTailPaddedWidthElements == 0u ||
+            ml.MipTailPaddedHeightElements == 0u ||
+            ml.MipTailPaddedDepthElements == 0u ||
+            element_x >= ml.MipTailPaddedWidthElements ||
+            element_y >= ml.MipTailPaddedHeightElements ||
+            element_z >= ml.MipTailPaddedDepthElements ||
+            ml.MipTailSubBlockBytes < bpe) {
+            return UINT64_MAX;
+        }
         const uint32_t bx = Log2Pow2(ml.MipTailPaddedWidthElements);
         const uint32_t by = Log2Pow2(ml.MipTailPaddedHeightElements);
         const uint32_t bz = Log2Pow2(ml.MipTailPaddedDepthElements);
@@ -1265,12 +1400,30 @@ uint64_t ComputeElementByteOffset3D(
             const uint32_t sub_xor = (mip_level & 0xFu) << 4u;
             sub_off ^= sub_xor;
         }
-        return layout.MipTailOffsetBytes + ml.MipTailSubTileOffsetBytes + sub_off;
+        if (sub_off > ml.MipTailSubBlockBytes - bpe) {
+            return UINT64_MAX;
+        }
+        const uint64_t tail_rel =
+            static_cast<uint64_t>(ml.MipTailSubTileOffsetBytes) + static_cast<uint64_t>(sub_off);
+        if (tail_rel + bpe > layout.MipTailSlicePitchBytes) {
+            return UINT64_MAX;
+        }
+        const uint64_t final_off = layout.MipTailOffsetBytes + tail_rel;
+        if (final_off > layout.SizeBytes || bpe > layout.SizeBytes - final_off) {
+            return UINT64_MAX;
+        }
+        return final_off;
     }
 
+    if (ml.TilesX == 0u || ml.TilesY == 0u || ml.TilesZ == 0u) {
+        return UINT64_MAX;
+    }
     const uint32_t tile_x = element_x / geom.tile_w_elems;
     const uint32_t tile_y = element_y / geom.tile_h_elems;
     const uint32_t tile_z = element_z / geom.tile_d_elems;
+    if (tile_x >= ml.TilesX || tile_y >= ml.TilesY || tile_z >= ml.TilesZ) {
+        return UINT64_MAX;
+    }
     const uint32_t in_x = element_x % geom.tile_w_elems;
     const uint32_t in_y = element_y % geom.tile_h_elems;
     const uint32_t in_z = element_z % geom.tile_d_elems;
@@ -1280,8 +1433,19 @@ uint64_t ComputeElementByteOffset3D(
 
     const uint32_t offset_in_tile = ComputeIntraTileOffset3D(
         layout.TileMode, geom, bpe, tile_x, tile_y, tile_z, in_x, in_y, in_z);
+    if (offset_in_tile > geom.tile_size_bytes - bpe) {
+        return UINT64_MAX;
+    }
 
-    return ml.OffsetBytes + tile_index * geom.tile_size_bytes + offset_in_tile;
+    const uint64_t mip_rel = tile_index * geom.tile_size_bytes + offset_in_tile;
+    if (mip_rel > ml.SizeBytes || bpe > ml.SizeBytes - mip_rel) {
+        return UINT64_MAX;
+    }
+    const uint64_t final_off = ml.OffsetBytes + mip_rel;
+    if (final_off > layout.SizeBytes || bpe > layout.SizeBytes - final_off) {
+        return UINT64_MAX;
+    }
+    return final_off;
 }
 
 bool TileSurface2DPlane(
@@ -1449,8 +1613,8 @@ bool UntileSurface2D(
         dst_linear, dst_row_pitch_bytes);
 }
 
-bool TileSurface3D(
-    const XG_TEXTURE3D_DESC& desc,
+bool TileSurface3DWithLayout(
+    const XG_RESOURCE_LAYOUT& layout,
     uint32_t mip_level,
     const void* src_linear,
     uint32_t src_row_pitch_bytes,
@@ -1458,18 +1622,25 @@ bool TileSurface3D(
     void* dst_tiled,
     uint64_t dst_tiled_size_bytes) noexcept {
     if (!src_linear || !dst_tiled) return false;
-
-    XG_RESOURCE_LAYOUT layout{};
-    if (!ComputeTexture3DLayout(desc, layout)) return false;
+    if (!ValidateTexture3DLayoutBounds(layout)) return false;
     if (mip_level >= layout.MipLevels) return false;
 
     const XG_MIPLEVEL_LAYOUT& ml = layout.Mips[mip_level];
     const uint32_t bpe = layout.FormatInfo.bytes_per_block;
-    const uint32_t min_row_bytes = ml.WidthElements * bpe;
+    const uint64_t min_row_bytes_64 = static_cast<uint64_t>(ml.WidthElements) * bpe;
+    if (min_row_bytes_64 == 0ull || min_row_bytes_64 > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    const uint32_t min_row_bytes = static_cast<uint32_t>(min_row_bytes_64);
     if (src_row_pitch_bytes == 0u) src_row_pitch_bytes = min_row_bytes;
     if (src_row_pitch_bytes < min_row_bytes) return false;
 
-    const uint32_t min_slice_bytes = src_row_pitch_bytes * ml.HeightElements;
+    const uint64_t min_slice_bytes_64 =
+        static_cast<uint64_t>(src_row_pitch_bytes) * static_cast<uint64_t>(ml.HeightElements);
+    if (min_slice_bytes_64 == 0ull || min_slice_bytes_64 > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    const uint32_t min_slice_bytes = static_cast<uint32_t>(min_slice_bytes_64);
     if (src_slice_pitch_bytes == 0u) src_slice_pitch_bytes = min_slice_bytes;
     if (src_slice_pitch_bytes < min_slice_bytes) return false;
 
@@ -1478,12 +1649,12 @@ bool TileSurface3D(
 
     if (ml.InMipTail != 0u) {
         const uint64_t sub_base = layout.MipTailOffsetBytes + ml.MipTailSubTileOffsetBytes;
-        if (sub_base + ml.MipTailSubBlockBytes > dst_tiled_size_bytes) {
+        if (sub_base > dst_tiled_size_bytes || ml.MipTailSubBlockBytes > dst_tiled_size_bytes - sub_base) {
             return false;
         }
         std::memset(dst_bytes + sub_base, 0, static_cast<size_t>(ml.MipTailSubBlockBytes));
     } else {
-        if (ml.OffsetBytes + ml.SizeBytes > dst_tiled_size_bytes) {
+        if (ml.OffsetBytes > dst_tiled_size_bytes || ml.SizeBytes > dst_tiled_size_bytes - ml.OffsetBytes) {
             return false;
         }
         std::memset(dst_bytes + ml.OffsetBytes, 0, static_cast<size_t>(ml.SizeBytes));
@@ -1495,7 +1666,8 @@ bool TileSurface3D(
             const uint8_t* src_row = src_slice + static_cast<uint64_t>(y) * src_row_pitch_bytes;
             for (uint32_t x = 0u; x < ml.WidthElements; ++x) {
                 const uint64_t dst_off = ComputeElementByteOffset3D(layout, mip_level, x, y, z);
-                if (dst_off == UINT64_MAX || dst_off + bpe > dst_tiled_size_bytes) {
+                if (dst_off == UINT64_MAX || dst_off > dst_tiled_size_bytes ||
+                    bpe > dst_tiled_size_bytes - dst_off) {
                     return false;
                 }
                 std::memcpy(dst_bytes + dst_off, src_row + static_cast<uint64_t>(x) * bpe, bpe);
@@ -1505,8 +1677,8 @@ bool TileSurface3D(
     return true;
 }
 
-bool UntileSurface3D(
-    const XG_TEXTURE3D_DESC& desc,
+bool UntileSurface3DWithLayout(
+    const XG_RESOURCE_LAYOUT& layout,
     uint32_t mip_level,
     const void* src_tiled,
     uint64_t src_tiled_size_bytes,
@@ -1514,27 +1686,37 @@ bool UntileSurface3D(
     uint32_t dst_row_pitch_bytes,
     uint32_t dst_slice_pitch_bytes) noexcept {
     if (!src_tiled || !dst_linear) return false;
-
-    XG_RESOURCE_LAYOUT layout{};
-    if (!ComputeTexture3DLayout(desc, layout)) return false;
+    if (!ValidateTexture3DLayoutBounds(layout)) return false;
     if (mip_level >= layout.MipLevels) return false;
 
     const XG_MIPLEVEL_LAYOUT& ml = layout.Mips[mip_level];
     const uint32_t bpe = layout.FormatInfo.bytes_per_block;
-    const uint32_t min_row_bytes = ml.WidthElements * bpe;
+    const uint64_t min_row_bytes_64 = static_cast<uint64_t>(ml.WidthElements) * bpe;
+    if (min_row_bytes_64 == 0ull || min_row_bytes_64 > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    const uint32_t min_row_bytes = static_cast<uint32_t>(min_row_bytes_64);
     if (dst_row_pitch_bytes == 0u) dst_row_pitch_bytes = min_row_bytes;
     if (dst_row_pitch_bytes < min_row_bytes) return false;
 
-    const uint32_t min_slice_bytes = dst_row_pitch_bytes * ml.HeightElements;
+    const uint64_t min_slice_bytes_64 =
+        static_cast<uint64_t>(dst_row_pitch_bytes) * static_cast<uint64_t>(ml.HeightElements);
+    if (min_slice_bytes_64 == 0ull || min_slice_bytes_64 > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    const uint32_t min_slice_bytes = static_cast<uint32_t>(min_slice_bytes_64);
     if (dst_slice_pitch_bytes == 0u) dst_slice_pitch_bytes = min_slice_bytes;
     if (dst_slice_pitch_bytes < min_slice_bytes) return false;
 
     if (ml.InMipTail != 0u) {
-        const uint64_t sub_end =
-            layout.MipTailOffsetBytes + ml.MipTailSubTileOffsetBytes + ml.MipTailSubBlockBytes;
-        if (src_tiled_size_bytes < sub_end) return false;
+        const uint64_t sub_base = layout.MipTailOffsetBytes + ml.MipTailSubTileOffsetBytes;
+        if (sub_base > src_tiled_size_bytes || ml.MipTailSubBlockBytes > src_tiled_size_bytes - sub_base) {
+            return false;
+        }
     } else {
-        if (src_tiled_size_bytes < ml.OffsetBytes + ml.SizeBytes) return false;
+        if (ml.OffsetBytes > src_tiled_size_bytes || ml.SizeBytes > src_tiled_size_bytes - ml.OffsetBytes) {
+            return false;
+        }
     }
 
     const auto* src_bytes = static_cast<const uint8_t*>(src_tiled);
@@ -1546,7 +1728,8 @@ bool UntileSurface3D(
             uint8_t* dst_row = dst_slice + static_cast<uint64_t>(y) * dst_row_pitch_bytes;
             for (uint32_t x = 0u; x < ml.WidthElements; ++x) {
                 const uint64_t src_off = ComputeElementByteOffset3D(layout, mip_level, x, y, z);
-                if (src_off == UINT64_MAX || src_off + bpe > src_tiled_size_bytes) {
+                if (src_off == UINT64_MAX || src_off > src_tiled_size_bytes ||
+                    bpe > src_tiled_size_bytes - src_off) {
                     return false;
                 }
                 std::memcpy(dst_row + static_cast<uint64_t>(x) * bpe, src_bytes + src_off, bpe);
@@ -1554,6 +1737,36 @@ bool UntileSurface3D(
         }
     }
     return true;
+}
+
+bool TileSurface3D(
+    const XG_TEXTURE3D_DESC& desc,
+    uint32_t mip_level,
+    const void* src_linear,
+    uint32_t src_row_pitch_bytes,
+    uint32_t src_slice_pitch_bytes,
+    void* dst_tiled,
+    uint64_t dst_tiled_size_bytes) noexcept {
+    XG_RESOURCE_LAYOUT layout{};
+    if (!ComputeTexture3DLayout(desc, layout)) return false;
+    return TileSurface3DWithLayout(
+        layout, mip_level, src_linear, src_row_pitch_bytes, src_slice_pitch_bytes,
+        dst_tiled, dst_tiled_size_bytes);
+}
+
+bool UntileSurface3D(
+    const XG_TEXTURE3D_DESC& desc,
+    uint32_t mip_level,
+    const void* src_tiled,
+    uint64_t src_tiled_size_bytes,
+    void* dst_linear,
+    uint32_t dst_row_pitch_bytes,
+    uint32_t dst_slice_pitch_bytes) noexcept {
+    XG_RESOURCE_LAYOUT layout{};
+    if (!ComputeTexture3DLayout(desc, layout)) return false;
+    return UntileSurface3DWithLayout(
+        layout, mip_level, src_tiled, src_tiled_size_bytes,
+        dst_linear, dst_row_pitch_bytes, dst_slice_pitch_bytes);
 }
 
 namespace {

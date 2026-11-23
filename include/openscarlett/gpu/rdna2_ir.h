@@ -32,7 +32,8 @@ enum class IrOp : uint16_t {
     StoreUav,       // Store operands[1] to uav[imm_u32] at byte offset operands[0]
 
     // Texture / Image ops (MIMG)
-    ImageSample,        // operands: [u_f32, v_f32, lod_f32], imm_u32 = channel (0..3) -> f32
+    ImageSample,        // operands: [u_f32, v_f32, lod_or_dref_f32], imm_u32 = channel (0..3) | (is_cmp << 7) -> f32
+    ImageSampleDynamic, // operands: [u_f32, v_f32, lod_or_dref_f32, desc_idx_u32], imm_u32 = ch | (is_cmp << 7) | (array_len << 8)
     ImageSampleImplicit,// operands: [u_f32, v_f32], imm_u32 = channel (0..3) -> f32 (PS helper-lane quad derivatives)
     ImageLoad,          // operands: [x_u32, y_u32], imm_u32 = channel (0..3) -> f32
     ImageLoadMip,       // operands: [x_u32, y_u32, z_or_face_u32, mip_u32], imm_u32 = ch | (dim << 4) -> f32
@@ -94,10 +95,14 @@ enum class IrOp : uint16_t {
     BitOr,
     BitXor,
     BitNot,
+    BitReverse32,   // operands: [src_u32] -> u32 (S_BREV_B32)
     BitCount32,     // operands: [src_u32] -> u32 (strictly low 32-bit popcount for S_BCNT1_I32_B32)
+    AbsDiffI32,     // operands: [a_i32, b_i32] -> u32 (S_ABSDIFF_I32)
     Shl,
     Shr,
+    AlignBit,       // operands: [src0_hi, src1_lo, src2_shift] -> u32 (UB-safe V_ALIGNBIT_B32)
     AlignByte,      // operands: [src0_hi, src1_lo, src2_byte_sel] -> u32 (UB-safe shift < 32)
+    FmaMix,         // operands: [a, b, c, old_dst], imm_u32 = mode(0=f32,1=lo16,2=hi16) | (vop3p_flags << 4)
     BufferLoadFormat, // operands: [byte_addr_u32], imm_u32 = uav_slot | (fmt<<4) | (comp<<12) | (d16<<16) -> u32/f32
 
     // 32-bit bitfield ops (V_BFE_U32, V_BFE_I32, V_BFI_B32)
@@ -133,6 +138,7 @@ enum class IrOp : uint16_t {
     CmpEqU,
     CmpGtU,
     CmpGeU,
+    CmpF32,         // operands: [a_f32, b_f32], imm_u32 = cmp_code(0..15 ordered/unordered IEEE-754) -> Bool
     CmpF16,         // operands: [a_u32, b_u32], imm_u32 = cmp_code(0..15) | (op_sel<<8) | (neg<<12) | (abs<<16) -> Bool
     LogicalAnd,     // operands: [bool_a, bool_b] -> Bool
     LogicalNot,     // operands: [bool_a] -> Bool
@@ -181,7 +187,13 @@ struct Rdna2IrOptStats {
     uint32_t pruned_mask_ops = 0;
     uint32_t eliminated_ops = 0;
     uint32_t inserted_lockstep_lds_barriers = 0;
+    uint32_t folded_execz_branches = 0;
 };
+
+// Shared IR flag constants between rdna2_ir.cpp and rdna2_lifter.cpp
+constexpr uint32_t kIrLoadCbHeapFlag = 0x80000000u;
+constexpr uint32_t kIrLoadSmemBoundsCheckFlag = 0x20000000u;
+constexpr uint32_t kIrWaveSwizzleFlag = 0x80000000u;
 
 // Optional SRV texture format contract for MIMG IMAGE_LOAD / IMAGE_LOAD_MIP
 enum class Rdna2TextureFormat : uint8_t {
@@ -243,6 +255,9 @@ struct Rdna2IrModule {
     uint32_t scratch_size_dwords = 64;
     bool uses_texture_srv = false;
     bool uses_texture_sample = false;
+    bool uses_comparison_sample = false;
+    bool uses_dynamic_sampled_indexing = false;
+    uint32_t sampled_image_array_size = 0;
     bool uses_pixel_quad_derivatives = false;
     bool uses_texture_load = false;
     bool uses_texture2d_mip_srv = false;

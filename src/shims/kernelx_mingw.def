@@ -30,6 +30,9 @@ EXPORTS
     KernelXVirtualAllocFromApp
     KernelXVirtualProtectFromApp
     KernelXVirtualFree
+    KernelXVirtualFreeEx
+    VirtualFree = KernelXVirtualFree
+    VirtualFreeEx = KernelXVirtualFreeEx
     GetConsoleType
     GetSystemOSVersion
     XGetProcessorCount

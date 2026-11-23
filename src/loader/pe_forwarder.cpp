@@ -736,8 +736,21 @@ PeForwarderPreflightReport PeForwarderResolver::BuildPreflightReport(
 
     auto tally = [&](const std::string& src_mod,
                      const std::string& spec,
-                     PeForwarderChainResult r) {
+                     PeForwarderChainResult r,
+                     bool is_delay_loaded) {
         ++out.total_entries;
+        if (is_delay_loaded) {
+            ++out.delay_load_count;
+            if (r.kind == ForwarderResolutionKind::OpenScarlettShim) {
+                ++out.delay_load_shim_count;
+            }
+            const std::string norm_dl = NormalizeForwarderDllName(src_mod, true);
+            if (!norm_dl.empty() &&
+                std::find(out.delay_load_dlls.begin(), out.delay_load_dlls.end(), norm_dl) ==
+                    out.delay_load_dlls.end()) {
+                out.delay_load_dlls.push_back(norm_dl);
+            }
+        }
         switch (r.kind) {
             case ForwarderResolutionKind::OpenScarlettShim:
                 ++out.openscarlett_shim_count;
@@ -767,13 +780,13 @@ PeForwarderPreflightReport PeForwarderResolver::BuildPreflightReport(
                 out.blockers.push_back(r.diagnostic);
                 break;
         }
-        out.entries.push_back(PeForwarderPreflightEntry{src_mod, spec, std::move(r)});
+        out.entries.push_back(PeForwarderPreflightEntry{src_mod, spec, std::move(r), is_delay_loaded});
     };
 
     for (const auto& mod : pe_report.imports) {
         if (mod.symbols.empty()) {
             auto r = ResolveImportSymbol(mod.dll_name, "<module>", 0u, true, next_lookup, max_depth);
-            tally(mod.dll_name, mod.dll_name, std::move(r));
+            tally(mod.dll_name, mod.dll_name, std::move(r), false);
             continue;
         }
         for (const auto& sym : mod.symbols) {
@@ -781,7 +794,7 @@ PeForwarderPreflightReport PeForwarderResolver::BuildPreflightReport(
                                          next_lookup, max_depth);
             const std::string spec =
                 mod.dll_name + "!" + (sym.by_ordinal ? ("#" + std::to_string(sym.ordinal)) : sym.name);
-            tally(mod.dll_name, spec, std::move(r));
+            tally(mod.dll_name, spec, std::move(r), sym.delay_loaded);
         }
     }
 
@@ -790,13 +803,33 @@ PeForwarderPreflightReport PeForwarderResolver::BuildPreflightReport(
             continue;
         }
         auto r = ResolveForwarder(exp.forwarder, next_lookup, max_depth);
-        tally("<export_forwarder>", exp.forwarder, std::move(r));
+        tally("<export_forwarder>", exp.forwarder, std::move(r), false);
     }
 
     out.ready_to_launch = (out.unresolved_count == 0u &&
                            out.cycle_error_count == 0u &&
                            out.malformed_error_count == 0u);
     return out;
+}
+
+std::vector<PeForwarderPreflightEntry> PeForwarderResolver::InspectDelayLoadImports(
+    const PeInspectionReport& pe_report,
+    const PeForwarderLookupFn& next_lookup,
+    uint32_t max_depth) const {
+    std::vector<PeForwarderPreflightEntry> results;
+    for (const auto& mod : pe_report.imports) {
+        for (const auto& sym : mod.symbols) {
+            if (!sym.delay_loaded) {
+                continue;
+            }
+            auto r = ResolveImportSymbol(mod.dll_name, sym.name, sym.ordinal, sym.by_ordinal,
+                                         next_lookup, max_depth);
+            const std::string spec =
+                mod.dll_name + "!" + (sym.by_ordinal ? ("#" + std::to_string(sym.ordinal)) : sym.name);
+            results.push_back(PeForwarderPreflightEntry{mod.dll_name, spec, std::move(r), true});
+        }
+    }
+    return results;
 }
 
 PeForwarderPreflightReport PeForwarderResolver::BuildPreflightReportFromForwarders(
@@ -839,7 +872,7 @@ PeForwarderPreflightReport PeForwarderResolver::BuildPreflightReportFromForwarde
                 out.blockers.push_back(r.diagnostic);
                 break;
         }
-        out.entries.push_back(PeForwarderPreflightEntry{"<forwarder>", fwd, std::move(r)});
+        out.entries.push_back(PeForwarderPreflightEntry{"<forwarder>", fwd, std::move(r), false});
     }
 
     out.ready_to_launch = (out.unresolved_count == 0u &&
@@ -857,6 +890,8 @@ std::string FormatPeForwarderPreflightText(const PeForwarderPreflightReport& rep
         << "  WindowsSystem    : " << report.windows_system_count
         << " (ApiSetRedirected=" << report.apiset_redirected_count << ")\n"
         << "  NativeGuestDll   : " << report.native_guest_count << "\n"
+        << "  DelayLoadEntries : " << report.delay_load_count
+        << " (Shims=" << report.delay_load_shim_count << ")\n"
         << "  Unresolved       : " << report.unresolved_count
         << " | Cycles=" << report.cycle_error_count
         << " | Malformed=" << report.malformed_error_count << "\n";
@@ -879,10 +914,17 @@ std::string FormatPeForwarderPreflightJson(const PeForwarderPreflightReport& rep
         << "  \"windows_system_count\": " << report.windows_system_count << ",\n"
         << "  \"apiset_redirected_count\": " << report.apiset_redirected_count << ",\n"
         << "  \"native_guest_count\": " << report.native_guest_count << ",\n"
+        << "  \"delay_load_count\": " << report.delay_load_count << ",\n"
+        << "  \"delay_load_shim_count\": " << report.delay_load_shim_count << ",\n"
         << "  \"unresolved_count\": " << report.unresolved_count << ",\n"
         << "  \"cycle_error_count\": " << report.cycle_error_count << ",\n"
         << "  \"malformed_error_count\": " << report.malformed_error_count << ",\n"
-        << "  \"blockers\": [";
+        << "  \"delay_load_dlls\": [";
+    for (size_t i = 0u; i < report.delay_load_dlls.size(); ++i) {
+        if (i > 0u) oss << ", ";
+        oss << "\"" << EscapeJson(report.delay_load_dlls[i]) << "\"";
+    }
+    oss << "],\n  \"blockers\": [";
     for (size_t i = 0u; i < report.blockers.size(); ++i) {
         if (i > 0u) oss << ", ";
         oss << "\"" << EscapeJson(report.blockers[i]) << "\"";

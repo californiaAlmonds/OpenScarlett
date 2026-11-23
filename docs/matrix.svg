@@ -1,10 +1,10 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="716" viewBox="0 0 900 716" role="img" aria-label="OpenScarlett RDNA2, D3D12/Vulkan and 30-DLL Coverage Matrix">
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="754" viewBox="0 0 900 754" role="img" aria-label="OpenScarlett RDNA2, D3D12/Vulkan and 31-DLL Coverage Matrix">
   <defs>
     <linearGradient id="mAccent" x1="0%" y1="0%" x2="100%" y2="0%">
       <stop offset="0%" stop-color="#e11d48"/>
       <stop offset="100%" stop-color="#fb7185"/>
     </linearGradient>
-    <clipPath id="mClip"><rect width="900" height="716" rx="12"/></clipPath>
+    <clipPath id="mClip"><rect width="900" height="754" rx="12"/></clipPath>
   </defs>
   <style>
     text { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; }
@@ -16,9 +16,9 @@
     .tiny { font-size: 10px; fill: #8b949e; }
   </style>
   <g clip-path="url(#mClip)">
-    <rect width="900" height="716" fill="#0d1117"/>
+    <rect width="900" height="754" fill="#0d1117"/>
     <rect x="0" y="0" width="900" height="3" fill="url(#mAccent)"/>
-    <text class="h1" x="26" y="36">Coverage Visualizer — RDNA2 Shaders, D3D12 / Vulkan &amp; All 30 DLLs</text>
+    <text class="h1" x="26" y="36">Coverage Visualizer — RDNA2 Shaders, D3D12 / Vulkan &amp; All 31 DLLs</text>
     <text class="sub" x="26" y="56">Honest breakdown of what works vs what is still behind · Green = Live / High · Amber = Partial · Red / Grey = Behind or Stub</text>
     <line x1="26" y1="70" x2="874" y2="70" stroke="#21262d" stroke-width="1"/>
     <text class="h2" x="26" y="94">1. RDNA2 / GFX10.3 Shader Instruction Coverage (779 / 779 decoded · 100%)</text>
@@ -33,7 +33,7 @@
     <text class="lbl" x="26" y="155">MIMG (Images / Samplers / BVH)</text>
     <rect x="224" y="147" width="156" height="9" rx="4.5" fill="#21262d"/>
     <rect x="224" y="147" width="156" height="9" rx="4.5" fill="#2ea043"/>
-    <text class="mono" x="440" y="155" text-anchor="end">97/85</text>
+    <text class="mono" x="440" y="155" text-anchor="end">98/85</text>
     <text class="lbl" x="458" y="155">FLAT / GLOBAL / SCRATCH</text>
     <rect x="656" y="147" width="156" height="9" rx="4.5" fill="#21262d"/>
     <rect x="656" y="147" width="156" height="9" rx="4.5" fill="#2ea043"/>
@@ -105,7 +105,7 @@
     <text class="lbl" x="620" y="405">GPU Compute Untiling</text>
     <text class="tiny" x="864" y="404.5" text-anchor="end" fill="#2ea043" font-weight="700">LIVE</text>
     <line x1="26" y1="430" x2="874" y2="430" stroke="#21262d" stroke-width="1"/>
-    <text class="h2" x="26" y="454">3. All 30 Shimmed Xbox / GDK DLLs (16 high coverage · 4 partial · 10 stub / telemetry)</text>
+    <text class="h2" x="26" y="454">3. All 31 Shimmed Xbox / GDK DLLs (18 high coverage · 5 partial · 8 stub / telemetry)</text>
     <rect x="26" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="26" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="36" y="482">xgameruntime</text>
@@ -117,7 +117,7 @@
     <rect x="368" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="368" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="378" y="482">kernelx</text>
-    <text class="tiny" x="378" y="493">89 exports · high</text>
+    <text class="tiny" x="378" y="493">92 exports · high</text>
     <rect x="539" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="539" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="549" y="482">XCurl</text>
@@ -149,7 +149,7 @@
     <rect x="26" y="544" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="26" y="544" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="36" y="558">d3d12_xs</text>
-    <text class="tiny" x="36" y="569">81 exports · high</text>
+    <text class="tiny" x="36" y="569">83 exports · high</text>
     <rect x="197" y="544" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="197" y="544" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="207" y="558">libHttpClient</text>
@@ -161,7 +161,7 @@
     <rect x="539" y="544" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
     <rect x="539" y="544" width="3.5" height="30" rx="2" fill="#d29922"/>
     <text class="mono" x="549" y="558">advapi32leg</text>
-    <text class="tiny" x="549" y="569">14 exports · partial</text>
+    <text class="tiny" x="549" y="569">24 exports · partial</text>
     <rect x="710" y="544" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
     <rect x="710" y="544" width="3.5" height="30" rx="2" fill="#d29922"/>
     <text class="mono" x="720" y="558">xcrdapi</text>
@@ -182,50 +182,54 @@
     <rect x="539" y="582" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="549" y="596">ffx_loader</text>
     <text class="tiny" x="549" y="607">5 exports · high</text>
-    <rect x="710" y="582" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
-    <rect x="710" y="582" width="3.5" height="30" rx="2" fill="#d29922"/>
+    <rect x="710" y="582" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <rect x="710" y="582" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="720" y="596">AcpHal</text>
-    <text class="tiny" x="720" y="607">10 exports · partial</text>
-    <rect x="26" y="620" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="26" y="620" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="36" y="634">pixevt</text>
-    <text class="tiny" x="36" y="645">13 exports · stub</text>
-    <rect x="197" y="620" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="197" y="620" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="207" y="634">hix_xs</text>
-    <text class="tiny" x="207" y="645">11 exports · stub</text>
+    <text class="tiny" x="720" y="607">10 exports · high</text>
+    <rect x="26" y="620" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <rect x="26" y="620" width="3.5" height="30" rx="2" fill="#2ea043"/>
+    <text class="mono" x="36" y="634">xapu</text>
+    <text class="tiny" x="36" y="645">4 exports · high</text>
+    <rect x="197" y="620" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
+    <rect x="197" y="620" width="3.5" height="30" rx="2" fill="#d29922"/>
+    <text class="mono" x="207" y="634">pixevt</text>
+    <text class="tiny" x="207" y="645">18 exports · partial</text>
     <rect x="368" y="620" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
     <rect x="368" y="620" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="378" y="634">KernelTrace</text>
-    <text class="tiny" x="378" y="645">9 exports · stub</text>
-    <rect x="539" y="620" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="539" y="620" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="549" y="634">xtfpix</text>
-    <text class="tiny" x="549" y="645">9 exports · stub</text>
+    <text class="mono" x="378" y="634">hix_xs</text>
+    <text class="tiny" x="378" y="645">11 exports · stub</text>
+    <rect x="539" y="620" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
+    <rect x="539" y="620" width="3.5" height="30" rx="2" fill="#d29922"/>
+    <text class="mono" x="549" y="634">KernelTrace</text>
+    <text class="tiny" x="549" y="645">18 exports · partial</text>
     <rect x="710" y="620" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
     <rect x="710" y="620" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="720" y="634">xbtp</text>
-    <text class="tiny" x="720" y="645">8 exports · stub</text>
+    <text class="mono" x="720" y="634">xtfpix</text>
+    <text class="tiny" x="720" y="645">9 exports · stub</text>
     <rect x="26" y="658" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
     <rect x="26" y="658" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="36" y="672">mflnmhelp</text>
+    <text class="mono" x="36" y="672">xbtp</text>
     <text class="tiny" x="36" y="683">8 exports · stub</text>
     <rect x="197" y="658" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
     <rect x="197" y="658" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="207" y="672">mfhevcdec</text>
+    <text class="mono" x="207" y="672">mflnmhelp</text>
     <text class="tiny" x="207" y="683">8 exports · stub</text>
     <rect x="368" y="658" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
     <rect x="368" y="658" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="378" y="672">gamecorecli</text>
+    <text class="mono" x="378" y="672">mfhevcdec</text>
     <text class="tiny" x="378" y="683">8 exports · stub</text>
     <rect x="539" y="658" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
     <rect x="539" y="658" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="549" y="672">minuserx</text>
-    <text class="tiny" x="549" y="683">7 exports · stub</text>
+    <text class="mono" x="549" y="672">gamecorecli</text>
+    <text class="tiny" x="549" y="683">8 exports · stub</text>
     <rect x="710" y="658" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
     <rect x="710" y="658" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="720" y="672">xtfdebugmon</text>
+    <text class="mono" x="720" y="672">minuserx</text>
     <text class="tiny" x="720" y="683">7 exports · stub</text>
+    <rect x="26" y="696" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <rect x="26" y="696" width="3.5" height="30" rx="2" fill="#6e7681"/>
+    <text class="mono" x="36" y="710">xtfdebugmon</text>
+    <text class="tiny" x="36" y="721">7 exports · stub</text>
   </g>
-  <rect x="0.5" y="0.5" width="899" height="715" rx="12" fill="none" stroke="#30363d" stroke-width="1"/>
+  <rect x="0.5" y="0.5" width="899" height="753" rx="12" fill="none" stroke="#30363d" stroke-width="1"/>
 </svg>

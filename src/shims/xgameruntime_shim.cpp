@@ -728,6 +728,7 @@ struct AsyncRecord {
     std::condition_variable cv;
     bool result_ready = false;
     bool completed = false;
+    bool result_claimed = false;
     std::thread::id callback_thread_id{};
     XGameResult result = XGR_E_PENDING;
     size_t required_buffer_size = 0;
@@ -1103,15 +1104,21 @@ void OPENSCARLETT_GDK_CALL AsyncCompletionTrampoline(void* context, bool /*cance
     bool should_auto_cleanup = false;
     {
         std::lock_guard<std::mutex> lk(rec->mutex);
-        rec->callback_thread_id = std::thread::id{};
-        rec->completed = true;
         should_auto_cleanup = (rec->required_buffer_size == 0 || rec->result < 0);
     }
-    rec->cv.notify_all();
 
+    // Run provider cleanup BEFORE marking completed & waking XAsyncGetStatus(wait=true) waiters
+    // so callers cannot destroy a stack-allocated XAsyncBlock while XAsyncOp_Cleanup runs.
     if (should_auto_cleanup) {
         CleanupAsyncRecordOnce(rec);
     }
+
+    {
+        std::lock_guard<std::mutex> lk(rec->mutex);
+        rec->callback_thread_id = std::thread::id{};
+        rec->completed = true;
+    }
+    rec->cv.notify_all();
 }
 
 void OPENSCARLETT_GDK_CALL AsyncWorkTrampoline(void* context, bool canceled) {
@@ -1212,16 +1219,49 @@ std::shared_ptr<XUser> CreateDefaultUserObj() {
     auto u = std::make_shared<XUser>();
     u->xuid = DefaultUserXuid();
     u->local_id = 1;
-    std::string env_gt = GetEnvString("OPENSCARLETT_GAMERTAG");
+    const std::string env_gt = GetEnvString("OPENSCARLETT_GAMERTAG");
+    const std::string env_suffix = GetEnvString("OPENSCARLETT_GAMERTAG_SUFFIX");
+
+    std::string modern = "ScarlettPlayer";
+    std::string suffix = env_suffix.empty() ? "1337" : env_suffix;
     if (!env_gt.empty()) {
-        u->gamertag_classic = env_gt;
-        u->gamertag_modern = env_gt;
-    } else {
-        u->gamertag_classic = "ScarlettPlayer";
-        u->gamertag_modern = "ScarlettPlayer";
+        const size_t hash_pos = env_gt.find('#');
+        if (hash_pos != std::string::npos && hash_pos > 0u) {
+            modern = env_gt.substr(0u, hash_pos);
+            const std::string parsed_suffix = env_gt.substr(hash_pos + 1u);
+            if (!parsed_suffix.empty()) {
+                suffix = parsed_suffix;
+            }
+        } else {
+            modern = env_gt;
+        }
     }
-    u->gamertag_suffix = "1337";
-    u->gamertag_unique = u->gamertag_modern + "#" + u->gamertag_suffix;
+    if (modern.size() >= XUserGamertagComponentModernMaxBytes) {
+        modern.resize(XUserGamertagComponentModernMaxBytes - 1u);
+    }
+    if (suffix.size() >= XUserGamertagComponentModernSuffixMaxBytes) {
+        suffix.resize(XUserGamertagComponentModernSuffixMaxBytes - 1u);
+    }
+
+    // Classic gamertag is capped at 15 chars (+ NUL = 16 bytes) per GDK spec.
+    std::string classic = modern;
+    if (!env_gt.empty() && env_gt.find('#') != std::string::npos &&
+        classic.size() + suffix.size() < XUserGamertagComponentClassicMaxBytes) {
+        classic += suffix;
+    }
+    if (classic.size() >= XUserGamertagComponentClassicMaxBytes) {
+        classic.resize(XUserGamertagComponentClassicMaxBytes - 1u);
+    }
+
+    std::string unique_modern = suffix.empty() ? modern : (modern + "#" + suffix);
+    if (unique_modern.size() >= XUserGamertagComponentUniqueModernMaxBytes) {
+        unique_modern.resize(XUserGamertagComponentUniqueModernMaxBytes - 1u);
+    }
+
+    u->gamertag_classic = std::move(classic);
+    u->gamertag_modern = std::move(modern);
+    u->gamertag_suffix = std::move(suffix);
+    u->gamertag_unique = std::move(unique_modern);
     return u;
 }
 
@@ -3504,10 +3544,35 @@ XGameResult OPENSCARLETT_GDK_CALL XAsyncBegin(
     rec->identity_name = identityName ? identityName : "";
     rec->provider = provider;
 
-    // Register record & write slot into asyncBlock->internal.
+    // Register record & write slot into asyncBlock->internal (evicting any stale reused slot).
     {
         auto& rt = GetRuntime();
         std::lock_guard<std::mutex> lk(rt.async_mutex);
+        AsyncSlot prev_slot{};
+        std::memcpy(&prev_slot, asyncBlock->internal, sizeof(prev_slot));
+        if (prev_slot.magic == kAsyncSlotMagic && prev_slot.id != 0) {
+            auto prev_it = rt.async_records.find(prev_slot.id);
+            if (prev_it != rt.async_records.end()) {
+                std::lock_guard<std::mutex> rlk(prev_it->second->mutex);
+                if (prev_it->second->completed) {
+                    rt.async_records.erase(prev_it);
+                }
+            }
+        }
+        if (rt.async_records.size() > 4096u) {
+            for (auto it = rt.async_records.begin(); it != rt.async_records.end();) {
+                bool can_prune = false;
+                if (it->second->cleaned_up.load(std::memory_order_acquire)) {
+                    std::lock_guard<std::mutex> rlk(it->second->mutex);
+                    can_prune = it->second->completed;
+                }
+                if (can_prune) {
+                    it = rt.async_records.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
         rec->id = rt.next_async_id++;
         rt.async_records[rec->id] = rec;
     }
@@ -3593,14 +3658,18 @@ void OPENSCARLETT_GDK_CALL XAsyncComplete(
     {
         std::lock_guard<std::mutex> lk(rec->mutex);
         rec->result_ready = true;
-        rec->completed = true;
         should_auto_cleanup = (rec->required_buffer_size == 0 || rec->result < 0);
     }
-    rec->cv.notify_all();
 
     if (should_auto_cleanup) {
         CleanupAsyncRecordOnce(rec);
     }
+
+    {
+        std::lock_guard<std::mutex> lk(rec->mutex);
+        rec->completed = true;
+    }
+    rec->cv.notify_all();
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XAsyncGetStatus(
@@ -3661,6 +3730,9 @@ XGameResult OPENSCARLETT_GDK_CALL XAsyncGetResult(
         if (!rec->result_ready && !rec->completed) {
             return RecordHr("XAsyncGetResult", XGR_E_PENDING);
         }
+        if (rec->result_claimed) {
+            return RecordHr("XAsyncGetResult", XGR_E_INVALIDARG);
+        }
         status = rec->result;
         req_size = rec->required_buffer_size;
     }
@@ -3675,6 +3747,10 @@ XGameResult OPENSCARLETT_GDK_CALL XAsyncGetResult(
 
     if (req_size == 0) {
         if (bufferUsed) *bufferUsed = 0;
+        {
+            std::lock_guard<std::mutex> lk(rec->mutex);
+            rec->result_claimed = true;
+        }
         CleanupAsyncRecordOnce(rec);
         return RecordHr("XAsyncGetResult", XGR_S_OK);
     }
@@ -3696,10 +3772,13 @@ XGameResult OPENSCARLETT_GDK_CALL XAsyncGetResult(
         *bufferUsed = req_size;
     }
     if (hr >= 0) {
+        {
+            std::lock_guard<std::mutex> lk(rec->mutex);
+            rec->result_claimed = true;
+        }
+        // Keep rec in rt.async_records so any concurrent thread waiting in
+        // XAsyncGetStatus(asyncBlock, true) continues waiting until asyncBlock->callback finishes!
         CleanupAsyncRecordOnce(rec);
-        auto& rt = GetRuntime();
-        std::lock_guard<std::mutex> lk(rt.async_mutex);
-        rt.async_records.erase(rec->id);
     }
     return RecordHr("XAsyncGetResult", hr);
 }
@@ -3865,7 +3944,21 @@ XGameResult OPENSCARLETT_GDK_CALL XUserGetGamertag(
         case XUserGamertagComponent_UniqueModern: src = &u->gamertag_unique; break;
         default: return RecordHr("XUserGetGamertag", XGR_E_INVALIDARG);
     }
-    return RecordHr("XUserGetGamertag", CopyStringResult(*src, gamertagSize, gamertag, gamertagUsed));
+    const size_t needed = src->size() + 1u;
+    if (gamertagUsed) {
+        *gamertagUsed = needed;
+    }
+    if (!gamertag) {
+        if (gamertagSize == 0u && gamertagUsed != nullptr) {
+            return RecordHr("XUserGetGamertag", XGR_E_BOUNDS);
+        }
+        return RecordHr("XUserGetGamertag", XGR_E_INVALIDARG);
+    }
+    if (gamertagSize < needed) {
+        return RecordHr("XUserGetGamertag", XGR_E_BOUNDS);
+    }
+    std::memcpy(gamertag, src->c_str(), needed);
+    return RecordHr("XUserGetGamertag", XGR_S_OK);
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XUserGetState(XUserHandle user, XUserState* state) {
@@ -5429,7 +5522,12 @@ XGameResult OPENSCARLETT_GDK_CALL XSystemGetConsoleId(
     size_t consoleIdSize,
     char* consoleId,
     size_t* consoleIdUsed) {
-    const std::string cid = "OS-SCARLETT-0001.0001.0001.0001";
+    // Documented Microsoft GDK Xbox ConsoleId format:
+    // 8 dot-separated 4-character hex groups (39 chars + NUL = 40 bytes).
+    std::string cid = GetEnvString("OPENSCARLETT_CONSOLE_ID");
+    if (cid.empty()) {
+        cid = "5CA0.0001.0001.0001.0001.0001.0001.0001";
+    }
     return RecordHr("XSystemGetConsoleId",
                     CopyStringResult(cid, consoleIdSize, consoleId, consoleIdUsed));
 }
@@ -5687,13 +5785,16 @@ void* OPENSCARLETT_GDK_CALL XMemAlloc(size_t size, uint64_t attributes) {
 }
 
 void OPENSCARLETT_GDK_CALL XMemFree(void* pointer, uint64_t attributes) {
+    RecordOk("XMemFree");
+    if (!pointer) {
+        return;
+    }
     XMemFreeFunction hook = nullptr;
     {
         auto& rt = GetRuntime();
         std::lock_guard<std::mutex> lk(rt.mem_mutex);
         hook = rt.free_hook;
     }
-    RecordOk("XMemFree");
     if (hook) {
         hook(pointer, attributes);
         return;
@@ -8816,11 +8917,20 @@ XGameResult OPENSCARLETT_GDK_CALL XStoreShowRateAndReviewUIAsync(
         StartVoidAsync(async, kIdStoreShowRateUi, kIdStoreShowRateUi, XGR_S_OK));
 }
 
-XGameResult OPENSCARLETT_GDK_CALL XStoreShowRateAndReviewUIResult(XAsyncBlock* async) {
+XGameResult OPENSCARLETT_GDK_CALL XStoreShowRateAndReviewUIResult(
+    XAsyncBlock* async,
+    XStoreRateAndReviewResult* result) {
     if (!async) {
         return RecordHr("XStoreShowRateAndReviewUIResult", XGR_E_INVALIDARG);
     }
-    return RecordHr("XStoreShowRateAndReviewUIResult", XAsyncGetStatus(async, true));
+    const XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr >= 0 && result != nullptr) {
+        // Strictly 1-byte bool write matching Microsoft GDK XStoreRateAndReviewResult ABI
+        // (never write 4 bytes past a 1-byte caller struct!).
+        const uint8_t was_updated = 0u;
+        std::memcpy(result, &was_updated, 1u);
+    }
+    return RecordHr("XStoreShowRateAndReviewUIResult", hr);
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XStoreShowRedeemTokenUIAsync(
@@ -8942,14 +9052,36 @@ XGameResult OPENSCARLETT_GDK_CALL XGameUiShowErrorDialogResult(XAsyncBlock* asyn
 
 XGameResult OPENSCARLETT_GDK_CALL XGameUiShowTextEntryAsync(
     XAsyncBlock* async,
-    const char* /*titleText*/,
-    const char* /*descriptionText*/,
+    const char* titleText,
+    const char* descriptionText,
     const char* defaultText,
-    XGameUiTextEntryInputScope /*inputScope*/,
+    XGameUiTextEntryInputScope inputScope,
     uint32_t maxTextLength) {
     if (!async) {
         return RecordHr("XGameUiShowTextEntryAsync", XGR_E_INVALIDARG);
     }
+#if defined(_WIN32)
+    {
+        static const std::string s_trace_xgr = []() {
+            char buf[512]{};
+            DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_XGR", buf, sizeof(buf));
+            return (n > 0 && n < sizeof(buf)) ? std::string(buf, n) : std::string{};
+        }();
+        if (!s_trace_xgr.empty()) {
+            FILE* f = nullptr;
+            if (::fopen_s(&f, s_trace_xgr.c_str(), "a") == 0 && f) {
+                std::fprintf(f, "[XGR] XGameUiShowTextEntryAsync title='%s' desc='%s' default='%s' scope=%u maxLen=%u\n",
+                             titleText ? titleText : "", descriptionText ? descriptionText : "",
+                             defaultText ? defaultText : "", static_cast<unsigned>(inputScope), maxTextLength);
+                std::fclose(f);
+            }
+        }
+    }
+#else
+    (void)titleText;
+    (void)descriptionText;
+    (void)inputScope;
+#endif
     std::string text = defaultText ? defaultText : "";
     if (maxTextLength > 0 && text.size() > maxTextLength) {
         text.resize(maxTextLength);
@@ -10142,6 +10274,12 @@ const IXgrAccessibilityApiVtable g_accessibility_vtable = {
     &XClosedCaptionGetProperties,
     &XClosedCaptionSetEnabled,
     &XHighContrastGetMode,
+    &XSpeechToTextSetPositionHint,
+    &XSpeechToTextSendString,
+    &XSpeechToTextBeginHypothesisString,
+    &XSpeechToTextUpdateHypothesisString,
+    &XSpeechToTextFinalizeHypothesisString,
+    &XSpeechToTextCancelHypothesisString,
 };
 
 const IXgrSpeechSynthesizerApiVtable g_speech_synth_vtable = {
@@ -10912,6 +11050,9 @@ constexpr RealComInterfaceMapping kRealComMappings[] = {
     // 10. XAccessibility + XSpeechSynthesizer + XSpeechToText
     {{0x3E241977u, 0x6237u, 0x41E9u, {0x85, 0x59, 0x10, 0x2C, 0x2D, 0x99, 0x83, 0xF1}},
      {0xD722B373u, 0x8C4Du, 0x4692u, {0x9E, 0x51, 0xD6, 0xAD, 0x9B, 0x37, 0xAA, 0x7D}},
+     kComAccessibilitySpeech},
+    {{0x3E241977u, 0x6237u, 0x41E9u, {0x85, 0x59, 0x10, 0x2C, 0x2D, 0x99, 0x83, 0xF1}},
+     {0x3E241977u, 0x6237u, 0x41E9u, {0x85, 0x59, 0x10, 0x2C, 0x2D, 0x99, 0x83, 0xF1}},
      kComAccessibilitySpeech},
     // 11. XGameSave
     {{0x704C3F58u, 0xE629u, 0x4CC2u, {0xB1, 0x97, 0x30, 0x51, 0x1B, 0x99, 0x6F, 0xE2}},

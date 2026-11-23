@@ -57,9 +57,12 @@ struct VulkanDeviceInfo {
     uint32_t supported_subgroup_operations = 0;
     bool supports_bc_texture_compression = false;
 
-    // OPENSCARLETT_VK_DEVICE adapter substring selection diagnostics
+    // OPENSCARLETT_VK_GPU / OPENSCARLETT_VK_DEVICE adapter selection diagnostics
     std::string selected_device_filter;
     bool matched_device_filter = false;
+    uint64_t device_local_vram_bytes = 0;
+    uint64_t device_rank_score = 0;
+    uint32_t enumerated_device_index = 0;
 
     // Extended D3D12 parity capabilities probed live via vkGetPhysicalDeviceFeatures2/Properties2
     bool supports_depth_bounds_test = false;
@@ -193,6 +196,7 @@ enum class VulkanCommandOp : uint32_t {
     BindComputePipeline = 2,
     BindDescriptorSets = 3,
     Dispatch = 4,
+    GlobalUavBarrier = 5,
 };
 
 struct VulkanCommandItem {
@@ -212,7 +216,28 @@ struct VulkanCommandListResult {
     uint32_t recorded_commands = 0;
     uint32_t dispatch_count = 0;
     uint32_t barrier_count = 0;
+    uint32_t global_uav_barrier_count = 0;
+    uint32_t last_global_uav_src_stage_mask = 0;
+    uint32_t last_global_uav_dst_stage_mask = 0;
+    uint32_t last_global_uav_src_access_mask = 0;
+    uint32_t last_global_uav_dst_access_mask = 0;
     bool executed_on_vulkan_icd = false;
+};
+
+// Candidate physical device metadata used by deterministic GPU ranking & OPENSCARLETT_VK_GPU selector (AnyBox #68).
+struct VulkanPhysicalDeviceCandidate {
+    uint32_t enumerated_index = 0;
+    std::string device_name;
+    uint32_t vendor_id = 0;
+    uint32_t device_id = 0;
+    uint32_t api_version = 0;
+    uint32_t driver_version = 0;
+    VulkanDeviceType device_type = VulkanDeviceType::Other;
+    uint64_t device_local_vram_bytes = 0;
+    bool supports_compute = false;
+    bool supports_graphics = false;
+    bool supports_mesh_shader = false;
+    uint64_t rank_score = 0;
 };
 
 // Supported Vulkan image formats (values match Khronos VkFormat constants).
@@ -611,6 +636,25 @@ public:
     bool is_fallback_mode() const noexcept;
 
     const VulkanDeviceInfo& GetDeviceInfo() const noexcept { return device_info_; }
+
+    // Deterministic physical-device ranking & OPENSCARLETT_VK_GPU selector helpers (AnyBox #68).
+    // Ranks Discrete > Integrated > Virtual > CPU > Other, weighted by graphics+compute,
+    // VK_EXT_mesh_shader, device-local VRAM size, and Vulkan API version.
+    static uint64_t ScorePhysicalDeviceCandidate(const VulkanPhysicalDeviceCandidate& candidate) noexcept;
+    static std::vector<VulkanPhysicalDeviceCandidate> RankPhysicalDeviceCandidates(
+        std::vector<VulkanPhysicalDeviceCandidate> candidates);
+    // Selects a physical device using OPENSCARLETT_VK_GPU syntax:
+    //   - empty string: highest-ranked eligible candidate
+    //   - non-negative integer (e.g. "0", "1"): selects candidate by enumerated_index
+    //   - non-numeric string (e.g. "Intel", "RTX"): highest-ranked case-insensitive name substring match
+    static bool SelectPhysicalDeviceCandidate(
+        const std::vector<VulkanPhysicalDeviceCandidate>& candidates,
+        const std::string& gpu_selector,
+        VulkanPhysicalDeviceCandidate& out_selected,
+        bool* out_matched_selector = nullptr);
+    // Enumerates and ranks all compute-capable physical devices on the live Vulkan ICD.
+    static Status EnumerateRankedPhysicalDevices(
+        std::vector<VulkanPhysicalDeviceCandidate>& out_ranked_devices);
 
     // Live Vulkan physical-device capability probe & D3D12 OPTIONS2 / OPTIONS7 mapping helpers.
     const VulkanFeatureProbe& GetFeatureProbe() const noexcept { return feature_probe_; }

@@ -74,6 +74,7 @@ struct PeForwarderPreflightEntry {
     std::string source_module;
     std::string input_spec;
     PeForwarderChainResult result;
+    bool delay_loaded = false;
 };
 
 struct PeForwarderPreflightReport {
@@ -83,11 +84,14 @@ struct PeForwarderPreflightReport {
     uint32_t windows_system_count = 0;
     uint32_t apiset_redirected_count = 0;
     uint32_t native_guest_count = 0;
+    uint32_t delay_load_count = 0;
+    uint32_t delay_load_shim_count = 0;
     uint32_t unresolved_count = 0;
     uint32_t cycle_error_count = 0;
     uint32_t malformed_error_count = 0;
     bool ready_to_launch = false;
     std::vector<PeForwarderPreflightEntry> entries;
+    std::vector<std::string> delay_load_dlls;
     std::vector<std::string> blockers;
 };
 
@@ -160,6 +164,13 @@ public:
     PeForwarderPreflightReport BuildPreflightReport(const PeInspectionReport& pe_report,
                                                     const PeForwarderLookupFn& next_lookup = {},
                                                     uint32_t max_depth = 16u) const;
+
+    // Inspects and resolves all delay-load import entries (IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT)
+    // discovered in a PE inspection report.
+    std::vector<PeForwarderPreflightEntry> InspectDelayLoadImports(
+        const PeInspectionReport& pe_report,
+        const PeForwarderLookupFn& next_lookup = {},
+        uint32_t max_depth = 16u) const;
 
     // Produces a preflight readiness report for a standalone list of forwarder strings.
     PeForwarderPreflightReport BuildPreflightReportFromForwarders(

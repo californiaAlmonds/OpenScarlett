@@ -105,6 +105,7 @@ struct D3D12XBOX_VRAM_RESIDENCY_STATS {
     uint64_t window0_descriptor_bytes = 0ull;
     uint64_t window1_title_buffer_allocs = 0ull;
     uint64_t window1_title_buffer_bytes = 0ull;
+    uint64_t promoted_oversized_placed_resources = 0ull;
 };
 
 struct D3D12XBOX_AGILITY_SDK_INFO {
@@ -149,6 +150,15 @@ struct IOpenScarlettVramResidencyControl : public IUnknown {
 };
 
 void QueryAgilitySdkRuntimeSnapshot(D3D12XBOX_AGILITY_SDK_INFO* out_info) noexcept;
+
+// Display VLine & Frame notification registry implemented in src/shims/d3d12_xs_shim.cpp
+// and signaled on CommandQueueX::PresentX completion (xvalkyrie a252811).
+void SignalRegisteredDisplayNotificationsOnPresent(
+    uint64_t* out_vline_signaled = nullptr,
+    uint64_t* out_frame_signaled = nullptr) noexcept;
+void GetDisplayNotificationCounts(
+    uint64_t* out_vline_signaled,
+    uint64_t* out_frame_signaled) noexcept;
 
 class DeviceExtendedProxy;
 class DxgiDeviceProxy;
@@ -218,7 +228,8 @@ class DeviceX final
       public IOpenScarlettUnifiedMemory,
       public IOpenScarlettVulkanRouting,
       public IOpenScarlettAaaRuntime,
-      public IOpenScarlettVramResidencyControl {
+      public IOpenScarlettVramResidencyControl,
+      public IOpenScarlettGraphicsParity {
 public:
     DeviceX(ID3D12Device* host_device,
             const D3D12AdapterInfo& adapter_info,
@@ -795,6 +806,34 @@ public:
     HRESULT STDMETHODCALLTYPE FreeSparseWindowVa(
         uint64_t va) override;
 
+    // IOpenScarlettGraphicsParity
+    HRESULT STDMETHODCALLTYPE GetGraphicsParityStats(
+        D3D12XBOX_GRAPHICS_PARITY_STATS* out_stats) override;
+
+    // Sprint 15: Live MSAA quality clamping, console flag stripping, and parity telemetry hooks.
+    bool ClampMsaaSampleDescForFormat(DXGI_FORMAT format, DXGI_SAMPLE_DESC& sample_desc) noexcept;
+    D3D12_RESOURCE_DESC SanitizeAndClampResourceDesc(const D3D12_RESOURCE_DESC& desc) noexcept;
+    D3D12_RESOURCE_DESC1 SanitizeAndClampResourceDesc1(const D3D12_RESOURCE_DESC1& desc) noexcept;
+    void RecordGlobalUavBarrier() noexcept {
+        global_uav_barriers_recorded_.fetch_add(1ull, std::memory_order_relaxed);
+    }
+    void RecordUnsupportedCmdListExtensionIgnored() noexcept {
+        unsupported_cmdlist_extensions_ignored_.fetch_add(1ull, std::memory_order_relaxed);
+    }
+    void RecordZeroCountNoop() noexcept {
+        zero_count_noop_calls_.fetch_add(1ull, std::memory_order_relaxed);
+    }
+    void RecordDepthStencilPlaneCopy() noexcept {
+        depth_stencil_plane_copies_.fetch_add(1ull, std::memory_order_relaxed);
+    }
+    void RecordFootprintOffsetCopy() noexcept {
+        footprint_offset_copies_.fetch_add(1ull, std::memory_order_relaxed);
+    }
+    void RecordDisplayNotificationsSignaled(uint64_t vlines, uint64_t frames) noexcept {
+        if (vlines > 0ull) vline_notifications_signaled_.fetch_add(vlines, std::memory_order_relaxed);
+        if (frames > 0ull) frame_notifications_signaled_.fetch_add(frames, std::memory_order_relaxed);
+    }
+
     void NotifyDescriptorHeapDestroyed(ID3D12DescriptorHeap* host_heap) noexcept;
 
 private:
@@ -1057,6 +1096,21 @@ private:
     std::atomic<uint64_t> pso_interp_validations_{0ull};
     std::atomic<uint64_t> pso_interp_matches_{0ull};
     bool retail_scarlett_abi_ = false;
+
+    // Sprint 15: D3D12X / Xbox Graphics Parity diagnostic counters
+    std::atomic<uint64_t> promoted_oversized_placed_resources_{0ull};
+    std::atomic<uint64_t> msaa_quality_clamps_{0ull};
+    std::atomic<uint64_t> console_flags_stripped_{0ull};
+    std::atomic<uint64_t> reserved_cross_adapter_preserved_{0ull};
+    std::atomic<uint64_t> reserved_cross_adapter_stripped_fallback_{0ull};
+    std::atomic<uint64_t> global_uav_barriers_recorded_{0ull};
+    std::atomic<uint64_t> unsupported_cmdlist_extensions_ignored_{0ull};
+    std::atomic<uint64_t> zero_count_noop_calls_{0ull};
+    std::atomic<uint64_t> readonly_dsv_creations_{0ull};
+    std::atomic<uint64_t> depth_stencil_plane_copies_{0ull};
+    std::atomic<uint64_t> footprint_offset_copies_{0ull};
+    std::atomic<uint64_t> vline_notifications_signaled_{0ull};
+    std::atomic<uint64_t> frame_notifications_signaled_{0ull};
 
     // 256-byte CBV alignment ring buffer for Xbox 16-byte-aligned root CBVs on desktop D3D12.
     std::mutex cbv_align_mutex_;

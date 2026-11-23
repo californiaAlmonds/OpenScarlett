@@ -211,6 +211,45 @@ enum class Rdna2MtbufFormat : uint8_t {
     R32G32B32A32_FLOAT = 74,
 };
 
+// Single authoritative GFX10.3 typed-buffer (MTBUF/MUBUF) format byte-size & kind descriptor (Leonida aa2988c)
+struct Rdna2MtbufFormatInfo {
+    Rdna2MtbufFormat format = Rdna2MtbufFormat::Invalid;
+    uint8_t component_bytes = 0;   // 1, 2, or 4 bytes per component (0 if invalid)
+    uint8_t component_count = 0;   // 1, 2, 3, or 4 components
+    uint8_t byte_stride = 0;       // total element byte stride
+    bool is_integer = false;       // UINT / SINT
+    bool is_signed = false;        // SNORM / SINT
+    bool is_normalized = false;    // UNORM / SNORM
+    bool is_float = false;         // FLOAT
+    bool is_valid = false;
+};
+
+Rdna2MtbufFormatInfo GetRdna2MtbufFormatInfo(Rdna2MtbufFormat fmt) noexcept;
+Rdna2MtbufFormatInfo GetRdna2MtbufFormatInfo(uint8_t raw_fmt) noexcept;
+
+// Full RDNA2 / GFX10.3 ds_swizzle_b32 offset mode decoding & source-lane evaluation (xbox-emulator #184/#186)
+enum class Rdna2DsSwizzleMode : uint8_t {
+    BitMode = 0,      // offset[15]==1: ((lane & and_mask) | or_mask) ^ xor_mask
+    QuadPermute = 1,  // offset[15]==0, offset[14:13]==0: 4x2-bit lane indices in 4-lane quad
+    Rotate = 2,       // offset[15]==0, offset[14:13]==1: rotate-right within cluster size
+    Fft = 3,          // offset[15]==0, offset[14:13]==2: butterfly pair swap
+    Reserved = 4,     // offset[15]==0, offset[14:13]==3
+};
+
+struct Rdna2DsSwizzleInfo {
+    Rdna2DsSwizzleMode mode = Rdna2DsSwizzleMode::BitMode;
+    uint8_t and_mask = 0x1Fu;
+    uint8_t or_mask = 0u;
+    uint8_t xor_mask = 0u;
+    uint8_t quad_sel[4] = {0u, 1u, 2u, 3u};
+    uint8_t rotate_shift = 0u;
+    uint8_t rotate_cluster_mask = 31u;  // cluster_size - 1
+    uint8_t fft_mask = 0u;
+};
+
+Rdna2DsSwizzleInfo DecodeRdna2DsSwizzleOffset(uint16_t offset) noexcept;
+uint32_t ComputeRdna2DsSwizzleSrcLane(uint32_t lane, uint16_t offset, uint32_t wave_size = 32u) noexcept;
+
 enum class Rdna2Encoding : uint8_t {
     Unknown = 0,
     SOP2,
@@ -241,6 +280,9 @@ enum class Rdna2Opcode : uint16_t {
     S_SUB_U32,
     S_ADD_I32,
     S_SUB_I32,
+    S_ADDC_U32,
+    S_SUBB_U32,
+    S_ABSDIFF_I32,
     S_MIN_I32,
     S_MIN_U32,
     S_MAX_I32,
@@ -260,6 +302,7 @@ enum class Rdna2Opcode : uint16_t {
     // SOP1
     S_MOV_B32,
     S_NOT_B32,
+    S_BREV_B32,
     S_BCNT1_I32_B32,
     S_BCNT1_I32_B64,
     S_SETPC_B64,
@@ -285,6 +328,10 @@ enum class Rdna2Opcode : uint16_t {
     S_VERSION,
     S_ADDK_I32,
     S_MULK_I32,
+    S_WAITCNT_VSCNT,
+    S_WAITCNT_VMCNT,
+    S_WAITCNT_EXPCNT,
+    S_WAITCNT_LGKMCNT,
 
     // SOPP
     S_NOP,
@@ -348,14 +395,25 @@ enum class Rdna2Opcode : uint16_t {
     V_FRACT_F32,
     V_CVT_NORM_I16_F16,
     V_CVT_NORM_U16_F16,
+    V_SWAP_B32,
 
-    // VOPC (and GFX10 V_CMPX execution-mask compares + split-range F16 compares)
+    // VOPC (and GFX10 V_CMPX execution-mask compares + full ordered/unordered F32 & split-range F16 compares)
+    V_CMP_F_F32,
     V_CMP_LT_F32,
     V_CMP_EQ_F32,
     V_CMP_LE_F32,
     V_CMP_GT_F32,
     V_CMP_LG_F32,
     V_CMP_GE_F32,
+    V_CMP_O_F32,
+    V_CMP_U_F32,
+    V_CMP_NGE_F32,
+    V_CMP_NLG_F32,
+    V_CMP_NGT_F32,
+    V_CMP_NLE_F32,
+    V_CMP_NEQ_F32,
+    V_CMP_NLT_F32,
+    V_CMP_TRU_F32,
     V_CMPX_LT_F32,
     V_CMPX_EQ_F32,
     V_CMPX_LE_F32,
@@ -410,7 +468,9 @@ enum class Rdna2Opcode : uint16_t {
     V_BFE_U32,
     V_BFE_I32,
     V_BFI_B32,
+    V_ALIGNBIT_B32,
     V_ALIGNBYTE_B32,
+    V_DIV_FMAS_F32,
     V_MUL_LO_U32,
     V_ADD_NC_U16,
     V_SUB_NC_U16,
@@ -432,13 +492,16 @@ enum class Rdna2Opcode : uint16_t {
     V_PERMLANE16_B32,
     V_PERMLANEX16_B32,
 
-    // VOP3P (packed 16-bit f16 / u16 / b16 ops, encoding 0x33)
+    // VOP3P (packed 16-bit f16 / u16 / b16 & mixed-precision ops, encoding 0x33)
     V_PK_LSHLREV_B16,
     V_PK_LSHRREV_B16,
     V_PK_ADD_U16,
     V_PK_FMA_F16,
     V_PK_ADD_F16,
     V_PK_MUL_F16,
+    V_FMA_MIX_F32,
+    V_FMA_MIXLO_F16,
+    V_FMA_MIXHI_F16,
 
     // SMEM
     S_LOAD_DWORD,
@@ -473,6 +536,7 @@ enum class Rdna2Opcode : uint16_t {
     IMAGE_ATOMIC_CMPSWAP,
     IMAGE_SAMPLE,
     IMAGE_SAMPLE_LZ,
+    IMAGE_SAMPLE_C_LZ,
     IMAGE_BVH_INTERSECT_RAY,
 
     // DS (LDS / Shared Memory & Swizzle)
@@ -481,6 +545,12 @@ enum class Rdna2Opcode : uint16_t {
     DS_ADD_RTN_U32,
     DS_SWIZZLE_B32,
     DS_READ_B32,
+    DS_READ_U8_D16,
+    DS_READ_U8_D16_HI,
+    DS_READ_I8_D16,
+    DS_READ_I8_D16_HI,
+    DS_READ_U16_D16,
+    DS_READ_U16_D16_HI,
 
     // FLAT / GLOBAL / SCRATCH
     GLOBAL_LOAD_DWORD,
@@ -776,13 +846,16 @@ public:
         uint16_t offset = 0,
         bool gds = false);
 
-    // GLOBAL / FLAT / SCRATCH (64-bit)
+    // GLOBAL / FLAT / SCRATCH (64-bit) — 12-bit offset strictly pinned to word0[11:0] against dlc/glc/slc
     void EmitGlobal(
         Rdna2Opcode op,
         uint8_t vdst_or_data,
         uint8_t vaddr,
         int16_t offset = 0,
-        uint8_t saddr = 0x7Fu);
+        uint8_t saddr = 0x7Fu,
+        bool dlc = false,
+        bool glc = false,
+        bool slc = false);
 
     // SCRATCH (64-bit FLAT encoding with flat_seg == 1)
     void EmitScratch(
@@ -790,7 +863,10 @@ public:
         uint8_t vdst_or_data,
         uint8_t vaddr,
         int16_t offset = 0,
-        uint8_t saddr = 0x7Fu);
+        uint8_t saddr = 0x7Fu,
+        bool dlc = false,
+        bool glc = false,
+        bool slc = false);
 
     // EXP (64-bit)
     void EmitExp(

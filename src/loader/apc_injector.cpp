@@ -17,6 +17,7 @@
 
 #include "openscarlett/core/telemetry.h"
 #include "openscarlett/loader/game_config.h"
+#include "openscarlett/loader/pe_forwarder.h"
 #include "openscarlett/loader/pe_inspector.h"
 #include "openscarlett/loader/vfs_mounts.h"
 
@@ -808,11 +809,15 @@ bool RedirectChildStaticXboxImports(HANDLE h_process,
 
     const uint32_t image_size = nt.OptionalHeader.SizeOfImage;
     const auto& imp_dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (imp_dir.VirtualAddress == 0 || imp_dir.VirtualAddress >= image_size) {
+    const auto& dly_dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+    const bool has_imp_dir = (imp_dir.VirtualAddress != 0 && imp_dir.VirtualAddress < image_size);
+    const bool has_dly_dir = (dly_dir.VirtualAddress != 0 && dly_dir.VirtualAddress < image_size);
+    if (!has_imp_dir && !has_dly_dir) {
         return true;
     }
 
     const DllRoutingTable routing = DllRoutingTable::CreateWithEnvOverrides();
+    const PeForwarderResolver forwarder_resolver(routing);
     const bool probe_unknown_imports = IsProbeUnknownImportsEnvEnabled();
     const std::wstring exe_dir_w = probe_unknown_imports ? QueryProcessExeDirW(h_process) : std::wstring{};
 
@@ -820,40 +825,115 @@ bool RedirectChildStaticXboxImports(HANDLE h_process,
     std::vector<std::string> imported_names;
     bool has_console_exclusive_import = false;
 
-    const uintptr_t imp_table_addr = image_base + imp_dir.VirtualAddress;
-    for (size_t idx = 0; idx < 1024; ++idx) {
-        IMAGE_IMPORT_DESCRIPTOR d{};
-        if (!::ReadProcessMemory(h_process,
-                                 reinterpret_cast<LPCVOID>(imp_table_addr + idx * sizeof(d)),
-                                 &d, sizeof(d), &rw) ||
-            rw != sizeof(d)) {
-            break;
+    const uintptr_t imp_table_addr = has_imp_dir ? (image_base + imp_dir.VirtualAddress) : 0u;
+    if (has_imp_dir) {
+        for (size_t idx = 0; idx < 1024; ++idx) {
+            IMAGE_IMPORT_DESCRIPTOR d{};
+            if (!::ReadProcessMemory(h_process,
+                                     reinterpret_cast<LPCVOID>(imp_table_addr + idx * sizeof(d)),
+                                     &d, sizeof(d), &rw) ||
+                rw != sizeof(d)) {
+                break;
+            }
+            if (d.OriginalFirstThunk == 0 && d.Name == 0 && d.FirstThunk == 0) {
+                break;
+            }
+            std::string dll_name;
+            if (d.Name != 0 && d.Name < image_size) {
+                char name_buf[260]{};
+                const size_t max_read = std::min<size_t>(sizeof(name_buf) - 1, image_size - d.Name);
+                if (::ReadProcessMemory(h_process,
+                                        reinterpret_cast<LPCVOID>(image_base + d.Name),
+                                        name_buf, max_read, &rw) &&
+                    rw > 0) {
+                    name_buf[rw] = '\0';
+                    dll_name = name_buf;
+                }
+            }
+            if (!dll_name.empty() && ClassifyImportDll(dll_name) == DllCategory::ConsoleExclusive) {
+                has_console_exclusive_import = true;
+            }
+            imported_names.push_back(std::move(dll_name));
+            descs.push_back(d);
         }
-        if (d.OriginalFirstThunk == 0 && d.Name == 0 && d.FirstThunk == 0) {
-            break;
+    }
+
+    // Also inspect PE delay-load imports (IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT) so delay-loaded
+    // console DLLs are discovered and redirected cleanly at launch before resume.
+    std::vector<IMAGE_DELAYLOAD_DESCRIPTOR> delay_descs;
+    std::vector<std::string> delay_names;
+    const uintptr_t dly_table_addr = has_dly_dir ? (image_base + dly_dir.VirtualAddress) : 0u;
+    if (has_dly_dir) {
+        for (size_t idx = 0; idx < 1024; ++idx) {
+            if (dly_dir.VirtualAddress + (idx + 1) * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR) > image_size) {
+                break;
+            }
+            IMAGE_DELAYLOAD_DESCRIPTOR d{};
+            if (!::ReadProcessMemory(h_process,
+                                     reinterpret_cast<LPCVOID>(dly_table_addr + idx * sizeof(d)),
+                                     &d, sizeof(d), &rw) ||
+                rw != sizeof(d)) {
+                break;
+            }
+            if (d.DllNameRVA == 0 && d.ImportAddressTableRVA == 0) {
+                break;
+            }
+            std::string dll_name;
+            if (d.Attributes.RvaBased != 0 && d.DllNameRVA != 0 && d.DllNameRVA < image_size) {
+                char name_buf[260]{};
+                const size_t max_read = std::min<size_t>(sizeof(name_buf) - 1, image_size - d.DllNameRVA);
+                if (::ReadProcessMemory(h_process,
+                                        reinterpret_cast<LPCVOID>(image_base + d.DllNameRVA),
+                                        name_buf, max_read, &rw) &&
+                    rw > 0) {
+                    name_buf[rw] = '\0';
+                    dll_name = name_buf;
+                }
+            }
+            if (!dll_name.empty() && ClassifyImportDll(dll_name) == DllCategory::ConsoleExclusive) {
+                has_console_exclusive_import = true;
+            }
+            delay_names.push_back(std::move(dll_name));
+            delay_descs.push_back(d);
         }
-        std::string dll_name;
-        if (d.Name != 0 && d.Name < image_size) {
-            char name_buf[260]{};
-            const size_t max_read = std::min<size_t>(sizeof(name_buf) - 1, image_size - d.Name);
-            if (::ReadProcessMemory(h_process,
-                                    reinterpret_cast<LPCVOID>(image_base + d.Name),
-                                    name_buf, max_read, &rw) &&
-                rw > 0) {
-                name_buf[rw] = '\0';
-                dll_name = name_buf;
+    }
+
+    auto resolve_redirect_for_dll = [&](const std::string& dll_name,
+                                        std::string& out_path,
+                                        int& out_priority) -> bool {
+        out_path.clear();
+        out_priority = 10;
+        if (dll_name.empty()) {
+            return false;
+        }
+        DllRouteDecision decision =
+            routing.ResolveRoute(dll_name, shim_dir_w, guest_dir_w, has_console_exclusive_import);
+        if (decision.policy != DllRoutePolicy::Shim) {
+            std::string canon_dll;
+            ForwarderResolutionKind fkind = ForwarderResolutionKind::Unresolved;
+            bool via_api_set = false;
+            bool via_alias = false;
+            if (forwarder_resolver.ResolveTargetDll(dll_name, canon_dll, fkind, via_api_set, via_alias) &&
+                fkind == ForwarderResolutionKind::OpenScarlettShim) {
+                decision = routing.ResolveRoute(
+                    canon_dll, shim_dir_w, guest_dir_w, has_console_exclusive_import);
             }
         }
-        if (!dll_name.empty() && ClassifyImportDll(dll_name) == DllCategory::ConsoleExclusive) {
-            has_console_exclusive_import = true;
+        const bool should_rewrite =
+            !decision.resolved_path.empty() &&
+            (decision.policy == DllRoutePolicy::Shim ||
+             (decision.policy == DllRoutePolicy::NativeGuestDll && decision.from_override));
+        if (!should_rewrite) {
+            return false;
         }
-        imported_names.push_back(std::move(dll_name));
-        descs.push_back(d);
-    }
+        out_path = WideToUtf8(decision.resolved_path);
+        out_priority = decision.load_priority;
+        return !out_path.empty();
+    };
 
     std::vector<std::string> full_paths(descs.size());
     std::vector<int> priorities(descs.size(), 10);
-    bool any_redirected = false;
+    bool any_static_redirected = false;
 
     struct MissingDllGroup {
         std::string display_name;
@@ -869,17 +949,12 @@ bool RedirectChildStaticXboxImports(HANDLE h_process,
         if (dll_name.empty()) {
             continue;
         }
-
-        const DllRouteDecision decision =
-            routing.ResolveRoute(dll_name, shim_dir_w, guest_dir_w, has_console_exclusive_import);
-        const bool should_rewrite =
-            !decision.resolved_path.empty() &&
-            (decision.policy == DllRoutePolicy::Shim ||
-             (decision.policy == DllRoutePolicy::NativeGuestDll && decision.from_override));
-        if (should_rewrite) {
-            full_paths[idx] = WideToUtf8(decision.resolved_path);
-            priorities[idx] = decision.load_priority;
-            any_redirected = true;
+        std::string resolved_path;
+        int prio = 10;
+        if (resolve_redirect_for_dll(dll_name, resolved_path, prio)) {
+            full_paths[idx] = std::move(resolved_path);
+            priorities[idx] = prio;
+            any_static_redirected = true;
             continue;
         }
 
@@ -930,7 +1005,7 @@ bool RedirectChildStaticXboxImports(HANDLE h_process,
                         full_paths[d_idx] = stub_path_u8;
                         priorities[d_idx] = 8;
                     }
-                    any_redirected = true;
+                    any_static_redirected = true;
 
                     CallTelemetry::Global().Record(
                         "probe_stub",
@@ -968,18 +1043,41 @@ bool RedirectChildStaticXboxImports(HANDLE h_process,
         }
     }
 
-    if (!any_redirected || descs.empty()) {
+    std::vector<std::string> delay_full_paths;
+    delay_full_paths.reserve(delay_descs.size());
+    uint32_t delay_redirected_count = 0;
+    for (size_t idx = 0; idx < delay_descs.size(); ++idx) {
+        std::string resolved_path;
+        int prio = 10;
+        if (delay_descs[idx].Attributes.RvaBased != 0 &&
+            resolve_redirect_for_dll(delay_names[idx], resolved_path, prio)) {
+            delay_full_paths.push_back(std::move(resolved_path));
+            ++delay_redirected_count;
+        } else {
+            delay_full_paths.emplace_back();
+        }
+    }
+
+    if (!any_static_redirected && delay_redirected_count == 0u) {
         return true;
     }
 
-    // Pack redirected full ASCII DLL paths into a contiguous buffer allocated within +2 GiB of image_base
-    // so every replacement Name RVA is a valid positive 32-bit offset from image_base.
+    // Pack redirected full ASCII DLL paths (both static & delay-load) into a contiguous buffer
+    // allocated within +2 GiB of image_base so every replacement RVA fits in a positive 32-bit offset.
     std::vector<char> str_blob;
     std::vector<uint32_t> str_offsets(descs.size(), 0u);
     for (size_t i = 0; i < descs.size(); ++i) {
         if (!full_paths[i].empty()) {
             str_offsets[i] = static_cast<uint32_t>(str_blob.size());
             str_blob.insert(str_blob.end(), full_paths[i].begin(), full_paths[i].end());
+            str_blob.push_back('\0');
+        }
+    }
+    std::vector<uint32_t> delay_str_offsets(delay_descs.size(), 0u);
+    for (size_t i = 0; i < delay_descs.size(); ++i) {
+        if (!delay_full_paths[i].empty()) {
+            delay_str_offsets[i] = static_cast<uint32_t>(str_blob.size());
+            str_blob.insert(str_blob.end(), delay_full_paths[i].begin(), delay_full_paths[i].end());
             str_blob.push_back('\0');
         }
     }
@@ -1010,73 +1108,97 @@ bool RedirectChildStaticXboxImports(HANDLE h_process,
 
     const uint32_t blob_base_rva =
         static_cast<uint32_t>(reinterpret_cast<uintptr_t>(remote_str_base) - image_base);
-    for (size_t i = 0; i < descs.size(); ++i) {
-        if (!full_paths[i].empty()) {
-            descs[i].Name = blob_base_rva + str_offsets[i];
-            descs[i].TimeDateStamp = 0;
-        }
-    }
+    bool wrote_ok = true;
 
-    // Order descriptors using deterministic Kahn's topological sort over PE imports
-    // so dependencies always initialize strictly before their importers (breaking ties by load_priority).
-    std::vector<DllDependencyNode> dep_nodes;
-    dep_nodes.reserve(descs.size());
-    for (size_t i = 0; i < descs.size(); ++i) {
-        DllDependencyNode node{};
-        std::string orig_name;
-        if (descs[i].Name != 0 && descs[i].Name < image_size) {
-            char name_buf[260]{};
-            const size_t max_read = std::min<size_t>(sizeof(name_buf) - 1, image_size - descs[i].Name);
-            if (::ReadProcessMemory(h_process,
-                                    reinterpret_cast<LPCVOID>(image_base + descs[i].Name),
-                                    name_buf, max_read, &rw) &&
-                rw > 0) {
-                name_buf[rw] = '\0';
-                orig_name = name_buf;
+    if (any_static_redirected && !descs.empty()) {
+        for (size_t i = 0; i < descs.size(); ++i) {
+            if (!full_paths[i].empty()) {
+                descs[i].Name = blob_base_rva + str_offsets[i];
+                descs[i].TimeDateStamp = 0;
             }
         }
-        node.name = !full_paths[i].empty()
-                        ? std::filesystem::path(full_paths[i]).filename().string()
-                        : (orig_name.empty() ? ("import_" + std::to_string(i)) : orig_name);
-        node.file_path = full_paths[i];
-        node.load_priority = priorities[i];
-        if (!full_paths[i].empty()) {
-            PeInspectionReport dep_report{};
-            if (InspectPeFile(full_paths[i], dep_report).ok()) {
-                for (const auto& imp : dep_report.imports) {
-                    node.imports.push_back(imp.dll_name);
+
+        // Order descriptors using deterministic Kahn's topological sort over PE imports
+        // so dependencies always initialize strictly before their importers (breaking ties by load_priority).
+        std::vector<DllDependencyNode> dep_nodes;
+        dep_nodes.reserve(descs.size());
+        for (size_t i = 0; i < descs.size(); ++i) {
+            DllDependencyNode node{};
+            const std::string& orig_name = imported_names[i];
+            node.name = !full_paths[i].empty()
+                            ? std::filesystem::path(full_paths[i]).filename().string()
+                            : (orig_name.empty() ? ("import_" + std::to_string(i)) : orig_name);
+            node.file_path = full_paths[i];
+            node.load_priority = priorities[i];
+            if (!full_paths[i].empty()) {
+                PeInspectionReport dep_report{};
+                if (InspectPeFile(full_paths[i], dep_report).ok()) {
+                    for (const auto& imp : dep_report.imports) {
+                        node.imports.push_back(imp.dll_name);
+                    }
                 }
             }
+            dep_nodes.push_back(std::move(node));
         }
-        dep_nodes.push_back(std::move(node));
+
+        const DllInitOrderResult topo = ComputeDllInitOrder(dep_nodes);
+        std::vector<IMAGE_IMPORT_DESCRIPTOR> sorted_descs;
+        sorted_descs.reserve(descs.size());
+        for (size_t idx : topo.ordered_indices) {
+            sorted_descs.push_back(descs[idx]);
+        }
+        CallTelemetry::Global().Record(
+            "loader",
+            "RedirectChildStaticXboxImports:topo_sort",
+            CallOutcome::Ok,
+            static_cast<int32_t>(sorted_descs.size()),
+            -1);
+
+        const size_t table_bytes = sorted_descs.size() * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+        DWORD old_prot = 0;
+        if (!::VirtualProtectEx(h_process, reinterpret_cast<LPVOID>(imp_table_addr),
+                                table_bytes, PAGE_READWRITE, &old_prot)) {
+            return false;
+        }
+        const bool static_ok =
+            ::WriteProcessMemory(h_process, reinterpret_cast<LPVOID>(imp_table_addr),
+                                 sorted_descs.data(), table_bytes, &rw) != 0 &&
+            rw == table_bytes;
+        DWORD dummy_prot = 0;
+        ::VirtualProtectEx(h_process, reinterpret_cast<LPVOID>(imp_table_addr),
+                           table_bytes, old_prot, &dummy_prot);
+        wrote_ok = wrote_ok && static_ok;
     }
 
-    const DllInitOrderResult topo = ComputeDllInitOrder(dep_nodes);
-    std::vector<IMAGE_IMPORT_DESCRIPTOR> sorted_descs;
-    sorted_descs.reserve(descs.size());
-    for (size_t idx : topo.ordered_indices) {
-        sorted_descs.push_back(descs[idx]);
+    if (delay_redirected_count > 0u && !delay_descs.empty()) {
+        for (size_t i = 0; i < delay_descs.size(); ++i) {
+            if (!delay_full_paths[i].empty()) {
+                delay_descs[i].DllNameRVA = blob_base_rva + delay_str_offsets[i];
+                delay_descs[i].TimeDateStamp = 0;
+            }
+        }
+        const size_t delay_bytes = delay_descs.size() * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR);
+        DWORD old_prot = 0;
+        if (!::VirtualProtectEx(h_process, reinterpret_cast<LPVOID>(dly_table_addr),
+                                delay_bytes, PAGE_READWRITE, &old_prot)) {
+            return false;
+        }
+        const bool delay_ok =
+            ::WriteProcessMemory(h_process, reinterpret_cast<LPVOID>(dly_table_addr),
+                                 delay_descs.data(), delay_bytes, &rw) != 0 &&
+            rw == delay_bytes;
+        DWORD dummy_prot = 0;
+        ::VirtualProtectEx(h_process, reinterpret_cast<LPVOID>(dly_table_addr),
+                           delay_bytes, old_prot, &dummy_prot);
+        CallTelemetry::Global().Record(
+            "loader",
+            "RedirectChildStaticXboxImports:delay_load",
+            delay_ok ? CallOutcome::Ok : CallOutcome::Error,
+            static_cast<int32_t>(delay_redirected_count),
+            -1);
+        wrote_ok = wrote_ok && delay_ok;
     }
-    CallTelemetry::Global().Record(
-        "loader",
-        "RedirectChildStaticXboxImports:topo_sort",
-        CallOutcome::Ok,
-        static_cast<int32_t>(sorted_descs.size()),
-        -1);
 
-    const size_t table_bytes = sorted_descs.size() * sizeof(IMAGE_IMPORT_DESCRIPTOR);
-    DWORD old_prot = 0;
-    if (!::VirtualProtectEx(h_process, reinterpret_cast<LPVOID>(imp_table_addr),
-                            table_bytes, PAGE_READWRITE, &old_prot)) {
-        return false;
-    }
-    const bool wrote_ok =
-        ::WriteProcessMemory(h_process, reinterpret_cast<LPVOID>(imp_table_addr),
-                             sorted_descs.data(), table_bytes, &rw) != 0 &&
-        rw == table_bytes;
-    DWORD dummy_prot = 0;
-    ::VirtualProtectEx(h_process, reinterpret_cast<LPVOID>(imp_table_addr),
-                       table_bytes, old_prot, &dummy_prot);
     return wrote_ok;
 #else
     (void)h_process;

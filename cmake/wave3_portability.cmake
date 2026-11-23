@@ -165,6 +165,10 @@ set(_openscarlett_known_targets
     test_mine_xapu_acphal
     test_mine_d3d12_xmem
     test_mine_routing_apisets
+    test_s15_rdna2_bench_trap_harness
+    test_s15_shader_peer_parity
+    test_s15_graphics_xg_bc6h
+    test_s15_loader_vfs_gdk_shims
 )
 
 foreach(_tgt IN LISTS _openscarlett_known_targets)

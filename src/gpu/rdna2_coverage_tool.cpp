@@ -27,6 +27,7 @@
 #include "openscarlett/gpu/rdna2_interpreter.h"
 #include "openscarlett/gpu/rdna2_ir.h"
 #include "openscarlett/gpu/rdna2_lifter.h"
+#include "openscarlett/gpu/rdna2_xbox_container.h"
 #include "openscarlett/gpu/vulkan_backend.h"
 
 #if defined(__has_include)
@@ -69,6 +70,408 @@ float BitsToFloat(uint32_t b) noexcept {
     float f = 0.0f;
     std::memcpy(&f, &b, sizeof(f));
     return f;
+}
+
+#if defined(_WIN32)
+// Self-contained minimal dxcompiler.dll COM ABI for high-throughput thread-local in-process
+// DXIL compilation (zero <dxcapi.h> dependency; 0 warnings on MSVC /W4, Clang-CL, and MinGW-w64).
+struct BenchDxcBuffer {
+    const void* Ptr;
+    SIZE_T Size;
+    UINT Encoding;
+};
+
+constexpr UINT kBenchDxcCpUtf8 = 65001u;
+constexpr UINT32 kBenchDxcOutObject = 1u;
+constexpr UINT32 kBenchDxcOutErrors = 2u;
+
+struct BenchIDxcBlob : public IUnknown {
+    virtual LPVOID STDMETHODCALLTYPE GetBufferPointer() = 0;
+    virtual SIZE_T STDMETHODCALLTYPE GetBufferSize() = 0;
+};
+
+struct BenchIDxcBlobEncoding : public BenchIDxcBlob {
+    virtual HRESULT STDMETHODCALLTYPE GetEncoding(BOOL* pKnown, UINT32* pCodePage) = 0;
+};
+
+struct BenchIDxcBlobUtf8 : public BenchIDxcBlobEncoding {
+    virtual LPCSTR STDMETHODCALLTYPE GetStringPointer() = 0;
+    virtual SIZE_T STDMETHODCALLTYPE GetStringLength() = 0;
+};
+
+struct BenchIDxcOperationResult : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetStatus(HRESULT* pStatus) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetResult(BenchIDxcBlob** ppResult) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetErrorBuffer(BenchIDxcBlobEncoding** ppErrors) = 0;
+};
+
+struct BenchIDxcResult : public BenchIDxcOperationResult {
+    virtual BOOL STDMETHODCALLTYPE HasOutput(UINT32 dxcOutKind) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetOutput(
+        UINT32 dxcOutKind, REFIID iid, void** ppvObject, void** ppOutputName) = 0;
+    virtual UINT32 STDMETHODCALLTYPE GetNumOutputs() = 0;
+    virtual UINT32 STDMETHODCALLTYPE GetOutputByIndex(UINT32 Index) = 0;
+    virtual UINT32 STDMETHODCALLTYPE PrimaryOutput() = 0;
+};
+
+struct BenchIDxcCompiler3 : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE Compile(
+        const BenchDxcBuffer* pSource,
+        LPCWSTR* pArguments,
+        UINT32 argCount,
+        void* pIncludeHandler,
+        REFIID riid,
+        LPVOID* ppResult) = 0;
+    virtual HRESULT STDMETHODCALLTYPE Disassemble(
+        const BenchDxcBuffer* pObject,
+        REFIID riid,
+        LPVOID* ppResult) = 0;
+};
+
+using BenchPfnDxcCreateInstance = HRESULT(STDMETHODCALLTYPE*)(REFCLSID rclsid, REFIID riid, LPVOID* ppv);
+
+constexpr CLSID kBenchClsidDxcCompiler = {
+    0x73e22d93u, 0xe6ceu, 0x47f3u, {0xb5u, 0xbfu, 0xf0u, 0x66u, 0x4fu, 0x39u, 0xc1u, 0xb0u}};
+constexpr IID kBenchIidIDxcCompiler3 = {
+    0x228b4687u, 0x5a6au, 0x4730u, {0x90u, 0x0cu, 0x97u, 0x02u, 0xb2u, 0x20u, 0x3fu, 0x54u}};
+constexpr IID kBenchIidIDxcResult = {
+    0x58346cdau, 0xdde7u, 0x4497u, {0x94u, 0x61u, 0x6fu, 0x87u, 0xafu, 0x5eu, 0x06u, 0x59u}};
+constexpr IID kBenchIidIDxcBlob = {
+    0x8ba5fb08u, 0x5195u, 0x40e2u, {0xacu, 0x58u, 0x0du, 0x98u, 0x9cu, 0x3au, 0x01u, 0x02u}};
+constexpr IID kBenchIidIDxcBlobUtf8 = {
+    0x3da636c9u, 0xba71u, 0x4024u, {0xa3u, 0x01u, 0x30u, 0xcbu, 0xf1u, 0x25u, 0x30u, 0x5bu}};
+
+std::wstring BenchUtf8ToWide(const std::string& s) {
+    if (s.empty()) return {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    if (n <= 0) return {};
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
+    return w;
+}
+
+class BenchDxcLoader {
+public:
+    static BenchDxcLoader& Instance() {
+        static BenchDxcLoader g_loader;
+        return g_loader;
+    }
+
+    BenchPfnDxcCreateInstance Resolve(const std::string& hint_dxc_path) {
+        if (auto* cached = create_fn_.load(std::memory_order_acquire); cached != nullptr) {
+            return cached;
+        }
+        std::lock_guard<std::mutex> lk(mu_);
+        if (auto* cached = create_fn_.load(std::memory_order_relaxed); cached != nullptr) {
+            return cached;
+        }
+        if (attempted_ && hint_dxc_path.empty()) return nullptr;
+        if (hint_dxc_path.empty()) attempted_ = true;
+
+        std::vector<std::filesystem::path> candidates;
+        std::error_code ec;
+        if (!hint_dxc_path.empty()) {
+            std::filesystem::path hp(hint_dxc_path);
+            candidates.push_back(std::filesystem::is_directory(hp, ec)
+                                     ? (hp / "dxcompiler.dll")
+                                     : (hp.parent_path() / "dxcompiler.dll"));
+        }
+        const std::string resolved_exe = ResolvePortableDxcPath(hint_dxc_path);
+        if (!resolved_exe.empty()) {
+            candidates.push_back(std::filesystem::path(resolved_exe).parent_path() / "dxcompiler.dll");
+        }
+        wchar_t self_buf[MAX_PATH]{};
+        const DWORD self_len = GetModuleFileNameW(nullptr, self_buf, static_cast<DWORD>(MAX_PATH));
+        if (self_len > 0u && self_len < MAX_PATH) {
+            candidates.push_back(std::filesystem::path(self_buf).parent_path() / L"dxcompiler.dll");
+        }
+
+        auto load_dxc_proc = [](HMODULE mod) noexcept -> BenchPfnDxcCreateInstance {
+            FARPROC sym = GetProcAddress(mod, "DxcCreateInstance");
+            if (!sym) return nullptr;
+            BenchPfnDxcCreateInstance fn = nullptr;
+            std::memcpy(&fn, &sym, sizeof(fn));
+            return fn;
+        };
+
+        for (const auto& cand : candidates) {
+            if (!std::filesystem::exists(cand, ec)) continue;
+            const std::wstring wpath = cand.wstring();
+            HMODULE mod = nullptr;
+#if defined(LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR) && defined(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)
+            mod = LoadLibraryExW(wpath.c_str(), nullptr,
+                                 LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+#endif
+            if (!mod) mod = LoadLibraryW(wpath.c_str());
+            if (!mod) continue;
+            if (auto fn = load_dxc_proc(mod); fn != nullptr) {
+                module_ = mod;
+                create_fn_.store(fn, std::memory_order_release);
+                return fn;
+            }
+            FreeLibrary(mod);
+        }
+        if (HMODULE mod = LoadLibraryW(L"dxcompiler.dll"); mod != nullptr) {
+            if (auto fn = load_dxc_proc(mod); fn != nullptr) {
+                module_ = mod;
+                create_fn_.store(fn, std::memory_order_release);
+                return fn;
+            }
+            FreeLibrary(mod);
+        }
+        return nullptr;
+    }
+
+private:
+    std::mutex mu_;
+    HMODULE module_ = nullptr;
+    std::atomic<BenchPfnDxcCreateInstance> create_fn_{nullptr};
+    bool attempted_ = false;
+};
+
+struct ThreadLocalDxcCompiler {
+    BenchIDxcCompiler3* ptr = nullptr;
+    ~ThreadLocalDxcCompiler() {
+        if (ptr) {
+            ptr->Release();
+            ptr = nullptr;
+        }
+    }
+    BenchIDxcCompiler3* Get(BenchPfnDxcCreateInstance fn) {
+        if (!ptr && fn) {
+            (void)fn(kBenchClsidDxcCompiler, kBenchIidIDxcCompiler3, reinterpret_cast<void**>(&ptr));
+        }
+        return ptr;
+    }
+};
+#endif
+
+// Fast thread-safe HLSL -> DXIL compilation using thread-local in-process dxcompiler.dll
+// (zero subprocess spawn / zero temp-file churn / lock-free after init) with clean fallback.
+// opt_level: 0 -> -O0 (corpus DXIL + MD5 validation), 1 -> -O1 (live GPU kernels), 3 -> -O3.
+Status CompileHlslFast(const std::string& hlsl,
+                       const std::string& target,
+                       const std::string& entry_point,
+                       std::vector<uint8_t>& out_dxil,
+                       std::string& out_diagnostics,
+                       const std::string& dxc_path,
+                       int opt_level = 1) {
+    out_dxil.clear();
+    out_diagnostics.clear();
+    if (hlsl.empty() || target.empty() || entry_point.empty()) {
+        return Status::Error(StatusCode::InvalidArgument, "CompileHlslFast requires non-empty HLSL/target/entry");
+    }
+#if defined(_WIN32)
+    if (auto fn = BenchDxcLoader::Instance().Resolve(dxc_path); fn != nullptr) {
+        thread_local ThreadLocalDxcCompiler tl_comp;
+        BenchIDxcCompiler3* compiler = tl_comp.Get(fn);
+        if (compiler) {
+            const std::wstring w_entry = BenchUtf8ToWide(entry_point);
+            const std::wstring w_target = BenchUtf8ToWide(target);
+            const wchar_t* opt_flag = (opt_level <= 0) ? L"-O0" : ((opt_level == 1) ? L"-O1" : L"-O3");
+            LPCWSTR args[5] = {L"-E", w_entry.c_str(), L"-T", w_target.c_str(), opt_flag};
+
+            BenchDxcBuffer src_buf{};
+            src_buf.Ptr = hlsl.data();
+            src_buf.Size = hlsl.size();
+            src_buf.Encoding = kBenchDxcCpUtf8;
+
+            BenchIDxcResult* result = nullptr;
+            HRESULT hr = compiler->Compile(&src_buf, args, 5u, nullptr,
+                                           kBenchIidIDxcResult, reinterpret_cast<void**>(&result));
+            if (SUCCEEDED(hr) && result != nullptr) {
+                if (result->HasOutput(kBenchDxcOutErrors)) {
+                    BenchIDxcBlobUtf8* err_utf8 = nullptr;
+                    if (SUCCEEDED(result->GetOutput(kBenchDxcOutErrors, kBenchIidIDxcBlobUtf8,
+                                                    reinterpret_cast<void**>(&err_utf8), nullptr)) &&
+                        err_utf8 != nullptr) {
+                        if (err_utf8->GetStringPointer() && err_utf8->GetStringLength() > 0u) {
+                            out_diagnostics.assign(err_utf8->GetStringPointer(), err_utf8->GetStringLength());
+                        }
+                        err_utf8->Release();
+                    }
+                }
+                HRESULT comp_status = E_FAIL;
+                (void)result->GetStatus(&comp_status);
+                if (FAILED(comp_status)) {
+                    result->Release();
+                    return Status::Error(StatusCode::ShaderError, "dxcompiler.dll compile failed: " + out_diagnostics);
+                }
+                BenchIDxcBlob* obj_blob = nullptr;
+                hr = result->GetOutput(kBenchDxcOutObject, kBenchIidIDxcBlob,
+                                       reinterpret_cast<void**>(&obj_blob), nullptr);
+                result->Release();
+                if (FAILED(hr) || !obj_blob || !obj_blob->GetBufferPointer() || obj_blob->GetBufferSize() < 32u) {
+                    if (obj_blob) obj_blob->Release();
+                    return Status::Error(StatusCode::ShaderError, "dxcompiler.dll produced empty DXIL object");
+                }
+                const auto* ptr = static_cast<const uint8_t*>(obj_blob->GetBufferPointer());
+                out_dxil.assign(ptr, ptr + obj_blob->GetBufferSize());
+                obj_blob->Release();
+                if (std::memcmp(out_dxil.data(), "DXBC", 4u) != 0) {
+                    out_dxil.clear();
+                    return Status::Error(StatusCode::ShaderError, "dxcompiler.dll output is not DXBC/DXIL");
+                }
+                if (!VerifyDxbcContainerHash(out_dxil.data(), out_dxil.size())) {
+                    if (auto rs = ResignDxilContainer(out_dxil); !rs.ok()) {
+                        return rs;
+                    }
+                }
+                return Status::Ok();
+            }
+        }
+    }
+#else
+    (void)opt_level;
+#endif
+    if (IsInProcessDxcAvailable(dxc_path)) {
+        Status st = CompileHlslInProcessDxc(hlsl, target, entry_point, out_dxil, out_diagnostics, dxc_path);
+        if (st.ok() || (st.code != StatusCode::NotFound && st.code != StatusCode::NotImplemented)) {
+            return st;
+        }
+    }
+    return CompileHlslWithDxc(hlsl, target, entry_point, out_dxil, out_diagnostics, dxc_path);
+}
+
+// Fast external spirv-val validation streaming SPIR-V directly over stdin pipe
+// (zero temp .spv files created/written/scanned/deleted on disk), falling back cleanly
+// to ValidateSpirvExternal if pipe setup is unavailable.
+Status ValidateSpirvExternalFast(const std::vector<uint32_t>& spirv,
+                                 std::string& out_diagnostics,
+                                 const std::string& spirv_val_path,
+                                 const std::string& target_env) {
+    out_diagnostics.clear();
+#if defined(_WIN32)
+    if (spirv.empty() || spirv_val_path.empty()) {
+        return ValidateSpirvExternal(spirv, out_diagnostics, spirv_val_path, target_env);
+    }
+    const size_t byte_len = spirv.size() * sizeof(uint32_t);
+    const DWORD pipe_cap = static_cast<DWORD>(std::max<size_t>(65536u, byte_len + 4096u));
+
+    HANDLE h_in_read = nullptr;
+    HANDLE h_in_write = nullptr;
+    HANDLE h_out_read = nullptr;
+    HANDLE h_out_write = nullptr;
+    PROCESS_INFORMATION pi{};
+    BOOL spawned = FALSE;
+
+    {
+        static std::mutex g_spv_pipe_spawn_mtx;
+        std::lock_guard<std::mutex> lk(g_spv_pipe_spawn_mtx);
+
+        SECURITY_ATTRIBUTES sa{};
+        sa.nLength = sizeof(sa);
+        sa.bInheritHandle = TRUE;
+        if (!CreatePipe(&h_in_read, &h_in_write, &sa, pipe_cap)) {
+            return ValidateSpirvExternal(spirv, out_diagnostics, spirv_val_path, target_env);
+        }
+        if (!CreatePipe(&h_out_read, &h_out_write, &sa, 16384u)) {
+            CloseHandle(h_in_read);
+            CloseHandle(h_in_write);
+            return ValidateSpirvExternal(spirv, out_diagnostics, spirv_val_path, target_env);
+        }
+        SetHandleInformation(h_in_write, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(h_out_read, HANDLE_FLAG_INHERIT, 0);
+
+        std::string cmd = "\"" + spirv_val_path + "\" --target-env " + target_env + " -";
+#if defined(PROC_THREAD_ATTRIBUTE_HANDLE_LIST) && defined(EXTENDED_STARTUPINFO_PRESENT)
+        STARTUPINFOEXA si_ex{};
+        si_ex.StartupInfo.cb = sizeof(si_ex);
+        si_ex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si_ex.StartupInfo.hStdInput = h_in_read;
+        si_ex.StartupInfo.hStdOutput = h_out_write;
+        si_ex.StartupInfo.hStdError = h_out_write;
+
+        SIZE_T attr_size = 0;
+        InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
+        std::vector<uint8_t> attr_buf(attr_size);
+        HANDLE inherit_list[2] = {h_in_read, h_out_write};
+        bool has_attr = false;
+        if (attr_size > 0 &&
+            InitializeProcThreadAttributeList(
+                reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data()), 1, 0, &attr_size)) {
+            if (UpdateProcThreadAttribute(
+                    reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data()),
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                    inherit_list,
+                    sizeof(inherit_list),
+                    nullptr,
+                    nullptr)) {
+                si_ex.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data());
+                has_attr = true;
+            } else {
+                DeleteProcThreadAttributeList(reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data()));
+            }
+        }
+
+        if (has_attr) {
+            spawned = CreateProcessA(
+                nullptr, cmd.data(), nullptr, nullptr, TRUE,
+                CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+                nullptr, nullptr, &si_ex.StartupInfo, &pi);
+            DeleteProcThreadAttributeList(si_ex.lpAttributeList);
+        } else {
+            si_ex.StartupInfo.cb = sizeof(STARTUPINFOA);
+            spawned = CreateProcessA(
+                nullptr, cmd.data(), nullptr, nullptr, TRUE,
+                CREATE_NO_WINDOW, nullptr, nullptr, &si_ex.StartupInfo, &pi);
+        }
+#else
+        STARTUPINFOA si{};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = h_in_read;
+        si.hStdOutput = h_out_write;
+        si.hStdError = h_out_write;
+        spawned = CreateProcessA(
+            nullptr, cmd.data(), nullptr, nullptr, TRUE,
+            CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+#endif
+
+        CloseHandle(h_in_read);
+        CloseHandle(h_out_write);
+    }
+
+    if (!spawned) {
+        CloseHandle(h_in_write);
+        CloseHandle(h_out_read);
+        return ValidateSpirvExternal(spirv, out_diagnostics, spirv_val_path, target_env);
+    }
+
+    // Write full SPIR-V binary to child stdin (fits within pipe_cap -> non-blocking!) then close stdin EOF
+    const auto* raw = reinterpret_cast<const uint8_t*>(spirv.data());
+    size_t written_total = 0u;
+    while (written_total < byte_len) {
+        DWORD chunk = 0u;
+        const DWORD to_write = static_cast<DWORD>(std::min<size_t>(byte_len - written_total, 65536u));
+        if (!WriteFile(h_in_write, raw + written_total, to_write, &chunk, nullptr) || chunk == 0u) {
+            break;
+        }
+        written_total += chunk;
+    }
+    CloseHandle(h_in_write);
+
+    char buf[4096];
+    DWORD bytes_read = 0u;
+    while (ReadFile(h_out_read, buf, sizeof(buf), &bytes_read, nullptr) && bytes_read > 0u) {
+        out_diagnostics.append(buf, bytes_read);
+    }
+    CloseHandle(h_out_read);
+
+    WaitForSingleObject(pi.hProcess, 30000u);
+    DWORD exit_code = 1u;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    if (exit_code != 0u) {
+        return Status::Error(StatusCode::ShaderError, "spirv-val failed: " + out_diagnostics);
+    }
+    return Status::Ok();
+#else
+    return ValidateSpirvExternal(spirv, out_diagnostics, spirv_val_path, target_env);
+#endif
 }
 
 uint64_t HashBytesFnv1a(const uint8_t* data, size_t size) noexcept {
@@ -2197,11 +2600,167 @@ struct D3D12BenchContext {
     uint32_t highest_sm = 0u;
     uint32_t mesh_tier = 0u;
 
+    // Cached root signatures (created once in Init -> zero per-kernel serialization churn)
+    ComRef<ID3D12RootSignature> rs_dual_uav;
+    ComRef<ID3D12RootSignature> rs_cbv_dual_uav;
+    ComRef<ID3D12RootSignature> rs_tex2d;
+    ComRef<ID3D12RootSignature> rs_empty;
+
+    // Grow-only reusable compute scratch buffers (always returned to COPY_DEST after each dispatch)
+    uint64_t scratch_in_cap = 0u;
+    uint64_t scratch_out_cap = 0u;
+    ComRef<ID3D12Resource> scratch_cbv_up;
+    ComRef<ID3D12Resource> scratch_in_up;
+    ComRef<ID3D12Resource> scratch_out_up;
+    ComRef<ID3D12Resource> scratch_in_gpu;
+    ComRef<ID3D12Resource> scratch_out_gpu;
+    ComRef<ID3D12Resource> scratch_rb;
+
     ~D3D12BenchContext() {
         if (fence_event) {
             CloseHandle(fence_event);
             fence_event = nullptr;
         }
+    }
+
+    bool InitRootSignatures() {
+        // 1. Dual UAV (u0, u1)
+        {
+            D3D12_ROOT_PARAMETER params[2]{};
+            params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            params[0].Descriptor.ShaderRegister = 0u;
+            params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            params[1].Descriptor.ShaderRegister = 1u;
+            params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            D3D12_ROOT_SIGNATURE_DESC rsd{};
+            rsd.NumParameters = 2u;
+            rsd.pParameters = params;
+            ComRef<ID3DBlob> sig_blob, err_blob;
+            if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, sig_blob.Put(), err_blob.Put()))) return false;
+            if (FAILED(device->CreateRootSignature(0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
+                                                   OS_BENCH_IID(ID3D12RootSignature), rs_dual_uav.PutVoid()))) return false;
+        }
+        // 2. CBV (b0) + Dual UAV (u0, u1)
+        {
+            D3D12_ROOT_PARAMETER params[3]{};
+            params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            params[0].Descriptor.ShaderRegister = 0u;
+            params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            params[1].Descriptor.ShaderRegister = 0u;
+            params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            params[2].Descriptor.ShaderRegister = 1u;
+            params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            D3D12_ROOT_SIGNATURE_DESC rsd{};
+            rsd.NumParameters = 3u;
+            rsd.pParameters = params;
+            ComRef<ID3DBlob> sig_blob, err_blob;
+            if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, sig_blob.Put(), err_blob.Put()))) return false;
+            if (FAILED(device->CreateRootSignature(0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
+                                                   OS_BENCH_IID(ID3D12RootSignature), rs_cbv_dual_uav.PutVoid()))) return false;
+        }
+        // 3. Tex2D (u0, u1, descriptor table [t0, u2, u3] + 2 static samplers s0/s1)
+        {
+            D3D12_DESCRIPTOR_RANGE ranges[3]{};
+            ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            ranges[0].NumDescriptors = 1u;
+            ranges[0].BaseShaderRegister = 0u;
+            ranges[0].OffsetInDescriptorsFromTableStart = 0u;
+            ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+            ranges[1].NumDescriptors = 1u;
+            ranges[1].BaseShaderRegister = 2u;
+            ranges[1].OffsetInDescriptorsFromTableStart = 1u;
+            ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+            ranges[2].NumDescriptors = 1u;
+            ranges[2].BaseShaderRegister = 3u;
+            ranges[2].OffsetInDescriptorsFromTableStart = 2u;
+            D3D12_ROOT_PARAMETER params[3]{};
+            params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            params[0].Descriptor.ShaderRegister = 0u;
+            params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            params[1].Descriptor.ShaderRegister = 1u;
+            params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            params[2].DescriptorTable = {3u, ranges};
+            params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            D3D12_STATIC_SAMPLER_DESC samps[2]{};
+            samps[0].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+            samps[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            samps[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            samps[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            samps[0].MaxLOD = D3D12_FLOAT32_MAX;
+            samps[0].ShaderRegister = 0u;
+            samps[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            samps[1].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
+            samps[1].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            samps[1].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            samps[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            samps[1].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+            samps[1].MaxLOD = D3D12_FLOAT32_MAX;
+            samps[1].ShaderRegister = 1u;
+            samps[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            D3D12_ROOT_SIGNATURE_DESC rsd{};
+            rsd.NumParameters = 3u;
+            rsd.pParameters = params;
+            rsd.NumStaticSamplers = 2u;
+            rsd.pStaticSamplers = samps;
+            ComRef<ID3DBlob> sig_blob, err_blob;
+            if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, sig_blob.Put(), err_blob.Put()))) return false;
+            if (FAILED(device->CreateRootSignature(0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
+                                                   OS_BENCH_IID(ID3D12RootSignature), rs_tex2d.PutVoid()))) return false;
+        }
+        // 4. Empty root signature (VS+PS / AS+MS+PS draws)
+        {
+            D3D12_ROOT_SIGNATURE_DESC rsd{};
+            ComRef<ID3DBlob> sig_blob, err_blob;
+            if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, sig_blob.Put(), err_blob.Put()))) return false;
+            if (FAILED(device->CreateRootSignature(0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
+                                                   OS_BENCH_IID(ID3D12RootSignature), rs_empty.PutVoid()))) return false;
+        }
+        return true;
+    }
+
+    bool EnsureComputeBuffers(uint64_t in_bytes, uint64_t out_bytes, bool need_cbv) {
+        if (need_cbv && !scratch_cbv_up) {
+            scratch_cbv_up = CreateBuffer(256u, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            if (!scratch_cbv_up) return false;
+        }
+        if (in_bytes > scratch_in_cap || !scratch_in_up || !scratch_in_gpu) {
+            const uint64_t cap = std::max<uint64_t>(65536u, (in_bytes + 4095u) & ~4095ull);
+            scratch_in_up = CreateBuffer(cap, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            scratch_in_gpu = CreateBuffer(cap, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+            if (!scratch_in_up || !scratch_in_gpu) return false;
+            scratch_in_cap = cap;
+        }
+        if (out_bytes > scratch_out_cap || !scratch_out_up || !scratch_out_gpu || !scratch_rb) {
+            const uint64_t cap = std::max<uint64_t>(65536u, (out_bytes + 4095u) & ~4095ull);
+            scratch_out_up = CreateBuffer(cap, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+            scratch_out_gpu = CreateBuffer(cap, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+            scratch_rb = CreateBuffer(cap, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+            if (!scratch_out_up || !scratch_out_gpu || !scratch_rb) return false;
+            scratch_out_cap = cap;
+        }
+        return true;
+    }
+
+    // Thread-safe PSO builder (ID3D12Device::CreateComputePipelineState is free-threaded by D3D12 spec)
+    ComRef<ID3D12PipelineState> CreateComputePsoForRootSig(ID3D12RootSignature* rs,
+                                                           const std::vector<uint8_t>& dxil) const {
+        if (!device || !rs || dxil.empty()) return {};
+        D3D12_COMPUTE_PIPELINE_STATE_DESC cpd{};
+        cpd.pRootSignature = rs;
+        cpd.CS = {dxil.data(), dxil.size()};
+        ComRef<ID3D12PipelineState> pso;
+        const HRESULT pso_hr = device->CreateComputePipelineState(&cpd, OS_BENCH_IID(ID3D12PipelineState), pso.PutVoid());
+        if (FAILED(pso_hr)) {
+            std::fprintf(stderr, "[D3D12-BENCH] CreateComputePipelineState failed (warp=%d, hr=0x%08X)\n",
+                         is_warp ? 1 : 0, static_cast<unsigned>(pso_hr));
+            return {};
+        }
+        return pso;
     }
 
     bool Init(bool use_warp) {
@@ -2254,7 +2813,8 @@ struct D3D12BenchContext {
             return false;
         }
         fence_event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-        return fence_event != nullptr;
+        if (!fence_event) return false;
+        return InitRootSignatures();
     }
 
     bool WaitGpu() {
@@ -2302,92 +2862,73 @@ struct D3D12BenchContext {
                            const std::vector<uint32_t>& in_uav0,
                            const std::vector<uint32_t>& init_uav1,
                            std::vector<uint32_t>& out_uav1,
-                           uint32_t group_x) {
+                           uint32_t group_x,
+                           ID3D12PipelineState* prebuilt_pso = nullptr) {
         if (!device || warp_hung || device->GetDeviceRemovedReason() != S_OK) return false;
         const uint64_t in_bytes = std::max<uint64_t>(4u, static_cast<uint64_t>(in_uav0.size()) * 4u);
         const uint64_t out_bytes = std::max<uint64_t>(4u, static_cast<uint64_t>(init_uav1.size()) * 4u);
         out_uav1.assign(init_uav1.size(), 0u);
 
-        D3D12_ROOT_PARAMETER params[2]{};
-        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-        params[0].Descriptor.ShaderRegister = 0u;
-        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-        params[1].Descriptor.ShaderRegister = 1u;
-        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        D3D12_ROOT_SIGNATURE_DESC rsd{};
-        rsd.NumParameters = 2u;
-        rsd.pParameters = params;
-        ComRef<ID3DBlob> sig_blob;
-        ComRef<ID3DBlob> err_blob;
-        if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, sig_blob.Put(), err_blob.Put()))) {
-            return false;
-        }
-        ComRef<ID3D12RootSignature> root_sig;
-        if (FAILED(device->CreateRootSignature(
-                0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
-                OS_BENCH_IID(ID3D12RootSignature), root_sig.PutVoid()))) {
-            return false;
+        ComRef<ID3D12PipelineState> local_pso;
+        ID3D12PipelineState* active_pso = prebuilt_pso;
+        if (!active_pso) {
+            local_pso = CreateComputePsoForRootSig(rs_dual_uav.Get(), dxil);
+            active_pso = local_pso.Get();
+            if (!active_pso) return false;
         }
 
-        D3D12_COMPUTE_PIPELINE_STATE_DESC cpd{};
-        cpd.pRootSignature = root_sig.Get();
-        cpd.CS = {dxil.data(), dxil.size()};
-        ComRef<ID3D12PipelineState> pso;
-        const HRESULT pso_hr = device->CreateComputePipelineState(&cpd, OS_BENCH_IID(ID3D12PipelineState), pso.PutVoid());
-        if (FAILED(pso_hr)) {
-            std::fprintf(stderr, "[D3D12-BENCH] CreateComputePipelineState failed (warp=%d, hr=0x%08X)\n",
-                         is_warp ? 1 : 0, static_cast<unsigned>(pso_hr));
-            return false;
-        }
-
-        auto in_up = CreateBuffer(in_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
-        auto out_up = CreateBuffer(out_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
-        auto in_gpu = CreateBuffer(in_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-        auto out_gpu = CreateBuffer(out_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-        auto rb = CreateBuffer(out_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-        if (!in_up || !out_up || !in_gpu || !out_gpu || !rb) return false;
+        if (!EnsureComputeBuffers(in_bytes, out_bytes, false)) return false;
 
         void* mapped = nullptr;
-        if (FAILED(in_up->Map(0, nullptr, &mapped))) return false;
+        if (FAILED(scratch_in_up->Map(0, nullptr, &mapped))) return false;
         if (!in_uav0.empty()) std::memcpy(mapped, in_uav0.data(), static_cast<size_t>(in_bytes));
-        in_up->Unmap(0, nullptr);
+        else std::memset(mapped, 0, static_cast<size_t>(in_bytes));
+        scratch_in_up->Unmap(0, nullptr);
 
-        if (FAILED(out_up->Map(0, nullptr, &mapped))) return false;
+        if (FAILED(scratch_out_up->Map(0, nullptr, &mapped))) return false;
         if (!init_uav1.empty()) std::memcpy(mapped, init_uav1.data(), static_cast<size_t>(out_bytes));
-        out_up->Unmap(0, nullptr);
+        else std::memset(mapped, 0, static_cast<size_t>(out_bytes));
+        scratch_out_up->Unmap(0, nullptr);
 
         if (FAILED(allocator->Reset())) return false;
-        if (FAILED(cmd_list->Reset(allocator.Get(), pso.Get()))) return false;
-        cmd_list->CopyResource(in_gpu.Get(), in_up.Get());
-        cmd_list->CopyResource(out_gpu.Get(), out_up.Get());
+        if (FAILED(cmd_list->Reset(allocator.Get(), active_pso))) return false;
+        cmd_list->CopyBufferRegion(scratch_in_gpu.Get(), 0, scratch_in_up.Get(), 0, in_bytes);
+        cmd_list->CopyBufferRegion(scratch_out_gpu.Get(), 0, scratch_out_up.Get(), 0, out_bytes);
 
         D3D12_RESOURCE_BARRIER to_uav[2]{};
         to_uav[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        to_uav[0].Transition = {in_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        to_uav[0].Transition = {scratch_in_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                                 D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
         to_uav[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        to_uav[1].Transition = {out_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        to_uav[1].Transition = {scratch_out_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                                 D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
         cmd_list->ResourceBarrier(2, to_uav);
 
-        cmd_list->SetComputeRootSignature(root_sig.Get());
-        cmd_list->SetComputeRootUnorderedAccessView(0, in_gpu->GetGPUVirtualAddress());
-        cmd_list->SetComputeRootUnorderedAccessView(1, out_gpu->GetGPUVirtualAddress());
+        cmd_list->SetComputeRootSignature(rs_dual_uav.Get());
+        cmd_list->SetComputeRootUnorderedAccessView(0, scratch_in_gpu->GetGPUVirtualAddress());
+        cmd_list->SetComputeRootUnorderedAccessView(1, scratch_out_gpu->GetGPUVirtualAddress());
         cmd_list->Dispatch(group_x, 1, 1);
 
         D3D12_RESOURCE_BARRIER uav_bar{};
         uav_bar.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        uav_bar.UAV.pResource = out_gpu.Get();
+        uav_bar.UAV.pResource = scratch_out_gpu.Get();
         cmd_list->ResourceBarrier(1, &uav_bar);
 
         D3D12_RESOURCE_BARRIER to_copy{};
         to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        to_copy.Transition = {out_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        to_copy.Transition = {scratch_out_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE};
         cmd_list->ResourceBarrier(1, &to_copy);
-        cmd_list->CopyResource(rb.Get(), out_gpu.Get());
+        cmd_list->CopyBufferRegion(scratch_rb.Get(), 0, scratch_out_gpu.Get(), 0, out_bytes);
+
+        D3D12_RESOURCE_BARRIER restore_dest[2]{};
+        restore_dest[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        restore_dest[0].Transition = {scratch_in_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST};
+        restore_dest[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        restore_dest[1].Transition = {scratch_out_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                      D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST};
+        cmd_list->ResourceBarrier(2, restore_dest);
 
         const HRESULT exec_close_hr = cmd_list->Close();
         if (FAILED(exec_close_hr)) {
@@ -2403,9 +2944,9 @@ struct D3D12BenchContext {
             return false;
         }
 
-        if (FAILED(rb->Map(0, nullptr, &mapped))) return false;
+        if (FAILED(scratch_rb->Map(0, nullptr, &mapped))) return false;
         if (!out_uav1.empty()) std::memcpy(out_uav1.data(), mapped, static_cast<size_t>(out_bytes));
-        rb->Unmap(0, nullptr);
+        scratch_rb->Unmap(0, nullptr);
         return true;
     }
 
@@ -2420,7 +2961,7 @@ struct D3D12BenchContext {
                                    ((highest_sm >= static_cast<uint32_t>(D3D_SHADER_MODEL_6_2)) ? "_6_2" : "_6_0");
         std::vector<uint8_t> out;
         std::string diag;
-        if (!CompileHlslWithDxc(hlsl, target, "main", out, diag, dxc_path).ok()) {
+        if (!CompileHlslFast(hlsl, target, "main", out, diag, dxc_path).ok()) {
             return {};
         }
         (void)ResignDxilContainer(out);
@@ -2438,103 +2979,81 @@ struct D3D12BenchContext {
                                  const std::vector<uint32_t>& in_uav0,
                                  const std::vector<uint32_t>& init_uav1,
                                  std::vector<uint32_t>& out_uav1,
-                                 uint32_t group_x) {
+                                 uint32_t group_x,
+                                 ID3D12PipelineState* prebuilt_pso = nullptr) {
+        if (!device || warp_hung || device->GetDeviceRemovedReason() != S_OK) return false;
         const uint64_t cbv_bytes = 256u;
         const uint64_t in_bytes = std::max<uint64_t>(4u, static_cast<uint64_t>(in_uav0.size()) * 4u);
         const uint64_t out_bytes = std::max<uint64_t>(4u, static_cast<uint64_t>(init_uav1.size()) * 4u);
         out_uav1.assign(init_uav1.size(), 0u);
 
-        D3D12_ROOT_PARAMETER params[3]{};
-        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-        params[0].Descriptor.ShaderRegister = 0u;
-        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-        params[1].Descriptor.ShaderRegister = 0u;
-        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-        params[2].Descriptor.ShaderRegister = 1u;
-        params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        D3D12_ROOT_SIGNATURE_DESC rsd{};
-        rsd.NumParameters = 3u;
-        rsd.pParameters = params;
-        ComRef<ID3DBlob> sig_blob;
-        ComRef<ID3DBlob> err_blob;
-        if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, sig_blob.Put(), err_blob.Put()))) {
-            return false;
-        }
-        ComRef<ID3D12RootSignature> root_sig;
-        if (FAILED(device->CreateRootSignature(
-                0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
-                OS_BENCH_IID(ID3D12RootSignature), root_sig.PutVoid()))) {
-            return false;
+        ComRef<ID3D12PipelineState> local_pso;
+        ID3D12PipelineState* active_pso = prebuilt_pso;
+        if (!active_pso) {
+            local_pso = CreateComputePsoForRootSig(rs_cbv_dual_uav.Get(), dxil);
+            active_pso = local_pso.Get();
+            if (!active_pso) return false;
         }
 
-        D3D12_COMPUTE_PIPELINE_STATE_DESC cpd{};
-        cpd.pRootSignature = root_sig.Get();
-        cpd.CS = {dxil.data(), dxil.size()};
-        ComRef<ID3D12PipelineState> pso;
-        const HRESULT pso_hr = device->CreateComputePipelineState(&cpd, OS_BENCH_IID(ID3D12PipelineState), pso.PutVoid());
-        if (FAILED(pso_hr)) {
-            std::fprintf(stderr, "[D3D12-BENCH] CreateComputePipelineState failed (warp=%d, hr=0x%08X)\n",
-                         is_warp ? 1 : 0, static_cast<unsigned>(pso_hr));
-            return false;
-        }
-
-        auto cbv_up = CreateBuffer(cbv_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
-        auto in_up = CreateBuffer(in_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
-        auto out_up = CreateBuffer(out_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
-        auto in_gpu = CreateBuffer(in_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-        auto out_gpu = CreateBuffer(out_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-        auto rb = CreateBuffer(out_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-        if (!cbv_up || !in_up || !out_up || !in_gpu || !out_gpu || !rb) return false;
+        if (!EnsureComputeBuffers(in_bytes, out_bytes, true)) return false;
 
         void* mapped = nullptr;
-        if (FAILED(cbv_up->Map(0, nullptr, &mapped))) return false;
+        if (FAILED(scratch_cbv_up->Map(0, nullptr, &mapped))) return false;
         std::memset(mapped, 0, static_cast<size_t>(cbv_bytes));
         const size_t copy_cbv = std::min<size_t>(static_cast<size_t>(cbv_bytes), root_cbv_u32.size() * 4u);
         if (copy_cbv > 0u) std::memcpy(mapped, root_cbv_u32.data(), copy_cbv);
-        cbv_up->Unmap(0, nullptr);
+        scratch_cbv_up->Unmap(0, nullptr);
 
-        if (FAILED(in_up->Map(0, nullptr, &mapped))) return false;
+        if (FAILED(scratch_in_up->Map(0, nullptr, &mapped))) return false;
         if (!in_uav0.empty()) std::memcpy(mapped, in_uav0.data(), static_cast<size_t>(in_bytes));
-        in_up->Unmap(0, nullptr);
+        else std::memset(mapped, 0, static_cast<size_t>(in_bytes));
+        scratch_in_up->Unmap(0, nullptr);
 
-        if (FAILED(out_up->Map(0, nullptr, &mapped))) return false;
+        if (FAILED(scratch_out_up->Map(0, nullptr, &mapped))) return false;
         if (!init_uav1.empty()) std::memcpy(mapped, init_uav1.data(), static_cast<size_t>(out_bytes));
-        out_up->Unmap(0, nullptr);
+        else std::memset(mapped, 0, static_cast<size_t>(out_bytes));
+        scratch_out_up->Unmap(0, nullptr);
 
         if (FAILED(allocator->Reset())) return false;
-        if (FAILED(cmd_list->Reset(allocator.Get(), pso.Get()))) return false;
-        cmd_list->CopyResource(in_gpu.Get(), in_up.Get());
-        cmd_list->CopyResource(out_gpu.Get(), out_up.Get());
+        if (FAILED(cmd_list->Reset(allocator.Get(), active_pso))) return false;
+        cmd_list->CopyBufferRegion(scratch_in_gpu.Get(), 0, scratch_in_up.Get(), 0, in_bytes);
+        cmd_list->CopyBufferRegion(scratch_out_gpu.Get(), 0, scratch_out_up.Get(), 0, out_bytes);
 
         D3D12_RESOURCE_BARRIER to_uav[2]{};
         to_uav[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        to_uav[0].Transition = {in_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        to_uav[0].Transition = {scratch_in_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                                 D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
         to_uav[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        to_uav[1].Transition = {out_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        to_uav[1].Transition = {scratch_out_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                                 D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
         cmd_list->ResourceBarrier(2, to_uav);
 
-        cmd_list->SetComputeRootSignature(root_sig.Get());
-        cmd_list->SetComputeRootConstantBufferView(0, cbv_up->GetGPUVirtualAddress());
-        cmd_list->SetComputeRootUnorderedAccessView(1, in_gpu->GetGPUVirtualAddress());
-        cmd_list->SetComputeRootUnorderedAccessView(2, out_gpu->GetGPUVirtualAddress());
+        cmd_list->SetComputeRootSignature(rs_cbv_dual_uav.Get());
+        cmd_list->SetComputeRootConstantBufferView(0, scratch_cbv_up->GetGPUVirtualAddress());
+        cmd_list->SetComputeRootUnorderedAccessView(1, scratch_in_gpu->GetGPUVirtualAddress());
+        cmd_list->SetComputeRootUnorderedAccessView(2, scratch_out_gpu->GetGPUVirtualAddress());
         cmd_list->Dispatch(group_x, 1, 1);
 
         D3D12_RESOURCE_BARRIER uav_bar{};
         uav_bar.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        uav_bar.UAV.pResource = out_gpu.Get();
+        uav_bar.UAV.pResource = scratch_out_gpu.Get();
         cmd_list->ResourceBarrier(1, &uav_bar);
 
         D3D12_RESOURCE_BARRIER to_copy{};
         to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        to_copy.Transition = {out_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        to_copy.Transition = {scratch_out_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE};
         cmd_list->ResourceBarrier(1, &to_copy);
-        cmd_list->CopyResource(rb.Get(), out_gpu.Get());
+        cmd_list->CopyBufferRegion(scratch_rb.Get(), 0, scratch_out_gpu.Get(), 0, out_bytes);
+
+        D3D12_RESOURCE_BARRIER restore_dest[2]{};
+        restore_dest[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        restore_dest[0].Transition = {scratch_in_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST};
+        restore_dest[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        restore_dest[1].Transition = {scratch_out_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                      D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST};
+        cmd_list->ResourceBarrier(2, restore_dest);
 
         const HRESULT exec_close_hr = cmd_list->Close();
         if (FAILED(exec_close_hr)) {
@@ -2550,9 +3069,9 @@ struct D3D12BenchContext {
             return false;
         }
 
-        if (FAILED(rb->Map(0, nullptr, &mapped))) return false;
+        if (FAILED(scratch_rb->Map(0, nullptr, &mapped))) return false;
         if (!out_uav1.empty()) std::memcpy(out_uav1.data(), mapped, static_cast<size_t>(out_bytes));
-        rb->Unmap(0, nullptr);
+        scratch_rb->Unmap(0, nullptr);
         return true;
     }
 
@@ -2592,7 +3111,9 @@ struct D3D12BenchContext {
                          std::vector<float>& out_rwtex_f4_4x4,
                          std::vector<uint32_t>& out_rwtex_u32_4x4,
                          uint32_t group_x,
-                         bool srv_is_r32f = false) {
+                         bool srv_is_r32f = false,
+                         ID3D12PipelineState* prebuilt_pso = nullptr) {
+        if (!device || warp_hung || device->GetDeviceRemovedReason() != S_OK) return false;
         constexpr uint32_t kTexW = 4u;
         constexpr uint32_t kTexH = 4u;
         constexpr uint32_t kPitch = 256u;
@@ -2604,74 +3125,12 @@ struct D3D12BenchContext {
         out_rwtex_f4_4x4.assign(kTexW * kTexH * 4u, 0.0f);
         out_rwtex_u32_4x4.assign(kTexW * kTexH, 0u);
 
-        D3D12_DESCRIPTOR_RANGE ranges[3]{};
-        ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[0].NumDescriptors = 1u;
-        ranges[0].BaseShaderRegister = 0u;
-        ranges[0].OffsetInDescriptorsFromTableStart = 0u;
-        ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        ranges[1].NumDescriptors = 1u;
-        ranges[1].BaseShaderRegister = 2u;
-        ranges[1].OffsetInDescriptorsFromTableStart = 1u;
-        ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        ranges[2].NumDescriptors = 1u;
-        ranges[2].BaseShaderRegister = 3u;
-        ranges[2].OffsetInDescriptorsFromTableStart = 2u;
-
-        D3D12_ROOT_PARAMETER params[3]{};
-        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-        params[0].Descriptor.ShaderRegister = 0u;
-        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-        params[1].Descriptor.ShaderRegister = 1u;
-        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[2].DescriptorTable = {3u, ranges};
-        params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        D3D12_STATIC_SAMPLER_DESC samps[2]{};
-        samps[0].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-        samps[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        samps[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        samps[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        samps[0].MaxLOD = D3D12_FLOAT32_MAX;
-        samps[0].ShaderRegister = 0u;
-        samps[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        samps[1].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
-        samps[1].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        samps[1].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        samps[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        samps[1].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
-        samps[1].MaxLOD = D3D12_FLOAT32_MAX;
-        samps[1].ShaderRegister = 1u;
-        samps[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        D3D12_ROOT_SIGNATURE_DESC rsd{};
-        rsd.NumParameters = 3u;
-        rsd.pParameters = params;
-        rsd.NumStaticSamplers = 2u;
-        rsd.pStaticSamplers = samps;
-        ComRef<ID3DBlob> sig_blob;
-        ComRef<ID3DBlob> err_blob;
-        if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, sig_blob.Put(), err_blob.Put()))) {
-            return false;
-        }
-        ComRef<ID3D12RootSignature> root_sig;
-        if (FAILED(device->CreateRootSignature(
-                0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
-                OS_BENCH_IID(ID3D12RootSignature), root_sig.PutVoid()))) {
-            return false;
-        }
-
-        D3D12_COMPUTE_PIPELINE_STATE_DESC cpd{};
-        cpd.pRootSignature = root_sig.Get();
-        cpd.CS = {dxil.data(), dxil.size()};
-        ComRef<ID3D12PipelineState> pso;
-        const HRESULT pso_hr = device->CreateComputePipelineState(&cpd, OS_BENCH_IID(ID3D12PipelineState), pso.PutVoid());
-        if (FAILED(pso_hr)) {
-            std::fprintf(stderr, "[D3D12-BENCH] CreateComputePipelineState failed (warp=%d, hr=0x%08X)\n",
-                         is_warp ? 1 : 0, static_cast<unsigned>(pso_hr));
-            return false;
+        ComRef<ID3D12PipelineState> local_pso;
+        ID3D12PipelineState* active_pso = prebuilt_pso;
+        if (!active_pso) {
+            local_pso = CreateComputePsoForRootSig(rs_tex2d.Get(), dxil);
+            active_pso = local_pso.Get();
+            if (!active_pso) return false;
         }
 
         D3D12_DESCRIPTOR_HEAP_DESC dhd{};
@@ -2683,11 +3142,7 @@ struct D3D12BenchContext {
             return false;
         }
 
-        auto in_up = CreateBuffer(in_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
-        auto out_up = CreateBuffer(out_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
-        auto in_gpu = CreateBuffer(in_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-        auto out_gpu = CreateBuffer(out_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-        auto rb_buf = CreateBuffer(out_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!EnsureComputeBuffers(in_bytes, out_bytes, false)) return false;
 
         auto srv_tex = CreateTex2D(kTexW, kTexH, 2u, srv_fmt, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
         auto rw_f4 = CreateTex2D(kTexW, kTexH, 1u, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -2698,8 +3153,7 @@ struct D3D12BenchContext {
         auto up_u32 = CreateBuffer(kPitch * kTexH, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
         auto rb_f4 = CreateBuffer(kPitch * kTexH, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
         auto rb_u32 = CreateBuffer(kPitch * kTexH, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-        if (!in_up || !out_up || !in_gpu || !out_gpu || !rb_buf || !srv_tex || !rw_f4 || !rw_u32 ||
-            !up_mip0 || !up_mip1 || !up_u32 || !rb_f4 || !rb_u32) {
+        if (!srv_tex || !rw_f4 || !rw_u32 || !up_mip0 || !up_mip1 || !up_u32 || !rb_f4 || !rb_u32) {
             return false;
         }
 
@@ -2726,13 +3180,15 @@ struct D3D12BenchContext {
         device->CreateUnorderedAccessView(rw_u32.Get(), nullptr, &uavd_u32, cpu_h);
 
         void* mapped = nullptr;
-        if (FAILED(in_up->Map(0, nullptr, &mapped))) return false;
+        if (FAILED(scratch_in_up->Map(0, nullptr, &mapped))) return false;
         if (!in_uav0.empty()) std::memcpy(mapped, in_uav0.data(), static_cast<size_t>(in_bytes));
-        in_up->Unmap(0, nullptr);
+        else std::memset(mapped, 0, static_cast<size_t>(in_bytes));
+        scratch_in_up->Unmap(0, nullptr);
 
-        if (FAILED(out_up->Map(0, nullptr, &mapped))) return false;
+        if (FAILED(scratch_out_up->Map(0, nullptr, &mapped))) return false;
         if (!init_uav1.empty()) std::memcpy(mapped, init_uav1.data(), static_cast<size_t>(out_bytes));
-        out_up->Unmap(0, nullptr);
+        else std::memset(mapped, 0, static_cast<size_t>(out_bytes));
+        scratch_out_up->Unmap(0, nullptr);
 
         if (FAILED(up_mip0->Map(0, nullptr, &mapped))) return false;
         std::memset(mapped, 0, kPitch * kTexH);
@@ -2774,9 +3230,9 @@ struct D3D12BenchContext {
         up_u32->Unmap(0, nullptr);
 
         if (FAILED(allocator->Reset())) return false;
-        if (FAILED(cmd_list->Reset(allocator.Get(), pso.Get()))) return false;
-        cmd_list->CopyResource(in_gpu.Get(), in_up.Get());
-        cmd_list->CopyResource(out_gpu.Get(), out_up.Get());
+        if (FAILED(cmd_list->Reset(allocator.Get(), active_pso))) return false;
+        cmd_list->CopyBufferRegion(scratch_in_gpu.Get(), 0, scratch_in_up.Get(), 0, in_bytes);
+        cmd_list->CopyBufferRegion(scratch_out_gpu.Get(), 0, scratch_out_up.Get(), 0, out_bytes);
 
         auto copy_buf_to_tex = [&](ID3D12Resource* dst_tex, UINT subres, ID3D12Resource* src_buf,
                                    uint32_t w, uint32_t h, DXGI_FORMAT fmt) {
@@ -2796,10 +3252,10 @@ struct D3D12BenchContext {
 
         D3D12_RESOURCE_BARRIER pre_bars[4]{};
         pre_bars[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        pre_bars[0].Transition = {in_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        pre_bars[0].Transition = {scratch_in_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                                   D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
         pre_bars[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        pre_bars[1].Transition = {out_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        pre_bars[1].Transition = {scratch_out_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                                   D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
         pre_bars[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         pre_bars[2].Transition = {srv_tex.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
@@ -2811,15 +3267,15 @@ struct D3D12BenchContext {
 
         ID3D12DescriptorHeap* heaps[] = {heap.Get()};
         cmd_list->SetDescriptorHeaps(1, heaps);
-        cmd_list->SetComputeRootSignature(root_sig.Get());
-        cmd_list->SetComputeRootUnorderedAccessView(0, in_gpu->GetGPUVirtualAddress());
-        cmd_list->SetComputeRootUnorderedAccessView(1, out_gpu->GetGPUVirtualAddress());
+        cmd_list->SetComputeRootSignature(rs_tex2d.Get());
+        cmd_list->SetComputeRootUnorderedAccessView(0, scratch_in_gpu->GetGPUVirtualAddress());
+        cmd_list->SetComputeRootUnorderedAccessView(1, scratch_out_gpu->GetGPUVirtualAddress());
         cmd_list->SetComputeRootDescriptorTable(2, heap->GetGPUDescriptorHandleForHeapStart());
         cmd_list->Dispatch(group_x, 1, 1);
 
         D3D12_RESOURCE_BARRIER post_bars[3]{};
         post_bars[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        post_bars[0].Transition = {out_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        post_bars[0].Transition = {scratch_out_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE};
         post_bars[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         post_bars[1].Transition = {rw_f4.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
@@ -2829,7 +3285,7 @@ struct D3D12BenchContext {
                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE};
         cmd_list->ResourceBarrier(3, post_bars);
 
-        cmd_list->CopyResource(rb_buf.Get(), out_gpu.Get());
+        cmd_list->CopyBufferRegion(scratch_rb.Get(), 0, scratch_out_gpu.Get(), 0, out_bytes);
         auto copy_tex_to_buf = [&](ID3D12Resource* dst_buf, ID3D12Resource* src_tex, DXGI_FORMAT fmt) {
             D3D12_TEXTURE_COPY_LOCATION dst_loc{};
             dst_loc.pResource = dst_buf;
@@ -2843,6 +3299,15 @@ struct D3D12BenchContext {
         };
         copy_tex_to_buf(rb_f4.Get(), rw_f4.Get(), DXGI_FORMAT_R32G32B32A32_FLOAT);
         copy_tex_to_buf(rb_u32.Get(), rw_u32.Get(), DXGI_FORMAT_R32_UINT);
+
+        D3D12_RESOURCE_BARRIER restore_dest[2]{};
+        restore_dest[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        restore_dest[0].Transition = {scratch_in_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST};
+        restore_dest[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        restore_dest[1].Transition = {scratch_out_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                      D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST};
+        cmd_list->ResourceBarrier(2, restore_dest);
 
         const HRESULT exec_close_hr = cmd_list->Close();
         if (FAILED(exec_close_hr)) {
@@ -2858,9 +3323,9 @@ struct D3D12BenchContext {
             return false;
         }
 
-        if (FAILED(rb_buf->Map(0, nullptr, &mapped))) return false;
+        if (FAILED(scratch_rb->Map(0, nullptr, &mapped))) return false;
         if (!out_uav1.empty()) std::memcpy(out_uav1.data(), mapped, static_cast<size_t>(out_bytes));
-        rb_buf->Unmap(0, nullptr);
+        scratch_rb->Unmap(0, nullptr);
 
         if (FAILED(rb_f4->Map(0, nullptr, &mapped))) return false;
         for (uint32_t y = 0; y < kTexH; ++y) {
@@ -3528,6 +3993,150 @@ struct PreparedExtKernel {
 };
 
 #if defined(OPENSCARLETT_HAS_RDNA2_SV_ISA)
+// PC-driven control-flow HLSL lifter for decoded RDNA2 streams exercising
+// s_call_b64, s_swappc_b64, s_setpc_b64, s_endpgm_saved, s_endpgm_ordered_ps_done, and s_code_end.
+std::string LiftSvPcControlHlsl(const std::vector<openscarlett::rdna2_sv::SvDecodedInst>& decoded,
+                                uint32_t tg_x,
+                                bool is_pixel_shader) {
+    auto hex_u32 = [](uint32_t v) -> std::string {
+        char buf[24]{};
+        std::snprintf(buf, sizeof(buf), "0x%08Xu", v);
+        return buf;
+    };
+    auto read_s32 = [&](const Rdna2Operand& op) -> std::string {
+        switch (op.kind) {
+            case Rdna2OperandKind::Sgpr:        return "s[" + std::to_string(op.reg_index & 63u) + "]";
+            case Rdna2OperandKind::InlineInt:   return hex_u32(static_cast<uint32_t>(op.int_value));
+            case Rdna2OperandKind::InlineFloat: return hex_u32(FloatToBits(op.float_value));
+            case Rdna2OperandKind::Literal32:   return hex_u32(op.literal_bits);
+            default:                            return "0u";
+        }
+    };
+    auto read_v32 = [&](const Rdna2Operand& op) -> std::string {
+        if (op.kind == Rdna2OperandKind::Vgpr) {
+            return "v[" + std::to_string(op.reg_index & 63u) + "]";
+        }
+        return read_s32(op);
+    };
+
+    std::ostringstream os;
+    os << "// Generated by OpenScarlett RDNA2 PC-Control-Flow Lifter (SM 6.5)\n";
+    if (is_pixel_shader) {
+        os << "struct PSIn { float4 pos : SV_POSITION; float4 param0 : TEXCOORD0; };\n"
+           << "float4 main(PSIn _in) : SV_TARGET0 {\n"
+           << "    uint s[64]; uint v[64];\n"
+           << "    [unroll] for (uint _i = 0u; _i < 64u; ++_i) { s[_i] = 0u; v[_i] = 0u; }\n"
+           << "    v[0] = asuint(_in.param0.x);\n"
+           << "    v[1] = asuint(_in.param0.y);\n"
+           << "    v[2] = asuint(_in.param0.z);\n"
+           << "    v[3] = asuint(_in.param0.w);\n";
+    } else {
+        os << "RWByteAddressBuffer _uav0 : register(u0);\n"
+           << "RWByteAddressBuffer _uav1 : register(u1);\n"
+           << "[numthreads(" << tg_x << ", 1, 1)]\n"
+           << "void main(uint3 _gid : SV_DispatchThreadID) {\n"
+           << "    uint s[64]; uint v[64];\n"
+           << "    [unroll] for (uint _i = 0u; _i < 64u; ++_i) { s[_i] = 0u; v[_i] = 0u; }\n"
+           << "    v[0] = _gid.x;\n";
+    }
+    os << "    uint _pc = 0u;\n"
+       << "    [loop] for (uint _step = 0u; _step < 256u && _pc != 0xFFFFFFFFu; ++_step) {\n"
+       << "        switch (_pc) {\n";
+
+    for (const auto& sv : decoded) {
+        const auto& inst = sv.base;
+        const uint32_t cur_w = inst.word_offset;
+        const uint32_t next_w = inst.word_offset + inst.word_count;
+        const Rdna2Encoding enc = inst.encoding;
+        const uint16_t raw = inst.raw_opcode;
+
+        os << "            case " << cur_w << "u: {\n"
+           << "                _pc = " << next_w << "u;\n";
+
+        if (enc == Rdna2Encoding::MUBUF && !is_pixel_shader) {
+            const uint32_t vd = inst.src[0].reg_index & 63u;
+            const uint32_t va = inst.src[1].reg_index & 63u;
+            const std::string addr = inst.offen
+                ? ("(v[" + std::to_string(va) + "] + " + std::to_string(inst.mem_offset) + "u)")
+                : (std::to_string(inst.mem_offset) + "u");
+            const char* buf = (inst.srsrc == 0u) ? "_uav0" : "_uav1";
+            if (inst.opcode == Rdna2Opcode::BUFFER_LOAD_DWORD) {
+                os << "                v[" << vd << "] = " << buf << ".Load(" << addr << ");\n";
+            } else if (inst.opcode == Rdna2Opcode::BUFFER_STORE_DWORD) {
+                os << "                " << buf << ".Store(" << addr << ", v[" << vd << "]);\n";
+            }
+        } else if (enc == Rdna2Encoding::SOP1) {
+            const uint32_t sd = inst.dst.reg_index & 63u;
+            const uint32_t sd1 = (sd + 1u) & 63u;
+            const std::string s0 = (inst.src_count > 0u) ? read_s32(inst.src[0]) : "0u";
+            switch (raw) {
+                case 0x03: os << "                s[" << sd << "] = " << s0 << ";\n"; break;
+                case 0x1D: // s_setpc_b64
+                    os << "                _pc = (" << s0 << " >> 2u);\n";
+                    break;
+                case 0x1E: // s_swappc_b64
+                    os << "                { uint _tgt = " << s0 << "; s[" << sd << "] = " << hex_u32(next_w * 4u)
+                       << "; s[" << sd1 << "] = 0u; _pc = (_tgt >> 2u); }\n";
+                    break;
+                case 0x1F: // s_getpc_b64
+                    os << "                s[" << sd << "] = " << hex_u32(next_w * 4u) << "; s[" << sd1 << "] = 0u;\n";
+                    break;
+                default: break;
+            }
+        } else if (enc == Rdna2Encoding::SOP2) {
+            const uint32_t sd = inst.dst.reg_index & 63u;
+            if (raw == 0x00u) {
+                os << "                s[" << sd << "] = " << read_s32(inst.src[0]) << " + " << read_s32(inst.src[1]) << ";\n";
+            }
+        } else if (enc == Rdna2Encoding::SOPK) {
+            const uint32_t sd = inst.dst.reg_index & 63u;
+            const uint32_t sd1 = (sd + 1u) & 63u;
+            if (raw == 0x00u) {
+                os << "                s[" << sd << "] = " << hex_u32(static_cast<uint32_t>(static_cast<int32_t>(inst.simm16))) << ";\n";
+            } else if (raw == 0x16u) {  // s_call_b64
+                const int32_t target_w = static_cast<int32_t>(next_w) + static_cast<int32_t>(inst.simm16);
+                os << "                s[" << sd << "] = " << hex_u32(next_w * 4u) << "; s[" << sd1 << "] = 0u; _pc = "
+                   << (target_w >= 0 ? static_cast<uint32_t>(target_w) : 0xFFFFFFFFu) << "u;\n";
+            }
+        } else if (enc == Rdna2Encoding::SOPP) {
+            if (raw == 0x01u || raw == 0x1Bu || raw == 0x1Eu || raw == 0x1Fu) {
+                // s_endpgm / s_endpgm_saved / s_endpgm_ordered_ps_done / s_code_end
+                os << "                _pc = 0xFFFFFFFFu;\n";
+            } else if (raw == 0x02u) {  // s_branch
+                const int32_t target_w = static_cast<int32_t>(next_w) + static_cast<int32_t>(inst.simm16);
+                os << "                _pc = " << (target_w >= 0 ? static_cast<uint32_t>(target_w) : 0xFFFFFFFFu) << "u;\n";
+            }
+        } else if (enc == Rdna2Encoding::VOP1) {
+            const uint32_t vd = inst.dst.reg_index & 63u;
+            if (raw == 0x01u) {
+                os << "                v[" << vd << "] = " << read_v32(inst.src[0]) << ";\n";
+            }
+        } else if (enc == Rdna2Encoding::VOP2) {
+            const uint32_t vd = inst.dst.reg_index & 63u;
+            const std::string a = read_v32(inst.src[0]);
+            const std::string b = read_v32(inst.src[1]);
+            switch (raw) {
+                case 0x03: os << "                v[" << vd << "] = asuint(asfloat(" << a << ") + asfloat(" << b << "));\n"; break;
+                case 0x08: os << "                v[" << vd << "] = asuint(asfloat(" << a << ") * asfloat(" << b << "));\n"; break;
+                case 0x18: os << "                v[" << vd << "] = " << b << " << (" << a << " & 31u);\n"; break;
+                case 0x1D: os << "                v[" << vd << "] = " << a << " ^ " << b << ";\n"; break;
+                case 0x25: os << "                v[" << vd << "] = " << a << " + " << b << ";\n"; break;
+                default: break;
+            }
+        }
+        os << "            } break;\n";
+    }
+
+    os << "            default: _pc = 0xFFFFFFFFu; break;\n"
+       << "        }\n"
+       << "    }\n";
+    if (is_pixel_shader) {
+        os << "    return float4(asfloat(v[4]), asfloat(v[5]), asfloat(v[6]), asfloat(v[7]));\n";
+    }
+    os << "}\n";
+    return os.str();
+}
+
 void AppendSvKernel(std::vector<PreparedExtKernel>& out_list,
                     const char* name,
                     uint32_t workload_idx,
@@ -5599,6 +6208,124 @@ void BuildExtendedSvGpuKernels(std::vector<PreparedExtKernel>& kernels, std::str
             append_sv64_kernel("sv64_vop3_f64_alu", 2u, 32u, code, uav0, static_cast<size_t>(slot) * 32u);
         }
     }
+
+    // 21. SV64-E1: Genuine PC-Control-Flow Subroutine Call & Return Kernel:
+    //     s_call_b64 -> sub1 -> s_setpc_b64 -> s_getpc_b64+s_add_u32 -> s_swappc_b64 -> sub2 -> s_setpc_b64 -> s_endpgm_saved
+    //     (with unreachable 0xDEAD0001 sentinel store after s_endpgm_saved proving clean GPU termination!)
+    {
+        std::vector<uint32_t> code;
+        enc(code, "v_lshlrev_b32", 1u, {Rdna2Operand::InlineInt(2), Rdna2Operand::Vgpr(0)});
+        AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 2u, 1u, 0u, 0u, true);
+        enc(code, "s_mov_b32", 4u, {Rdna2Operand::LiteralU32(0x100u)});
+        const size_t call_word_idx = code.size();
+        enc(code, "s_call_b64", 6u, {}, 0);  // patched to sub1
+        enc(code, "s_getpc_b64", 8u, {});
+        const size_t getpc_next_word = code.size();
+        const size_t add_lit_idx = code.size() + 1u;
+        enc(code, "s_add_u32", 8u, {Rdna2Operand::Sgpr(8), Rdna2Operand::LiteralU32(0x12345678u)});  // patched to sub2
+        enc(code, "s_swappc_b64", 10u, {Rdna2Operand::Sgpr(8)});
+        AppendMubufRaw(code, Rdna2Opcode::BUFFER_STORE_DWORD, 2u, 1u, 4u, 0u, true);
+        enc(code, "v_mov_b32", 3u, {Rdna2Operand::Sgpr(6)});
+        AppendMubufRaw(code, Rdna2Opcode::BUFFER_STORE_DWORD, 3u, 1u, 4u, 128u, true);
+        enc(code, "v_mov_b32", 4u, {Rdna2Operand::Sgpr(10)});
+        AppendMubufRaw(code, Rdna2Opcode::BUFFER_STORE_DWORD, 4u, 1u, 4u, 256u, true);
+        enc(code, "s_endpgm_saved", 0u, {}, 0);
+        // Unreachable clobber after s_endpgm_saved (MUST NOT EXECUTE!)
+        enc(code, "v_mov_b32", 2u, {Rdna2Operand::LiteralU32(0xDEAD0001u)});
+        AppendMubufRaw(code, Rdna2Opcode::BUFFER_STORE_DWORD, 2u, 1u, 4u, 0u, true);
+        // sub1 (invoked by s_call_b64): v2 += 0x1111; s4 += 0x22; return via s_setpc_b64 s[6:7]
+        const size_t sub1_word = code.size();
+        const int16_t call_delta = static_cast<int16_t>(static_cast<int32_t>(sub1_word) - static_cast<int32_t>(call_word_idx + 1u));
+        code[call_word_idx] = (code[call_word_idx] & 0xFFFF0000u) | static_cast<uint16_t>(call_delta);
+        enc(code, "v_add_nc_u32", 2u, {Rdna2Operand::LiteralU32(0x1111u), Rdna2Operand::Vgpr(2)});
+        enc(code, "s_add_u32", 4u, {Rdna2Operand::Sgpr(4), Rdna2Operand::InlineInt(34)});
+        enc(code, "s_setpc_b64", 0u, {Rdna2Operand::Sgpr(6)});
+        // sub2 (invoked by s_swappc_b64): v2 ^= s4; return via s_setpc_b64 s[10:11]
+        const size_t sub2_word = code.size();
+        code[add_lit_idx] = static_cast<uint32_t>((sub2_word - getpc_next_word) * 4u);
+        enc(code, "v_xor_b32", 2u, {Rdna2Operand::Sgpr(4), Rdna2Operand::Vgpr(2)});
+        enc(code, "s_setpc_b64", 0u, {Rdna2Operand::Sgpr(10)});
+
+        std::vector<SvDecodedInst> decoded;
+        if (DecodeScalarVectorStream(code, decoded).ok()) {
+            std::vector<uint32_t> uav0(32u, 0u);
+            for (uint32_t i = 0u; i < 32u; ++i) uav0[i] = 0x2000u + i * 19u;
+            SvWaveState wave{};
+            wave.Reset(32u);
+            wave.SeedThreadIds(0u);
+            wave.uav0 = uav0;
+            wave.uav1.assign(96u, 0u);
+            if (ExecuteScalarVectorCpu(decoded, wave).ok() && wave.ended) {
+                PreparedExtKernel k{};
+                k.name = "sv64_pc_call_endpgm_saved";
+                k.workload_idx = 11u;
+                k.kind = ExtKernelKind::DualUav;
+                k.parity_mode = ExtParityMode::ExactU32;
+                k.allow_vulkan = false;
+                k.group_x = 1u;
+                k.uav0 = uav0;
+                k.init_uav1.assign(96u, 0u);
+                k.expected_uav1 = wave.uav1;
+                k.expected_uav1.resize(96u, 0u);
+                k.hlsl_source = LiftSvPcControlHlsl(decoded, 32u, /*is_pixel_shader=*/false);
+                for (const auto& sv : decoded) {
+                    if (sv.entry && sv.entry->mnemonic) k.mnemonics.emplace_back(sv.entry->mnemonic);
+                }
+                kernels.push_back(std::move(k));
+            } else if (first_error.empty()) {
+                first_error = "sv64_pc_call_endpgm_saved CPU ref failed";
+            }
+        } else if (first_error.empty()) {
+            first_error = "sv64_pc_call_endpgm_saved decode failed";
+        }
+    }
+
+    // 22. SV64-E2: Genuine s_code_end termination kernel (with unreachable 0xDEAD0002 sentinel store)
+    {
+        std::vector<uint32_t> code;
+        enc(code, "v_lshlrev_b32", 1u, {Rdna2Operand::InlineInt(2), Rdna2Operand::Vgpr(0)});
+        AppendMubufRaw(code, Rdna2Opcode::BUFFER_LOAD_DWORD, 2u, 1u, 0u, 0u, true);
+        enc(code, "v_add_nc_u32", 2u, {Rdna2Operand::LiteralU32(0x1234u), Rdna2Operand::Vgpr(2)});
+        enc(code, "v_xor_b32", 2u, {Rdna2Operand::LiteralU32(0x5A5A5A5Au), Rdna2Operand::Vgpr(2)});
+        AppendMubufRaw(code, Rdna2Opcode::BUFFER_STORE_DWORD, 2u, 1u, 4u, 0u, true);
+        enc(code, "s_code_end", 0u, {}, 0);
+        // Unreachable clobber after s_code_end (MUST NOT EXECUTE!)
+        enc(code, "v_mov_b32", 2u, {Rdna2Operand::LiteralU32(0xDEAD0002u)});
+        AppendMubufRaw(code, Rdna2Opcode::BUFFER_STORE_DWORD, 2u, 1u, 4u, 0u, true);
+
+        std::vector<SvDecodedInst> decoded;
+        if (DecodeScalarVectorStream(code, decoded).ok()) {
+            std::vector<uint32_t> uav0(32u, 0u);
+            for (uint32_t i = 0u; i < 32u; ++i) uav0[i] = 0x700u + i * 13u;
+            SvWaveState wave{};
+            wave.Reset(32u);
+            wave.SeedThreadIds(0u);
+            wave.uav0 = uav0;
+            wave.uav1.assign(32u, 0u);
+            if (ExecuteScalarVectorCpu(decoded, wave).ok() && wave.ended) {
+                PreparedExtKernel k{};
+                k.name = "sv64_code_end_term";
+                k.workload_idx = 11u;
+                k.kind = ExtKernelKind::DualUav;
+                k.parity_mode = ExtParityMode::ExactU32;
+                k.allow_vulkan = false;
+                k.group_x = 1u;
+                k.uav0 = uav0;
+                k.init_uav1.assign(32u, 0u);
+                k.expected_uav1 = wave.uav1;
+                k.expected_uav1.resize(32u, 0u);
+                k.hlsl_source = LiftSvPcControlHlsl(decoded, 32u, /*is_pixel_shader=*/false);
+                for (const auto& sv : decoded) {
+                    if (sv.entry && sv.entry->mnemonic) k.mnemonics.emplace_back(sv.entry->mnemonic);
+                }
+                kernels.push_back(std::move(k));
+            } else if (first_error.empty()) {
+                first_error = "sv64_code_end_term CPU ref failed";
+            }
+        } else if (first_error.empty()) {
+            first_error = "sv64_code_end_term decode failed";
+        }
+    }
 }
 #endif
 
@@ -6359,7 +7086,11 @@ void RunExtendedGpuOpcodeVerification(
     D3D12BenchContext* d3d_warp_opt,
 #endif
     std::string& first_error) {
-    // 1. Core SOPP branch-coverage kernel (verifies all 7 branch opcodes: s_branch + 6 s_cbranch_*)
+    // 1. Build ALL compute verification kernels (in-memory lift + CPU ref)
+    std::vector<PreparedExtKernel> kernels;
+    kernels.reserve(56u);
+
+    // 1A. Core SOPP branch-coverage kernel (verifies all 7 branch opcodes: s_branch + 6 s_cbranch_*)
     {
         Rdna2Assembler a;
         a.EmitVop2(Rdna2Opcode::V_LSHLREV_B32, 1, Rdna2Operand::InlineInt(2), 0);
@@ -6395,9 +7126,7 @@ void RunExtendedGpuOpcodeVerification(
         lopts.use_sm65 = true;
         lopts.emit_spirv = true;
         lopts.emit_hlsl = true;
-        lopts.compile_dxil_with_dxc = out_report.has_dxc_tool;
-        lopts.resign_dxil = true;
-        lopts.dxc_path = dxc_path;
+        lopts.compile_dxil_with_dxc = false;
         Rdna2LiftResult lifted{};
         if (LiftRdna2Xs2Shader(a.BuildXs2(ShaderStage::Compute, 32, 1, 1, 16, 16, 32), lifted, lopts).ok()) {
             Rdna2CpuExecState cpu{};
@@ -6405,58 +7134,94 @@ void RunExtendedGpuOpcodeVerification(
             for (uint32_t i = 0; i < 32u; ++i) cpu.uav0[i] = 100u + i;
             cpu.uav1.assign(32u, 0u);
             if (ExecuteRdna2Cpu(lifted.container, lifted.instructions, cpu).ok()) {
-                bool any_ran = false;
-                bool all_ok = true;
-                if (vk_opt) {
-                    std::vector<uint32_t> vk_out;
-                    if (vk_opt->ExecuteComputeShader(lifted.spirv_words, cpu.uav0, vk_out, 1u).ok() &&
-                        VerifyExtParity(vk_out, cpu.uav1, ExtParityMode::ExactU32)) {
-                        ++out_report.corpus_vulkan_executed;
-                        any_ran = true;
-                    } else {
-                        all_ok = false;
-                        if (first_error.empty()) first_error = "Vulkan parity mismatch: core_sopp_branches";
-                    }
+                PreparedExtKernel k{};
+                k.name = "core_sopp_branches";
+                k.workload_idx = 11u;
+                k.kind = ExtKernelKind::DualUav;
+                k.parity_mode = ExtParityMode::ExactU32;
+                k.allow_vulkan = true;
+                k.group_x = 1u;
+                k.uav0 = cpu.uav0;
+                k.init_uav1.assign(32u, 0u);
+                k.expected_uav1 = cpu.uav1;
+                k.spirv_words = std::move(lifted.spirv_words);
+                k.hlsl_source = std::move(lifted.hlsl_source);
+                for (const auto& inst : lifted.instructions) {
+                    if (!inst.mnemonic.empty()) k.mnemonics.push_back(inst.mnemonic);
                 }
-#if defined(_WIN32)
-                if (d3d_hw_opt && out_report.has_dxc_tool) {
-                    const auto dxil = d3d_hw_opt->CompileDxilForThisAdapter(lifted.hlsl_source, lifted.pc_dxil, dxc_path);
-                    std::vector<uint32_t> hw_out;
-                    if (!dxil.empty() && d3d_hw_opt->RunComputeDualUav(dxil, cpu.uav0, std::vector<uint32_t>(32u, 0u), hw_out, 1u) &&
-                        VerifyExtParity(hw_out, cpu.uav1, ExtParityMode::ExactU32)) {
-                        ++out_report.corpus_gpu_hw_executed;
-                        any_ran = true;
-                    } else {
-                        all_ok = false;
-                        if (first_error.empty()) first_error = "D3D12 HW parity mismatch: core_sopp_branches";
-                    }
-                }
-                if (d3d_warp_opt && out_report.has_dxc_tool) {
-                    const auto dxil = d3d_warp_opt->CompileDxilForThisAdapter(lifted.hlsl_source, lifted.pc_dxil, dxc_path);
-                    std::vector<uint32_t> warp_out;
-                    if (!dxil.empty() && d3d_warp_opt->RunComputeDualUav(dxil, cpu.uav0, std::vector<uint32_t>(32u, 0u), warp_out, 1u) &&
-                        VerifyExtParity(warp_out, cpu.uav1, ExtParityMode::ExactU32)) {
-                        ++out_report.corpus_gpu_warp_executed;
-                        any_ran = true;
-                    } else {
-                        all_ok = false;
-                        if (first_error.empty()) first_error = "D3D12 WARP parity mismatch: core_sopp_branches";
-                    }
-                }
-#endif
-                if (any_ran && all_ok) {
-                    ++out_report.corpus_gpu_executed;
-                    ++out_report.stages[static_cast<size_t>(StageSlot::CS)].gpu_passed;
-                    ++out_report.workloads[11u].gpu_passed;
-                    audit.MarkGpuOpcodes(lifted.instructions);
-                }
+                kernels.push_back(std::move(k));
             }
         }
     }
 
+    // 1B. Core ISA indirect subroutine call/return + s_code_end kernel
+    //     (verifies s_swappc_b64 + s_setpc_b64 + s_code_end across Vulkan HW + D3D12 HW + WARP!)
+#if defined(OPENSCARLETT_HAS_RDNA2_SV_ISA)
+    {
+        Rdna2Assembler a;
+        a.EmitVop2(Rdna2Opcode::V_LSHLREV_B32, 2, Rdna2Operand::InlineInt(2), 0);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 1, 2, 0, 0);
+        a.EmitSop1(Rdna2Opcode::S_GETPC_B64, 8, Rdna2Operand::InlineInt(0));
+        const uint32_t after_getpc_word = a.CurrentWordOffset();
+        // s_add_u32 (1) + s_swappc_b64 (1) + v_lshlrev_b32 (1) + buffer_store_dword (2) + s_code_end (1) + s_endpgm (1) = 7 words = 28 bytes
+        a.EmitSop2(Rdna2Opcode::S_ADD_U32, 8, Rdna2Operand::Sgpr(8), Rdna2Operand::InlineInt(28));
+        a.EmitSop1(Rdna2Opcode::S_SWAPPC_B64, 10, Rdna2Operand::Sgpr(8));
+        a.EmitVop2(Rdna2Opcode::V_LSHLREV_B32, 2, Rdna2Operand::InlineInt(2), 0);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 1, 2, 4, 0);
+        a.EmitSopp(Rdna2Opcode::S_CODE_END, 0);
+        a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+        const uint32_t helper_word = a.CurrentWordOffset();
+        a.EmitVop3(Rdna2Opcode::V_MUL_LO_U32, 1, Rdna2Operand::Vgpr(1), Rdna2Operand::InlineInt(3));
+        a.EmitVop2(Rdna2Opcode::V_ADD_NC_U32, 1, Rdna2Operand::InlineInt(7), 1);
+        a.EmitSop1(Rdna2Opcode::S_SETPC_B64, 0, Rdna2Operand::Sgpr(10));
+
+        if ((helper_word - after_getpc_word) * 4u != 28u) {
+            if (first_error.empty()) first_error = "core_swappc_setpc_code_end byte delta mismatch";
+        } else {
+            Rdna2LiftOptions lopts{};
+            lopts.use_sm65 = true;
+            lopts.emit_spirv = true;
+            lopts.emit_hlsl = true;
+            lopts.compile_dxil_with_dxc = false;
+            Rdna2LiftResult lifted{};
+            if (LiftRdna2Xs2Shader(a.BuildXs2(ShaderStage::Compute, 32, 1, 1, 16, 16, 32), lifted, lopts).ok()) {
+                std::vector<openscarlett::rdna2_sv::SvDecodedInst> sv_dec;
+                if (openscarlett::rdna2_sv::DecodeScalarVectorStream(a.Words(), sv_dec).ok()) {
+                    openscarlett::rdna2_sv::SvWaveState wave{};
+                    wave.Reset(32u);
+                    wave.SeedThreadIds(0u);
+                    wave.uav0.resize(32u);
+                    for (uint32_t i = 0u; i < 32u; ++i) wave.uav0[i] = 10u + i * 5u;
+                    wave.uav1.assign(32u, 0u);
+                    if (openscarlett::rdna2_sv::ExecuteScalarVectorCpu(sv_dec, wave).ok()) {
+                        PreparedExtKernel k{};
+                        k.name = "core_swappc_setpc_code_end";
+                        k.workload_idx = 11u;
+                        k.kind = ExtKernelKind::DualUav;
+                        k.parity_mode = ExtParityMode::ExactU32;
+                        k.allow_vulkan = true;
+                        k.group_x = 1u;
+                        k.uav0 = wave.uav0;
+                        k.init_uav1.assign(32u, 0u);
+                        k.expected_uav1 = wave.uav1;
+                        k.spirv_words = std::move(lifted.spirv_words);
+                        k.hlsl_source = std::move(lifted.hlsl_source);
+                        for (const auto& inst : lifted.instructions) {
+                            if (!inst.mnemonic.empty()) k.mnemonics.push_back(inst.mnemonic);
+                        }
+                        kernels.push_back(std::move(k));
+                    } else if (first_error.empty()) {
+                        first_error = "core_swappc_setpc_code_end CPU ref failed";
+                    }
+                }
+            } else if (first_error.empty()) {
+                first_error = "core_swappc_setpc_code_end lift failed";
+            }
+        }
+    }
+#endif
+
     // 2. Build all extended SV + MemImg compute kernels (in-memory lift + CPU ref)
-    std::vector<PreparedExtKernel> kernels;
-    kernels.reserve(32u);
 #if defined(OPENSCARLETT_HAS_RDNA2_SV_ISA)
     BuildExtendedSvGpuKernels(kernels, first_error);
 #endif
@@ -6464,137 +7229,29 @@ void RunExtendedGpuOpcodeVerification(
     BuildExtendedMemGpuKernels(kernels, first_error);
 #endif
 
-    // 3. Parallel DXIL compilation across worker threads for all extended kernels
+    // 2B. Prepare Graphics (VS + PS + PS_ordered_ps_done) & Mesh/AS shaders (in-memory lift, no DXC yet)
 #if defined(_WIN32)
-    if (out_report.has_dxc_tool && (d3d_hw_opt || d3d_warp_opt) && !kernels.empty()) {
-        const uint32_t hw_sm = d3d_hw_opt ? d3d_hw_opt->highest_sm : 0u;
-        const uint32_t warp_sm = d3d_warp_opt ? d3d_warp_opt->highest_sm : 0u;
-        auto target_for_sm = [](uint32_t sm) -> const char* {
-            if (sm >= static_cast<uint32_t>(D3D_SHADER_MODEL_6_5)) return "cs_6_5";
-            if (sm >= static_cast<uint32_t>(D3D_SHADER_MODEL_6_2)) return "cs_6_2";
-            return "cs_6_0";
-        };
-        const std::string hw_tgt = d3d_hw_opt ? target_for_sm(hw_sm) : "";
-        const std::string warp_tgt = d3d_warp_opt ? target_for_sm(warp_sm) : "";
-        const bool same_tgt = (d3d_hw_opt && d3d_warp_opt && hw_tgt == warp_tgt);
+    struct PreparedGfxShaders {
+        bool ready = false;
+        Rdna2LiftResult vs_lift{};
+        Rdna2LiftResult ps_lift{};
+        std::array<float, 4> expected_rgba{};
+        std::vector<uint8_t> vs_dxil_hw, vs_dxil_warp;
+        std::vector<uint8_t> ps_dxil_hw, ps_dxil_warp;
 
-        std::atomic<size_t> next_k{0u};
-        const size_t n_threads = std::min<size_t>(
-            kernels.size(), std::min<size_t>(8u, std::max<size_t>(1u, std::thread::hardware_concurrency())));
-        std::vector<std::thread> workers;
-        workers.reserve(n_threads);
-        for (size_t t = 0; t < n_threads; ++t) {
-            workers.emplace_back([&]() {
-                while (true) {
-                    const size_t idx = next_k.fetch_add(1u);
-                    if (idx >= kernels.size()) break;
-                    auto& k = kernels[idx];
-                    std::string diag;
-                    if (d3d_hw_opt) {
-                        if (CompileHlslWithDxc(k.hlsl_source, hw_tgt, "main", k.dxil_hw, diag, dxc_path).ok()) {
-                            (void)ResignDxilContainer(k.dxil_hw);
-                        }
-                    }
-                    if (same_tgt) {
-                        k.dxil_warp = k.dxil_hw;
-                    } else if (d3d_warp_opt) {
-                        if (CompileHlslWithDxc(k.hlsl_source, warp_tgt, "main", k.dxil_warp, diag, dxc_path).ok()) {
-                            (void)ResignDxilContainer(k.dxil_warp);
-                        }
-                    }
-                }
-            });
-        }
-        for (auto& w : workers) w.join();
-    }
-#endif
+        bool ordered_ps_ready = false;
+        std::string ordered_ps_hlsl;
+        std::array<float, 4> ordered_expected_rgba{};
+        std::vector<std::string> ordered_ps_mnemonics;
+        std::vector<uint8_t> ordered_ps_dxil_hw, ordered_ps_dxil_warp;
 
-    // 4. Execute every extended kernel on real GPU(s) & verify readback parity against CPU ref
-    for (const auto& k : kernels) {
-        bool any_ran = false;
-        bool all_ok = true;
-        std::string diff;
+        bool mesh_ready = false;
+        Rdna2LiftResult as_lift{};
+        Rdna2LiftResult ms_lift{};
+        std::vector<uint8_t> as_dxil_sm65;
+        std::vector<uint8_t> ms_dxil_sm65;
+    } gfx{};
 
-        if (vk_opt && k.allow_vulkan && k.kind == ExtKernelKind::DualUav && !k.spirv_words.empty()) {
-            std::vector<uint32_t> vk_in = k.uav0;
-            if (vk_in.size() < k.expected_uav1.size()) vk_in.resize(k.expected_uav1.size(), 0u);
-            std::vector<uint32_t> vk_out;
-            if (vk_opt->ExecuteComputeShader(k.spirv_words, vk_in, vk_out, k.group_x).ok() &&
-                VerifyExtParity(vk_out, k.expected_uav1, k.parity_mode, &diff)) {
-                ++out_report.corpus_vulkan_executed;
-                any_ran = true;
-            } else {
-                all_ok = false;
-                std::fprintf(stderr, "[EXT-GPU-FAIL] Vulkan (%s): %s\n", k.name, diff.c_str());
-                if (first_error.empty()) first_error = std::string("Vulkan GPU parity mismatch (") + k.name + "): " + diff;
-            }
-        }
-
-#if defined(_WIN32)
-        auto run_d3d_one = [&](D3D12BenchContext* ctx, const std::vector<uint8_t>& dxil,
-                               const char* tag, uint32_t& counter) {
-            if (!ctx || !out_report.has_dxc_tool) return;
-            if (dxil.empty()) {
-                all_ok = false;
-                std::fprintf(stderr, "[EXT-GPU-FAIL] %s DXC empty (%s)\n", tag, k.name);
-                if (first_error.empty()) first_error = std::string(tag) + " DXC compile failed: " + k.name;
-                return;
-            }
-            std::vector<uint32_t> out_uav1;
-            bool ok = false;
-            if (k.kind == ExtKernelKind::DualUav) {
-                ok = ctx->RunComputeDualUav(dxil, k.uav0, k.init_uav1, out_uav1, k.group_x) &&
-                     VerifyExtParity(out_uav1, k.expected_uav1, k.parity_mode, &diff);
-            } else if (k.kind == ExtKernelKind::CbvAndDualUav) {
-                ok = ctx->RunComputeCbvAndDualUav(dxil, k.root_cbv, k.uav0, k.init_uav1, out_uav1, k.group_x) &&
-                     VerifyExtParity(out_uav1, k.expected_uav1, k.parity_mode, &diff);
-            } else if (k.kind == ExtKernelKind::Tex2D) {
-                std::vector<float> out_f4;
-                std::vector<uint32_t> out_u32;
-                ok = ctx->RunComputeTex2D(dxil, k.uav0, k.init_uav1, k.srv_mip0_4x4, k.srv_mip1_2x2,
-                                          k.init_rwtex_u32_4x4, out_uav1, out_f4, out_u32, k.group_x, k.srv_is_r32f) &&
-                     VerifyExtParity(out_uav1, k.expected_uav1, k.parity_mode, &diff);
-                if (ok && k.verify_rwtex_f4) {
-                    for (size_t i = 0; i < k.expected_rwtex_f4_4x4.size(); ++i) {
-                        if (std::fabs(out_f4[i] - k.expected_rwtex_f4_4x4[i]) > 1e-4f) {
-                            ok = false;
-                            diff = "rwtex_f4 mismatch at idx=" + std::to_string(i);
-                            break;
-                        }
-                    }
-                }
-                if (ok && k.verify_rwtex_u32) {
-                    if (out_u32 != k.expected_rwtex_u32_4x4) {
-                        ok = false;
-                        diff = "rwtex_u32 mismatch";
-                    }
-                }
-            }
-            if (ok) {
-                ++counter;
-                any_ran = true;
-            } else {
-                all_ok = false;
-                std::fprintf(stderr, "[EXT-GPU-FAIL] %s (%s): %s\n", tag, k.name, diff.c_str());
-                if (first_error.empty()) first_error = std::string(tag) + " parity mismatch (" + k.name + "): " + diff;
-            }
-        };
-        run_d3d_one(d3d_hw_opt, k.dxil_hw, "D3D12 HW", out_report.corpus_gpu_hw_executed);
-        run_d3d_one(d3d_warp_opt, k.dxil_warp, "D3D12 WARP", out_report.corpus_gpu_warp_executed);
-#endif
-
-        if (any_ran && all_ok) {
-            ++out_report.corpus_gpu_executed;
-            ++out_report.stages[static_cast<size_t>(StageSlot::CS)].gpu_passed;
-            ++out_report.workloads[k.workload_idx].gpu_passed;
-            for (const auto& mnem : k.mnemonics) {
-                audit.Mark(mnem, true, true, true, true, true);
-            }
-        }
-    }
-
-    // 5. Real D3D12 Graphics Draw (VS + PS) verifying EXP & VINTRP on GTX 1650 Ti + WARP!
-#if defined(_WIN32)
     if (out_report.has_dxc_tool && (d3d_hw_opt || d3d_warp_opt)) {
         // Fullscreen triangle VS: vid 0->(-1,-1), 1->(3,-1), 2->(-1,3); Param0 = (0.25, 0.5, 0.75, 1.0)
         Rdna2Assembler vs_a;
@@ -6629,135 +7286,470 @@ void RunExtendedGpuOpcodeVerification(
         gopts.use_sm65 = true;
         gopts.emit_spirv = false;
         gopts.emit_hlsl = true;
-        gopts.compile_dxil_with_dxc = true;
-        gopts.resign_dxil = true;
-        gopts.dxc_path = dxc_path;
+        gopts.compile_dxil_with_dxc = false;
 
-        Rdna2LiftResult vs_lift{};
-        Rdna2LiftResult ps_lift{};
-        if (LiftRdna2Xs2Shader(vs_a.BuildXs2(ShaderStage::Vertex, 1, 1, 1, 16, 16, 32), vs_lift, gopts).ok() &&
-            LiftRdna2Xs2Shader(ps_a.BuildXs2(ShaderStage::Pixel, 1, 1, 1, 16, 16, 32), ps_lift, gopts).ok()) {
+        if (LiftRdna2Xs2Shader(vs_a.BuildXs2(ShaderStage::Vertex, 1, 1, 1, 16, 16, 32), gfx.vs_lift, gopts).ok() &&
+            LiftRdna2Xs2Shader(ps_a.BuildXs2(ShaderStage::Pixel, 1, 1, 1, 16, 16, 32), gfx.ps_lift, gopts).ok()) {
             Rdna2CpuExecState ps_cpu{};
             ps_cpu.stage_inputs = {{0.25f, 0.5f, 0.75f, 1.0f}};
-            if (ExecuteRdna2Cpu(ps_lift.container, ps_lift.instructions, ps_cpu).ok() &&
+            if (ExecuteRdna2Cpu(gfx.ps_lift.container, gfx.ps_lift.instructions, ps_cpu).ok() &&
                 !ps_cpu.exports.empty() && ps_cpu.exports[0].wrote_mrt0) {
-                const auto expected_rgba = ps_cpu.exports[0].mrt0;
-                bool any_ran = false;
-                bool all_ok = true;
-                auto run_gfx = [&](D3D12BenchContext* ctx, const char* tag, uint32_t& counter) {
-                    if (!ctx) return;
-                    const auto vs_dxil = ctx->CompileDxilForStage(vs_lift.hlsl_source, vs_lift.pc_dxil, "vs", dxc_path);
-                    const auto ps_dxil = ctx->CompileDxilForStage(ps_lift.hlsl_source, ps_lift.pc_dxil, "ps", dxc_path);
-                    std::vector<float> fb;
-                    bool ok = !vs_dxil.empty() && !ps_dxil.empty() && ctx->RunGraphicsDrawQuad(vs_dxil, ps_dxil, fb);
-                    if (ok) {
-                        for (size_t px = 0; px < 16u; ++px) {
-                            for (size_t c = 0; c < 4u; ++c) {
-                                if (std::fabs(fb[px * 4u + c] - expected_rgba[c]) > 1e-4f) {
-                                    ok = false;
-                                    break;
-                                }
-                            }
-                            if (!ok) break;
-                        }
+                gfx.expected_rgba = ps_cpu.exports[0].mrt0;
+                gfx.ready = true;
+            }
+        }
+
+        // Real D3D12 Graphics Pixel Shader verifying s_endpgm_ordered_ps_done (SOPP 0x1E)!
+#if defined(OPENSCARLETT_HAS_RDNA2_SV_ISA)
+        if (gfx.ready) {
+            using namespace openscarlett::rdna2_sv;
+            std::vector<uint32_t> ps_ord_code;
+            const bool ok_enc =
+                EncodeScalarVectorInst("v_add_f32", 4u, {Rdna2Operand::LiteralF32(0.125f), Rdna2Operand::Vgpr(0)}, 0, ps_ord_code) &&
+                EncodeScalarVectorInst("v_mul_f32", 5u, {Rdna2Operand::InlineFloat(0.5f), Rdna2Operand::Vgpr(1)}, 0, ps_ord_code) &&
+                EncodeScalarVectorInst("v_add_f32", 6u, {Rdna2Operand::LiteralF32(0.125f), Rdna2Operand::Vgpr(2)}, 0, ps_ord_code) &&
+                EncodeScalarVectorInst("v_mov_b32", 7u, {Rdna2Operand::Vgpr(3)}, 0, ps_ord_code) &&
+                EncodeScalarVectorInst("s_endpgm_ordered_ps_done", 0u, {}, 0, ps_ord_code) &&
+                // Unreachable clobber after s_endpgm_ordered_ps_done (MUST NOT EXECUTE!)
+                EncodeScalarVectorInst("v_mov_b32", 4u, {Rdna2Operand::LiteralF32(9.0f)}, 0, ps_ord_code) &&
+                EncodeScalarVectorInst("v_mov_b32", 5u, {Rdna2Operand::LiteralF32(9.0f)}, 0, ps_ord_code);
+            std::vector<SvDecodedInst> ord_dec;
+            if (ok_enc && DecodeScalarVectorStream(ps_ord_code, ord_dec).ok()) {
+                SvWaveState ps_wave{};
+                ps_wave.Reset(32u);
+                ps_wave.exec = 1ull;
+                ps_wave.WriteVgprF32(0u, 0u, 0.25f);
+                ps_wave.WriteVgprF32(0u, 1u, 0.5f);
+                ps_wave.WriteVgprF32(0u, 2u, 0.75f);
+                ps_wave.WriteVgprF32(0u, 3u, 1.0f);
+                if (ExecuteScalarVectorCpu(ord_dec, ps_wave).ok() && ps_wave.ended) {
+                    gfx.ordered_expected_rgba = {
+                        ps_wave.ReadVgprF32(0u, 4u),
+                        ps_wave.ReadVgprF32(0u, 5u),
+                        ps_wave.ReadVgprF32(0u, 6u),
+                        ps_wave.ReadVgprF32(0u, 7u),
+                    };
+                    gfx.ordered_ps_hlsl = LiftSvPcControlHlsl(ord_dec, 1u, /*is_pixel_shader=*/true);
+                    for (const auto& sv : ord_dec) {
+                        if (sv.entry && sv.entry->mnemonic) gfx.ordered_ps_mnemonics.emplace_back(sv.entry->mnemonic);
                     }
-                    if (ok) {
-                        ++counter;
-                        any_ran = true;
-                    } else {
-                        all_ok = false;
-                        if (first_error.empty()) first_error = std::string(tag) + " graphics VS+PS draw parity mismatch";
-                    }
-                };
-                run_gfx(d3d_hw_opt, "D3D12 HW", out_report.corpus_gpu_hw_executed);
-                run_gfx(d3d_warp_opt, "D3D12 WARP", out_report.corpus_gpu_warp_executed);
-                if (any_ran && all_ok) {
-                    ++out_report.corpus_gpu_executed;
-                    ++out_report.stages[static_cast<size_t>(StageSlot::VS)].gpu_passed;
-                    ++out_report.stages[static_cast<size_t>(StageSlot::PS)].gpu_passed;
-                    ++out_report.workloads[0u].gpu_passed;
-                    audit.MarkGpuOpcodes(vs_lift.instructions);
-                    audit.MarkGpuOpcodes(ps_lift.instructions);
+                    gfx.ordered_ps_ready = true;
                 }
+            }
+        }
+#endif
 
-                // 6. Real D3D12 Amplification + Mesh + Pixel Shader Draw (MeshTier >= 10) on HW + WARP!
-                const bool hw_mesh = (d3d_hw_opt && d3d_hw_opt->mesh_tier >= 10u);
-                const bool warp_mesh = (d3d_warp_opt && d3d_warp_opt->mesh_tier >= 10u);
-                if (hw_mesh || warp_mesh) {
-                    Rdna2Assembler as_a;
-                    as_a.EmitSopk(Rdna2Opcode::S_MOVK_I32, 0, 1);
-                    as_a.EmitSopk(Rdna2Opcode::S_MOVK_I32, 1, 1);
-                    as_a.EmitSopk(Rdna2Opcode::S_MOVK_I32, 2, 1);
-                    as_a.EmitSopp(Rdna2Opcode::S_SENDMSG, static_cast<int16_t>(kRdna2SendMsgDispatchMesh));
-                    as_a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+        const bool hw_mesh = (d3d_hw_opt && d3d_hw_opt->mesh_tier >= 10u);
+        const bool warp_mesh = (d3d_warp_opt && d3d_warp_opt->mesh_tier >= 10u);
+        if (d3d_hw_opt && !hw_mesh) {
+            std::fprintf(stderr, "SKIPPED D3D12 HW Mesh/AS: adapter MeshShaderTier=%u (< 10)\n", d3d_hw_opt->mesh_tier);
+        }
+        if (d3d_warp_opt && !warp_mesh) {
+            std::fprintf(stderr, "SKIPPED D3D12 WARP Mesh/AS: adapter MeshShaderTier=%u (< 10)\n", d3d_warp_opt->mesh_tier);
+        }
+        if (gfx.ready && (hw_mesh || warp_mesh)) {
+            Rdna2Assembler as_a;
+            as_a.EmitSopk(Rdna2Opcode::S_MOVK_I32, 0, 1);
+            as_a.EmitSopk(Rdna2Opcode::S_MOVK_I32, 1, 1);
+            as_a.EmitSopk(Rdna2Opcode::S_MOVK_I32, 2, 1);
+            as_a.EmitSopp(Rdna2Opcode::S_SENDMSG, static_cast<int16_t>(kRdna2SendMsgDispatchMesh));
+            as_a.EmitSopp(Rdna2Opcode::S_ENDPGM);
 
-                    Rdna2Assembler ms_a;
-                    ms_a.EmitSop1(Rdna2Opcode::S_MOV_B32, 124u /*M0*/, Rdna2Operand::LiteralU32(PackGsAllocReqM0(3u, 1u)));
-                    ms_a.EmitSopp(Rdna2Opcode::S_SENDMSG, static_cast<int16_t>(kRdna2SendMsgGsAllocReq));
-                    ms_a.EmitVop2(Rdna2Opcode::V_AND_B32, 1, Rdna2Operand::InlineInt(1), 0);
-                    ms_a.EmitVop2(Rdna2Opcode::V_LSHRREV_B32, 2, Rdna2Operand::InlineInt(1), 0);
-                    ms_a.EmitVop1(Rdna2Opcode::V_CVT_F32_U32, 3, Rdna2Operand::Vgpr(1));
-                    ms_a.EmitVop1(Rdna2Opcode::V_CVT_F32_U32, 4, Rdna2Operand::Vgpr(2));
-                    ms_a.EmitVop3(Rdna2Opcode::V_FMA_F32, 5, Rdna2Operand::Vgpr(3), Rdna2Operand::LiteralF32(4.0f), Rdna2Operand::InlineFloat(-1.0f));
-                    ms_a.EmitVop3(Rdna2Opcode::V_FMA_F32, 6, Rdna2Operand::Vgpr(4), Rdna2Operand::LiteralF32(4.0f), Rdna2Operand::InlineFloat(-1.0f));
-                    ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 7, Rdna2Operand::InlineFloat(0.0f));
-                    ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 8, Rdna2Operand::InlineFloat(1.0f));
-                    ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 10, Rdna2Operand::LiteralF32(0.25f));
-                    ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 11, Rdna2Operand::InlineFloat(0.5f));
-                    ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 12, Rdna2Operand::LiteralF32(0.75f));
-                    ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 13, Rdna2Operand::InlineFloat(1.0f));
-                    ms_a.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Pos0), 5, 6, 7, 8, 0xFu, false);
-                    ms_a.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Param0), 10, 11, 12, 13, 0xFu, false);
-                    const uint32_t packed_prim = (2u << 20) | (1u << 10) | 0u;
-                    ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 14, Rdna2Operand::LiteralU32(packed_prim));
-                    ms_a.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Prim), 14, 0, 0, 0, 0x1u, true, true);
-                    ms_a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+            Rdna2Assembler ms_a;
+            ms_a.EmitSop1(Rdna2Opcode::S_MOV_B32, 124u /*M0*/, Rdna2Operand::LiteralU32(PackGsAllocReqM0(3u, 1u)));
+            ms_a.EmitSopp(Rdna2Opcode::S_SENDMSG, static_cast<int16_t>(kRdna2SendMsgGsAllocReq));
+            ms_a.EmitVop2(Rdna2Opcode::V_AND_B32, 1, Rdna2Operand::InlineInt(1), 0);
+            ms_a.EmitVop2(Rdna2Opcode::V_LSHRREV_B32, 2, Rdna2Operand::InlineInt(1), 0);
+            ms_a.EmitVop1(Rdna2Opcode::V_CVT_F32_U32, 3, Rdna2Operand::Vgpr(1));
+            ms_a.EmitVop1(Rdna2Opcode::V_CVT_F32_U32, 4, Rdna2Operand::Vgpr(2));
+            ms_a.EmitVop3(Rdna2Opcode::V_FMA_F32, 5, Rdna2Operand::Vgpr(3), Rdna2Operand::LiteralF32(4.0f), Rdna2Operand::InlineFloat(-1.0f));
+            ms_a.EmitVop3(Rdna2Opcode::V_FMA_F32, 6, Rdna2Operand::Vgpr(4), Rdna2Operand::LiteralF32(4.0f), Rdna2Operand::InlineFloat(-1.0f));
+            ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 7, Rdna2Operand::InlineFloat(0.0f));
+            ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 8, Rdna2Operand::InlineFloat(1.0f));
+            ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 10, Rdna2Operand::LiteralF32(0.25f));
+            ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 11, Rdna2Operand::InlineFloat(0.5f));
+            ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 12, Rdna2Operand::LiteralF32(0.75f));
+            ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 13, Rdna2Operand::InlineFloat(1.0f));
+            ms_a.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Pos0), 5, 6, 7, 8, 0xFu, false);
+            ms_a.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Param0), 10, 11, 12, 13, 0xFu, false);
+            const uint32_t packed_prim = (2u << 20) | (1u << 10) | 0u;
+            ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 14, Rdna2Operand::LiteralU32(packed_prim));
+            ms_a.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Prim), 14, 0, 0, 0, 0x1u, true, true);
+            ms_a.EmitSopp(Rdna2Opcode::S_ENDPGM);
 
-                    Rdna2LiftOptions mopts = gopts;
-                    mopts.mesh_has_payload = true;
-                    Rdna2LiftResult as_lift{};
-                    Rdna2LiftResult ms_lift{};
-                    if (LiftRdna2Xs2Shader(as_a.BuildXs2(ShaderStage::Amplification, 1, 1, 1, 16, 16, 32), as_lift, gopts).ok() &&
-                        LiftRdna2Xs2Shader(ms_a.BuildXs2(ShaderStage::Mesh, 32, 1, 1, 16, 16, 32), ms_lift, mopts).ok()) {
-                        bool mesh_any = false;
-                        bool mesh_ok = true;
-                        auto run_mesh = [&](D3D12BenchContext* ctx, const char* tag, uint32_t& counter) {
-                            if (!ctx || ctx->mesh_tier < 10u) return;
-                            std::vector<float> fb;
-                            bool ok = !as_lift.pc_dxil.empty() && !ms_lift.pc_dxil.empty() && !ps_lift.pc_dxil.empty() &&
-                                      ctx->RunMeshDrawQuad(as_lift.pc_dxil, ms_lift.pc_dxil, ps_lift.pc_dxil, fb);
-                            if (ok) {
-                                for (size_t px = 0; px < 16u; ++px) {
-                                    for (size_t c = 0; c < 4u; ++c) {
-                                        if (std::fabs(fb[px * 4u + c] - expected_rgba[c]) > 1e-4f) {
-                                            ok = false;
-                                            break;
-                                        }
-                                    }
-                                    if (!ok) break;
+            Rdna2LiftOptions mopts = gopts;
+            mopts.mesh_has_payload = true;
+            if (LiftRdna2Xs2Shader(as_a.BuildXs2(ShaderStage::Amplification, 1, 1, 1, 16, 16, 32), gfx.as_lift, gopts).ok() &&
+                LiftRdna2Xs2Shader(ms_a.BuildXs2(ShaderStage::Mesh, 32, 1, 1, 16, 16, 32), gfx.ms_lift, mopts).ok()) {
+                gfx.mesh_ready = true;
+            }
+        }
+    }
+
+    // 3. Parallel In-Process DXIL Compilation + Parallel D3D12 Compute PSO Creation!
+    std::vector<ComRef<ID3D12PipelineState>> hw_psos(kernels.size());
+    std::vector<ComRef<ID3D12PipelineState>> warp_psos(kernels.size());
+    if (out_report.has_dxc_tool && (d3d_hw_opt || d3d_warp_opt)) {
+        const uint32_t hw_sm = d3d_hw_opt ? d3d_hw_opt->highest_sm : 0u;
+        const uint32_t warp_sm = d3d_warp_opt ? d3d_warp_opt->highest_sm : 0u;
+        auto sm_suffix = [](uint32_t sm) -> const char* {
+            if (sm >= static_cast<uint32_t>(D3D_SHADER_MODEL_6_5)) return "_6_5";
+            if (sm >= static_cast<uint32_t>(D3D_SHADER_MODEL_6_2)) return "_6_2";
+            return "_6_0";
+        };
+        const std::string hw_suf = d3d_hw_opt ? sm_suffix(hw_sm) : "";
+        const std::string warp_suf = d3d_warp_opt ? sm_suffix(warp_sm) : "";
+        const bool same_suf = (d3d_hw_opt && d3d_warp_opt && hw_suf == warp_suf);
+
+        const std::string hw_cs = d3d_hw_opt ? ("cs" + hw_suf) : "";
+        const std::string warp_cs = d3d_warp_opt ? ("cs" + warp_suf) : "";
+
+        // Compile compute kernels + up to 5 graphics shaders in one parallel pool (in-process dxcompiler.dll!)
+        const size_t total_compile_jobs = kernels.size() + 5u;
+        std::atomic<size_t> next_job{0u};
+        const size_t n_threads = std::min<size_t>(
+            total_compile_jobs, std::min<size_t>(12u, std::max<size_t>(2u, std::thread::hardware_concurrency())));
+        auto root_sig_for_kind = [](D3D12BenchContext* ctx, ExtKernelKind kind) -> ID3D12RootSignature* {
+            if (!ctx) return nullptr;
+            if (kind == ExtKernelKind::CbvAndDualUav) return ctx->rs_cbv_dual_uav.Get();
+            if (kind == ExtKernelKind::Tex2D) return ctx->rs_tex2d.Get();
+            return ctx->rs_dual_uav.Get();
+        };
+
+        std::vector<std::thread> workers;
+        workers.reserve(n_threads);
+        for (size_t t = 0; t < n_threads; ++t) {
+            workers.emplace_back([&]() {
+                while (true) {
+                    const size_t j = next_job.fetch_add(1u);
+                    if (j >= total_compile_jobs) break;
+                    std::string diag;
+                    if (j < kernels.size()) {
+                        auto& k = kernels[j];
+                        if (d3d_hw_opt) {
+                            if (CompileHlslFast(k.hlsl_source, hw_cs, "main", k.dxil_hw, diag, dxc_path).ok()) {
+                                (void)ResignDxilContainer(k.dxil_hw);
+                                hw_psos[j] = d3d_hw_opt->CreateComputePsoForRootSig(root_sig_for_kind(d3d_hw_opt, k.kind), k.dxil_hw);
+                            }
+                        }
+                        if (same_suf) {
+                            k.dxil_warp = k.dxil_hw;
+                            if (d3d_warp_opt && !k.dxil_warp.empty()) {
+                                warp_psos[j] = d3d_warp_opt->CreateComputePsoForRootSig(root_sig_for_kind(d3d_warp_opt, k.kind), k.dxil_warp);
+                            }
+                        } else if (d3d_warp_opt) {
+                            if (CompileHlslFast(k.hlsl_source, warp_cs, "main", k.dxil_warp, diag, dxc_path).ok()) {
+                                (void)ResignDxilContainer(k.dxil_warp);
+                                warp_psos[j] = d3d_warp_opt->CreateComputePsoForRootSig(root_sig_for_kind(d3d_warp_opt, k.kind), k.dxil_warp);
+                            }
+                        }
+                    } else {
+                        const size_t gj = j - kernels.size();
+                        auto compile_stage_pair = [&](const std::string& hlsl, const char* stage,
+                                                      std::vector<uint8_t>& out_hw, std::vector<uint8_t>& out_warp) {
+                            if (hlsl.empty()) return;
+                            if (d3d_hw_opt) {
+                                if (CompileHlslFast(hlsl, std::string(stage) + hw_suf, "main", out_hw, diag, dxc_path).ok()) {
+                                    (void)ResignDxilContainer(out_hw);
                                 }
                             }
-                            if (ok) {
-                                ++counter;
-                                mesh_any = true;
-                            } else {
-                                mesh_ok = false;
-                                std::fprintf(stderr, "[EXT-GPU-FAIL] %s (as_ms_ps_draw): mesh draw parity mismatch\n", tag);
+                            if (same_suf) {
+                                out_warp = out_hw;
+                            } else if (d3d_warp_opt) {
+                                if (CompileHlslFast(hlsl, std::string(stage) + warp_suf, "main", out_warp, diag, dxc_path).ok()) {
+                                    (void)ResignDxilContainer(out_warp);
+                                }
                             }
                         };
-                        run_mesh(d3d_hw_opt, "D3D12 HW", out_report.corpus_gpu_hw_executed);
-                        run_mesh(d3d_warp_opt, "D3D12 WARP", out_report.corpus_gpu_warp_executed);
-                        if (mesh_any && mesh_ok) {
-                            ++out_report.corpus_gpu_executed;
-                            ++out_report.stages[static_cast<size_t>(StageSlot::AS)].gpu_passed;
-                            ++out_report.stages[static_cast<size_t>(StageSlot::MS)].gpu_passed;
-                            ++out_report.workloads[4u].gpu_passed;
-                            audit.MarkGpuOpcodes(as_lift.instructions);
-                            audit.MarkGpuOpcodes(ms_lift.instructions);
+                        if (gj == 0u && gfx.ready) {
+                            compile_stage_pair(gfx.vs_lift.hlsl_source, "vs", gfx.vs_dxil_hw, gfx.vs_dxil_warp);
+                        } else if (gj == 1u && gfx.ready) {
+                            compile_stage_pair(gfx.ps_lift.hlsl_source, "ps", gfx.ps_dxil_hw, gfx.ps_dxil_warp);
+                        } else if (gj == 2u && gfx.ordered_ps_ready) {
+                            compile_stage_pair(gfx.ordered_ps_hlsl, "ps", gfx.ordered_ps_dxil_hw, gfx.ordered_ps_dxil_warp);
+                        } else if (gj == 3u && gfx.mesh_ready) {
+                            if (CompileHlslFast(gfx.as_lift.hlsl_source, "as_6_5", "main", gfx.as_dxil_sm65, diag, dxc_path).ok()) {
+                                (void)ResignDxilContainer(gfx.as_dxil_sm65);
+                            }
+                        } else if (gj == 4u && gfx.mesh_ready) {
+                            if (CompileHlslFast(gfx.ms_lift.hlsl_source, "ms_6_5", "main", gfx.ms_dxil_sm65, diag, dxc_path).ok()) {
+                                (void)ResignDxilContainer(gfx.ms_dxil_sm65);
+                            }
                         }
+                    }
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
+    }
+#endif
+
+    // 4. Execute every extended compute kernel concurrently across independent GPU backends
+    //    (Vulkan HW + D3D12 HW + D3D12 WARP), then aggregate deterministically!
+    const size_t nk = kernels.size();
+    std::vector<uint8_t> vk_ran(nk, 0u), vk_ok(nk, 0u);
+    std::vector<std::string> vk_err(nk);
+#if defined(_WIN32)
+    std::vector<uint8_t> hw_ran(nk, 0u), hw_ok(nk, 0u);
+    std::vector<std::string> hw_err(nk);
+    std::vector<uint8_t> warp_ran(nk, 0u), warp_ok(nk, 0u);
+    std::vector<std::string> warp_err(nk);
+
+    auto run_d3d_backend = [&](D3D12BenchContext* ctx,
+                               const std::vector<ComRef<ID3D12PipelineState>>& psos,
+                               bool use_hw_dxil,
+                               const char* tag,
+                               std::vector<uint8_t>& ran_vec,
+                               std::vector<uint8_t>& ok_vec,
+                               std::vector<std::string>& err_vec) {
+        if (!ctx || !out_report.has_dxc_tool) return;
+        for (size_t i = 0u; i < nk; ++i) {
+            const auto& k = kernels[i];
+            const auto& dxil = use_hw_dxil ? k.dxil_hw : k.dxil_warp;
+            ran_vec[i] = 1u;
+            if (dxil.empty()) {
+                err_vec[i] = std::string(tag) + " DXC compile failed: " + k.name;
+                std::fprintf(stderr, "[EXT-GPU-FAIL] %s DXC empty (%s)\n", tag, k.name);
+                continue;
+            }
+            std::vector<uint32_t> out_uav1;
+            std::string diff;
+            bool ok = false;
+            ID3D12PipelineState* pso_ptr = psos[i].Get();
+            if (k.kind == ExtKernelKind::DualUav) {
+                ok = ctx->RunComputeDualUav(dxil, k.uav0, k.init_uav1, out_uav1, k.group_x, pso_ptr) &&
+                     VerifyExtParity(out_uav1, k.expected_uav1, k.parity_mode, &diff);
+            } else if (k.kind == ExtKernelKind::CbvAndDualUav) {
+                ok = ctx->RunComputeCbvAndDualUav(dxil, k.root_cbv, k.uav0, k.init_uav1, out_uav1, k.group_x, pso_ptr) &&
+                     VerifyExtParity(out_uav1, k.expected_uav1, k.parity_mode, &diff);
+            } else if (k.kind == ExtKernelKind::Tex2D) {
+                std::vector<float> out_f4;
+                std::vector<uint32_t> out_u32;
+                ok = ctx->RunComputeTex2D(dxil, k.uav0, k.init_uav1, k.srv_mip0_4x4, k.srv_mip1_2x2,
+                                          k.init_rwtex_u32_4x4, out_uav1, out_f4, out_u32, k.group_x, k.srv_is_r32f, pso_ptr) &&
+                     VerifyExtParity(out_uav1, k.expected_uav1, k.parity_mode, &diff);
+                if (ok && k.verify_rwtex_f4) {
+                    for (size_t pi = 0; pi < k.expected_rwtex_f4_4x4.size(); ++pi) {
+                        if (std::fabs(out_f4[pi] - k.expected_rwtex_f4_4x4[pi]) > 1e-4f) {
+                            ok = false;
+                            diff = "rwtex_f4 mismatch at idx=" + std::to_string(pi);
+                            break;
+                        }
+                    }
+                }
+                if (ok && k.verify_rwtex_u32) {
+                    if (out_u32 != k.expected_rwtex_u32_4x4) {
+                        ok = false;
+                        diff = "rwtex_u32 mismatch";
                     }
                 }
             }
+            if (ok) {
+                ok_vec[i] = 1u;
+            } else {
+                std::fprintf(stderr, "[EXT-GPU-FAIL] %s (%s): %s\n", tag, k.name, diff.c_str());
+                err_vec[i] = std::string(tag) + " parity mismatch (" + k.name + "): " + diff;
+            }
+        }
+    };
+#endif
+
+    auto run_vk_backend = [&]() {
+        if (!vk_opt) return;
+        for (size_t i = 0u; i < nk; ++i) {
+            const auto& k = kernels[i];
+            if (!k.allow_vulkan || k.kind != ExtKernelKind::DualUav || k.spirv_words.empty()) continue;
+            vk_ran[i] = 1u;
+            std::vector<uint32_t> vk_in = k.uav0;
+            if (vk_in.size() < k.expected_uav1.size()) vk_in.resize(k.expected_uav1.size(), 0u);
+            std::vector<uint32_t> vk_out;
+            std::string diff;
+            if (vk_opt->ExecuteComputeShader(k.spirv_words, vk_in, vk_out, k.group_x).ok() &&
+                VerifyExtParity(vk_out, k.expected_uav1, k.parity_mode, &diff)) {
+                vk_ok[i] = 1u;
+            } else {
+                std::fprintf(stderr, "[EXT-GPU-FAIL] Vulkan (%s): %s\n", k.name, diff.c_str());
+                vk_err[i] = std::string("Vulkan GPU parity mismatch (") + k.name + "): " + diff;
+            }
+        }
+    };
+
+    {
+        std::vector<std::thread> exec_threads;
+        if (vk_opt) exec_threads.emplace_back(run_vk_backend);
+#if defined(_WIN32)
+        if (d3d_hw_opt && out_report.has_dxc_tool) {
+            exec_threads.emplace_back([&]() {
+                run_d3d_backend(d3d_hw_opt, hw_psos, true, "D3D12 HW", hw_ran, hw_ok, hw_err);
+            });
+        }
+        if (d3d_warp_opt && out_report.has_dxc_tool) {
+            exec_threads.emplace_back([&]() {
+                run_d3d_backend(d3d_warp_opt, warp_psos, false, "D3D12 WARP", warp_ran, warp_ok, warp_err);
+            });
+        }
+#endif
+        for (auto& th : exec_threads) th.join();
+    }
+
+    for (size_t i = 0u; i < nk; ++i) {
+        bool any_ran = false;
+        bool all_ok = true;
+        if (vk_ran[i]) {
+            if (vk_ok[i]) {
+                ++out_report.corpus_vulkan_executed;
+                any_ran = true;
+            } else {
+                all_ok = false;
+                if (first_error.empty()) first_error = vk_err[i];
+            }
+        }
+#if defined(_WIN32)
+        if (hw_ran[i]) {
+            if (hw_ok[i]) {
+                ++out_report.corpus_gpu_hw_executed;
+                any_ran = true;
+            } else {
+                all_ok = false;
+                if (first_error.empty()) first_error = hw_err[i];
+            }
+        }
+        if (warp_ran[i]) {
+            if (warp_ok[i]) {
+                ++out_report.corpus_gpu_warp_executed;
+                any_ran = true;
+            } else {
+                all_ok = false;
+                if (first_error.empty()) first_error = warp_err[i];
+            }
+        }
+#endif
+        if (any_ran && all_ok) {
+            ++out_report.corpus_gpu_executed;
+            ++out_report.stages[static_cast<size_t>(StageSlot::CS)].gpu_passed;
+            ++out_report.workloads[kernels[i].workload_idx].gpu_passed;
+            for (const auto& mnem : kernels[i].mnemonics) {
+                audit.Mark(mnem, true, true, true, true, true);
+            }
+        }
+    }
+
+    // 5. Real D3D12 Graphics Draws:
+    //    (a) VS + PS verifying EXP & VINTRP
+    //    (b) VS + PS_ordered verifying s_endpgm_ordered_ps_done (SOPP 0x1E)
+    //    (c) AS + MS + PS verifying Mesh Shader Tier 1.0+ (where supported)
+#if defined(_WIN32)
+    if (gfx.ready) {
+        auto verify_fb_rgba = [](const std::vector<float>& fb, const std::array<float, 4>& exp) -> bool {
+            if (fb.size() < 64u) return false;
+            for (size_t px = 0; px < 16u; ++px) {
+                for (size_t c = 0; c < 4u; ++c) {
+                    if (std::fabs(fb[px * 4u + c] - exp[c]) > 1e-4f) return false;
+                }
+            }
+            return true;
+        };
+
+        struct GfxBackendOutcome {
+            bool base_ran = false, base_ok = false;
+            bool ord_ran = false, ord_ok = false;
+            bool mesh_ran = false, mesh_ok = false;
+            std::string err;
+        };
+        GfxBackendOutcome hw_gfx{}, warp_gfx{};
+
+        auto run_gfx_backend = [&](D3D12BenchContext* ctx, bool is_hw, const char* tag, GfxBackendOutcome& out) {
+            if (!ctx) return;
+            const auto& vs_dxil = is_hw ? gfx.vs_dxil_hw : gfx.vs_dxil_warp;
+            const auto& ps_dxil = is_hw ? gfx.ps_dxil_hw : gfx.ps_dxil_warp;
+            out.base_ran = true;
+            std::vector<float> fb;
+            if (!vs_dxil.empty() && !ps_dxil.empty() && ctx->RunGraphicsDrawQuad(vs_dxil, ps_dxil, fb) &&
+                verify_fb_rgba(fb, gfx.expected_rgba)) {
+                out.base_ok = true;
+            } else {
+                out.err = std::string(tag) + " graphics VS+PS draw parity mismatch";
+            }
+
+            if (gfx.ordered_ps_ready) {
+                const auto& ops_dxil = is_hw ? gfx.ordered_ps_dxil_hw : gfx.ordered_ps_dxil_warp;
+                out.ord_ran = true;
+                std::vector<float> fb_ord;
+                if (!vs_dxil.empty() && !ops_dxil.empty() && ctx->RunGraphicsDrawQuad(vs_dxil, ops_dxil, fb_ord) &&
+                    verify_fb_rgba(fb_ord, gfx.ordered_expected_rgba)) {
+                    out.ord_ok = true;
+                } else {
+                    std::fprintf(stderr, "[EXT-GPU-FAIL] %s (ps_endpgm_ordered_ps_done): draw parity mismatch\n", tag);
+                    if (out.err.empty()) out.err = std::string(tag) + " graphics PS s_endpgm_ordered_ps_done parity mismatch";
+                }
+            }
+
+            if (gfx.mesh_ready && ctx->mesh_tier >= 10u) {
+                out.mesh_ran = true;
+                std::vector<float> fb_mesh;
+                if (!gfx.as_dxil_sm65.empty() && !gfx.ms_dxil_sm65.empty() && !ps_dxil.empty() &&
+                    ctx->RunMeshDrawQuad(gfx.as_dxil_sm65, gfx.ms_dxil_sm65, ps_dxil, fb_mesh) &&
+                    verify_fb_rgba(fb_mesh, gfx.expected_rgba)) {
+                    out.mesh_ok = true;
+                } else {
+                    std::fprintf(stderr, "[EXT-GPU-FAIL] %s (as_ms_ps_draw): mesh draw parity mismatch\n", tag);
+                    if (out.err.empty()) out.err = std::string(tag) + " mesh draw parity mismatch";
+                }
+            }
+        };
+
+        std::vector<std::thread> gfx_threads;
+        if (d3d_hw_opt) {
+            gfx_threads.emplace_back([&]() { run_gfx_backend(d3d_hw_opt, true, "D3D12 HW", hw_gfx); });
+        }
+        if (d3d_warp_opt) {
+            gfx_threads.emplace_back([&]() { run_gfx_backend(d3d_warp_opt, false, "D3D12 WARP", warp_gfx); });
+        }
+        for (auto& th : gfx_threads) th.join();
+
+        if (!hw_gfx.err.empty() && first_error.empty()) first_error = hw_gfx.err;
+        if (!warp_gfx.err.empty() && first_error.empty()) first_error = warp_gfx.err;
+
+        // Aggregate base VS + PS
+        if (hw_gfx.base_ok) ++out_report.corpus_gpu_hw_executed;
+        if (warp_gfx.base_ok) ++out_report.corpus_gpu_warp_executed;
+        if ((hw_gfx.base_ran || warp_gfx.base_ran) &&
+            (!hw_gfx.base_ran || hw_gfx.base_ok) &&
+            (!warp_gfx.base_ran || warp_gfx.base_ok)) {
+            ++out_report.corpus_gpu_executed;
+            ++out_report.stages[static_cast<size_t>(StageSlot::VS)].gpu_passed;
+            ++out_report.stages[static_cast<size_t>(StageSlot::PS)].gpu_passed;
+            ++out_report.workloads[0u].gpu_passed;
+            audit.MarkGpuOpcodes(gfx.vs_lift.instructions);
+            audit.MarkGpuOpcodes(gfx.ps_lift.instructions);
+        }
+
+        // Aggregate PS s_endpgm_ordered_ps_done
+        if (hw_gfx.ord_ok) ++out_report.corpus_gpu_hw_executed;
+        if (warp_gfx.ord_ok) ++out_report.corpus_gpu_warp_executed;
+        if ((hw_gfx.ord_ran || warp_gfx.ord_ran) &&
+            (!hw_gfx.ord_ran || hw_gfx.ord_ok) &&
+            (!warp_gfx.ord_ran || warp_gfx.ord_ok)) {
+            ++out_report.corpus_gpu_executed;
+            ++out_report.stages[static_cast<size_t>(StageSlot::PS)].gpu_passed;
+            ++out_report.workloads[0u].gpu_passed;
+            for (const auto& mnem : gfx.ordered_ps_mnemonics) {
+                audit.Mark(mnem, true, true, true, true, true);
+            }
+        }
+
+        // Aggregate AS + MS + PS
+        if (hw_gfx.mesh_ok) ++out_report.corpus_gpu_hw_executed;
+        if (warp_gfx.mesh_ok) ++out_report.corpus_gpu_warp_executed;
+        if ((hw_gfx.mesh_ran || warp_gfx.mesh_ran) &&
+            (!hw_gfx.mesh_ran || hw_gfx.mesh_ok) &&
+            (!warp_gfx.mesh_ran || warp_gfx.mesh_ok)) {
+            ++out_report.corpus_gpu_executed;
+            ++out_report.stages[static_cast<size_t>(StageSlot::AS)].gpu_passed;
+            ++out_report.stages[static_cast<size_t>(StageSlot::MS)].gpu_passed;
+            ++out_report.workloads[4u].gpu_passed;
+            audit.MarkGpuOpcodes(gfx.as_lift.instructions);
+            audit.MarkGpuOpcodes(gfx.ms_lift.instructions);
         }
     }
 #endif
@@ -6807,14 +7799,21 @@ Status RunRdna2CoverageBenchmark(const Rdna2BenchOptions& opts, Rdna2CoverageRep
     AuditMemImgExtension(audit);
 #endif
 
-    // 2. Probe external validators (spirv-val.exe & dxc.exe)
+    // 2. Probe external validators (spirv-val.exe & in-process dxcompiler.dll / dxc.exe)
     const std::string spirv_val_path = opts.spirv_val_path.empty()
                                            ? std::string(kDefaultSpirvValPath)
                                            : opts.spirv_val_path;
     const std::string dxc_path = ResolvePortableDxcPath(opts.dxc_path);
     std::error_code ec;
     out_report.has_spirv_val_tool = !spirv_val_path.empty() && std::filesystem::exists(spirv_val_path, ec);
-    out_report.has_dxc_tool = !dxc_path.empty() && std::filesystem::exists(dxc_path, ec);
+    const bool has_inproc_dxc = IsInProcessDxcAvailable(dxc_path);
+    out_report.has_dxc_tool = has_inproc_dxc || (!dxc_path.empty() && std::filesystem::exists(dxc_path, ec));
+    if (opts.run_external_validators && !out_report.has_spirv_val_tool) {
+        std::fprintf(stderr, "SKIPPED spirv-val: tool not found at %s\n", spirv_val_path.c_str());
+    }
+    if ((opts.run_external_validators || opts.run_live_gpu) && !out_report.has_dxc_tool) {
+        std::fprintf(stderr, "SKIPPED DXC/DXIL: neither dxcompiler.dll nor dxc.exe available\n");
+    }
 
     // 3. Initialize stage & workload breakdown vectors
     out_report.stages.resize(static_cast<size_t>(StageSlot::Count));
@@ -6982,18 +7981,36 @@ Status RunRdna2CoverageBenchmark(const Rdna2BenchOptions& opts, Rdna2CoverageRep
         }
     }
 
-    // 4D. Run external spirv-val & DXC SM 6.5 compilation + MD5 re-signing concurrently across worker threads
+    // 4D. Launch external spirv-val (zero-temp-file stdin pipe) & in-process DXC (-O0) + MD5 re-signing
+    //     worker threads concurrently WITH Step 5 (Live GPU parity) so CPU/process validation and GPU
+    //     execution overlap cleanly with zero shared mutable state!
+    struct ExtValAggregate {
+        uint32_t spv_validated = 0u;
+        uint32_t dxil_compiled = 0u;
+        uint32_t dxil_resigned = 0u;
+        uint32_t failed_total = 0u;
+        std::array<uint32_t, static_cast<size_t>(StageSlot::Count)> stage_dxil_passed{};
+        std::array<uint32_t, static_cast<size_t>(StageSlot::Count)> stage_failed{};
+        std::array<uint32_t, 12> wl_dxil_passed{};
+        std::array<uint32_t, 12> wl_failed{};
+        std::string first_err;
+    } ext_agg{};
+    std::atomic<size_t> ext_next_job{0u};
+    std::mutex ext_agg_mtx;
+    std::vector<std::thread> ext_workers;
     if (!ext_jobs.empty()) {
-        std::atomic<size_t> next_job{0u};
-        std::mutex agg_mtx;
+#if defined(_WIN32)
+        // Warm up dxcompiler.dll once before spawning workers
+        (void)BenchDxcLoader::Instance().Resolve(dxc_path);
+#endif
+        const size_t hw_cores = std::max<size_t>(2u, std::thread::hardware_concurrency());
         const size_t n_threads = std::min<size_t>(
-            ext_jobs.size(), std::min<size_t>(8u, std::max<size_t>(1u, std::thread::hardware_concurrency())));
-        std::vector<std::thread> workers;
-        workers.reserve(n_threads);
+            ext_jobs.size(), opts.run_live_gpu ? std::min<size_t>(8u, hw_cores) : std::min<size_t>(12u, hw_cores));
+        ext_workers.reserve(n_threads);
         for (size_t t = 0; t < n_threads; ++t) {
-            workers.emplace_back([&]() {
+            ext_workers.emplace_back([&]() {
                 while (true) {
-                    const size_t jidx = next_job.fetch_add(1u);
+                    const size_t jidx = ext_next_job.fetch_add(1u);
                     if (jidx >= ext_jobs.size()) break;
                     const auto& job = ext_jobs[jidx];
                     bool spv_ok = false;
@@ -7003,7 +8020,7 @@ Status RunRdna2CoverageBenchmark(const Rdna2BenchOptions& opts, Rdna2CoverageRep
 
                     if (job.do_spv_val) {
                         std::string diag;
-                        Status st = ValidateSpirvExternal(job.spirv_words, diag, spirv_val_path, job.spirv_env);
+                        Status st = ValidateSpirvExternalFast(job.spirv_words, diag, spirv_val_path, job.spirv_env);
                         if (st.ok()) {
                             spv_ok = true;
                         } else {
@@ -7014,7 +8031,7 @@ Status RunRdna2CoverageBenchmark(const Rdna2BenchOptions& opts, Rdna2CoverageRep
                     if (job.do_dxc) {
                         std::vector<uint8_t> dxil;
                         std::string diag;
-                        Status st = CompileHlslWithDxc(job.hlsl_source, job.hlsl_target, "main", dxil, diag, dxc_path);
+                        Status st = CompileHlslFast(job.hlsl_source, job.hlsl_target, "main", dxil, diag, dxc_path, /*opt_level=*/0);
                         if (!st.ok() || dxil.empty()) {
                             if (err.empty()) err = job.label + " dxc failed: " + st.message;
                         } else {
@@ -7036,24 +8053,23 @@ Status RunRdna2CoverageBenchmark(const Rdna2BenchOptions& opts, Rdna2CoverageRep
                         }
                     }
 
-                    std::lock_guard<std::mutex> lk(agg_mtx);
-                    if (spv_ok) ++out_report.spirv_val_external_validated;
+                    std::lock_guard<std::mutex> lk(ext_agg_mtx);
+                    if (spv_ok) ++ext_agg.spv_validated;
                     if (dxc_ok) {
-                        ++out_report.corpus_dxil_compiled;
-                        ++out_report.stages[job.st_idx].dxil_passed;
-                        ++out_report.workloads[job.wl].dxil_passed;
+                        ++ext_agg.dxil_compiled;
+                        ++ext_agg.stage_dxil_passed[job.st_idx];
+                        ++ext_agg.wl_dxil_passed[job.wl];
                     }
-                    if (resign_ok) ++out_report.corpus_dxil_resigned_verified;
+                    if (resign_ok) ++ext_agg.dxil_resigned;
                     if (!err.empty()) {
-                        if (out_report.corpus_shaders_passed > 0u) --out_report.corpus_shaders_passed;
-                        if (out_report.stages[job.st_idx].passed > 0u) --out_report.stages[job.st_idx].passed;
-                        if (out_report.workloads[job.wl].passed > 0u) --out_report.workloads[job.wl].passed;
-                        if (first_error.empty()) first_error = err;
+                        ++ext_agg.failed_total;
+                        ++ext_agg.stage_failed[job.st_idx];
+                        ++ext_agg.wl_failed[job.wl];
+                        if (ext_agg.first_err.empty()) ext_agg.first_err = err;
                     }
                 }
             });
         }
-        for (auto& w : workers) w.join();
     }
 
     out_report.corpus_unique_hashes = static_cast<uint32_t>(seen_hashes.size());
@@ -7064,6 +8080,8 @@ Status RunRdna2CoverageBenchmark(const Rdna2BenchOptions& opts, Rdna2CoverageRep
         if (vk.Initialize(/*allow_software_fallback=*/false).ok() && vk.GetDeviceInfo().is_hardware) {
             out_report.has_vulkan_hw = true;
             out_report.vulkan_adapter = vk.GetDeviceInfo().device_name;
+        } else {
+            std::fprintf(stderr, "SKIPPED Vulkan HW: no hardware Vulkan ICD adapter available\n");
         }
 
 #if defined(_WIN32)
@@ -7072,89 +8090,194 @@ Status RunRdna2CoverageBenchmark(const Rdna2BenchOptions& opts, Rdna2CoverageRep
         if (d3d_hw.Init(/*use_warp=*/false)) {
             out_report.has_d3d12_hw = true;
             out_report.d3d12_hw_adapter = d3d_hw.adapter_name;
+        } else {
+            std::fprintf(stderr, "SKIPPED D3D12 HW: no hardware D3D12 adapter available\n");
         }
         if (d3d_warp.Init(/*use_warp=*/true)) {
             out_report.has_d3d12_warp = true;
+        } else {
+            std::fprintf(stderr, "SKIPPED D3D12 WARP: WARP adapter unavailable\n");
         }
 #endif
 
+        // 5A. Lift & CPU-ref all LiveGpuParityCases in-memory, then compile DXIL & PSOs in parallel!
         const auto gpu_cases = BuildLiveGpuParityCases();
-        for (const auto& gc : gpu_cases) {
+        const size_t n_cases = gpu_cases.size();
+        struct PreparedLiveCase {
+            bool valid = false;
+            Rdna2LiftResult lifted{};
+            Rdna2CpuExecState cpu{};
+            std::vector<uint8_t> dxil_hw;
+            std::vector<uint8_t> dxil_warp;
+#if defined(_WIN32)
+            ComRef<ID3D12PipelineState> pso_hw;
+            ComRef<ID3D12PipelineState> pso_warp;
+#endif
+        };
+        std::vector<PreparedLiveCase> prep_cases(n_cases);
+        for (size_t i = 0u; i < n_cases; ++i) {
+            const auto& gc = gpu_cases[i];
             Rdna2LiftOptions lopts{};
             lopts.use_sm65 = true;
             lopts.emit_spirv = true;
             lopts.emit_hlsl = true;
             lopts.validate_spirv_external = false;
-            lopts.compile_dxil_with_dxc = out_report.has_dxc_tool;
+            lopts.compile_dxil_with_dxc = false;
             lopts.resign_dxil = true;
-            lopts.dxc_path = dxc_path;
 
-            Rdna2LiftResult lifted{};
-            if (!LiftRdna2Xs2Shader(gc.xs2_blob, lifted, lopts).ok()) {
+            if (!LiftRdna2Xs2Shader(gc.xs2_blob, prep_cases[i].lifted, lopts).ok()) {
                 if (first_error.empty()) first_error = std::string("Live GPU lift failed: ") + gc.name;
                 continue;
             }
-
-            Rdna2CpuExecState cpu{};
-            cpu.uav0 = gc.uav0;
-            cpu.uav1 = gc.init_uav1;
-            if (!ExecuteRdna2Cpu(lifted.container, lifted.instructions, cpu).ok()) {
+            prep_cases[i].cpu.uav0 = gc.uav0;
+            prep_cases[i].cpu.uav1 = gc.init_uav1;
+            if (!ExecuteRdna2Cpu(prep_cases[i].lifted.container, prep_cases[i].lifted.instructions, prep_cases[i].cpu).ok()) {
                 if (first_error.empty()) first_error = std::string("Live GPU CPU ref failed: ") + gc.name;
                 continue;
             }
+            prep_cases[i].valid = true;
+        }
 
+#if defined(_WIN32)
+        if (out_report.has_dxc_tool && (out_report.has_d3d12_hw || out_report.has_d3d12_warp) && n_cases > 0u) {
+            auto cs_for_sm = [](uint32_t sm) -> const char* {
+                if (sm >= static_cast<uint32_t>(D3D_SHADER_MODEL_6_5)) return "cs_6_5";
+                if (sm >= static_cast<uint32_t>(D3D_SHADER_MODEL_6_2)) return "cs_6_2";
+                return "cs_6_0";
+            };
+            const std::string hw_tgt = out_report.has_d3d12_hw ? cs_for_sm(d3d_hw.highest_sm) : "";
+            const std::string warp_tgt = out_report.has_d3d12_warp ? cs_for_sm(d3d_warp.highest_sm) : "";
+            const bool same_tgt = (out_report.has_d3d12_hw && out_report.has_d3d12_warp && hw_tgt == warp_tgt);
+            std::atomic<size_t> next_c{0u};
+            const size_t n_th = std::min<size_t>(n_cases, std::max<size_t>(1u, std::thread::hardware_concurrency()));
+            std::vector<std::thread> cw;
+            cw.reserve(n_th);
+            for (size_t t = 0; t < n_th; ++t) {
+                cw.emplace_back([&]() {
+                    while (true) {
+                        const size_t idx = next_c.fetch_add(1u);
+                        if (idx >= n_cases) break;
+                        auto& pc = prep_cases[idx];
+                        if (!pc.valid) continue;
+                        std::string diag;
+                        if (out_report.has_d3d12_hw) {
+                            if (CompileHlslFast(pc.lifted.hlsl_source, hw_tgt, "main", pc.dxil_hw, diag, dxc_path).ok()) {
+                                (void)ResignDxilContainer(pc.dxil_hw);
+                                pc.pso_hw = d3d_hw.CreateComputePsoForRootSig(d3d_hw.rs_dual_uav.Get(), pc.dxil_hw);
+                            }
+                        }
+                        if (same_tgt) {
+                            pc.dxil_warp = pc.dxil_hw;
+                            if (!pc.dxil_warp.empty()) {
+                                pc.pso_warp = d3d_warp.CreateComputePsoForRootSig(d3d_warp.rs_dual_uav.Get(), pc.dxil_warp);
+                            }
+                        } else if (out_report.has_d3d12_warp) {
+                            if (CompileHlslFast(pc.lifted.hlsl_source, warp_tgt, "main", pc.dxil_warp, diag, dxc_path).ok()) {
+                                (void)ResignDxilContainer(pc.dxil_warp);
+                                pc.pso_warp = d3d_warp.CreateComputePsoForRootSig(d3d_warp.rs_dual_uav.Get(), pc.dxil_warp);
+                            }
+                        }
+                    }
+                });
+            }
+            for (auto& w : cw) w.join();
+        }
+#endif
+
+        // Execute LiveGpuParityCases concurrently across Vulkan HW, D3D12 HW, and D3D12 WARP
+        std::vector<uint8_t> vk_ran(n_cases, 0u), vk_ok(n_cases, 0u);
+        std::vector<uint8_t> hw_ran(n_cases, 0u), hw_ok(n_cases, 0u);
+        std::vector<uint8_t> warp_ran(n_cases, 0u), warp_ok(n_cases, 0u);
+        {
+            std::vector<std::thread> live_threads;
+            if (out_report.has_vulkan_hw) {
+                live_threads.emplace_back([&]() {
+                    for (size_t i = 0u; i < n_cases; ++i) {
+                        if (!prep_cases[i].valid || !gpu_cases[i].allow_vulkan) continue;
+                        vk_ran[i] = 1u;
+                        std::vector<uint32_t> vk_in = gpu_cases[i].uav0;
+                        if (vk_in.size() < prep_cases[i].cpu.uav1.size()) {
+                            vk_in.resize(prep_cases[i].cpu.uav1.size(), 0u);
+                        }
+                        std::vector<uint32_t> vk_out;
+                        if (vk.ExecuteComputeShader(prep_cases[i].lifted.spirv_words, vk_in, vk_out, gpu_cases[i].group_x).ok() &&
+                            VerifyBufferParity(vk_out, prep_cases[i].cpu.uav1, gpu_cases[i].float_tolerance)) {
+                            vk_ok[i] = 1u;
+                        }
+                    }
+                });
+            }
+#if defined(_WIN32)
+            if (out_report.has_d3d12_hw && out_report.has_dxc_tool) {
+                live_threads.emplace_back([&]() {
+                    for (size_t i = 0u; i < n_cases; ++i) {
+                        if (!prep_cases[i].valid) continue;
+                        hw_ran[i] = 1u;
+                        std::vector<uint32_t> hw_out;
+                        if (!prep_cases[i].dxil_hw.empty() &&
+                            d3d_hw.RunComputeDualUav(prep_cases[i].dxil_hw, gpu_cases[i].uav0, gpu_cases[i].init_uav1,
+                                                     hw_out, gpu_cases[i].group_x, prep_cases[i].pso_hw.Get()) &&
+                            VerifyBufferParity(hw_out, prep_cases[i].cpu.uav1, gpu_cases[i].float_tolerance)) {
+                            hw_ok[i] = 1u;
+                        }
+                    }
+                });
+            }
+            if (out_report.has_d3d12_warp && out_report.has_dxc_tool) {
+                live_threads.emplace_back([&]() {
+                    for (size_t i = 0u; i < n_cases; ++i) {
+                        if (!prep_cases[i].valid) continue;
+                        warp_ran[i] = 1u;
+                        std::vector<uint32_t> warp_out;
+                        if (!prep_cases[i].dxil_warp.empty() &&
+                            d3d_warp.RunComputeDualUav(prep_cases[i].dxil_warp, gpu_cases[i].uav0, gpu_cases[i].init_uav1,
+                                                       warp_out, gpu_cases[i].group_x, prep_cases[i].pso_warp.Get()) &&
+                            VerifyBufferParity(warp_out, prep_cases[i].cpu.uav1, gpu_cases[i].float_tolerance)) {
+                            warp_ok[i] = 1u;
+                        }
+                    }
+                });
+            }
+#endif
+            for (auto& th : live_threads) th.join();
+        }
+
+        for (size_t i = 0u; i < n_cases; ++i) {
+            if (!prep_cases[i].valid) continue;
             bool any_gpu_ran = false;
             bool all_gpu_ok = true;
-
-            if (out_report.has_vulkan_hw && gc.allow_vulkan) {
-                std::vector<uint32_t> vk_in = gc.uav0;
-                if (vk_in.size() < cpu.uav1.size()) vk_in.resize(cpu.uav1.size(), 0u);
-                std::vector<uint32_t> vk_out;
-                if (vk.ExecuteComputeShader(lifted.spirv_words, vk_in, vk_out, gc.group_x).ok() &&
-                    VerifyBufferParity(vk_out, cpu.uav1, gc.float_tolerance)) {
+            if (vk_ran[i]) {
+                if (vk_ok[i]) {
                     ++out_report.corpus_vulkan_executed;
                     any_gpu_ran = true;
                 } else {
                     all_gpu_ok = false;
-                    if (first_error.empty()) first_error = std::string("Vulkan GPU parity mismatch: ") + gc.name;
+                    if (first_error.empty()) first_error = std::string("Vulkan GPU parity mismatch: ") + gpu_cases[i].name;
                 }
             }
-
-#if defined(_WIN32)
-            if (out_report.has_d3d12_hw && out_report.has_dxc_tool) {
-                const auto dxil = d3d_hw.CompileDxilForThisAdapter(lifted.hlsl_source, lifted.pc_dxil, dxc_path);
-                std::vector<uint32_t> hw_out;
-                if (!dxil.empty() &&
-                    d3d_hw.RunComputeDualUav(dxil, gc.uav0, gc.init_uav1, hw_out, gc.group_x) &&
-                    VerifyBufferParity(hw_out, cpu.uav1, gc.float_tolerance)) {
+            if (hw_ran[i]) {
+                if (hw_ok[i]) {
                     ++out_report.corpus_gpu_hw_executed;
                     any_gpu_ran = true;
                 } else {
                     all_gpu_ok = false;
-                    if (first_error.empty()) first_error = std::string("D3D12 HW GPU parity mismatch: ") + gc.name;
+                    if (first_error.empty()) first_error = std::string("D3D12 HW GPU parity mismatch: ") + gpu_cases[i].name;
                 }
             }
-
-            if (out_report.has_d3d12_warp && out_report.has_dxc_tool) {
-                const auto dxil = d3d_warp.CompileDxilForThisAdapter(lifted.hlsl_source, lifted.pc_dxil, dxc_path);
-                std::vector<uint32_t> warp_out;
-                if (!dxil.empty() &&
-                    d3d_warp.RunComputeDualUav(dxil, gc.uav0, gc.init_uav1, warp_out, gc.group_x) &&
-                    VerifyBufferParity(warp_out, cpu.uav1, gc.float_tolerance)) {
+            if (warp_ran[i]) {
+                if (warp_ok[i]) {
                     ++out_report.corpus_gpu_warp_executed;
                     any_gpu_ran = true;
                 } else {
                     all_gpu_ok = false;
-                    if (first_error.empty()) first_error = std::string("D3D12 WARP parity mismatch: ") + gc.name;
+                    if (first_error.empty()) first_error = std::string("D3D12 WARP parity mismatch: ") + gpu_cases[i].name;
                 }
             }
-#endif
-
             if (any_gpu_ran && all_gpu_ok) {
                 ++out_report.corpus_gpu_executed;
                 ++out_report.stages[static_cast<size_t>(StageSlot::CS)].gpu_passed;
-                ++out_report.workloads[gc.workload_idx].gpu_passed;
-                audit.MarkGpuOpcodes(lifted.instructions);
+                ++out_report.workloads[gpu_cases[i].workload_idx].gpu_passed;
+                audit.MarkGpuOpcodes(prep_cases[i].lifted.instructions);
             }
         }
 
@@ -7173,6 +8296,30 @@ Status RunRdna2CoverageBenchmark(const Rdna2BenchOptions& opts, Rdna2CoverageRep
         if (out_report.has_vulkan_hw) {
             vk.Shutdown();
         }
+    }
+
+    // Join overlapped Step 4D external validator threads and merge deterministically
+    for (auto& w : ext_workers) w.join();
+    out_report.spirv_val_external_validated += ext_agg.spv_validated;
+    out_report.corpus_dxil_compiled += ext_agg.dxil_compiled;
+    out_report.corpus_dxil_resigned_verified += ext_agg.dxil_resigned;
+    out_report.corpus_shaders_passed = (out_report.corpus_shaders_passed > ext_agg.failed_total)
+                                           ? (out_report.corpus_shaders_passed - ext_agg.failed_total)
+                                           : 0u;
+    for (size_t s = 0u; s < out_report.stages.size(); ++s) {
+        out_report.stages[s].dxil_passed += ext_agg.stage_dxil_passed[s];
+        out_report.stages[s].passed = (out_report.stages[s].passed > ext_agg.stage_failed[s])
+                                          ? (out_report.stages[s].passed - ext_agg.stage_failed[s])
+                                          : 0u;
+    }
+    for (size_t w = 0u; w < out_report.workloads.size(); ++w) {
+        out_report.workloads[w].dxil_passed += ext_agg.wl_dxil_passed[w];
+        out_report.workloads[w].passed = (out_report.workloads[w].passed > ext_agg.wl_failed[w])
+                                             ? (out_report.workloads[w].passed - ext_agg.wl_failed[w])
+                                             : 0u;
+    }
+    if (!ext_agg.first_err.empty() && first_error.empty()) {
+        first_error = ext_agg.first_err;
     }
 
     // 6. Finalize audited opcode counts & elapsed time
@@ -7403,6 +8550,105 @@ int RunRdna2BenchCli(int argc, char** argv) {
         return 1;
     }
     return 0;
+}
+
+Status ExecuteRdna2PrivilegedTrapHarness(
+    const std::vector<uint32_t>& code_words,
+    const std::vector<uint32_t>& uav0,
+    size_t uav1_dwords,
+    Rdna2PrivilegedTrapResult& out_result) {
+    out_result = Rdna2PrivilegedTrapResult{};
+#if defined(OPENSCARLETT_HAS_RDNA2_SV_ISA)
+    using namespace openscarlett::rdna2_sv;
+    std::vector<SvDecodedInst> decoded;
+    if (auto st = DecodeScalarVectorStream(code_words, decoded); !st.ok()) {
+        return st;
+    }
+    if (decoded.empty()) {
+        return Status::Error(StatusCode::InvalidArgument, "ExecuteRdna2PrivilegedTrapHarness: empty code stream");
+    }
+
+    std::unordered_map<uint32_t, size_t> pc_to_idx;
+    pc_to_idx.reserve(decoded.size());
+    for (size_t i = 0u; i < decoded.size(); ++i) {
+        pc_to_idx[decoded[i].base.word_offset] = i;
+    }
+
+    SvWaveState wave{};
+    wave.Reset(32u);
+    wave.SeedThreadIds(0u);
+    wave.exec = 1ull;
+    wave.uav0 = uav0;
+    wave.uav1.assign(uav1_dwords, 0u);
+
+    size_t idx = 0u;
+    uint32_t steps = 0u;
+    while (idx < decoded.size() && steps < wave.max_steps) {
+        ++steps;
+        const SvDecodedInst& sv = decoded[idx];
+        const Rdna2Instruction& inst = sv.base;
+        const uint32_t next_word = inst.word_offset + inst.word_count;
+        ++out_result.instructions_executed;
+
+        if (inst.encoding == Rdna2Encoding::SOPP) {
+            if (inst.raw_opcode == 0x0Du) {  // s_sethalt
+                out_result.termination = Rdna2TrapTerminationKind::Halted;
+                out_result.trap_id = static_cast<uint16_t>(inst.simm16);
+                out_result.saved_pc_bytes = static_cast<uint64_t>(next_word) * 4ull;
+                break;
+            }
+            if (inst.raw_opcode == 0x11u) {  // s_sendmsghalt
+                out_result.termination = Rdna2TrapTerminationKind::SendMsgHalt;
+                out_result.trap_id = static_cast<uint16_t>(inst.simm16);
+                out_result.saved_pc_bytes = static_cast<uint64_t>(next_word) * 4ull;
+                break;
+            }
+            if (inst.raw_opcode == 0x12u) {  // s_trap
+                out_result.termination = Rdna2TrapTerminationKind::TrapRaised;
+                out_result.trap_id = static_cast<uint32_t>(static_cast<uint16_t>(inst.simm16) & 0xFFu);
+                out_result.saved_pc_bytes = static_cast<uint64_t>(next_word) * 4ull;
+                break;
+            }
+            if (inst.raw_opcode == 0x01u || inst.raw_opcode == 0x1Bu ||
+                inst.raw_opcode == 0x1Eu || inst.raw_opcode == 0x1Fu) {
+                break;
+            }
+        } else if (inst.encoding == Rdna2Encoding::SOP1 && inst.raw_opcode == 0x20u) {  // s_rfe_b64
+            uint64_t target_bytes = 0ull;
+            if (inst.src_count > 0u && inst.src[0].kind == Rdna2OperandKind::Sgpr) {
+                target_bytes = wave.ReadSgpr64(static_cast<uint8_t>(inst.src[0].reg_index));
+            }
+            out_result.termination = Rdna2TrapTerminationKind::RfeReturned;
+            out_result.rfe_target_pc_bytes = target_bytes;
+            if (target_bytes != 0ull && (target_bytes & 3ull) == 0ull) {
+                auto it = pc_to_idx.find(static_cast<uint32_t>(target_bytes >> 2u));
+                if (it != pc_to_idx.end()) {
+                    idx = it->second;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        // Delegate standard instruction execution to ExecuteScalarVectorCpu
+        std::vector<SvDecodedInst> single{sv};
+        if (auto st = ExecuteScalarVectorCpu(single, wave); !st.ok()) {
+            return st;
+        }
+        if (wave.ended || wave.halted) {
+            break;
+        }
+        ++idx;
+    }
+
+    out_result.uav1 = std::move(wave.uav1);
+    return Status::Ok();
+#else
+    (void)code_words;
+    (void)uav0;
+    (void)uav1_dwords;
+    return Status::Error(StatusCode::NotImplemented, "rdna2_sv ISA extension not compiled");
+#endif
 }
 
 }  // namespace openscarlett

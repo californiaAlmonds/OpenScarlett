@@ -663,87 +663,14 @@ std::string FormatExpTargetName(uint8_t target) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// MTBUF Unified 7-bit Format Pack / Unpack
+// MTBUF Unified 7-bit Format Pack / Unpack (single authoritative table)
 // ---------------------------------------------------------------------------
 uint32_t MtbufFormatComponentBytes(Rdna2MtbufFormat fmt) noexcept {
-    switch (fmt) {
-        case Rdna2MtbufFormat::R8_UNORM:
-        case Rdna2MtbufFormat::R8_SNORM:
-        case Rdna2MtbufFormat::R8_UINT:
-        case Rdna2MtbufFormat::R8_SINT:
-        case Rdna2MtbufFormat::R8G8_UNORM:
-        case Rdna2MtbufFormat::R8G8_SNORM:
-        case Rdna2MtbufFormat::R8G8_UINT:
-        case Rdna2MtbufFormat::R8G8_SINT:
-        case Rdna2MtbufFormat::R8G8B8A8_UNORM:
-        case Rdna2MtbufFormat::R8G8B8A8_SNORM:
-        case Rdna2MtbufFormat::R8G8B8A8_UINT:
-        case Rdna2MtbufFormat::R8G8B8A8_SINT:
-            return 1u;
-        case Rdna2MtbufFormat::R16_UNORM:
-        case Rdna2MtbufFormat::R16_SNORM:
-        case Rdna2MtbufFormat::R16_UINT:
-        case Rdna2MtbufFormat::R16_SINT:
-        case Rdna2MtbufFormat::R16_FLOAT:
-        case Rdna2MtbufFormat::R16G16_UNORM:
-        case Rdna2MtbufFormat::R16G16_SNORM:
-        case Rdna2MtbufFormat::R16G16_UINT:
-        case Rdna2MtbufFormat::R16G16_SINT:
-        case Rdna2MtbufFormat::R16G16_FLOAT:
-        case Rdna2MtbufFormat::R16G16B16A16_UNORM:
-        case Rdna2MtbufFormat::R16G16B16A16_SNORM:
-        case Rdna2MtbufFormat::R16G16B16A16_UINT:
-        case Rdna2MtbufFormat::R16G16B16A16_SINT:
-        case Rdna2MtbufFormat::R16G16B16A16_FLOAT:
-            return 2u;
-        default:
-            return 4u;
-    }
+    return GetRdna2MtbufFormatInfo(fmt).component_bytes;
 }
 
 uint32_t MtbufFormatByteStride(Rdna2MtbufFormat fmt) noexcept {
-    switch (fmt) {
-        case Rdna2MtbufFormat::R8_UNORM:
-        case Rdna2MtbufFormat::R8_SNORM:
-        case Rdna2MtbufFormat::R8_UINT:
-        case Rdna2MtbufFormat::R8_SINT:
-            return 1u;
-        case Rdna2MtbufFormat::R16_UNORM:
-        case Rdna2MtbufFormat::R16_SNORM:
-        case Rdna2MtbufFormat::R16_UINT:
-        case Rdna2MtbufFormat::R16_SINT:
-        case Rdna2MtbufFormat::R16_FLOAT:
-        case Rdna2MtbufFormat::R8G8_UNORM:
-        case Rdna2MtbufFormat::R8G8_SNORM:
-        case Rdna2MtbufFormat::R8G8_UINT:
-        case Rdna2MtbufFormat::R8G8_SINT:
-            return 2u;
-        case Rdna2MtbufFormat::R32_UINT:
-        case Rdna2MtbufFormat::R32_SINT:
-        case Rdna2MtbufFormat::R32_FLOAT:
-        case Rdna2MtbufFormat::R16G16_UNORM:
-        case Rdna2MtbufFormat::R16G16_SNORM:
-        case Rdna2MtbufFormat::R16G16_UINT:
-        case Rdna2MtbufFormat::R16G16_SINT:
-        case Rdna2MtbufFormat::R16G16_FLOAT:
-        case Rdna2MtbufFormat::R8G8B8A8_UNORM:
-        case Rdna2MtbufFormat::R8G8B8A8_SNORM:
-        case Rdna2MtbufFormat::R8G8B8A8_UINT:
-        case Rdna2MtbufFormat::R8G8B8A8_SINT:
-            return 4u;
-        case Rdna2MtbufFormat::R32G32_FLOAT:
-        case Rdna2MtbufFormat::R16G16B16A16_UNORM:
-        case Rdna2MtbufFormat::R16G16B16A16_SNORM:
-        case Rdna2MtbufFormat::R16G16B16A16_UINT:
-        case Rdna2MtbufFormat::R16G16B16A16_SINT:
-        case Rdna2MtbufFormat::R16G16B16A16_FLOAT:
-            return 8u;
-        case Rdna2MtbufFormat::R32G32B32_FLOAT:
-            return 12u;
-        case Rdna2MtbufFormat::R32G32B32A32_FLOAT:
-        default:
-            return 16u;
-    }
+    return GetRdna2MtbufFormatInfo(fmt).byte_stride;
 }
 
 uint32_t UnpackMtbufFormatComponent(
@@ -3641,6 +3568,22 @@ Status EmitMemImgHlsl(
                 os << "    { uint _a = " << base_a << "; uint _h = (_lds[(_a >> 2u) & 4095u] >> ((_a & 2u) * 8u)) & 0xFFFFu;\n"
                    << "      v[" << static_cast<uint32_t>(vdst) << "] = "
                    << ((op == 0x3Bu) ? "asuint(((int)(_h << 16u)) >> 16)" : "_h") << "; }\n";
+            } else if (op >= 0xA2u && op <= 0xA7u) {
+                const bool is16 = (op == 0xA6u || op == 0xA7u);
+                const bool sgn = (op == 0xA4u || op == 0xA5u);
+                const bool hi = ((op & 1u) != 0u);
+                os << "    { uint _a = " << base_a << "; uint _raw = (_lds[(_a >> 2u) & 4095u] >> ((_a & "
+                   << (is16 ? "2u" : "3u") << ") * 8u)) & " << (is16 ? "0xFFFFu" : "0xFFu") << ";\n";
+                if (sgn) {
+                    os << "      uint _d16 = asuint(((int)(_raw << 24u)) >> 24) & 0xFFFFu;\n";
+                } else {
+                    os << "      uint _d16 = _raw & 0xFFFFu;\n";
+                }
+                if (hi) {
+                    os << "      v[" << static_cast<uint32_t>(vdst) << "] = (v[" << static_cast<uint32_t>(vdst) << "] & 0x0000FFFFu) | (_d16 << 16u); }\n";
+                } else {
+                    os << "      v[" << static_cast<uint32_t>(vdst) << "] = (v[" << static_cast<uint32_t>(vdst) << "] & 0xFFFF0000u) | _d16; }\n";
+                }
             } else if (op == 0x76u || op == 0xFEu || op == 0xFFu) {
                 const uint32_t n = e->data_dwords;
                 for (uint32_t k = 0; k < n; ++k) {
@@ -5058,6 +5001,22 @@ private:
                     v = BitcastU32(EmitBinary(OpShiftRightArithmetic, t_i32_, BitcastI32(EmitBinary(OpShiftLeftLogical, t_u32_, v, ConstU32(sb))), ConstI32(static_cast<int32_t>(sb))));
                 }
                 StoreVgpr(vdst, v);
+            } else if (op >= 0xA2u && op <= 0xA7u) {
+                const bool is16 = (op == 0xA6u || op == 0xA7u);
+                const bool sgn = (op == 0xA4u || op == 0xA5u);
+                const bool hi = ((op & 1u) != 0u);
+                const uint32_t w = AllocId(); EmitInst(sec_fn_, OpLoad, {t_u32_, w, lds_ptr(base_a)});
+                const uint32_t sh = EmitBinary(OpIMul, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, base_a, is16 ? c_u2_ : c_u3_), ConstU32(8u));
+                uint32_t v = EmitBinary(OpBitwiseAnd, t_u32_, EmitBinary(OpShiftRightLogical, t_u32_, w, sh), ConstU32(is16 ? 0xFFFFu : 0xFFu));
+                if (sgn) {
+                    v = BitcastU32(EmitBinary(OpShiftRightArithmetic, t_i32_, BitcastI32(EmitBinary(OpShiftLeftLogical, t_u32_, v, ConstU32(24u))), ConstI32(24)));
+                }
+                const uint32_t d16 = EmitBinary(OpBitwiseAnd, t_u32_, v, ConstU32(0xFFFFu));
+                const uint32_t old_v = LoadVgpr(vdst);
+                const uint32_t merged = hi
+                    ? EmitBinary(OpBitwiseOr, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, old_v, ConstU32(0x0000FFFFu)), EmitBinary(OpShiftLeftLogical, t_u32_, d16, ConstU32(16u)))
+                    : EmitBinary(OpBitwiseOr, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, old_v, ConstU32(0xFFFF0000u)), d16);
+                StoreVgpr(vdst, merged);
             } else if (e->is_atomic) {
                 if (op == 0x40u || op == 0x60u) {
                     const uint32_t p_lo = lds_ptr(base_a);

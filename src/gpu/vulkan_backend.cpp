@@ -283,6 +283,9 @@ inline constexpr uint32_t kVkAccessTransferReadBit = 0x00000800u;
 inline constexpr uint32_t kVkAccessTransferWriteBit = 0x00001000u;
 inline constexpr uint32_t kVkAccessHostReadBit = 0x00002000u;
 inline constexpr uint32_t kVkAccessHostWriteBit = 0x00004000u;
+inline constexpr uint32_t kVkAccessMemoryReadBit = 0x00008000u;
+inline constexpr uint32_t kVkAccessMemoryWriteBit = 0x00010000u;
+inline constexpr uint32_t kVkMemoryHeapDeviceLocalBit = 0x00000001u;
 
 struct VkApplicationInfo {
     int32_t sType;
@@ -4606,11 +4609,250 @@ Status VulkanBackend::InitializeSoftwareFallback() {
     return Status::Ok();
 }
 
+uint64_t VulkanBackend::ScorePhysicalDeviceCandidate(
+    const VulkanPhysicalDeviceCandidate& candidate) noexcept {
+    if (!candidate.supports_compute) {
+        return 0ull;
+    }
+    const uint64_t type_tier = static_cast<uint64_t>(
+        DeviceTypeRank(static_cast<uint32_t>(candidate.device_type)));
+    const uint64_t gfx_bonus = candidate.supports_graphics ? (1ull << 48) : 0ull;
+    const uint64_t mesh_bonus = candidate.supports_mesh_shader ? (1ull << 44) : 0ull;
+    const uint64_t vram_mib = std::min<uint64_t>(
+        candidate.device_local_vram_bytes / (1024ull * 1024ull), 0xFFFFFull);
+    const uint64_t api_major = VkApiMajor(candidate.api_version);
+    const uint64_t api_minor = VkApiMinor(candidate.api_version);
+    const uint64_t api_patch = std::min<uint64_t>(VkApiPatch(candidate.api_version), 15ull);
+    const uint64_t api_score = std::min<uint64_t>(
+        (api_major << 12) | (api_minor << 4) | api_patch, 0xFFFFFull);
+    return (type_tier << 52) | gfx_bonus | mesh_bonus | (vram_mib << 20) | api_score;
+}
+
+std::vector<VulkanPhysicalDeviceCandidate> VulkanBackend::RankPhysicalDeviceCandidates(
+    std::vector<VulkanPhysicalDeviceCandidate> candidates) {
+    for (auto& c : candidates) {
+        c.rank_score = ScorePhysicalDeviceCandidate(c);
+    }
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const VulkanPhysicalDeviceCandidate& a,
+                        const VulkanPhysicalDeviceCandidate& b) {
+                         if (a.rank_score != b.rank_score) {
+                             return a.rank_score > b.rank_score;
+                         }
+                         return a.enumerated_index < b.enumerated_index;
+                     });
+    return candidates;
+}
+
+bool VulkanBackend::SelectPhysicalDeviceCandidate(
+    const std::vector<VulkanPhysicalDeviceCandidate>& candidates,
+    const std::string& gpu_selector,
+    VulkanPhysicalDeviceCandidate& out_selected,
+    bool* out_matched_selector) {
+    if (out_matched_selector) *out_matched_selector = false;
+    const std::vector<VulkanPhysicalDeviceCandidate> ranked =
+        RankPhysicalDeviceCandidates(candidates);
+
+    std::string trimmed = gpu_selector;
+    while (!trimmed.empty() && std::isspace(static_cast<unsigned char>(trimmed.front()))) {
+        trimmed.erase(trimmed.begin());
+    }
+    while (!trimmed.empty() && std::isspace(static_cast<unsigned char>(trimmed.back()))) {
+        trimmed.pop_back();
+    }
+
+    if (trimmed.empty()) {
+        for (const auto& c : ranked) {
+            if (c.supports_compute) {
+                out_selected = c;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool is_non_neg_int = true;
+    for (char ch : trimmed) {
+        if (ch < '0' || ch > '9') {
+            is_non_neg_int = false;
+            break;
+        }
+    }
+    if (is_non_neg_int) {
+        uint64_t parsed_idx = 0ull;
+        for (char ch : trimmed) {
+            parsed_idx = parsed_idx * 10ull + static_cast<uint64_t>(ch - '0');
+            if (parsed_idx > 0xFFFFFFFFull) {
+                return false;
+            }
+        }
+        const uint32_t target_idx = static_cast<uint32_t>(parsed_idx);
+        for (const auto& c : ranked) {
+            if (c.supports_compute && c.enumerated_index == target_idx) {
+                out_selected = c;
+                if (out_matched_selector) *out_matched_selector = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    for (const auto& c : ranked) {
+        if (c.supports_compute && ContainsCaseInsensitive(c.device_name, trimmed)) {
+            out_selected = c;
+            if (out_matched_selector) *out_matched_selector = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+Status VulkanBackend::EnumerateRankedPhysicalDevices(
+    std::vector<VulkanPhysicalDeviceCandidate>& out_ranked_devices) {
+    out_ranked_devices.clear();
+#if defined(_WIN32)
+    HMODULE dll = LoadLibraryA("vulkan-1.dll");
+    if (!dll) {
+        return Status::Error(StatusCode::DeviceError, "vulkan-1.dll not found");
+    }
+    auto cleanup_dll = [&]() {
+        if (dll) {
+            FreeLibrary(dll);
+            dll = nullptr;
+        }
+    };
+    auto get_ipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+        GetProcAddress(dll, "vkGetInstanceProcAddr"));
+    if (!get_ipa) {
+        cleanup_dll();
+        return Status::Error(StatusCode::DeviceError, "vkGetInstanceProcAddr missing");
+    }
+    auto create_inst = reinterpret_cast<PFN_vkCreateInstance>(get_ipa(nullptr, "vkCreateInstance"));
+    if (!create_inst) {
+        cleanup_dll();
+        return Status::Error(StatusCode::DeviceError, "vkCreateInstance missing");
+    }
+
+    VkApplicationInfo app_info{};
+    app_info.sType = kVkStypeApplicationInfo;
+    app_info.pApplicationName = "OpenScarlett-Enum";
+    app_info.applicationVersion = VkMakeApiVersion(0, 0, 1, 0);
+    app_info.pEngineName = "OpenScarlett-Vulkan";
+    app_info.engineVersion = VkMakeApiVersion(0, 0, 1, 0);
+    app_info.apiVersion = kVkApiVersion1_2;
+
+    VkInstanceCreateInfo inst_info{};
+    inst_info.sType = kVkStypeInstanceCreateInfo;
+    inst_info.pApplicationInfo = &app_info;
+
+    VkInstance inst = nullptr;
+    if (create_inst(&inst_info, nullptr, &inst) != kVkSuccess || !inst) {
+        app_info.apiVersion = kVkApiVersion1_1;
+        if (create_inst(&inst_info, nullptr, &inst) != kVkSuccess || !inst) {
+            cleanup_dll();
+            return Status::Error(StatusCode::DeviceError, "vkCreateInstance failed during enumeration");
+        }
+    }
+    auto destroy_inst = reinterpret_cast<PFN_vkDestroyInstance>(get_ipa(inst, "vkDestroyInstance"));
+    auto enum_pdevs = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(get_ipa(inst, "vkEnumeratePhysicalDevices"));
+    auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(get_ipa(inst, "vkGetPhysicalDeviceProperties"));
+    auto get_qfs = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(get_ipa(inst, "vkGetPhysicalDeviceQueueFamilyProperties"));
+    auto get_mem = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(get_ipa(inst, "vkGetPhysicalDeviceMemoryProperties"));
+    auto enum_dext = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(get_ipa(inst, "vkEnumerateDeviceExtensionProperties"));
+
+    if (!enum_pdevs || !get_props || !get_qfs || !get_mem || !enum_dext) {
+        if (destroy_inst) destroy_inst(inst, nullptr);
+        cleanup_dll();
+        return Status::Error(StatusCode::DeviceError, "Required Vulkan enumeration entry points missing");
+    }
+
+    uint32_t dev_count = 0u;
+    if (enum_pdevs(inst, &dev_count, nullptr) == kVkSuccess && dev_count > 0u) {
+        std::vector<VkPhysicalDevice> pdevs(dev_count, nullptr);
+        if (enum_pdevs(inst, &dev_count, pdevs.data()) == kVkSuccess) {
+            pdevs.resize(dev_count);
+            std::vector<VulkanPhysicalDeviceCandidate> raw_candidates;
+            raw_candidates.reserve(dev_count);
+            for (uint32_t idx = 0u; idx < dev_count; ++idx) {
+                VkPhysicalDevice pd = pdevs[idx];
+                if (!pd) continue;
+                VkPhysicalDevicePropertiesRaw props{};
+                get_props(pd, &props);
+                props.deviceName[sizeof(props.deviceName) - 1] = '\0';
+
+                uint32_t qf_count = 0u;
+                get_qfs(pd, &qf_count, nullptr);
+                bool has_compute = false;
+                bool has_graphics = false;
+                if (qf_count > 0u) {
+                    std::vector<VkQueueFamilyProperties> qfs(qf_count);
+                    get_qfs(pd, &qf_count, qfs.data());
+                    for (uint32_t q = 0u; q < qf_count; ++q) {
+                        if (qfs[q].queueCount == 0u) continue;
+                        if ((qfs[q].queueFlags & kVkQueueComputeBit) != 0u) has_compute = true;
+                        if ((qfs[q].queueFlags & kVkQueueGraphicsBit) != 0u) has_graphics = true;
+                    }
+                }
+
+                VkPhysicalDeviceMemoryProperties mp{};
+                get_mem(pd, &mp);
+                uint64_t vram_bytes = 0ull;
+                const uint32_t heap_cnt = std::min<uint32_t>(mp.memoryHeapCount, 16u);
+                for (uint32_t h = 0u; h < heap_cnt; ++h) {
+                    if ((mp.memoryHeaps[h].flags & kVkMemoryHeapDeviceLocalBit) != 0u) {
+                        vram_bytes += mp.memoryHeaps[h].size;
+                    }
+                }
+
+                bool has_mesh = false;
+                uint32_t dext_cnt = 0u;
+                if (enum_dext(pd, nullptr, &dext_cnt, nullptr) == kVkSuccess && dext_cnt > 0u) {
+                    std::vector<VkExtensionProperties> dexts(dext_cnt);
+                    if (enum_dext(pd, nullptr, &dext_cnt, dexts.data()) == kVkSuccess) {
+                        for (uint32_t e = 0u; e < dext_cnt; ++e) {
+                            if (std::strcmp(dexts[e].extensionName, "VK_EXT_mesh_shader") == 0) {
+                                has_mesh = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                VulkanPhysicalDeviceCandidate c{};
+                c.enumerated_index = idx;
+                c.device_name = props.deviceName;
+                c.vendor_id = props.vendorID;
+                c.device_id = props.deviceID;
+                c.api_version = props.apiVersion;
+                c.driver_version = props.driverVersion;
+                c.device_type = static_cast<VulkanDeviceType>(props.deviceType);
+                c.device_local_vram_bytes = vram_bytes;
+                c.supports_compute = has_compute;
+                c.supports_graphics = has_graphics;
+                c.supports_mesh_shader = has_mesh;
+                raw_candidates.push_back(std::move(c));
+            }
+            out_ranked_devices = RankPhysicalDeviceCandidates(std::move(raw_candidates));
+        }
+    }
+
+    if (destroy_inst) destroy_inst(inst, nullptr);
+    cleanup_dll();
+    return Status::Ok();
+#else
+    return Status::Error(StatusCode::UnsupportedFormat, "Vulkan enumeration requires Win32");
+#endif
+}
+
 Status VulkanBackend::Initialize(bool allow_software_fallback) {
     Shutdown();
 
     std::string failure_reason;
-    const std::string device_filter = ReadEnvStringTrimmed("OPENSCARLETT_VK_DEVICE");
+    const std::string gpu_selector_env = ReadEnvStringTrimmed("OPENSCARLETT_VK_GPU");
+    const std::string legacy_device_env = ReadEnvStringTrimmed("OPENSCARLETT_VK_DEVICE");
+    const std::string device_filter = !gpu_selector_env.empty() ? gpu_selector_env : legacy_device_env;
+    const char* active_filter_env_name =
+        !gpu_selector_env.empty() ? "OPENSCARLETT_VK_GPU" : "OPENSCARLETT_VK_DEVICE";
     const std::string force_sw = ReadEnvStringTrimmed("OPENSCARLETT_VK_FORCE_SOFTWARE");
     bool matched_filter = false;
 
@@ -4786,23 +5028,31 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             }
             phys_devs.resize(dev_count);
 
-            VkPhysicalDevice best_dev = nullptr;
-            VkPhysicalDevicePropertiesRaw best_props{};
-            uint32_t best_compute_qf = std::numeric_limits<uint32_t>::max();
-            uint32_t best_graphics_qf = std::numeric_limits<uint32_t>::max();
-            uint32_t best_sparse_qf = std::numeric_limits<uint32_t>::max();
-            int best_rank = -1;
-
-            for (VkPhysicalDevice candidate : phys_devs) {
-                if (!candidate) continue;
+            struct EnumeratedPhysDevRecord {
+                VkPhysicalDevice handle = nullptr;
                 VkPhysicalDevicePropertiesRaw props{};
-                impl_->vkGetPhysicalDeviceProperties(candidate, &props);
+                uint32_t compute_qf = std::numeric_limits<uint32_t>::max();
+                uint32_t graphics_qf = std::numeric_limits<uint32_t>::max();
+                uint32_t sparse_qf = std::numeric_limits<uint32_t>::max();
+                VulkanPhysicalDeviceCandidate candidate{};
+            };
+
+            std::vector<EnumeratedPhysDevRecord> records;
+            std::vector<VulkanPhysicalDeviceCandidate> candidates;
+            records.reserve(dev_count);
+            candidates.reserve(dev_count);
+
+            for (uint32_t idx = 0u; idx < dev_count; ++idx) {
+                VkPhysicalDevice candidate_dev = phys_devs[idx];
+                if (!candidate_dev) continue;
+                VkPhysicalDevicePropertiesRaw props{};
+                impl_->vkGetPhysicalDeviceProperties(candidate_dev, &props);
 
                 uint32_t qf_count = 0;
-                impl_->vkGetPhysicalDeviceQueueFamilyProperties(candidate, &qf_count, nullptr);
+                impl_->vkGetPhysicalDeviceQueueFamilyProperties(candidate_dev, &qf_count, nullptr);
                 if (qf_count == 0) continue;
                 std::vector<VkQueueFamilyProperties> qfs(qf_count);
-                impl_->vkGetPhysicalDeviceQueueFamilyProperties(candidate, &qf_count, qfs.data());
+                impl_->vkGetPhysicalDeviceQueueFamilyProperties(candidate_dev, &qf_count, qfs.data());
 
                 uint32_t compute_qf = std::numeric_limits<uint32_t>::max();
                 uint32_t graphics_qf = std::numeric_limits<uint32_t>::max();
@@ -4811,7 +5061,7 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                     if (qfs[q].queueCount == 0) continue;
                     if ((qfs[q].queueFlags & kVkQueueGraphicsBit) != 0) {
                         const bool win32_ok = !impl_->vkGetPhysicalDeviceWin32PresentationSupportKHR ||
-                                              impl_->vkGetPhysicalDeviceWin32PresentationSupportKHR(candidate, q) != 0;
+                                              impl_->vkGetPhysicalDeviceWin32PresentationSupportKHR(candidate_dev, q) != 0;
                         if (graphics_qf == std::numeric_limits<uint32_t>::max() || win32_ok) {
                             if (graphics_qf == std::numeric_limits<uint32_t>::max()) {
                                 graphics_qf = q;
@@ -4832,22 +5082,79 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                 }
                 if (compute_qf == std::numeric_limits<uint32_t>::max()) continue;
 
-                props.deviceName[sizeof(props.deviceName) - 1] = '\0';
-                if (!device_filter.empty() &&
-                    !ContainsCaseInsensitive(std::string(props.deviceName), device_filter)) {
-                    continue;
+                VkPhysicalDeviceMemoryProperties cand_mem{};
+                impl_->vkGetPhysicalDeviceMemoryProperties(candidate_dev, &cand_mem);
+                uint64_t cand_vram_bytes = 0ull;
+                const uint32_t heap_cnt = std::min<uint32_t>(cand_mem.memoryHeapCount, 16u);
+                for (uint32_t h = 0u; h < heap_cnt; ++h) {
+                    if ((cand_mem.memoryHeaps[h].flags & kVkMemoryHeapDeviceLocalBit) != 0u) {
+                        cand_vram_bytes += cand_mem.memoryHeaps[h].size;
+                    }
                 }
 
-                const int rank = DeviceTypeRank(props.deviceType);
-                if (rank > best_rank) {
-                    best_rank = rank;
-                    best_dev = candidate;
-                    best_props = props;
-                    best_compute_qf = compute_qf;
-                    best_graphics_qf = graphics_qf;
-                    best_sparse_qf = sparse_qf;
-                    if (!device_filter.empty()) {
-                        matched_filter = true;
+                bool cand_has_mesh = false;
+                uint32_t cand_ext_count = 0u;
+                if (impl_->vkEnumerateDeviceExtensionProperties(
+                        candidate_dev, nullptr, &cand_ext_count, nullptr) == kVkSuccess &&
+                    cand_ext_count > 0u) {
+                    std::vector<VkExtensionProperties> cand_exts(cand_ext_count);
+                    if (impl_->vkEnumerateDeviceExtensionProperties(
+                            candidate_dev, nullptr, &cand_ext_count, cand_exts.data()) == kVkSuccess) {
+                        for (uint32_t e = 0u; e < cand_ext_count; ++e) {
+                            if (std::strcmp(cand_exts[e].extensionName, "VK_EXT_mesh_shader") == 0) {
+                                cand_has_mesh = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                props.deviceName[sizeof(props.deviceName) - 1] = '\0';
+                EnumeratedPhysDevRecord rec{};
+                rec.handle = candidate_dev;
+                rec.props = props;
+                rec.compute_qf = compute_qf;
+                rec.graphics_qf = graphics_qf;
+                rec.sparse_qf = sparse_qf;
+                rec.candidate.enumerated_index = idx;
+                rec.candidate.device_name = props.deviceName;
+                rec.candidate.vendor_id = props.vendorID;
+                rec.candidate.device_id = props.deviceID;
+                rec.candidate.api_version = props.apiVersion;
+                rec.candidate.driver_version = props.driverVersion;
+                rec.candidate.device_type = static_cast<VulkanDeviceType>(props.deviceType);
+                rec.candidate.device_local_vram_bytes = cand_vram_bytes;
+                rec.candidate.supports_compute = true;
+                rec.candidate.supports_graphics =
+                    (graphics_qf != std::numeric_limits<uint32_t>::max());
+                rec.candidate.supports_mesh_shader = cand_has_mesh;
+                rec.candidate.rank_score = ScorePhysicalDeviceCandidate(rec.candidate);
+                candidates.push_back(rec.candidate);
+                records.push_back(std::move(rec));
+            }
+
+            VkPhysicalDevice best_dev = nullptr;
+            VkPhysicalDevicePropertiesRaw best_props{};
+            uint32_t best_compute_qf = std::numeric_limits<uint32_t>::max();
+            uint32_t best_graphics_qf = std::numeric_limits<uint32_t>::max();
+            uint32_t best_sparse_qf = std::numeric_limits<uint32_t>::max();
+            uint64_t best_vram_bytes = 0ull;
+            uint64_t best_rank_score = 0ull;
+            uint32_t best_enum_idx = 0u;
+
+            VulkanPhysicalDeviceCandidate chosen_candidate{};
+            if (SelectPhysicalDeviceCandidate(candidates, device_filter, chosen_candidate, &matched_filter)) {
+                for (const auto& rec : records) {
+                    if (rec.candidate.enumerated_index == chosen_candidate.enumerated_index) {
+                        best_dev = rec.handle;
+                        best_props = rec.props;
+                        best_compute_qf = rec.compute_qf;
+                        best_graphics_qf = rec.graphics_qf;
+                        best_sparse_qf = rec.sparse_qf;
+                        best_vram_bytes = rec.candidate.device_local_vram_bytes;
+                        best_rank_score = chosen_candidate.rank_score;
+                        best_enum_idx = rec.candidate.enumerated_index;
+                        break;
                     }
                 }
             }
@@ -4855,7 +5162,8 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             if (!best_dev) {
                 if (!device_filter.empty()) {
                     failure_reason =
-                        "No Vulkan physical device matched OPENSCARLETT_VK_DEVICE=\"" + device_filter + "\"";
+                        std::string("No Vulkan physical device matched ") + active_filter_env_name +
+                        "=\"" + device_filter + "\"";
                 } else {
                     failure_reason = "No Vulkan physical device with a compute-capable queue family";
                 }
@@ -5330,6 +5638,9 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             device_info_.supports_bc_texture_compression = want_bc_compression;
             device_info_.selected_device_filter = device_filter;
             device_info_.matched_device_filter = matched_filter;
+            device_info_.device_local_vram_bytes = best_vram_bytes;
+            device_info_.device_rank_score = best_rank_score;
+            device_info_.enumerated_device_index = best_enum_idx;
             device_info_.supports_depth_bounds_test = impl_->depth_bounds_enabled;
             device_info_.supports_sample_locations_ext = has_dev_sample_locations;
             device_info_.supports_custom_border_color = impl_->custom_border_color_enabled;
@@ -5750,28 +6061,56 @@ Status VulkanBackend::RecordCommandList(const VulkanCommandListDesc& desc,
     }
     out_result = VulkanCommandListResult{};
 
+    bool has_global_uav_barrier = false;
     for (const auto& cmd : desc.commands) {
         if (cmd.op == VulkanCommandOp::Dispatch && (cmd.x == 0 || cmd.y == 0 || cmd.z == 0)) {
             return Status::Error(StatusCode::InvalidArgument, "Dispatch command dimensions must be > 0");
+        }
+        if (cmd.op == VulkanCommandOp::GlobalUavBarrier) {
+            has_global_uav_barrier = true;
         }
     }
 
     std::lock_guard<std::mutex> lock(impl_->mutex);
 
+    const uint32_t global_uav_access = kVkAccessMemoryReadBit | kVkAccessMemoryWriteBit;
+    const bool use_graphics_queue_for_global_uav =
+        has_global_uav_barrier && impl_->has_graphics_queue &&
+        impl_->graphics_queue != nullptr && impl_->graphics_command_pool != kVkNullHandle;
+    const uint32_t global_uav_stage =
+        (impl_->has_graphics_queue || impl_->fallback_mode)
+            ? (kVkPipelineStageAllGraphicsBit | kVkPipelineStageComputeShaderBit)
+            : kVkPipelineStageAllCommandsBit;
+
     if (impl_->fallback_mode || !impl_->device) {
         for (const auto& cmd : desc.commands) {
             ++out_result.recorded_commands;
-            if (cmd.op == VulkanCommandOp::Dispatch) ++out_result.dispatch_count;
-            if (cmd.op == VulkanCommandOp::PipelineBarrier) ++out_result.barrier_count;
+            if (cmd.op == VulkanCommandOp::Dispatch) {
+                ++out_result.dispatch_count;
+            } else if (cmd.op == VulkanCommandOp::PipelineBarrier) {
+                ++out_result.barrier_count;
+            } else if (cmd.op == VulkanCommandOp::GlobalUavBarrier) {
+                ++out_result.barrier_count;
+                ++out_result.global_uav_barrier_count;
+                out_result.last_global_uav_src_stage_mask = global_uav_stage;
+                out_result.last_global_uav_dst_stage_mask = global_uav_stage;
+                out_result.last_global_uav_src_access_mask = global_uav_access;
+                out_result.last_global_uav_dst_access_mask = global_uav_access;
+            }
         }
         out_result.executed_on_vulkan_icd = false;
         return Status::Ok();
     }
 
+    VkCommandPool target_pool =
+        use_graphics_queue_for_global_uav ? impl_->graphics_command_pool : impl_->command_pool;
+    VkQueue target_queue =
+        use_graphics_queue_for_global_uav ? impl_->graphics_queue : impl_->compute_queue;
+
     VkCommandBuffer cmd_buf = nullptr;
     VkCommandBufferAllocateInfo cba_ci{};
     cba_ci.sType = kVkStypeCommandBufferAllocateInfo;
-    cba_ci.commandPool = impl_->command_pool;
+    cba_ci.commandPool = target_pool;
     cba_ci.level = kVkCommandBufferLevelPrimary;
     cba_ci.commandBufferCount = 1;
     if (impl_->vkAllocateCommandBuffers(impl_->device, &cba_ci, &cmd_buf) != kVkSuccess || !cmd_buf) {
@@ -5780,7 +6119,7 @@ Status VulkanBackend::RecordCommandList(const VulkanCommandListDesc& desc,
 
     auto free_cb = [&]() {
         if (cmd_buf) {
-            impl_->vkFreeCommandBuffers(impl_->device, impl_->command_pool, 1, &cmd_buf);
+            impl_->vkFreeCommandBuffers(impl_->device, target_pool, 1, &cmd_buf);
             cmd_buf = nullptr;
         }
     };
@@ -5803,6 +6142,21 @@ Status VulkanBackend::RecordCommandList(const VulkanCommandListDesc& desc,
             impl_->vkCmdPipelineBarrier(cmd_buf, kVkPipelineStageComputeShaderBit, kVkPipelineStageHostBit,
                                         0, 1, &mb, 0, nullptr, 0, nullptr);
             ++out_result.barrier_count;
+        } else if (cmd.op == VulkanCommandOp::GlobalUavBarrier) {
+            // Console UAV barrier with UAV.pResource == nullptr (xcl #68):
+            // conservatively synchronize all memory reads/writes across graphics & compute stages.
+            VkMemoryBarrier mb{};
+            mb.sType = kVkStypeMemoryBarrier;
+            mb.srcAccessMask = global_uav_access;
+            mb.dstAccessMask = global_uav_access;
+            impl_->vkCmdPipelineBarrier(cmd_buf, global_uav_stage, global_uav_stage,
+                                        0, 1, &mb, 0, nullptr, 0, nullptr);
+            ++out_result.barrier_count;
+            ++out_result.global_uav_barrier_count;
+            out_result.last_global_uav_src_stage_mask = global_uav_stage;
+            out_result.last_global_uav_dst_stage_mask = global_uav_stage;
+            out_result.last_global_uav_src_access_mask = global_uav_access;
+            out_result.last_global_uav_dst_access_mask = global_uav_access;
         } else if (cmd.op == VulkanCommandOp::Dispatch) {
             ++out_result.dispatch_count;
         }
@@ -5818,8 +6172,8 @@ Status VulkanBackend::RecordCommandList(const VulkanCommandListDesc& desc,
         si.sType = kVkStypeSubmitInfo;
         si.commandBufferCount = 1;
         si.pCommandBuffers = &cmd_buf;
-        if (impl_->vkQueueSubmit(impl_->compute_queue, 1, &si, kVkNullHandle) != kVkSuccess ||
-            impl_->vkQueueWaitIdle(impl_->compute_queue) != kVkSuccess) {
+        if (impl_->vkQueueSubmit(target_queue, 1, &si, kVkNullHandle) != kVkSuccess ||
+            impl_->vkQueueWaitIdle(target_queue) != kVkSuccess) {
             free_cb();
             return Status::Error(StatusCode::DeviceError, "RecordCommandList: queue submit/wait failed");
         }

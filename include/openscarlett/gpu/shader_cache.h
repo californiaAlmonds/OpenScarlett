@@ -47,6 +47,10 @@ struct ShaderCacheStats {
     uint64_t async_compiles_queued = 0;
     uint64_t async_compiles_completed = 0;
     uint64_t async_compiles_failed = 0;
+    uint64_t sync_compiles_succeeded = 0;
+    uint64_t sync_compiles_failed = 0;
+    uint64_t total_compile_failures = 0;
+    uint64_t standins_served = 0;
 };
 
 struct CachedShaderResult {
@@ -57,6 +61,7 @@ struct CachedShaderResult {
     bool from_memory_cache = false;
     bool from_disk_cache = false;
     bool is_standin_async = false;
+    std::string diagnostics;
 };
 
 struct ShaderCacheLiftRequest {
@@ -101,9 +106,11 @@ public:
     // Clears in-memory cache entries (preserving on-disk cache files).
     void ClearMemoryCache();
 
-    // Resets internal hit/miss/async statistics counters.
+    // Resets internal hit/miss/async statistics counters and last diagnostic error.
     void ResetStats();
     ShaderCacheStats Stats() const noexcept;
+    std::string LastCompileError() const;
+    std::string FormatDiagnosticsSummary() const;
 
     // Direct cache lookup / store by key (validates header magic + checksum on disk).
     bool TryGet(const ShaderCacheKey& key, CachedShaderResult& out_result);
@@ -176,6 +183,10 @@ private:
     std::atomic<uint64_t> async_queued_{0};
     std::atomic<uint64_t> async_completed_{0};
     std::atomic<uint64_t> async_failed_{0};
+    std::atomic<uint64_t> sync_succeeded_{0};
+    std::atomic<uint64_t> sync_failed_{0};
+    std::atomic<uint64_t> standins_served_{0};
+    std::string last_compile_error_;
 
     mutable std::mutex async_mutex_;
     std::condition_variable async_cv_;

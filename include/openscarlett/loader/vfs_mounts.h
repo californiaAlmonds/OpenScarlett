@@ -42,6 +42,8 @@ struct VfsMountConfig {
     std::wstring g_overlay_root;  // CoW overlay & whiteout directory for G: / GAME:
     std::vector<VfsSubMount> g_sub_mounts;  // Optional nested read-only sub-mounts under G:/GAME:
     bool forbid_system_drive_writes = false;  // When true, mutating operations targeting C:\ or %SystemDrive% are rejected
+    bool preserve_host_drive_folders = true;  // Preserve real host PC directories on console drive letters (D:/G:/T:/S:/P:)
+    std::vector<std::wstring> preserved_host_prefixes;  // Explicit host path prefixes preserved verbatim when unshadowed
 };
 
 // UTF-8 / UTF-16 conversion helpers (safe on Windows x64).
@@ -89,6 +91,10 @@ public:
     // All writes inside the sub-mount still redirect to g_overlay_root without touching host_ro_root.
     bool AddGameSubMount(std::wstring_view virtual_subpath, std::wstring_view host_ro_root);
 
+    // Registers an explicit host path prefix (e.g. "G:\HostApps" or "D:\Work") that is preserved
+    // verbatim as NotVirtual whenever not shadowed by a guest file, overlay entry, or sub-mount.
+    bool AddPreservedHostPrefixW(std::wstring_view host_prefix);
+
     // Creates T:\, S:\, and G_overlay backing directories on disk if configured (never touches g_root).
     bool EnsureWritableMounts() const;
 
@@ -122,6 +128,11 @@ public:
                           std::wstring_view dst_path,
                           uint32_t flags,
                           uint32_t& out_win32_error) const;
+    bool ReplaceVirtualFileW(std::wstring_view replaced_path,
+                             std::wstring_view replacement_path,
+                             std::wstring_view backup_path,
+                             uint32_t flags,
+                             uint32_t& out_win32_error) const;
 
     // Resolves both read-only base and overlay paths for a G:/GAME: path (used by FindFirstFileW).
     VfsTranslateStatus ResolveGamePairW(std::wstring_view virtual_path,
@@ -136,6 +147,10 @@ public:
     const std::wstring& GetSaveRoot() const noexcept { return s_root_; }
     const std::vector<VfsSubMount>& GetGameSubMounts() const noexcept { return g_sub_mounts_; }
     bool GetForbidSystemDriveWrites() const noexcept { return forbid_system_drive_writes_; }
+    bool GetPreserveHostDriveFolders() const noexcept { return preserve_host_drive_folders_; }
+    const std::vector<std::wstring>& GetPreservedHostPrefixes() const noexcept {
+        return preserved_host_prefixes_;
+    }
 
 private:
     static std::wstring NormalizeRoot(std::wstring_view root);
@@ -146,6 +161,8 @@ private:
     std::wstring g_overlay_root_;
     std::vector<VfsSubMount> g_sub_mounts_;
     bool forbid_system_drive_writes_ = false;
+    bool preserve_host_drive_folders_ = true;
+    std::vector<std::wstring> preserved_host_prefixes_;
 };
 
 }  // namespace openscarlett

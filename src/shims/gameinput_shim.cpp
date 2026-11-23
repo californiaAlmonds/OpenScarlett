@@ -7,10 +7,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <new>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -371,15 +374,46 @@ void PollGamepadAndKeyboard(
     const XInputApi& xi = GetXInput();
     if (xi.get_state) {
         OsXInputState st{};
-        if (xi.get_state(preferred_slot, &st) == ERROR_SUCCESS) {
+        DWORD last_rc = xi.get_state(preferred_slot, &st);
+        if (last_rc == ERROR_SUCCESS) {
             physical_pad_found = true;
             out_active_slot = preferred_slot;
         } else {
             for (DWORD slot = 0; slot < 4; ++slot) {
-                if (xi.get_state(slot, &st) == ERROR_SUCCESS) {
+                DWORD rc = xi.get_state(slot, &st);
+                if (rc == ERROR_SUCCESS) {
                     physical_pad_found = true;
                     out_active_slot = static_cast<uint32_t>(slot);
+                    last_rc = rc;
                     break;
+                }
+            }
+        }
+        static const std::string s_trace_gi_path = []() {
+            char buf[512]{};
+            DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_GAMEINPUT", buf, sizeof(buf));
+            return (n > 0 && n < sizeof(buf)) ? std::string(buf, n) : std::string{};
+        }();
+        if (!s_trace_gi_path.empty()) {
+            static std::atomic<uint32_t> s_prev_state{0xFFFFFFFFu};
+            const uint32_t packed = (physical_pad_found ? 0x80000000u : 0u) |
+                                    ((out_active_slot & 0xFu) << 16) |
+                                    (physical_pad_found ? static_cast<uint32_t>(st.Gamepad.wButtons) : (last_rc & 0xFFFFu));
+            if (s_prev_state.exchange(packed, std::memory_order_relaxed) != packed) {
+                char msg[220];
+                std::snprintf(msg, sizeof(msg),
+                              "[GameInput] XInput found=%d slot=%u rc=%lu pkt=%u btn=0x%04X lx=%d ly=%d\n",
+                              physical_pad_found ? 1 : 0, out_active_slot, static_cast<unsigned long>(last_rc),
+                              st.dwPacketNumber, physical_pad_found ? st.Gamepad.wButtons : 0u,
+                              physical_pad_found ? static_cast<int>(st.Gamepad.sThumbLX) : 0,
+                              physical_pad_found ? static_cast<int>(st.Gamepad.sThumbLY) : 0);
+                ::OutputDebugStringA(msg);
+                if (s_trace_gi_path != "1") {
+                    FILE* f = nullptr;
+                    if (::fopen_s(&f, s_trace_gi_path.c_str(), "a") == 0 && f) {
+                        std::fputs(msg, f);
+                        std::fclose(f);
+                    }
                 }
             }
         }
@@ -435,7 +469,7 @@ void PollGamepadAndKeyboard(
         }
     }
 
-    if (!physical_pad_found || virtual_gamepad_fallback_enabled) {
+    if (!physical_pad_found && virtual_gamepad_fallback_enabled) {
         uint32_t eff_mouse_buttons = raw_mouse_buttons;
         if (is_down(VK_LBUTTON)) eff_mouse_buttons |= GameInputMouseLeftButton;
         if (is_down(VK_RBUTTON)) eff_mouse_buttons |= GameInputMouseRightButton;
@@ -953,8 +987,7 @@ public:
     GameInputImpl() {
         default_device_ = CreateTrackedDevice(
             0u,
-            GameInputKindGamepad | GameInputKindController | GameInputKindKeyboard |
-                GameInputKindMouse | GameInputKindUiNavigation,
+            GameInputKindGamepad | GameInputKindController | GameInputKindUiNavigation,
             0x045Eu, 0x0B12u,
             GameInputFamilyXboxOne,
             GameInputRumbleLowFrequency | GameInputRumbleHighFrequency |
@@ -1121,7 +1154,7 @@ public:
         bool injected_gp_explicit = false;
         if (input_allowed) {
             std::lock_guard<std::mutex> lk(mutex_);
-            if (test_inject_enabled_) {
+            if (test_inject_enabled_.load(std::memory_order_acquire)) {
                 gp = injected_gamepad_;
                 keys = injected_keys_;
                 use_injected = true;
@@ -1634,7 +1667,7 @@ public:
         uint32_t key_count,
         bool enable) {
         std::lock_guard<std::mutex> lk(mutex_);
-        test_inject_enabled_ = enable;
+        test_inject_enabled_.store(enable, std::memory_order_release);
         if (!enable) {
             injected_gamepad_explicit_ = false;
             injected_gamepad_ = GameInputGamepadState{};
@@ -1660,7 +1693,7 @@ public:
             return GAMEINPUT_E_INVALIDARG;
         }
         raw_mouse_registered_.store(true, std::memory_order_release);
-        if (hwnd) {
+        if (hwnd && ::IsWindowVisible(reinterpret_cast<HWND>(hwnd)) != FALSE) {
             target_hwnd_.store(hwnd, std::memory_order_release);
         }
         return GAMEINPUT_S_OK;
@@ -1840,30 +1873,73 @@ private:
         raw_mouse_ring_.push_back(pkt);
     }
 
+#if defined(_WIN32)
+    static bool ProcessOwnsVisibleGuiWindow() noexcept {
+        struct EnumCtx {
+            DWORD self_pid;
+            HWND console_hwnd;
+            bool found;
+        };
+        EnumCtx ctx{GetCurrentProcessId(), GetConsoleWindow(), false};
+        EnumWindows(
+            [](HWND hwnd, LPARAM lparam) -> BOOL {
+                auto* c = reinterpret_cast<EnumCtx*>(lparam);
+                if (!hwnd || hwnd == c->console_hwnd || !IsWindowVisible(hwnd)) {
+                    return TRUE;
+                }
+                DWORD pid = 0;
+                GetWindowThreadProcessId(hwnd, &pid);
+                if (pid != c->self_pid) {
+                    return TRUE;
+                }
+                RECT rc{};
+                if (GetWindowRect(hwnd, &rc) && (rc.right - rc.left) > 0 && (rc.bottom - rc.top) > 0) {
+                    c->found = true;
+                    return FALSE;
+                }
+                return TRUE;
+            },
+            reinterpret_cast<LPARAM>(&ctx));
+        return ctx.found;
+    }
+#endif
+
     bool ShouldAllowInput() const noexcept {
         const uint32_t policy = focus_policy_.load(std::memory_order_acquire);
         if ((policy & GameInputEnableBackgroundInput) != 0u) {
             return true;
         }
-        const uint32_t fg_gate_mask =
-            GameInputDisableBackgroundInput | GameInputExclusiveForegroundInput;
-        if ((policy & fg_gate_mask) == 0u) {
-            return true;
-        }
 #if defined(_WIN32)
         HWND fg = GetForegroundWindow();
-        if (!fg) {
-            return false;
-        }
         HWND target = reinterpret_cast<HWND>(target_hwnd_.load(std::memory_order_acquire));
         if (target && IsWindow(target) != FALSE) {
+            if (!fg) {
+                return false;
+            }
             return (fg == target) ||
                    (IsChild(target, fg) != FALSE) ||
                    (GetAncestor(fg, GA_ROOTOWNER) == target);
         }
-        DWORD fg_pid = 0;
-        GetWindowThreadProcessId(fg, &fg_pid);
-        return fg_pid == GetCurrentProcessId();
+        const DWORD self_pid = GetCurrentProcessId();
+        if (fg) {
+            DWORD fg_pid = 0;
+            GetWindowThreadProcessId(fg, &fg_pid);
+            if (fg_pid == self_pid) {
+                return true;
+            }
+        }
+        const uint32_t explicit_fg_mask =
+            GameInputDisableBackgroundInput | GameInputExclusiveForegroundInput;
+        if ((policy & explicit_fg_mask) != 0u) {
+            return false;
+        }
+        // GameInputDefaultFocusPolicy (0): block background input whenever this process
+        // owns a visible GUI window (e.g. a game swapchain window) that is not focused,
+        // while keeping headless console unit tests & explicit test injection functional.
+        if (test_inject_enabled_.load(std::memory_order_acquire)) {
+            return true;
+        }
+        return !ProcessOwnsVisibleGuiWindow();
 #else
         return true;
 #endif
@@ -1875,7 +1951,7 @@ private:
     GameInputDeviceImpl* default_device_ = nullptr;
     GameInputDeviceImpl* keyboard_device_ = nullptr;
     GameInputDeviceImpl* mouse_device_ = nullptr;
-    std::unordered_map<uint32_t, GameInputDeviceImpl*> slot_devices_;
+    std::map<uint32_t, GameInputDeviceImpl*> slot_devices_;
     std::mutex mutex_;
     std::atomic<uint64_t> event_seq_{0ull};
     std::atomic<bool> virtual_gamepad_fallback_{true};
@@ -1886,7 +1962,7 @@ private:
     std::deque<GameInputReadingImpl*> history_;
     std::vector<DeviceCallbackEntry> device_callbacks_;
     std::vector<UserAssocCallbackEntry> user_assoc_callbacks_;
-    bool test_inject_enabled_ = false;
+    std::atomic<bool> test_inject_enabled_{false};
     bool injected_gamepad_explicit_ = false;
     GameInputGamepadState injected_gamepad_{};
     std::vector<GameInputKeyState> injected_keys_;

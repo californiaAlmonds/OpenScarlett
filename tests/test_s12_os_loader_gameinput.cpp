@@ -1,4 +1,6 @@
 #include <windows.h>
+#include <share.h>
+#include <sys/stat.h>
 
 #include <algorithm>
 #include <atomic>
@@ -508,7 +510,40 @@ void TestHookDllTlsNtForwarderLsa(const fs::path& bin_dir, const fs::path& scrat
         OS_REQUIRE(st == static_cast<OS_NTSTATUS>(0xC0000022UL));
     }
 
-    std::printf("[PASS] Hook DLL live TLS slot 0, PeForwarder, ConsoleLsaPolicy & Nt* VFS hooks\n");
+    // 2e. UCRT stdio (_wfsopen / _wstat64 / _wremove) & std::ofstream on P:/ forward-slash paths
+    //     (validates LevelDB / CRT I/O routed through patched ucrtbase.dll & msvcp140.dll IATs).
+    {
+        const fs::path host_db = s_dir / L"Users" / L"2533274790400823" / L"games" / L"com.mojang" /
+                                 L"minecraftWorlds" / L"test_world" / L"db";
+        std::error_code ec;
+        fs::create_directories(host_db, ec);
+        OS_REQUIRE(!ec);
+
+        const wchar_t* vlock = L"P:/Users/2533274790400823/games/com.mojang/minecraftWorlds/test_world/db/LOCK";
+        FILE* fp = _wfsopen(vlock, L"wb", _SH_DENYNO);
+        OS_REQUIRE(fp != nullptr);
+        const char payload[] = "LOCK_OK";
+        OS_REQUIRE(std::fwrite(payload, 1, sizeof(payload) - 1, fp) == sizeof(payload) - 1);
+        std::fclose(fp);
+        OS_REQUIRE(ReadTextFile(host_db / L"LOCK") == "LOCK_OK");
+
+        struct __stat64 st64{};
+        OS_REQUIRE(_wstat64(vlock, &st64) == 0);
+        OS_REQUIRE(st64.st_size == static_cast<__int64>(sizeof(payload) - 1));
+
+        {
+            std::ofstream ofs("P:/Users/2533274790400823/games/com.mojang/minecraftWorlds/test_world/levelname.txt",
+                              std::ios::binary | std::ios::trunc);
+            OS_REQUIRE(static_cast<bool>(ofs));
+            ofs << "My World";
+        }
+        OS_REQUIRE(ReadTextFile(host_db.parent_path() / L"levelname.txt") == "My World");
+
+        OS_REQUIRE(_wremove(vlock) == 0);
+        OS_REQUIRE(!fs::exists(host_db / L"LOCK"));
+    }
+
+    std::printf("[PASS] Hook DLL live TLS slot 0, PeForwarder, ConsoleLsaPolicy, Nt* & UCRT VFS hooks\n");
 }
 
 // ---------------------------------------------------------------------------

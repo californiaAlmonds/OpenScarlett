@@ -166,6 +166,10 @@ foreach(_os_module_cmake
     cmake/mine_xapu_acphal.cmake
     cmake/mine_d3d12_xmem.cmake
     cmake/mine_routing_apisets.cmake
+    cmake/s15_w1_rdna2_bench.cmake
+    cmake/s15_w2_shaders.cmake
+    cmake/s15_w3_graphics.cmake
+    cmake/s15_w4_shims.cmake
     cmake/ue5_dxc_xcrdapi_xg.cmake
     cmake/ue5_d3d12_exports.cmake
     cmake/ue5_acphal_xmem_mfplat.cmake

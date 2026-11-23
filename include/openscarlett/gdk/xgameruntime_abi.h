@@ -34,6 +34,7 @@ constexpr XGameResult XGR_E_POINTER = static_cast<XGameResult>(0x80004003u);
 constexpr XGameResult XGR_E_ABORT = static_cast<XGameResult>(0x80004004u);
 constexpr XGameResult XGR_E_FAIL = static_cast<XGameResult>(0x80004005u);
 constexpr XGameResult XGR_E_PENDING = static_cast<XGameResult>(0x8000000Au);
+constexpr XGameResult XGR_E_BOUNDS = static_cast<XGameResult>(0x8000000Bu);
 constexpr XGameResult XGR_E_ACCESSDENIED = static_cast<XGameResult>(0x80070005u);
 constexpr XGameResult XGR_E_HANDLE = static_cast<XGameResult>(0x80070006u);
 constexpr XGameResult XGR_E_OUTOFMEMORY = static_cast<XGameResult>(0x8007000Eu);
@@ -719,6 +720,7 @@ struct XSystemRuntimeInfo {
     XVersion availableVersion;
 };
 
+constexpr size_t XSystemConsoleIdBytes = 40;
 constexpr size_t XSystemAppSpecificDeviceIdBytes = 45;
 
 OPENSCARLETT_GDK_API XSystemDeviceType OPENSCARLETT_GDK_CALL XSystemGetDeviceType(void);
@@ -1933,11 +1935,25 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreShowPurchaseUIAsync
     XAsyncBlock* async);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreShowPurchaseUIResult(
     XAsyncBlock* async);
+struct XStoreRateAndReviewResult {
+    bool wasUpdated;
+};
+static_assert(sizeof(XStoreRateAndReviewResult) == 1,
+              "XStoreRateAndReviewResult must be strictly 1 byte");
+
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreShowRateAndReviewUIAsync(
     XStoreContextHandle storeContextHandle,
     XAsyncBlock* async);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreShowRateAndReviewUIResult(
-    XAsyncBlock* async);
+    XAsyncBlock* async
+#ifdef __cplusplus
+    ,
+    XStoreRateAndReviewResult* result = nullptr
+#else
+    ,
+    XStoreRateAndReviewResult* result
+#endif
+);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreShowRedeemTokenUIAsync(
     XStoreContextHandle storeContextHandle,
     const char* token,
@@ -3074,7 +3090,9 @@ struct IXgrStoreApiVtable {
     XGameResult(OPENSCARLETT_GDK_CALL* XStoreShowRateAndReviewUIAsync)(
         XStoreContextHandle storeContextHandle,
         XAsyncBlock* async);
-    XGameResult(OPENSCARLETT_GDK_CALL* XStoreShowRateAndReviewUIResult)(XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreShowRateAndReviewUIResult)(
+        XAsyncBlock* async,
+        XStoreRateAndReviewResult* result);
     XGameResult(OPENSCARLETT_GDK_CALL* XStoreShowRedeemTokenUIAsync)(
         XStoreContextHandle storeContextHandle,
         const char* token,
@@ -3268,6 +3286,25 @@ struct IXgrAccessibilityApiVtable {
         bool enabled);
     XGameResult(OPENSCARLETT_GDK_CALL* XHighContrastGetMode)(
         XHighContrastMode* mode);
+    XGameResult(OPENSCARLETT_GDK_CALL* XSpeechToTextSetPositionHint)(
+        XSpeechToTextPositionHint position);
+    XGameResult(OPENSCARLETT_GDK_CALL* XSpeechToTextSendString)(
+        const char* speakerName,
+        const char* content,
+        XSpeechToTextType type);
+    XGameResult(OPENSCARLETT_GDK_CALL* XSpeechToTextBeginHypothesisString)(
+        const char* speakerName,
+        const char* content,
+        XSpeechToTextType type,
+        uint32_t* hypothesisId);
+    XGameResult(OPENSCARLETT_GDK_CALL* XSpeechToTextUpdateHypothesisString)(
+        uint32_t hypothesisId,
+        const char* content);
+    XGameResult(OPENSCARLETT_GDK_CALL* XSpeechToTextFinalizeHypothesisString)(
+        uint32_t hypothesisId,
+        const char* content);
+    XGameResult(OPENSCARLETT_GDK_CALL* XSpeechToTextCancelHypothesisString)(
+        uint32_t hypothesisId);
 };
 
 struct IXgrSpeechSynthesizerApiVtable {

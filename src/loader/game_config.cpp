@@ -568,6 +568,10 @@ const GameExecutableEntry* GameConfig::SelectPrimaryExecutable() const noexcept 
     return best;
 }
 
+Status DecodeXmlEntities(std::string_view raw, std::string& out) {
+    return UnescapeXmlEntities(raw, out);
+}
+
 Status ParseGameConfigXml(std::string_view xml_text,
                           const std::string& label,
                           GameConfig& out_config) {
@@ -620,6 +624,8 @@ Status ParseGameConfigXml(std::string_view xml_text,
     if (const auto* visuals = root.FindChild("ShellVisuals")) {
         if (const auto* v = visuals->FindAttr("DefaultDisplayName")) {
             out_config.display_name = *v;
+        } else if (const auto* v_alt = visuals->FindAttr("DisplayName")) {
+            out_config.display_name = *v_alt;
         }
     }
 

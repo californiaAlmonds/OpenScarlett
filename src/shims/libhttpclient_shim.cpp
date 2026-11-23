@@ -16,7 +16,11 @@
 #include <utility>
 #include <vector>
 
+constexpr uint32_t kMagicHttpCall = 0x48434341u;    // 'HCCA'
+constexpr uint32_t kMagicWebSocket = 0x48435753u;   // 'HCWS'
+
 struct HCCallObject {
+    uint32_t magic = kMagicHttpCall;
     std::atomic<int32_t> ref_count{1};
     std::mutex mutex;
     uint64_t call_id = 0;
@@ -98,6 +102,7 @@ typedef int32_t(OS_SHIM_CALL* HCWebSocketDisconnectFunction)(
     void* context);
 
 struct HCWebSocketObject {
+    uint32_t magic = kMagicWebSocket;
     std::atomic<int32_t> ref_count{1};
     std::mutex mutex;
     std::string uri;
@@ -196,12 +201,102 @@ std::string EscapeJsonString(const std::string& s) {
     return out;
 }
 
+bool IsValidHttpToken(const char* s) {
+    if (!s || !*s) {
+        return false;
+    }
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(s); *p != '\0'; ++p) {
+        const unsigned char c = *p;
+        const bool is_alnum =
+            (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        const bool is_tchar_sym =
+            c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' ||
+            c == '*' || c == '+' || c == '-' || c == '.' || c == '^' || c == '_' ||
+            c == '`' || c == '|' || c == '~';
+        if (!is_alnum && !is_tchar_sym) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool IsValidHttpHeaderName(const char* name) {
+    return IsValidHttpToken(name);
+}
+
+bool IsValidHttpHeaderValue(const char* value) {
+    if (!value) {
+        return false;
+    }
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(value); *p != '\0'; ++p) {
+        const unsigned char c = *p;
+        if (c == '\r' || c == '\n' || c == 0x7Fu || (c < 0x20u && c != '\t')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool HasSchemeCaseInsensitive(const char* url, const char* scheme) {
+    if (!url || !scheme) {
+        return false;
+    }
+    while (*scheme != '\0') {
+        if (*url == '\0') {
+            return false;
+        }
+        if (std::tolower(static_cast<unsigned char>(*url)) !=
+            std::tolower(static_cast<unsigned char>(*scheme))) {
+            return false;
+        }
+        ++url;
+        ++scheme;
+    }
+    return true;
+}
+
+bool IsValidSchemeUrl(const char* url, const char* scheme1, const char* scheme2) {
+    if (!url || !*url) {
+        return false;
+    }
+    size_t scheme_len = 0u;
+    if (HasSchemeCaseInsensitive(url, scheme1)) {
+        scheme_len = std::strlen(scheme1);
+    } else if (HasSchemeCaseInsensitive(url, scheme2)) {
+        scheme_len = std::strlen(scheme2);
+    } else {
+        return false;
+    }
+    const char* host_start = url + scheme_len;
+    if (*host_start == '\0' || *host_start == '/' || *host_start == '?' || *host_start == '#') {
+        return false;
+    }
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(url); *p != '\0'; ++p) {
+        const unsigned char c = *p;
+        if (c <= 0x20u || c == 0x7Fu) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool IsValidHttpUrl(const char* url) {
+    return IsValidSchemeUrl(url, "http://", "https://");
+}
+
+bool IsValidWebSocketUrl(const char* url) {
+    return IsValidSchemeUrl(url, "ws://", "wss://");
+}
+
 std::shared_ptr<HCCallObject> LookupCall(HCCallHandle handle) {
     if (!handle) return nullptr;
     auto& st = GetHc();
     std::lock_guard<std::mutex> lk(st.mutex);
     auto it = st.live_calls.find(handle);
-    return it == st.live_calls.end() ? nullptr : it->second;
+    if (it == st.live_calls.end() || !it->second || it->second->magic != kMagicHttpCall) {
+        return nullptr;
+    }
+    return it->second;
 }
 
 std::shared_ptr<HCWebSocketObject> LookupWebSocket(HCWebsocketHandle handle) {
@@ -209,7 +304,10 @@ std::shared_ptr<HCWebSocketObject> LookupWebSocket(HCWebsocketHandle handle) {
     auto& st = GetHc();
     std::lock_guard<std::mutex> lk(st.mutex);
     auto it = st.live_websockets.find(handle);
-    return it == st.live_websockets.end() ? nullptr : it->second;
+    if (it == st.live_websockets.end() || !it->second || it->second->magic != kMagicWebSocket) {
+        return nullptr;
+    }
+    return it->second;
 }
 
 const char kIdHcPerform[] = "HCHttpCallPerformAsync";
@@ -498,7 +596,7 @@ int32_t OS_SHIM_CALL HCHttpCallRequestSetUrl(
     HCCallHandle call,
     const char* method,
     const char* url) {
-    if (!call || !method || !*method || !url || !*url) {
+    if (!call || !IsValidHttpToken(method) || !IsValidHttpUrl(url)) {
         return RecordHr("HCHttpCallRequestSetUrl", OS_SHIM_E_INVALIDARG);
     }
     auto obj = LookupCall(call);
@@ -516,7 +614,7 @@ int32_t OS_SHIM_CALL HCHttpCallRequestSetHeader(
     const char* headerName,
     const char* headerValue,
     bool /*allowTracing*/) {
-    if (!call || !headerName || !*headerName || !headerValue) {
+    if (!call || !IsValidHttpHeaderName(headerName) || !IsValidHttpHeaderValue(headerValue)) {
         return RecordHr("HCHttpCallRequestSetHeader", OS_SHIM_E_INVALIDARG);
     }
     auto obj = LookupCall(call);
@@ -650,7 +748,7 @@ int32_t OS_SHIM_CALL HCHttpCallResponseGetResponseBodyBytes(
     size_t bufferSize,
     uint8_t* buffer,
     size_t* bufferUsed) {
-    if (!call || (!buffer && bufferSize > 0u)) {
+    if (!call || (!buffer && (bufferSize > 0u || !bufferUsed))) {
         return RecordHr("HCHttpCallResponseGetResponseBodyBytes", OS_SHIM_E_INVALIDARG);
     }
     auto obj = LookupCall(call);
@@ -662,10 +760,14 @@ int32_t OS_SHIM_CALL HCHttpCallResponseGetResponseBodyBytes(
     if (bufferUsed) {
         *bufferUsed = n;
     }
+    if (!buffer) {
+        return RecordHr("HCHttpCallResponseGetResponseBodyBytes",
+                        n == 0u ? OS_SHIM_S_OK : OS_SHIM_E_NOT_SUFFICIENT_BUFFER);
+    }
     if (bufferSize < n) {
         return RecordHr("HCHttpCallResponseGetResponseBodyBytes", OS_SHIM_E_NOT_SUFFICIENT_BUFFER);
     }
-    if (n > 0u && buffer) {
+    if (n > 0u) {
         std::memcpy(buffer, obj->response_body.data(), n);
     }
     return RecordHr("HCHttpCallResponseGetResponseBodyBytes", OS_SHIM_S_OK);
@@ -675,7 +777,7 @@ int32_t OS_SHIM_CALL HCHttpCallResponseGetHeader(
     HCCallHandle call,
     const char* headerName,
     const char** headerValue) {
-    if (!call || !headerName || !*headerName || !headerValue) {
+    if (!call || !IsValidHttpHeaderName(headerName) || !headerValue) {
         return RecordHr("HCHttpCallResponseGetHeader", OS_SHIM_E_INVALIDARG);
     }
     *headerValue = nullptr;
@@ -738,6 +840,7 @@ OS_HC_API uint64_t OS_SHIM_CALL HCHttpCallGetId(HCCallHandle call) {
 }
 
 OS_HC_API int32_t OS_SHIM_CALL HCHttpCallSetTracing(HCCallHandle call, bool traceCall) {
+    if (!call) return RecordHr("HCHttpCallSetTracing", OS_SHIM_E_INVALIDARG);
     auto obj = LookupCall(call);
     if (!obj) return RecordHr("HCHttpCallSetTracing", OS_SHIM_E_HANDLE);
     std::lock_guard<std::mutex> lk(obj->mutex);
@@ -746,6 +849,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallSetTracing(HCCallHandle call, bool trac
 }
 
 OS_HC_API int32_t OS_SHIM_CALL HCHttpCallSetContext(HCCallHandle call, void* context) {
+    if (!call) return RecordHr("HCHttpCallSetContext", OS_SHIM_E_INVALIDARG);
     auto obj = LookupCall(call);
     if (!obj) return RecordHr("HCHttpCallSetContext", OS_SHIM_E_HANDLE);
     std::lock_guard<std::mutex> lk(obj->mutex);
@@ -754,7 +858,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallSetContext(HCCallHandle call, void* con
 }
 
 OS_HC_API int32_t OS_SHIM_CALL HCHttpCallGetContext(HCCallHandle call, void** context) {
-    if (!context) return RecordHr("HCHttpCallGetContext", OS_SHIM_E_INVALIDARG);
+    if (!call || !context) return RecordHr("HCHttpCallGetContext", OS_SHIM_E_INVALIDARG);
     auto obj = LookupCall(call);
     if (!obj) return RecordHr("HCHttpCallGetContext", OS_SHIM_E_HANDLE);
     std::lock_guard<std::mutex> lk(obj->mutex);
@@ -765,6 +869,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallGetContext(HCCallHandle call, void** co
 OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetTimeout(
     HCCallHandle call,
     uint32_t timeoutInSeconds) {
+    if (!call) return RecordHr("HCHttpCallRequestSetTimeout", OS_SHIM_E_INVALIDARG);
     auto obj = LookupCall(call);
     if (!obj) return RecordHr("HCHttpCallRequestSetTimeout", OS_SHIM_E_HANDLE);
     std::lock_guard<std::mutex> lk(obj->mutex);
@@ -775,7 +880,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetTimeout(
 OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetTimeout(
     HCCallHandle call,
     uint32_t* timeoutInSeconds) {
-    if (!timeoutInSeconds) return RecordHr("HCHttpCallRequestGetTimeout", OS_SHIM_E_INVALIDARG);
+    if (!call || !timeoutInSeconds) return RecordHr("HCHttpCallRequestGetTimeout", OS_SHIM_E_INVALIDARG);
     auto obj = LookupCall(call);
     if (!obj) return RecordHr("HCHttpCallRequestGetTimeout", OS_SHIM_E_HANDLE);
     std::lock_guard<std::mutex> lk(obj->mutex);
@@ -786,6 +891,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetTimeout(
 OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetRetryAllowed(
     HCCallHandle call,
     bool retryAllowed) {
+    if (!call) return RecordHr("HCHttpCallRequestSetRetryAllowed", OS_SHIM_E_INVALIDARG);
     auto obj = LookupCall(call);
     if (!obj) return RecordHr("HCHttpCallRequestSetRetryAllowed", OS_SHIM_E_HANDLE);
     std::lock_guard<std::mutex> lk(obj->mutex);
@@ -796,7 +902,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetRetryAllowed(
 OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetRetryAllowed(
     HCCallHandle call,
     bool* retryAllowed) {
-    if (!retryAllowed) return RecordHr("HCHttpCallRequestGetRetryAllowed", OS_SHIM_E_INVALIDARG);
+    if (!call || !retryAllowed) return RecordHr("HCHttpCallRequestGetRetryAllowed", OS_SHIM_E_INVALIDARG);
     auto obj = LookupCall(call);
     if (!obj) return RecordHr("HCHttpCallRequestGetRetryAllowed", OS_SHIM_E_HANDLE);
     std::lock_guard<std::mutex> lk(obj->mutex);
@@ -807,6 +913,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetRetryAllowed(
 OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetRetryDelay(
     HCCallHandle call,
     uint32_t retryDelayInSeconds) {
+    if (!call) return RecordHr("HCHttpCallRequestSetRetryDelay", OS_SHIM_E_INVALIDARG);
     auto obj = LookupCall(call);
     if (!obj) return RecordHr("HCHttpCallRequestSetRetryDelay", OS_SHIM_E_HANDLE);
     std::lock_guard<std::mutex> lk(obj->mutex);
@@ -817,7 +924,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetRetryDelay(
 OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetRetryDelay(
     HCCallHandle call,
     uint32_t* retryDelayInSeconds) {
-    if (!retryDelayInSeconds) return RecordHr("HCHttpCallRequestGetRetryDelay", OS_SHIM_E_INVALIDARG);
+    if (!call || !retryDelayInSeconds) return RecordHr("HCHttpCallRequestGetRetryDelay", OS_SHIM_E_INVALIDARG);
     auto obj = LookupCall(call);
     if (!obj) return RecordHr("HCHttpCallRequestGetRetryDelay", OS_SHIM_E_HANDLE);
     std::lock_guard<std::mutex> lk(obj->mutex);
@@ -828,6 +935,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetRetryDelay(
 OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetTimeoutWindow(
     HCCallHandle call,
     uint32_t timeoutWindowInSeconds) {
+    if (!call) return RecordHr("HCHttpCallRequestSetTimeoutWindow", OS_SHIM_E_INVALIDARG);
     auto obj = LookupCall(call);
     if (!obj) return RecordHr("HCHttpCallRequestSetTimeoutWindow", OS_SHIM_E_HANDLE);
     std::lock_guard<std::mutex> lk(obj->mutex);
@@ -838,7 +946,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetTimeoutWindow(
 OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetTimeoutWindow(
     HCCallHandle call,
     uint32_t* timeoutWindowInSeconds) {
-    if (!timeoutWindowInSeconds) {
+    if (!call || !timeoutWindowInSeconds) {
         return RecordHr("HCHttpCallRequestGetTimeoutWindow", OS_SHIM_E_INVALIDARG);
     }
     auto obj = LookupCall(call);
@@ -851,6 +959,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetTimeoutWindow(
 OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetRetryCacheId(
     HCCallHandle call,
     uint32_t retryAfterCacheId) {
+    if (!call) return RecordHr("HCHttpCallRequestSetRetryCacheId", OS_SHIM_E_INVALIDARG);
     auto obj = LookupCall(call);
     if (!obj) return RecordHr("HCHttpCallRequestSetRetryCacheId", OS_SHIM_E_HANDLE);
     std::lock_guard<std::mutex> lk(obj->mutex);
@@ -861,6 +970,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetRetryCacheId(
 OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetSSLValidation(
     HCCallHandle call,
     bool sslValidation) {
+    if (!call) return RecordHr("HCHttpCallRequestSetSSLValidation", OS_SHIM_E_INVALIDARG);
     auto obj = LookupCall(call);
     if (!obj) return RecordHr("HCHttpCallRequestSetSSLValidation", OS_SHIM_E_HANDLE);
     std::lock_guard<std::mutex> lk(obj->mutex);
@@ -872,7 +982,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetUrl(
     HCCallHandle call,
     const char** method,
     const char** url) {
-    if (!method || !url) return RecordHr("HCHttpCallRequestGetUrl", OS_SHIM_E_INVALIDARG);
+    if (!call || !method || !url) return RecordHr("HCHttpCallRequestGetUrl", OS_SHIM_E_INVALIDARG);
     auto obj = LookupCall(call);
     if (!obj) return RecordHr("HCHttpCallRequestGetUrl", OS_SHIM_E_HANDLE);
     std::lock_guard<std::mutex> lk(obj->mutex);
@@ -884,7 +994,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetUrl(
 OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetNumHeaders(
     HCCallHandle call,
     uint32_t* numHeaders) {
-    if (!numHeaders) return RecordHr("HCHttpCallRequestGetNumHeaders", OS_SHIM_E_INVALIDARG);
+    if (!call || !numHeaders) return RecordHr("HCHttpCallRequestGetNumHeaders", OS_SHIM_E_INVALIDARG);
     auto obj = LookupCall(call);
     if (!obj) return RecordHr("HCHttpCallRequestGetNumHeaders", OS_SHIM_E_HANDLE);
     std::lock_guard<std::mutex> lk(obj->mutex);
@@ -897,7 +1007,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetHeaderAtIndex(
     uint32_t headerIndex,
     const char** headerName,
     const char** headerValue) {
-    if (!headerName || !headerValue) {
+    if (!call || !headerName || !headerValue) {
         return RecordHr("HCHttpCallRequestGetHeaderAtIndex", OS_SHIM_E_INVALIDARG);
     }
     auto obj = LookupCall(call);
@@ -915,7 +1025,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetHeader(
     HCCallHandle call,
     const char* headerName,
     const char** headerValue) {
-    if (!headerName || !*headerName || !headerValue) {
+    if (!call || !IsValidHttpHeaderName(headerName) || !headerValue) {
         return RecordHr("HCHttpCallRequestGetHeader", OS_SHIM_E_INVALIDARG);
     }
     *headerValue = nullptr;
@@ -935,7 +1045,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetRequestBodyBytes(
     HCCallHandle call,
     const uint8_t** requestBodyBytes,
     uint32_t* requestBodySize) {
-    if (!requestBodyBytes || !requestBodySize) {
+    if (!call || !requestBodyBytes || !requestBodySize) {
         return RecordHr("HCHttpCallRequestGetRequestBodyBytes", OS_SHIM_E_INVALIDARG);
     }
     auto obj = LookupCall(call);
@@ -950,7 +1060,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallResponseGetNetworkErrorCode(
     HCCallHandle call,
     int32_t* networkErrorCode,
     uint32_t* platformNetworkErrorCode) {
-    if (!networkErrorCode || !platformNetworkErrorCode) {
+    if (!call || !networkErrorCode || !platformNetworkErrorCode) {
         return RecordHr("HCHttpCallResponseGetNetworkErrorCode", OS_SHIM_E_INVALIDARG);
     }
     auto obj = LookupCall(call);
@@ -964,7 +1074,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallResponseGetNetworkErrorCode(
 OS_HC_API int32_t OS_SHIM_CALL HCHttpCallResponseGetPlatformNetworkErrorMessage(
     HCCallHandle call,
     const char** platformNetworkErrorMessage) {
-    if (!platformNetworkErrorMessage) {
+    if (!call || !platformNetworkErrorMessage) {
         return RecordHr("HCHttpCallResponseGetPlatformNetworkErrorMessage", OS_SHIM_E_INVALIDARG);
     }
     auto obj = LookupCall(call);
@@ -979,7 +1089,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallResponseGetPlatformNetworkErrorMessage(
 OS_HC_API int32_t OS_SHIM_CALL HCHttpCallResponseGetNumHeaders(
     HCCallHandle call,
     uint32_t* numHeaders) {
-    if (!numHeaders) return RecordHr("HCHttpCallResponseGetNumHeaders", OS_SHIM_E_INVALIDARG);
+    if (!call || !numHeaders) return RecordHr("HCHttpCallResponseGetNumHeaders", OS_SHIM_E_INVALIDARG);
     auto obj = LookupCall(call);
     if (!obj) return RecordHr("HCHttpCallResponseGetNumHeaders", OS_SHIM_E_HANDLE);
     std::lock_guard<std::mutex> lk(obj->mutex);
@@ -992,7 +1102,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallResponseGetHeaderAtIndex(
     uint32_t headerIndex,
     const char** headerName,
     const char** headerValue) {
-    if (!headerName || !headerValue) {
+    if (!call || !headerName || !headerValue) {
         return RecordHr("HCHttpCallResponseGetHeaderAtIndex", OS_SHIM_E_INVALIDARG);
     }
     auto obj = LookupCall(call);
@@ -1078,7 +1188,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCWebSocketSetHeader(
     HCWebsocketHandle websocket,
     const char* headerName,
     const char* headerValue) {
-    if (!websocket || !headerName || !*headerName || !headerValue) {
+    if (!websocket || !IsValidHttpHeaderName(headerName) || !IsValidHttpHeaderValue(headerValue)) {
         return RecordHr("HCWebSocketSetHeader", OS_SHIM_E_INVALIDARG);
     }
     auto obj = LookupWebSocket(websocket);
@@ -1147,7 +1257,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCWebSocketConnectAsync(
     const char* subProtocol,
     HCWebsocketHandle websocket,
     XAsyncBlock* asyncBlock) {
-    if (!uri || !*uri || !websocket || !asyncBlock) {
+    if (!IsValidWebSocketUrl(uri) || !websocket || !asyncBlock) {
         return RecordHr("HCWebSocketConnectAsync", OS_SHIM_E_INVALIDARG);
     }
     auto obj = LookupWebSocket(websocket);

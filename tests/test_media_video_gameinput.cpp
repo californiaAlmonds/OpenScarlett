@@ -1199,6 +1199,31 @@ void TestGameInputLifecycle() {
     OS_REQUIRE(fn_rumble_tel(gp_dev, &rtel) == GAMEINPUT_S_OK);
     OS_REQUIRE(rtel.xinputLeftMotor == 0u && rtel.xinputRightMotor == 0u);
     OS_REQUIRE(rtel.updateCount == 4ull);
+
+    // 4D. Clean device capability separation (gamepad must not advertise KB/Mouse bits
+    //     so multi-device engines bind gamepad + keyboard + mouse to Player 1 without collision)
+    const GameInputDeviceInfo* gp_info = gp_dev->GetDeviceInfo();
+    OS_REQUIRE(gp_info != nullptr);
+    OS_REQUIRE((gp_info->supportedInput & GameInputKindGamepad) != 0u);
+    OS_REQUIRE((gp_info->supportedInput & GameInputKindKeyboard) == 0u);
+    OS_REQUIRE((gp_info->supportedInput & GameInputKindMouse) == 0u);
+
+    // 4E. Default focus policy blocks background input when target window is not foreground
+    HWND hidden_wnd = CreateWindowExW(
+        0, L"STATIC", L"OS_GI_Unfocused_Test", WS_POPUP, 0, 0, 16, 16,
+        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    OS_REQUIRE(hidden_wnd != nullptr);
+    OS_REQUIRE(OpenScarlettGameInputSetTargetWindow(gi, hidden_wnd) == GAMEINPUT_S_OK);
+    gi->SetFocusPolicy(GameInputDefaultFocusPolicy);
+    IGameInputReading* blocked_r = nullptr;
+    OS_REQUIRE(gi->GetCurrentReading(all_kinds, nullptr, &blocked_r) == GAMEINPUT_S_OK && blocked_r != nullptr);
+    GameInputGamepadState blocked_gp{};
+    OS_REQUIRE(blocked_r->GetGamepadState(&blocked_gp));
+    OS_REQUIRE(blocked_gp.buttons == GameInputGamepadNone);
+    OS_REQUIRE(blocked_r->GetKeyCount() == 0u);
+    blocked_r->Release();
+    OS_REQUIRE(OpenScarlettGameInputSetTargetWindow(gi, nullptr) == GAMEINPUT_S_OK);
+    DestroyWindow(hidden_wnd);
 #endif
 
     gi_ex->Release();

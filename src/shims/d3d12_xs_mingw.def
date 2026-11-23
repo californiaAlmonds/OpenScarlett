@@ -48,6 +48,8 @@ EXPORTS
     OpenScarlettD3D12SetBackendMode
     OpenScarlettD3D12GetActiveBackend
     OpenScarlettD3D12GetVulkanRoutingStats
+    DXGIXSetVLineNotification
+    DXGIXSetFrameNotification
     D3D12SDKVersion DATA
     D3D12SDKPath DATA
     D3D12XboxSetProcessDebugFlags

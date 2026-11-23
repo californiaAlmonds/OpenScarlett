@@ -373,6 +373,12 @@ OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL KernelXVirtualFree(
     size_t size,
     uint32_t freeType);
 
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL KernelXVirtualFreeEx(
+    void* hProcess,
+    void* address,
+    size_t size,
+    uint32_t freeType);
+
 // ---------------------------------------------------------------------------
 // Scarlett System, Thread & Timer Services
 // ---------------------------------------------------------------------------

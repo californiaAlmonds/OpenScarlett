@@ -12,6 +12,7 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <unordered_map>
 
 #include "gpu/d3d12_xs/command_list_x.h"
 #include "gpu/d3d12_xs/device_x.h"
@@ -699,12 +700,22 @@ public:
     D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override { return inner_->GetDesc(); }
 #endif
 
+    static bool IsRetailTraceEnabled() noexcept {
+        static const bool enabled = []() {
+            char v[16]{};
+            const DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_RETAIL", v, static_cast<DWORD>(sizeof(v)));
+            return n > 0u && v[0] != '0';
+        }();
+        return enabled;
+    }
+
     HRESULT RecordUnimpl(int slot) {
         char buf[96];
         std::snprintf(buf, sizeof(buf), "ScarlettRetailCommandQueue::Slot_%d", slot);
-        std::fprintf(stderr, "[OpenScarlett][d3d12_xs] UNIMPL %s (+0x%X)\n", buf, slot * 8);
-        std::fflush(stderr);
-        OutputDebugStringA(buf);
+        if (IsRetailTraceEnabled()) {
+            std::fprintf(stderr, "[OpenScarlett][d3d12_xs] UNIMPL %s (+0x%X)\n", buf, slot * 8);
+            std::fflush(stderr);
+        }
         openscarlett::CallTelemetry::Global().Record(
             "d3d12_xs.dll", buf, openscarlett::CallOutcome::NotImplemented, E_NOTIMPL, slot);
         return E_NOTIMPL;
@@ -887,15 +898,29 @@ public:
     virtual void STDMETHODCALLTYPE EndEvent() { inner_->EndEvent(); }
     virtual void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature* cs, UINT mc, ID3D12Resource* ab, UINT64 aoff, ID3D12Resource* cb, UINT64 coff) { inner_->ExecuteIndirect(cs, mc, ab, aoff, cb, coff); }
 
-    // Safe telemetry stubs for any extended retail Scarlett slots 60..89
+    // Safe telemetry stubs for any extended retail Scarlett slots 60..139
+    static bool IsRetailTraceEnabled() noexcept {
+        static const bool enabled = []() {
+            char v[16]{};
+            const DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_RETAIL", v, static_cast<DWORD>(sizeof(v)));
+            return n > 0u && v[0] != '0';
+        }();
+        return enabled;
+    }
+
     void RecordClUnimpl(int slot) {
         char buf[96];
         std::snprintf(buf, sizeof(buf), "ScarlettRetailCmdList::Slot_%d", slot);
-        std::fprintf(stderr, "[OpenScarlett][d3d12_xs] UNIMPL %s (+0x%X)\n", buf, slot * 8);
-        std::fflush(stderr);
-        OutputDebugStringA(buf);
-        openscarlett::CallTelemetry::Global().Record(
-            "d3d12_xs.dll", buf, openscarlett::CallOutcome::NotImplemented, E_NOTIMPL, slot);
+        if (IsRetailTraceEnabled()) {
+            std::fprintf(stderr, "[OpenScarlett][d3d12_xs] UNIMPL %s (+0x%X)\n", buf, slot * 8);
+            std::fflush(stderr);
+        }
+        if (inner_) {
+            inner_->RecordUnsupportedExtensionIgnored(buf, slot);
+        } else {
+            openscarlett::CallTelemetry::Global().Record(
+                "d3d12_xs.dll", buf, openscarlett::CallOutcome::NotImplemented, E_NOTIMPL, slot);
+        }
     }
     virtual void STDMETHODCALLTYPE Slot60() { RecordClUnimpl(60); }
     virtual void STDMETHODCALLTYPE Slot61() { RecordClUnimpl(61); }
@@ -1454,13 +1479,23 @@ public:
     LUID STDMETHODCALLTYPE GetAdapterLuid() override { return inner_->GetAdapterLuid(); }
 #endif
 
-    // Retail Scarlett d3d12_xs.h ID3D12Device extended vtable (slots 44..89)
+    // Retail Scarlett d3d12_xs.h ID3D12Device extended vtable (slots 44..127)
+    static bool IsRetailTraceEnabled() noexcept {
+        static const bool enabled = []() {
+            char v[16]{};
+            const DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_RETAIL", v, static_cast<DWORD>(sizeof(v)));
+            return n > 0u && v[0] != '0';
+        }();
+        return enabled;
+    }
+
     HRESULT RecordUnimpl(int slot) {
         char buf[96];
         std::snprintf(buf, sizeof(buf), "ScarlettRetailDevice::Slot_%d", slot);
-        std::fprintf(stderr, "[OpenScarlett][d3d12_xs] UNIMPL %s (+0x%X)\n", buf, slot * 8);
-        std::fflush(stderr);
-        OutputDebugStringA(buf);
+        if (IsRetailTraceEnabled()) {
+            std::fprintf(stderr, "[OpenScarlett][d3d12_xs] UNIMPL %s (+0x%X)\n", buf, slot * 8);
+            std::fflush(stderr);
+        }
         openscarlett::CallTelemetry::Global().Record(
             "d3d12_xs.dll", buf, openscarlett::CallOutcome::NotImplemented, E_NOTIMPL, slot);
         return E_NOTIMPL;
@@ -2907,3 +2942,176 @@ OPENSCARLETT_D3D12_API void WINAPI OpenScarlettD3D12ResetTrackedDevice() {
 }
 
 }  // extern "C"
+
+namespace {
+
+struct RegisteredVLineEvent {
+    UINT vline = 0u;
+    HANDLE dup_event = nullptr;
+};
+
+struct DisplayNotificationRegistry {
+    std::mutex mutex;
+    std::unordered_map<UINT, RegisteredVLineEvent> vline_events;
+    std::unordered_map<UINT, HANDLE> frame_events;
+    uint64_t total_vline_signaled = 0ull;
+    uint64_t total_frame_signaled = 0ull;
+
+    ~DisplayNotificationRegistry() {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto& kv : vline_events) {
+            if (kv.second.dup_event) CloseHandle(kv.second.dup_event);
+        }
+        vline_events.clear();
+        for (auto& kv : frame_events) {
+            if (kv.second) CloseHandle(kv.second);
+        }
+        frame_events.clear();
+    }
+};
+
+DisplayNotificationRegistry& GetDisplayNotificationRegistry() {
+    static DisplayNotificationRegistry s_reg;
+    return s_reg;
+}
+
+bool DuplicateEventHandleForSignaling(HANDLE src_event, HANDLE& out_dup) noexcept {
+    out_dup = nullptr;
+    if (!src_event || src_event == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    HANDLE cur_proc = GetCurrentProcess();
+    if (DuplicateHandle(cur_proc, src_event, cur_proc, &out_dup, EVENT_MODIFY_STATE, FALSE, 0) != FALSE &&
+        out_dup != nullptr) {
+        return true;
+    }
+    if (DuplicateHandle(cur_proc, src_event, cur_proc, &out_dup, 0, FALSE, DUPLICATE_SAME_ACCESS) != FALSE &&
+        out_dup != nullptr) {
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+extern "C" {
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI DXGIXSetVLineNotification(
+    UINT VLineCounter,
+    UINT VLine,
+    HANDLE hEvent) {
+    if (hEvent == INVALID_HANDLE_VALUE) {
+        RecordExport("DXGIXSetVLineNotification", E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+    auto& reg = GetDisplayNotificationRegistry();
+    if (hEvent == nullptr) {
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        auto it = reg.vline_events.find(VLineCounter);
+        if (it != reg.vline_events.end()) {
+            if (it->second.dup_event) CloseHandle(it->second.dup_event);
+            reg.vline_events.erase(it);
+        }
+        RecordExport("DXGIXSetVLineNotification", S_OK);
+        return S_OK;
+    }
+
+    HANDLE dup = nullptr;
+    if (!DuplicateEventHandleForSignaling(hEvent, dup)) {
+        RecordExport("DXGIXSetVLineNotification", E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        auto it = reg.vline_events.find(VLineCounter);
+        if (it != reg.vline_events.end()) {
+            if (it->second.dup_event) CloseHandle(it->second.dup_event);
+            it->second.vline = VLine;
+            it->second.dup_event = dup;
+        } else {
+            reg.vline_events.emplace(VLineCounter, RegisteredVLineEvent{VLine, dup});
+        }
+    }
+    RecordExport("DXGIXSetVLineNotification", S_OK);
+    return S_OK;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI DXGIXSetFrameNotification(
+    UINT FrameCounter,
+    HANDLE hEvent) {
+    if (hEvent == INVALID_HANDLE_VALUE) {
+        RecordExport("DXGIXSetFrameNotification", E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+    auto& reg = GetDisplayNotificationRegistry();
+    if (hEvent == nullptr) {
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        auto it = reg.frame_events.find(FrameCounter);
+        if (it != reg.frame_events.end()) {
+            if (it->second) CloseHandle(it->second);
+            reg.frame_events.erase(it);
+        }
+        RecordExport("DXGIXSetFrameNotification", S_OK);
+        return S_OK;
+    }
+
+    HANDLE dup = nullptr;
+    if (!DuplicateEventHandleForSignaling(hEvent, dup)) {
+        RecordExport("DXGIXSetFrameNotification", E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        auto it = reg.frame_events.find(FrameCounter);
+        if (it != reg.frame_events.end()) {
+            if (it->second) CloseHandle(it->second);
+            it->second = dup;
+        } else {
+            reg.frame_events.emplace(FrameCounter, dup);
+        }
+    }
+    RecordExport("DXGIXSetFrameNotification", S_OK);
+    return S_OK;
+}
+
+}  // extern "C"
+
+namespace openscarlett::d3d12_xs {
+
+void SignalRegisteredDisplayNotificationsOnPresent(
+    uint64_t* out_vline_signaled,
+    uint64_t* out_frame_signaled) noexcept {
+    auto& reg = GetDisplayNotificationRegistry();
+    uint64_t vline_sig = 0ull;
+    uint64_t frame_sig = 0ull;
+    {
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        for (const auto& kv : reg.vline_events) {
+            if (kv.second.dup_event && SetEvent(kv.second.dup_event) != FALSE) {
+                ++vline_sig;
+            }
+        }
+        for (const auto& kv : reg.frame_events) {
+            if (kv.second && SetEvent(kv.second) != FALSE) {
+                ++frame_sig;
+            }
+        }
+        reg.total_vline_signaled += vline_sig;
+        reg.total_frame_signaled += frame_sig;
+    }
+    if (out_vline_signaled) *out_vline_signaled = vline_sig;
+    if (out_frame_signaled) *out_frame_signaled = frame_sig;
+}
+
+void GetDisplayNotificationCounts(
+    uint64_t* out_vline_signaled,
+    uint64_t* out_frame_signaled) noexcept {
+    auto& reg = GetDisplayNotificationRegistry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    if (out_vline_signaled) *out_vline_signaled = reg.total_vline_signaled;
+    if (out_frame_signaled) *out_frame_signaled = reg.total_frame_signaled;
+}
+
+}  // namespace openscarlett::d3d12_xs

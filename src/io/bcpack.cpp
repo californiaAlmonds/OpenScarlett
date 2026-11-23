@@ -3137,16 +3137,50 @@ struct Bc4ChannelState {
     }
 };
 
+// Helper to classify BC6H mode/region from block byte 0 for 1-region <-> 2-region transition safety (SixNG #15/#20/#21).
+Bc6hBcpPresetInfo ClassifyBc6hPresetFromByte0(uint8_t b0) noexcept {
+    Bc6hBcpPresetInfo info{};
+    const uint8_t m2 = b0 & 0x03u;
+    const uint8_t m5 = b0 & 0x1Fu;
+    if (m2 == 0x00u) {
+        info = Bc6hBcpPresetInfo{0u, 0u, 2u, true};
+    } else if (m2 == 0x01u) {
+        info = Bc6hBcpPresetInfo{1u, 1u, 2u, true};
+    } else {
+        switch (m5) {
+            case 0x02u: info = Bc6hBcpPresetInfo{2u, 2u, 2u, true}; break;
+            case 0x06u: info = Bc6hBcpPresetInfo{3u, 3u, 2u, true}; break;
+            case 0x0Au: info = Bc6hBcpPresetInfo{4u, 4u, 2u, true}; break;
+            case 0x0Eu: info = Bc6hBcpPresetInfo{5u, 5u, 2u, true}; break;
+            case 0x12u: info = Bc6hBcpPresetInfo{6u, 6u, 2u, true}; break;
+            case 0x16u: info = Bc6hBcpPresetInfo{7u, 7u, 2u, true}; break;
+            case 0x1Au: info = Bc6hBcpPresetInfo{8u, 8u, 2u, true}; break;
+            case 0x1Eu: info = Bc6hBcpPresetInfo{9u, 9u, 2u, true}; break;
+            case 0x03u: info = Bc6hBcpPresetInfo{10u, 10u, 1u, true}; break;
+            case 0x07u: info = Bc6hBcpPresetInfo{11u, 11u, 1u, true}; break;
+            case 0x0Bu: info = Bc6hBcpPresetInfo{12u, 12u, 1u, true}; break;
+            case 0x0Fu: info = Bc6hBcpPresetInfo{13u, 13u, 1u, true}; break;
+            default:    info = Bc6hBcpPresetInfo{14u, 0xFFu, 0u, false}; break;
+        }
+    }
+    return info;
+}
+
 struct Bc67State {
     HwLruCache<uint8_t, 4u> mode_cache;
     HwLruCache<std::array<uint8_t, 11>, 8u> ep_cache;
     HwLruCache<uint32_t, 16u> sel_cache;
+    // Separate BC6H 1-region caches prevent 1-region <-> 2-region transitions from corrupting
+    // spatial predictors or polluting 2-region preset/endpoint tables (SixNG #15/#20/#21).
+    HwLruCache<std::array<uint8_t, 11>, 8u> ep_cache_1r;
+    HwLruCache<uint32_t, 16u> sel_cache_1r;
 
     static void Encode(
         HwBitWriter& bw,
         const uint8_t* blk,
         const uint8_t* pred,
-        Bc67State& st) {
+        Bc67State& st,
+        bool is_bc6h = false) {
         // 1. Mode header byte (BC6H 2/5-bit mode prefix or BC7 unary mode prefix).
         const uint8_t m_cur = blk[0];
         const uint8_t m_pred = pred ? pred[0] : 0u;
@@ -3164,16 +3198,32 @@ struct Bc67State {
         }
         st.mode_cache.PushOrPromote(m_cur);
 
+        bool use_1r_cache = false;
+        const uint8_t* eff_pred = pred;
+        if (is_bc6h) {
+            const Bc6hBcpPresetInfo cur_p = ClassifyBc6hPresetFromByte0(m_cur);
+            use_1r_cache = (cur_p.is_valid && cur_p.region_count == 1u);
+            if (pred) {
+                const Bc6hBcpPresetInfo pred_p = ClassifyBc6hPresetFromByte0(pred[0]);
+                if (!cur_p.is_valid || !pred_p.is_valid || cur_p.region_count != pred_p.region_count) {
+                    // 1-region <-> 2-region transition: do not cross-predict incompatible 65b vs 82b layouts.
+                    eff_pred = nullptr;
+                }
+            }
+        }
+        auto& active_ep_cache = use_1r_cache ? st.ep_cache_1r : st.ep_cache;
+        auto& active_sel_cache = use_1r_cache ? st.sel_cache_1r : st.sel_cache;
+
         // 2. Partition/Rotation/Endpoint payload (11 bytes).
         std::array<uint8_t, 11> ep_cur{};
         std::array<uint8_t, 11> ep_pred{};
         std::memcpy(ep_cur.data(), blk + 1u, 11u);
-        if (pred) std::memcpy(ep_pred.data(), pred + 1u, 11u);
+        if (eff_pred) std::memcpy(ep_pred.data(), eff_pred + 1u, 11u);
 
         if (ep_cur == ep_pred) {
             bw.WriteBits(0u, 2u);
         } else {
-            const int hit = st.ep_cache.Find(ep_cur);
+            const int hit = active_ep_cache.Find(ep_cur);
             if (hit >= 0) {
                 bw.WriteBits(1u, 2u);
                 bw.WriteBits(static_cast<uint32_t>(hit), 3u);
@@ -3206,15 +3256,15 @@ struct Bc67State {
                 }
             }
         }
-        st.ep_cache.PushOrPromote(ep_cur);
+        active_ep_cache.PushOrPromote(ep_cur);
 
         // 3. Selector index word (32-bit).
         const uint32_t sel_cur = ReadLe32(blk + 12u);
-        const uint32_t sel_pred = pred ? ReadLe32(pred + 12u) : 0u;
+        const uint32_t sel_pred = eff_pred ? ReadLe32(eff_pred + 12u) : 0u;
         if (sel_cur == sel_pred) {
             bw.WriteBits(0u, 2u);
         } else {
-            const int hit = st.sel_cache.Find(sel_cur);
+            const int hit = active_sel_cache.Find(sel_cur);
             if (hit >= 0) {
                 bw.WriteBits(1u, 2u);
                 bw.WriteBits(static_cast<uint32_t>(hit), 4u);
@@ -3242,14 +3292,15 @@ struct Bc67State {
                 }
             }
         }
-        st.sel_cache.PushOrPromote(sel_cur);
+        active_sel_cache.PushOrPromote(sel_cur);
     }
 
     static bool Decode(
         HwBitReader& br,
         uint8_t* out_blk,
         const uint8_t* pred,
-        Bc67State& st) noexcept {
+        Bc67State& st,
+        bool is_bc6h = false) noexcept {
         const uint8_t m_pred = pred ? pred[0] : 0u;
         uint32_t m_mode = 0u;
         if (!br.ReadBits(2u, m_mode)) return false;
@@ -3267,14 +3318,29 @@ struct Bc67State {
         st.mode_cache.PushOrPromote(m_cur);
         out_blk[0] = m_cur;
 
+        bool use_1r_cache = false;
+        const uint8_t* eff_pred = pred;
+        if (is_bc6h) {
+            const Bc6hBcpPresetInfo cur_p = ClassifyBc6hPresetFromByte0(m_cur);
+            use_1r_cache = (cur_p.is_valid && cur_p.region_count == 1u);
+            if (pred) {
+                const Bc6hBcpPresetInfo pred_p = ClassifyBc6hPresetFromByte0(pred[0]);
+                if (!cur_p.is_valid || !pred_p.is_valid || cur_p.region_count != pred_p.region_count) {
+                    eff_pred = nullptr;
+                }
+            }
+        }
+        auto& active_ep_cache = use_1r_cache ? st.ep_cache_1r : st.ep_cache;
+        auto& active_sel_cache = use_1r_cache ? st.sel_cache_1r : st.sel_cache;
+
         std::array<uint8_t, 11> ep_pred{};
-        if (pred) std::memcpy(ep_pred.data(), pred + 1u, 11u);
+        if (eff_pred) std::memcpy(ep_pred.data(), eff_pred + 1u, 11u);
         std::array<uint8_t, 11> ep_cur = ep_pred;
         uint32_t ep_mode = 0u;
         if (!br.ReadBits(2u, ep_mode)) return false;
         if (ep_mode == 1u) {
             uint32_t idx = 0u;
-            if (!br.ReadBits(3u, idx) || !st.ep_cache.Get(idx, ep_cur)) return false;
+            if (!br.ReadBits(3u, idx) || !active_ep_cache.Get(idx, ep_cur)) return false;
         } else if (ep_mode == 2u) {
             uint32_t mask = 0u;
             if (!br.ReadBits(11u, mask)) return false;
@@ -3292,16 +3358,16 @@ struct Bc67State {
                 ep_cur[i] = static_cast<uint8_t>(raw);
             }
         }
-        st.ep_cache.PushOrPromote(ep_cur);
+        active_ep_cache.PushOrPromote(ep_cur);
         std::memcpy(out_blk + 1u, ep_cur.data(), 11u);
 
-        const uint32_t sel_pred = pred ? ReadLe32(pred + 12u) : 0u;
+        const uint32_t sel_pred = eff_pred ? ReadLe32(eff_pred + 12u) : 0u;
         uint32_t sel_mode = 0u;
         if (!br.ReadBits(2u, sel_mode)) return false;
         uint32_t sel_cur = sel_pred;
         if (sel_mode == 1u) {
             uint32_t idx = 0u;
-            if (!br.ReadBits(4u, idx) || !st.sel_cache.Get(idx, sel_cur)) return false;
+            if (!br.ReadBits(4u, idx) || !active_sel_cache.Get(idx, sel_cur)) return false;
         } else if (sel_mode == 2u) {
             uint32_t mask = 0u;
             if (!br.ReadBits(4u, mask)) return false;
@@ -3317,7 +3383,7 @@ struct Bc67State {
         } else if (sel_mode == 3u) {
             if (!br.ReadBits(32u, sel_cur)) return false;
         }
-        st.sel_cache.PushOrPromote(sel_cur);
+        active_sel_cache.PushOrPromote(sel_cur);
         out_blk[12] = static_cast<uint8_t>(sel_cur & 0xFFu);
         out_blk[13] = static_cast<uint8_t>((sel_cur >> 8u) & 0xFFu);
         out_blk[14] = static_cast<uint8_t>((sel_cur >> 16u) & 0xFFu);
@@ -3525,8 +3591,10 @@ Status BcPackHwEncodeBitstream(
                 Bc4ChannelState::Encode(bw, cur + 8u, pred ? (pred + 8u) : nullptr, bc4_g_st);
                 break;
             case BcFormat::BC6H:
+                Bc67State::Encode(bw, cur, pred, bc67_st, /*is_bc6h=*/true);
+                break;
             case BcFormat::BC7:
-                Bc67State::Encode(bw, cur, pred, bc67_st);
+                Bc67State::Encode(bw, cur, pred, bc67_st, /*is_bc6h=*/false);
                 break;
             default:
                 return Status::Error(StatusCode::UnsupportedFormat, "Unsupported BC format");
@@ -3613,8 +3681,10 @@ Status BcPackHwDecodeBitstream(
                      Bc4ChannelState::Decode(br, cur + 8u, pred ? (pred + 8u) : nullptr, bc4_g_st);
                 break;
             case BcFormat::BC6H:
+                ok = Bc67State::Decode(br, cur, pred, bc67_st, /*is_bc6h=*/true);
+                break;
             case BcFormat::BC7:
-                ok = Bc67State::Decode(br, cur, pred, bc67_st);
+                ok = Bc67State::Decode(br, cur, pred, bc67_st, /*is_bc6h=*/false);
                 break;
             default:
                 return Status::Error(StatusCode::UnsupportedFormat, "Unsupported BC format");
@@ -3636,6 +3706,760 @@ Status BcPackHwDecodeBitstream(
     std::memcpy(dst_blocks, staged.data(), staged.size());
     if (out_written) {
         *out_written = staged.size();
+    }
+    return Status::Ok();
+}
+
+// ===========================================================================
+// Sprint 15: Spec-Correct Bit-Exact BC6H Decoder (UF16/SF16), Signed-Zero Rule,
+// 64-bit TTPF Codec-Mask / >4 GiB Bounds, & Strict Bounds-Checked rANS Codec
+// (SixNG #15/#20/#21/#23/#24, bcpack-rs c51ec52)
+// ===========================================================================
+namespace {
+
+inline uint32_t Bc6hReadBits128(uint64_t lo, uint64_t hi, int bit_pos, int count) noexcept {
+    if (count <= 0 || bit_pos < 0 || bit_pos + count > 128) return 0u;
+    const uint64_t mask = (count >= 32) ? 0xFFFFFFFFull : ((1ull << count) - 1ull);
+    if (bit_pos + count <= 64) {
+        return static_cast<uint32_t>((lo >> bit_pos) & mask);
+    }
+    if (bit_pos >= 64) {
+        return static_cast<uint32_t>((hi >> (bit_pos - 64)) & mask);
+    }
+    const int lo_bits = 64 - bit_pos;
+    const uint64_t v_lo = lo >> bit_pos;
+    const uint64_t v_hi = hi << lo_bits;
+    return static_cast<uint32_t>((v_lo | v_hi) & mask);
+}
+
+inline uint32_t Bc6hReadBitsReversed128(uint64_t lo, uint64_t hi, int bit_pos, int count) noexcept {
+    const uint32_t raw = Bc6hReadBits128(lo, hi, bit_pos, count);
+    uint32_t rev = 0u;
+    for (int i = 0; i < count; ++i) {
+        rev = (rev << 1u) | ((raw >> i) & 1u);
+    }
+    return rev;
+}
+
+inline int32_t Bc6hSignExtend(int32_t val, int bits) noexcept {
+    const int32_t mask = (1 << bits) - 1;
+    val &= mask;
+    const int32_t sign_bit = 1 << (bits - 1);
+    return (val ^ sign_bit) - sign_bit;
+}
+
+inline int32_t Bc6hUnquantize(int32_t comp, int bits, bool is_signed) noexcept {
+    if (!is_signed) {
+        if (bits >= 15) return comp;
+        if (comp <= 0) return 0;
+        if (comp >= ((1 << bits) - 1)) return 0xFFFF;
+        return ((comp << 16) + 0x8000) >> bits;
+    }
+    if (bits >= 16) {
+        return comp;
+    }
+    bool neg = false;
+    if (comp < 0) {
+        neg = true;
+        comp = -comp;
+    }
+    int32_t unq = 0;
+    if (comp == 0) {
+        unq = 0;
+    } else if (comp >= ((1 << (bits - 1)) - 1)) {
+        unq = 0x7FFF;
+    } else {
+        unq = ((comp << 15) + 0x4000) >> (bits - 1);
+    }
+    return neg ? -unq : unq;
+}
+
+inline int32_t Bc6hInterpolate(int32_t e0, int32_t e1, int32_t weight) noexcept {
+    return (e0 * (64 - weight) + e1 * weight + 32) >> 6;
+}
+
+// Official DXGI / D3D11 BC6H 2-subset partition table (32 shapes x 16 texels).
+constexpr uint8_t kBc6hPartitionTable2[32][16] = {
+    {0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1},  // 0
+    {0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1},  // 1
+    {0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1},  // 2
+    {0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 1, 1, 1},  // 3
+    {0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1},  // 4
+    {0, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1},  // 5
+    {0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1},  // 6
+    {0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 1},  // 7
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1},  // 8
+    {0, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},  // 9
+    {0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1},  // 10
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1},  // 11
+    {0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},  // 12
+    {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1},  // 13
+    {0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},  // 14
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1},  // 15
+    {0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1},  // 16
+    {0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0},  // 17
+    {0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0},  // 18
+    {0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0},  // 19
+    {0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0},  // 20
+    {0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0},  // 21
+    {0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0},  // 22
+    {0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 1},  // 23
+    {0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0},  // 24
+    {0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0},  // 25
+    {0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0},  // 26
+    {0, 0, 1, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 1, 0, 0},  // 27
+    {0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0},  // 28
+    {0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0},  // 29
+    {0, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0},  // 30
+    {0, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0},  // 31
+};
+
+constexpr uint8_t kBc6hAnchorIndexSecondSubset[32] = {
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15,  2,  8,  2,  2,  8,  8, 15,  2,  8,  2,  2,  8,  8,  2,  2,
+};
+
+constexpr int32_t kBc6hWeights3[8] = {0, 9, 18, 27, 37, 46, 55, 64};
+constexpr int32_t kBc6hWeights4[16] = {
+    0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64
+};
+
+constexpr uint32_t kRansMagic = 0x534E4152u;       // 'RANS'
+constexpr uint32_t kRansProbBits = 12u;
+constexpr uint32_t kRansProbScale = 1u << kRansProbBits;  // 4096
+constexpr uint32_t kRansLowerBound = 1u << 23u;
+constexpr size_t kRansHeaderBytes = 4u + 8u + 256u * 2u + 4u;  // magic + size64 + 256*u16 freqs + final_state
+
+}  // namespace
+
+uint16_t Bc6hFinishUnquantize(int32_t comp, bool is_signed) noexcept {
+    if (!is_signed) {
+        if (comp <= 0) return 0u;
+        int32_t scaled = (comp * 31) >> 6;
+        if (scaled > 0x7BFF) scaled = 0x7BFF;
+        return static_cast<uint16_t>(scaled);
+    }
+    // Exact DXGI BC6H signed rule (SixNG #24):
+    // Scale the signed integer by 31/32 FIRST, then select the sign bit AFTER final scaling!
+    // Values like comp == -1 scale to 0 and MUST emit +0.0 (0x0000), NEVER -0.0 (0x8000).
+    comp = (comp < 0) ? -(((-comp) * 31) >> 5) : ((comp * 31) >> 5);
+    uint16_t s = 0u;
+    if (comp < 0) {
+        s = 0x8000u;
+        comp = -comp;
+    }
+    if (comp > 0x7BFF) {
+        comp = 0x7BFF;
+    }
+    return static_cast<uint16_t>(s | static_cast<uint16_t>(comp));
+}
+
+bool Bc6hInspectBlockMode(const uint8_t block[16], Bc6hBlockInfo& out_info) noexcept {
+    out_info = Bc6hBlockInfo{};
+    if (!block) return false;
+    uint64_t lo = 0ull;
+    uint64_t hi = 0ull;
+    std::memcpy(&lo, block, 8u);
+    std::memcpy(&hi, block + 8u, 8u);
+
+    const Bc6hBcpPresetInfo preset = ClassifyBc6hPresetFromByte0(block[0]);
+    if (!preset.is_valid) {
+        out_info.mode_index = 0xFFu;
+        out_info.region_count = 0u;
+        out_info.is_reserved_mode = true;
+        return false;
+    }
+    out_info.mode_index = preset.mode_index;
+    out_info.region_count = preset.region_count;
+    out_info.is_reserved_mode = false;
+    if (preset.region_count == 2u) {
+        out_info.partition_index = static_cast<uint8_t>(Bc6hReadBits128(lo, hi, 77, 5));
+    } else {
+        out_info.partition_index = 0u;
+    }
+    static constexpr uint8_t kEpBits[14] = {10, 7, 11, 11, 11, 9, 8, 8, 8, 6, 10, 11, 12, 16};
+    out_info.endpoint_bits = kEpBits[preset.mode_index];
+    out_info.is_transformed = (preset.mode_index != 9u && preset.mode_index != 10u);
+    return true;
+}
+
+bool Bc6hResolveBcpPreset(const uint8_t block[16], Bc6hBcpPresetInfo& out_preset) noexcept {
+    out_preset = Bc6hBcpPresetInfo{};
+    if (!block) return false;
+    out_preset = ClassifyBc6hPresetFromByte0(block[0]);
+    return out_preset.is_valid;
+}
+
+void Bc6hDecodeBlock(
+    const uint8_t block[16],
+    bool is_signed,
+    uint16_t out_rgb_f16[48]) noexcept {
+    if (!out_rgb_f16) return;
+    std::memset(out_rgb_f16, 0, 48u * sizeof(uint16_t));
+    if (!block) return;
+
+    uint64_t lo = 0ull;
+    uint64_t hi = 0ull;
+    std::memcpy(&lo, block, 8u);
+    std::memcpy(&hi, block + 8u, 8u);
+
+    Bc6hBlockInfo info{};
+    if (!Bc6hInspectBlockMode(block, info) || info.is_reserved_mode) {
+        // Reserved BC6H modes decode to exact zero (0x0000) per DXGI BC6H spec.
+        return;
+    }
+
+    auto rb = [&](int pos, int cnt) noexcept -> int32_t {
+        return static_cast<int32_t>(Bc6hReadBits128(lo, hi, pos, cnt));
+    };
+    auto rbr = [&](int pos, int cnt) noexcept -> int32_t {
+        return static_cast<int32_t>(Bc6hReadBitsReversed128(lo, hi, pos, cnt));
+    };
+
+    // Endpoints: ep[subset][0..1][r=0,g=1,b=2]
+    // rw,gw,bw = ep[0][0]; rx,gx,bx = ep[0][1]; ry,gy,by = ep[1][0]; rz,gz,bz = ep[1][1]
+    int32_t ep[2][2][3]{};
+    int delta_bits[3] = {0, 0, 0};
+    const int ep_bits = static_cast<int>(info.endpoint_bits);
+
+    switch (info.mode_index) {
+        case 0: {  // 2-region, transformed, 10b, deltas (5,5,5)
+            delta_bits[0] = 5; delta_bits[1] = 5; delta_bits[2] = 5;
+            ep[0][0][0] = rb(5, 10);
+            ep[0][0][1] = rb(15, 10);
+            ep[0][0][2] = rb(25, 10);
+            ep[0][1][0] = rb(35, 5);
+            ep[0][1][1] = rb(45, 5);
+            ep[0][1][2] = rb(55, 5);
+            ep[1][0][0] = rb(65, 5);
+            ep[1][0][1] = rb(41, 4) | (rb(2, 1) << 4);
+            ep[1][0][2] = rb(61, 4) | (rb(3, 1) << 4);
+            ep[1][1][0] = rb(71, 5);
+            ep[1][1][1] = rb(51, 4) | (rb(40, 1) << 4);
+            ep[1][1][2] = rb(50, 1) | (rb(60, 1) << 1) | (rb(70, 1) << 2) | (rb(76, 1) << 3) | (rb(4, 1) << 4);
+            break;
+        }
+        case 1: {  // 2-region, transformed, 7b, deltas (6,6,6)
+            delta_bits[0] = 6; delta_bits[1] = 6; delta_bits[2] = 6;
+            ep[0][0][0] = rb(5, 7);
+            ep[0][0][1] = rb(15, 7);
+            ep[0][0][2] = rb(25, 7);
+            ep[0][1][0] = rb(35, 6);
+            ep[0][1][1] = rb(45, 6);
+            ep[0][1][2] = rb(55, 6);
+            ep[1][0][0] = rb(65, 6);
+            ep[1][0][1] = rb(41, 4) | (rb(24, 1) << 4) | (rb(2, 1) << 5);
+            ep[1][0][2] = rb(61, 4) | (rb(14, 1) << 4) | (rb(22, 1) << 5);
+            ep[1][1][0] = rb(71, 6);
+            ep[1][1][1] = rb(51, 4) | (rb(3, 1) << 4) | (rb(4, 1) << 5);
+            ep[1][1][2] = rb(12, 1) | (rb(13, 1) << 1) | (rb(23, 1) << 2) |
+                          (rb(32, 1) << 3) | (rb(34, 1) << 4) | (rb(33, 1) << 5);
+            break;
+        }
+        case 2: {  // 2-region, transformed, 11b, deltas (5,4,4)
+            delta_bits[0] = 5; delta_bits[1] = 4; delta_bits[2] = 4;
+            ep[0][0][0] = rb(5, 10) | (rb(40, 1) << 10);
+            ep[0][0][1] = rb(15, 10) | (rb(49, 1) << 10);
+            ep[0][0][2] = rb(25, 10) | (rb(59, 1) << 10);
+            ep[0][1][0] = rb(35, 5);
+            ep[0][1][1] = rb(45, 4);
+            ep[0][1][2] = rb(55, 4);
+            ep[1][0][0] = rb(65, 5);
+            ep[1][0][1] = rb(41, 4);
+            ep[1][0][2] = rb(61, 4);
+            ep[1][1][0] = rb(71, 5);
+            ep[1][1][1] = rb(51, 4);
+            ep[1][1][2] = rb(50, 1) | (rb(60, 1) << 1) | (rb(70, 1) << 2) | (rb(76, 1) << 3);
+            break;
+        }
+        case 3: {  // 2-region, transformed, 11b, deltas (4,5,4)
+            delta_bits[0] = 4; delta_bits[1] = 5; delta_bits[2] = 4;
+            ep[0][0][0] = rb(5, 10) | (rb(39, 1) << 10);
+            ep[0][0][1] = rb(15, 10) | (rb(50, 1) << 10);
+            ep[0][0][2] = rb(25, 10) | (rb(59, 1) << 10);
+            ep[0][1][0] = rb(35, 4);
+            ep[0][1][1] = rb(45, 5);
+            ep[0][1][2] = rb(55, 4);
+            ep[1][0][0] = rb(65, 4);
+            ep[1][0][1] = rb(41, 4) | (rb(75, 1) << 4);
+            ep[1][0][2] = rb(61, 4);
+            ep[1][1][0] = rb(71, 4);
+            ep[1][1][1] = rb(51, 4) | (rb(40, 1) << 4);
+            ep[1][1][2] = rb(69, 1) | (rb(60, 1) << 1) | (rb(70, 1) << 2) | (rb(76, 1) << 3);
+            break;
+        }
+        case 4: {  // 2-region, transformed, 11b, deltas (4,4,5)
+            delta_bits[0] = 4; delta_bits[1] = 4; delta_bits[2] = 5;
+            ep[0][0][0] = rb(5, 10) | (rb(39, 1) << 10);
+            ep[0][0][1] = rb(15, 10) | (rb(49, 1) << 10);
+            ep[0][0][2] = rb(25, 10) | (rb(60, 1) << 10);
+            ep[0][1][0] = rb(35, 4);
+            ep[0][1][1] = rb(45, 4);
+            ep[0][1][2] = rb(55, 5);
+            ep[1][0][0] = rb(65, 4);
+            ep[1][0][1] = rb(41, 4);
+            ep[1][0][2] = rb(61, 4) | (rb(40, 1) << 4);
+            ep[1][1][0] = rb(71, 4);
+            ep[1][1][1] = rb(51, 4);
+            ep[1][1][2] = rb(50, 1) | (rb(69, 1) << 1) | (rb(70, 1) << 2) | (rb(76, 1) << 3) | (rb(75, 1) << 4);
+            break;
+        }
+        case 5: {  // 2-region, transformed, 9b, deltas (5,5,5)
+            delta_bits[0] = 5; delta_bits[1] = 5; delta_bits[2] = 5;
+            ep[0][0][0] = rb(5, 9);
+            ep[0][0][1] = rb(15, 9);
+            ep[0][0][2] = rb(25, 9);
+            ep[0][1][0] = rb(35, 5);
+            ep[0][1][1] = rb(45, 5);
+            ep[0][1][2] = rb(55, 5);
+            ep[1][0][0] = rb(65, 5);
+            ep[1][0][1] = rb(41, 4) | (rb(24, 1) << 4);
+            ep[1][0][2] = rb(61, 4) | (rb(14, 1) << 4);
+            ep[1][1][0] = rb(71, 5);
+            ep[1][1][1] = rb(51, 4) | (rb(40, 1) << 4);
+            ep[1][1][2] = rb(50, 1) | (rb(60, 1) << 1) | (rb(70, 1) << 2) | (rb(76, 1) << 3) | (rb(34, 1) << 4);
+            break;
+        }
+        case 6: {  // 2-region, transformed, 8b, deltas (6,5,5)
+            delta_bits[0] = 6; delta_bits[1] = 5; delta_bits[2] = 5;
+            ep[0][0][0] = rb(5, 8);
+            ep[0][0][1] = rb(15, 8);
+            ep[0][0][2] = rb(25, 8);
+            ep[0][1][0] = rb(35, 6);
+            ep[0][1][1] = rb(45, 5);
+            ep[0][1][2] = rb(55, 5);
+            ep[1][0][0] = rb(65, 6);
+            ep[1][0][1] = rb(41, 4) | (rb(24, 1) << 4);
+            ep[1][0][2] = rb(61, 4) | (rb(14, 1) << 4);
+            ep[1][1][0] = rb(71, 6);
+            ep[1][1][1] = rb(51, 4) | (rb(13, 1) << 4);
+            ep[1][1][2] = rb(50, 1) | (rb(60, 1) << 1) | (rb(23, 1) << 2) | (rb(33, 1) << 3) | (rb(34, 1) << 4);
+            break;
+        }
+        case 7: {  // 2-region, transformed, 8b, deltas (5,6,5)
+            delta_bits[0] = 5; delta_bits[1] = 6; delta_bits[2] = 5;
+            ep[0][0][0] = rb(5, 8);
+            ep[0][0][1] = rb(15, 8);
+            ep[0][0][2] = rb(25, 8);
+            ep[0][1][0] = rb(35, 5);
+            ep[0][1][1] = rb(45, 6);
+            ep[0][1][2] = rb(55, 5);
+            ep[1][0][0] = rb(65, 5);
+            ep[1][0][1] = rb(41, 4) | (rb(24, 1) << 4) | (rb(23, 1) << 5);
+            ep[1][0][2] = rb(61, 4) | (rb(14, 1) << 4);
+            ep[1][1][0] = rb(71, 5);
+            ep[1][1][1] = rb(51, 4) | (rb(40, 1) << 4) | (rb(33, 1) << 5);
+            ep[1][1][2] = rb(13, 1) | (rb(60, 1) << 1) | (rb(70, 1) << 2) | (rb(76, 1) << 3) | (rb(34, 1) << 4);
+            break;
+        }
+        case 8: {  // 2-region, transformed, 8b, deltas (5,5,6)
+            delta_bits[0] = 5; delta_bits[1] = 5; delta_bits[2] = 6;
+            ep[0][0][0] = rb(5, 8);
+            ep[0][0][1] = rb(15, 8);
+            ep[0][0][2] = rb(25, 8);
+            ep[0][1][0] = rb(35, 5);
+            ep[0][1][1] = rb(45, 5);
+            ep[0][1][2] = rb(55, 6);
+            ep[1][0][0] = rb(65, 5);
+            ep[1][0][1] = rb(41, 4) | (rb(24, 1) << 4);
+            ep[1][0][2] = rb(61, 4) | (rb(14, 1) << 4) | (rb(23, 1) << 5);
+            ep[1][1][0] = rb(71, 5);
+            ep[1][1][1] = rb(51, 4) | (rb(40, 1) << 4);
+            ep[1][1][2] = rb(50, 1) | (rb(13, 1) << 1) | (rb(70, 1) << 2) |
+                          (rb(76, 1) << 3) | (rb(34, 1) << 4) | (rb(33, 1) << 5);
+            break;
+        }
+        case 9: {  // 2-region, UNTRANSFORMED, 6b
+            ep[0][0][0] = rb(5, 6);
+            ep[0][0][1] = rb(15, 6);
+            ep[0][0][2] = rb(25, 6);
+            ep[0][1][0] = rb(35, 6);
+            ep[0][1][1] = rb(45, 6);
+            ep[0][1][2] = rb(55, 6);
+            ep[1][0][0] = rb(65, 6);
+            ep[1][0][1] = rb(41, 4) | (rb(24, 1) << 4) | (rb(21, 1) << 5);
+            ep[1][0][2] = rb(61, 4) | (rb(14, 1) << 4) | (rb(22, 1) << 5);
+            ep[1][1][0] = rb(71, 6);
+            ep[1][1][1] = rb(51, 4) | (rb(11, 1) << 4) | (rb(31, 1) << 5);
+            ep[1][1][2] = rb(12, 1) | (rb(13, 1) << 1) | (rb(23, 1) << 2) |
+                          (rb(32, 1) << 3) | (rb(34, 1) << 4) | (rb(33, 1) << 5);
+            break;
+        }
+        case 10: {  // 1-region, UNTRANSFORMED, 10b
+            ep[0][0][0] = rb(5, 10);
+            ep[0][0][1] = rb(15, 10);
+            ep[0][0][2] = rb(25, 10);
+            ep[0][1][0] = rb(35, 10);
+            ep[0][1][1] = rb(45, 10);
+            ep[0][1][2] = rb(55, 10);
+            break;
+        }
+        case 11: {  // 1-region, transformed, 11b, deltas (9,9,9)
+            delta_bits[0] = 9; delta_bits[1] = 9; delta_bits[2] = 9;
+            ep[0][0][0] = rb(5, 10) | (rb(44, 1) << 10);
+            ep[0][0][1] = rb(15, 10) | (rb(54, 1) << 10);
+            ep[0][0][2] = rb(25, 10) | (rb(64, 1) << 10);
+            ep[0][1][0] = rb(35, 9);
+            ep[0][1][1] = rb(45, 9);
+            ep[0][1][2] = rb(55, 9);
+            break;
+        }
+        case 12: {  // 1-region, transformed, 12b, deltas (8,8,8), high bits reversed [11:10]
+            delta_bits[0] = 8; delta_bits[1] = 8; delta_bits[2] = 8;
+            ep[0][0][0] = rb(5, 10) | (rbr(43, 2) << 10);
+            ep[0][0][1] = rb(15, 10) | (rbr(53, 2) << 10);
+            ep[0][0][2] = rb(25, 10) | (rbr(63, 2) << 10);
+            ep[0][1][0] = rb(35, 8);
+            ep[0][1][1] = rb(45, 8);
+            ep[0][1][2] = rb(55, 8);
+            break;
+        }
+        case 13: {  // 1-region, transformed, 16b, deltas (4,4,4), high bits reversed [15:10]
+            delta_bits[0] = 4; delta_bits[1] = 4; delta_bits[2] = 4;
+            ep[0][0][0] = rb(5, 10) | (rbr(39, 6) << 10);
+            ep[0][0][1] = rb(15, 10) | (rbr(49, 6) << 10);
+            ep[0][0][2] = rb(25, 10) | (rbr(59, 6) << 10);
+            ep[0][1][0] = rb(35, 4);
+            ep[0][1][1] = rb(45, 4);
+            ep[0][1][2] = rb(55, 4);
+            break;
+        }
+        default:
+            return;
+    }
+
+    const int num_subsets = static_cast<int>(info.region_count);
+    const int32_t ep_mask = (1 << ep_bits) - 1;
+
+    if (info.is_transformed) {
+        if (is_signed) {
+            for (int c = 0; c < 3; ++c) {
+                ep[0][0][c] = Bc6hSignExtend(ep[0][0][c], ep_bits);
+            }
+        }
+        for (int s = 0; s < num_subsets; ++s) {
+            for (int e = (s == 0 ? 1 : 0); e < 2; ++e) {
+                for (int c = 0; c < 3; ++c) {
+                    const int32_t d = Bc6hSignExtend(ep[s][e][c], delta_bits[c]);
+                    int32_t v = (ep[0][0][c] + d) & ep_mask;
+                    if (is_signed) {
+                        v = Bc6hSignExtend(v, ep_bits);
+                    }
+                    ep[s][e][c] = v;
+                }
+            }
+        }
+    } else if (is_signed) {
+        for (int s = 0; s < num_subsets; ++s) {
+            for (int e = 0; e < 2; ++e) {
+                for (int c = 0; c < 3; ++c) {
+                    ep[s][e][c] = Bc6hSignExtend(ep[s][e][c], ep_bits);
+                }
+            }
+        }
+    }
+
+    // Strict bit-exact integer unquantization of endpoints.
+    for (int s = 0; s < num_subsets; ++s) {
+        for (int e = 0; e < 2; ++e) {
+            for (int c = 0; c < 3; ++c) {
+                ep[s][e][c] = Bc6hUnquantize(ep[s][e][c], ep_bits, is_signed);
+            }
+        }
+    }
+
+    // Read compressed per-texel palette indices and perform exact integer weight interpolation + final scaling.
+    int bit_cursor = (num_subsets == 2) ? 82 : 65;
+    const int idx_bits = (num_subsets == 2) ? 3 : 4;
+    const uint8_t part = (num_subsets == 2) ? (info.partition_index & 31u) : 0u;
+    const uint8_t anchor2 = (num_subsets == 2) ? kBc6hAnchorIndexSecondSubset[part] : 0u;
+
+    for (int i = 0; i < 16; ++i) {
+        const int subset = (num_subsets == 2) ? static_cast<int>(kBc6hPartitionTable2[part][i]) : 0;
+        const bool is_anchor = (i == 0) || (num_subsets == 2 && i == static_cast<int>(anchor2));
+        const int read_cnt = is_anchor ? (idx_bits - 1) : idx_bits;
+        const int idx = rb(bit_cursor, read_cnt);
+        bit_cursor += read_cnt;
+        const int32_t w = (num_subsets == 2) ? kBc6hWeights3[idx & 7] : kBc6hWeights4[idx & 15];
+
+        for (int c = 0; c < 3; ++c) {
+            const int32_t interp = Bc6hInterpolate(ep[subset][0][c], ep[subset][1][c], w);
+            out_rgb_f16[i * 3 + c] = Bc6hFinishUnquantize(interp, is_signed);
+        }
+    }
+}
+
+Status Bc6hDecodeSurface(
+    const uint8_t* blocks,
+    size_t blocks_size,
+    uint32_t width,
+    uint32_t height,
+    bool is_signed,
+    std::vector<uint16_t>& out_rgba_f16) {
+    out_rgba_f16.clear();
+    if (!blocks || width == 0u || height == 0u ||
+        width > kBcPackMaxDimension || height > kBcPackMaxDimension) {
+        return Status::Error(StatusCode::InvalidArgument, "Invalid BC6H surface parameters");
+    }
+    const uint64_t expected_bytes = BcCalculateSurfaceSize(BcFormat::BC6H, width, height);
+    if (expected_bytes == 0ull || blocks_size < expected_bytes) {
+        return Status::Error(StatusCode::InvalidArgument, "BC6H source buffer smaller than surface size");
+    }
+    const uint32_t bx_count = (width + 3u) / 4u;
+    const uint32_t by_count = (height + 3u) / 4u;
+    out_rgba_f16.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u, 0u);
+
+    constexpr uint16_t kHalfOne = 0x3C00u;
+    uint16_t rgb[48]{};
+    for (uint32_t by = 0u; by < by_count; ++by) {
+        for (uint32_t bx = 0u; bx < bx_count; ++bx) {
+            const size_t blk_idx = static_cast<size_t>(by) * bx_count + bx;
+            Bc6hDecodeBlock(blocks + blk_idx * 16u, is_signed, rgb);
+            for (uint32_t ty = 0u; ty < 4u; ++ty) {
+                const uint32_t py = by * 4u + ty;
+                if (py >= height) continue;
+                for (uint32_t tx = 0u; tx < 4u; ++tx) {
+                    const uint32_t px = bx * 4u + tx;
+                    if (px >= width) continue;
+                    const size_t src_i = (static_cast<size_t>(ty) * 4u + tx) * 3u;
+                    const size_t dst_i = (static_cast<size_t>(py) * width + px) * 4u;
+                    out_rgba_f16[dst_i + 0u] = rgb[src_i + 0u];
+                    out_rgba_f16[dst_i + 1u] = rgb[src_i + 1u];
+                    out_rgba_f16[dst_i + 2u] = rgb[src_i + 2u];
+                    out_rgba_f16[dst_i + 3u] = kHalfOne;
+                }
+            }
+        }
+    }
+    return Status::Ok();
+}
+
+uint64_t TtpfComputeCodecBitMask(uint32_t codec_index) noexcept {
+    if (codec_index >= kTtpfMaxCodecBits) {
+        return 0ull;
+    }
+    // Strictly 64-bit shift (1ull << codec_index) so indices 32..63 never truncate or UB (bcpack-rs c51ec52).
+    return 1ull << codec_index;
+}
+
+bool TtpfValidatePayloadBounds(
+    uint64_t logical_size_bytes,
+    uint64_t tile_offset_bytes,
+    uint64_t tile_size_bytes,
+    uint64_t codec_mask,
+    TtpfCodecMaskInfo* out_info) noexcept {
+    if (out_info) {
+        *out_info = TtpfCodecMaskInfo{};
+    }
+    if (logical_size_bytes == 0ull || tile_size_bytes == 0ull || codec_mask == 0ull) {
+        return false;
+    }
+    if (tile_offset_bytes > logical_size_bytes ||
+        tile_size_bytes > logical_size_bytes - tile_offset_bytes) {
+        return false;
+    }
+    uint32_t bits_set = 0u;
+    uint64_t m = codec_mask;
+    while (m != 0ull) {
+        m &= (m - 1ull);
+        ++bits_set;
+    }
+    if (out_info) {
+        out_info->codec_mask = codec_mask;
+        out_info->logical_size_bytes = logical_size_bytes;
+        out_info->tile_offset_bytes = tile_offset_bytes;
+        out_info->tile_size_bytes = tile_size_bytes;
+        out_info->active_codec_count = bits_set;
+        out_info->exceeds_4gib =
+            (logical_size_bytes > 0xFFFFFFFFull) ||
+            ((tile_offset_bytes + tile_size_bytes) > 0xFFFFFFFFull);
+    }
+    return true;
+}
+
+Status BcPackRansEncode(
+    const uint8_t* src,
+    size_t src_size,
+    std::vector<uint8_t>& out_encoded) {
+    out_encoded.clear();
+    if (!src && src_size > 0u) {
+        return Status::Error(StatusCode::InvalidArgument, "Null source buffer for rANS encode");
+    }
+
+    std::array<uint64_t, 256> raw_counts{};
+    for (size_t i = 0u; i < src_size; ++i) {
+        ++raw_counts[src[i]];
+    }
+
+    std::array<uint16_t, 256> freqs{};
+    if (src_size == 0u) {
+        freqs[0] = static_cast<uint16_t>(kRansProbScale);
+    } else {
+        uint32_t sum = 0u;
+        uint32_t max_sym = 0u;
+        uint64_t max_cnt = 0ull;
+        for (uint32_t s = 0u; s < 256u; ++s) {
+            if (raw_counts[s] > 0ull) {
+                if (raw_counts[s] > max_cnt) {
+                    max_cnt = raw_counts[s];
+                    max_sym = s;
+                }
+                const uint64_t scaled = (raw_counts[s] * static_cast<uint64_t>(kRansProbScale)) / src_size;
+                const uint16_t f = static_cast<uint16_t>(std::max<uint64_t>(1ull, std::min<uint64_t>(scaled, kRansProbScale)));
+                freqs[s] = f;
+                sum += f;
+            }
+        }
+        while (sum > kRansProbScale) {
+            // Decrement largest frequency > 1 to guarantee exact sum == 4096 without zeroing any present symbol.
+            uint32_t best_s = 256u;
+            uint16_t best_f = 1u;
+            for (uint32_t s = 0u; s < 256u; ++s) {
+                if (freqs[s] > best_f) {
+                    best_f = freqs[s];
+                    best_s = s;
+                }
+            }
+            if (best_s >= 256u) {
+                return Status::Error(StatusCode::InvalidArgument, "rANS frequency normalization underflow");
+            }
+            --freqs[best_s];
+            --sum;
+        }
+        if (sum < kRansProbScale) {
+            freqs[max_sym] = static_cast<uint16_t>(freqs[max_sym] + (kRansProbScale - sum));
+        }
+    }
+
+    std::array<uint16_t, 256> cum{};
+    {
+        uint32_t acc = 0u;
+        for (uint32_t s = 0u; s < 256u; ++s) {
+            cum[s] = static_cast<uint16_t>(acc);
+            acc += freqs[s];
+        }
+    }
+
+    uint32_t state = kRansLowerBound;
+    std::vector<uint8_t> rev_bytes;
+    rev_bytes.reserve(src_size + 16u);
+    for (size_t i = src_size; i > 0u; --i) {
+        const uint8_t sym = src[i - 1u];
+        const uint32_t f = freqs[sym];
+        const uint32_t c = cum[sym];
+        const uint32_t x_max = ((kRansLowerBound >> kRansProbBits) << 8u) * f;
+        while (state >= x_max) {
+            rev_bytes.push_back(static_cast<uint8_t>(state & 0xFFu));
+            state >>= 8u;
+        }
+        state = ((state / f) << kRansProbBits) + (state % f) + c;
+    }
+
+    out_encoded.reserve(kRansHeaderBytes + rev_bytes.size());
+    AppendLe32(out_encoded, kRansMagic);
+    const uint64_t sz64 = static_cast<uint64_t>(src_size);
+    for (uint32_t b = 0u; b < 8u; ++b) {
+        out_encoded.push_back(static_cast<uint8_t>((sz64 >> (b * 8u)) & 0xFFull));
+    }
+    for (uint32_t s = 0u; s < 256u; ++s) {
+        AppendLe16(out_encoded, freqs[s]);
+    }
+    AppendLe32(out_encoded, state);
+    for (size_t i = rev_bytes.size(); i > 0u; --i) {
+        out_encoded.push_back(rev_bytes[i - 1u]);
+    }
+    return Status::Ok();
+}
+
+Status BcPackRansDecode(
+    const uint8_t* src,
+    size_t src_size,
+    uint64_t expected_output_size,
+    std::vector<uint8_t>& out_decoded) {
+    out_decoded.clear();
+    if (!src || src_size < kRansHeaderBytes) {
+        return Status::Error(StatusCode::ParseError, "rANS stream truncated before header");
+    }
+    if (ReadLe32(src) != kRansMagic) {
+        return Status::Error(StatusCode::ParseError, "rANS stream magic mismatch");
+    }
+    uint64_t logical_size = 0ull;
+    for (uint32_t b = 0u; b < 8u; ++b) {
+        logical_size |= (static_cast<uint64_t>(src[4u + b]) << (b * 8u));
+    }
+    if (logical_size != expected_output_size) {
+        return Status::Error(StatusCode::ParseError, "rANS logical size does not match expected output size");
+    }
+    if (logical_size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        return Status::Error(StatusCode::ParseError, "rANS output size exceeds address space");
+    }
+
+    std::array<uint16_t, 256> freqs{};
+    std::array<uint16_t, 256> cum{};
+    std::array<uint8_t, kRansProbScale> slot_to_sym{};
+    uint32_t sum = 0u;
+    for (uint32_t s = 0u; s < 256u; ++s) {
+        const uint16_t f = ReadLe16(src + 12u + static_cast<size_t>(s) * 2u);
+        freqs[s] = f;
+        cum[s] = static_cast<uint16_t>(sum);
+        if (sum + f > kRansProbScale) {
+            return Status::Error(StatusCode::ParseError, "rANS frequency table overflow (> 4096)");
+        }
+        for (uint32_t k = 0u; k < f; ++k) {
+            slot_to_sym[sum + k] = static_cast<uint8_t>(s);
+        }
+        sum += f;
+    }
+    if (sum != kRansProbScale) {
+        return Status::Error(StatusCode::ParseError, "rANS frequency table sum != 4096");
+    }
+
+    uint32_t state = ReadLe32(src + 12u + 512u);
+    if (state < kRansLowerBound) {
+        return Status::Error(StatusCode::ParseError, "rANS initial state below lower bound");
+    }
+
+    const uint8_t* ptr = src + kRansHeaderBytes;
+    const uint8_t* const end = src + src_size;
+
+    // Guard against zip-bomb / malformed huge headers with zero backing payload.
+    const uint64_t stream_bytes = static_cast<uint64_t>(end - ptr);
+    bool has_single_symbol = false;
+    for (uint32_t s = 0u; s < 256u; ++s) {
+        if (freqs[s] == kRansProbScale) {
+            has_single_symbol = true;
+            break;
+        }
+    }
+    if (!has_single_symbol && logical_size > 0ull && stream_bytes == 0ull && logical_size > 1024ull) {
+        return Status::Error(StatusCode::ParseError, "rANS stream missing renormalization payload");
+    }
+
+    out_decoded.resize(static_cast<size_t>(logical_size));
+    constexpr uint32_t kProbMask = kRansProbScale - 1u;
+    for (uint64_t i = 0ull; i < logical_size; ++i) {
+        const uint32_t slot = state & kProbMask;
+        const uint8_t sym = slot_to_sym[slot];
+        const uint32_t f = freqs[sym];
+        const uint32_t c = cum[sym];
+        if (f == 0u || slot < c || slot >= c + f) {
+            out_decoded.clear();
+            return Status::Error(StatusCode::ParseError, "rANS corrupt symbol slot");
+        }
+        out_decoded[static_cast<size_t>(i)] = sym;
+        state = f * (state >> kRansProbBits) + (slot - c);
+        while (state < kRansLowerBound) {
+            if (ptr >= end) {
+                out_decoded.clear();
+                return Status::Error(StatusCode::ParseError, "rANS stream truncated during renormalization");
+            }
+            state = (state << 8u) | static_cast<uint32_t>(*ptr++);
+        }
+    }
+
+    if (ptr != end || state != kRansLowerBound) {
+        out_decoded.clear();
+        return Status::Error(StatusCode::ParseError, "rANS final state or stream length mismatch");
     }
     return Status::Ok();
 }

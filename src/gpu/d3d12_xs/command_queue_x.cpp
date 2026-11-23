@@ -1360,12 +1360,16 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     std::vector<uint64_t> pending_writeback_vas;
     std::vector<DeferredCpuWrite32> deferred_writes;
     std::vector<DeferredCpuWait> deferred_waits;
+    UINT valid_list_count = 0u;
     for (UINT i = 0; i < NumCommandLists; ++i) {
-        raw_lists[i] = CommandListX::UnwrapHostList(ppCommandLists[i]);
         if (CommandListX* clx = CommandListX::TryFromCommandList(ppCommandLists[i])) {
+            if (clx->LastCloseFailed()) {
+                continue;  // Never pass an unclosed/invalid command list to host D3D12 queue
+            }
             clx->ExtractPendingMirrorWritebacks(pending_writeback_vas);
             clx->ExtractDeferredCpuOps(deferred_writes, deferred_waits);
         }
+        raw_lists[valid_list_count++] = CommandListX::UnwrapHostList(ppCommandLists[i]);
     }
 
     // Enforce any CPU/mirrored Wait32BitValueX / Wait64BitValueX recorded on command lists.
@@ -1379,10 +1383,52 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     }
 
     if (const auto hook = submit_hook_.load(std::memory_order_acquire)) {
-        hook(host_queue_, NumCommandLists, raw_lists, submit_hook_ctx_.load(std::memory_order_acquire));
+        hook(host_queue_, valid_list_count, raw_lists, submit_hook_ctx_.load(std::memory_order_acquire));
     }
 
-    host_queue_->ExecuteCommandLists(NumCommandLists, raw_lists);
+    if (valid_list_count > 0u) {
+        host_queue_->ExecuteCommandLists(valid_list_count, raw_lists);
+    }
+    if (device_x_ && CommandListX::IsDiagTraceEnabled() && device_x_->HostDevice()) {
+        // Flush this submission immediately so GetDeviceRemovedReason pinpoints the exact offending list.
+        static std::mutex s_diag_mu;
+        static std::atomic<bool> s_dumped{false};
+        if (!s_dumped.load(std::memory_order_acquire)) {
+            ID3D12Fence* tmp_fence = nullptr;
+            if (SUCCEEDED(device_x_->HostDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&tmp_fence))) && tmp_fence) {
+                if (SUCCEEDED(host_queue_->Signal(tmp_fence, 1))) {
+                    HANDLE ev = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                    if (ev) {
+                        if (tmp_fence->GetCompletedValue() < 1) {
+                            tmp_fence->SetEventOnCompletion(1, ev);
+                            ::WaitForSingleObject(ev, 5000);
+                        }
+                        ::CloseHandle(ev);
+                    }
+                }
+                tmp_fence->Release();
+            }
+            const HRESULT rem_hr = device_x_->HostDevice()->GetDeviceRemovedReason();
+            if (FAILED(rem_hr) && !s_dumped.exchange(true)) {
+                std::lock_guard<std::mutex> dlk(s_diag_mu);
+                FILE* f = nullptr;
+                if (::fopen_s(&f, CommandListX::DiagTraceLogPath(), "a") == 0 && f) {
+                    std::fprintf(f, "\n=== DEVICE REMOVED AFTER ExecuteCommandLists(n=%u, valid=%u, queue_type=%d) hr=0x%08X ===\n",
+                                 NumCommandLists, valid_list_count, static_cast<int>(queue_type_), static_cast<unsigned>(rem_hr));
+                    for (UINT i = 0; i < NumCommandLists; ++i) {
+                        if (CommandListX* clx = CommandListX::TryFromCommandList(ppCommandLists[i])) {
+                            const auto ops = clx->CopyDiagOps();
+                            std::fprintf(f, "--- List[%u] (%zu ops) ---\n", i, ops.size());
+                            for (const auto& op : ops) {
+                                std::fprintf(f, "  %s\n", op.c_str());
+                            }
+                        }
+                    }
+                    std::fclose(f);
+                }
+            }
+        }
+    }
 
     // Schedule fence-tracked GPU->CPU writeback for any TitleVAMirror resources written by these lists.
     if (device_x_ && !pending_writeback_vas.empty() &&
@@ -1477,10 +1523,13 @@ void CommandQueueX::ExecuteVulkanRecordedBatch(const VulkanRecordedBatch& batch)
         switch (op.kind) {
             case VulkanRecordedOpKind::Barrier: {
                 const uint32_t n = std::max<uint32_t>(1u, op.barrier_count);
+                const uint32_t n_global = std::min<uint32_t>(n, op.global_uav_barrier_count);
                 barriers_cnt += n;
                 for (uint32_t b = 0; b < n; ++b) {
                     openscarlett::VulkanCommandItem item{};
-                    item.op = openscarlett::VulkanCommandOp::PipelineBarrier;
+                    item.op = (b < n_global)
+                                  ? openscarlett::VulkanCommandOp::GlobalUavBarrier
+                                  : openscarlett::VulkanCommandOp::PipelineBarrier;
                     vk_cl_desc.commands.push_back(item);
                 }
                 break;
@@ -2516,6 +2565,14 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
                 ? (static_cast<double>(pres_qpc - total_start_qpc) * 1000000.0 / static_cast<double>(qpc_freq_))
                 : 0.0;
         last_timing_stats_.present_count = present_count_;
+        {
+            uint64_t sig_vlines = 0ull;
+            uint64_t sig_frames = 0ull;
+            SignalRegisteredDisplayNotificationsOnPresent(&sig_vlines, &sig_frames);
+            if (device_x_ && (sig_vlines > 0ull || sig_frames > 0ull)) {
+                device_x_->RecordDisplayNotificationsSignaled(sig_vlines, sig_frames);
+            }
+        }
         RecordQueue("ID3D12CommandQueueX::PresentX", 19, S_OK);
         return S_OK;
     }
@@ -3114,6 +3171,14 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
                static_cast<double>(qpc_freq_))
             : 0.0;
     last_timing_stats_.present_count = present_count_;
+    {
+        uint64_t sig_vlines = 0ull;
+        uint64_t sig_frames = 0ull;
+        SignalRegisteredDisplayNotificationsOnPresent(&sig_vlines, &sig_frames);
+        if (device_x_ && (sig_vlines > 0ull || sig_frames > 0ull)) {
+            device_x_->RecordDisplayNotificationsSignaled(sig_vlines, sig_frames);
+        }
+    }
 
     RecordQueue("ID3D12CommandQueueX::PresentX", 19, S_OK);
     return S_OK;

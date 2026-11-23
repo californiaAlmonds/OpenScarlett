@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="542" viewBox="0 0 900 542" role="img" aria-label="OpenScarlett Honest Subsystem Progress (75/75 tests passing)">
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="542" viewBox="0 0 900 542" role="img" aria-label="OpenScarlett Honest Subsystem Progress (79/79 tests passing)">
   <defs>
     <linearGradient id="accentBar" x1="0%" y1="0%" x2="100%" y2="0%">
       <stop offset="0%" stop-color="#e11d48"/>
@@ -19,7 +19,7 @@
     <rect width="900" height="542" fill="#0d1117"/>
     <rect x="0" y="0" width="900" height="3" fill="url(#accentBar)"/>
     <text class="h1" x="28" y="40">OpenScarlett — Honest Subsystem Progress (Early Alpha)</text>
-    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · 75/75 tests passing · 30 DLLs (1146 exports) · 779/779 RDNA2 ops · 11 PCs</text>
+    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · 79/79 tests passing · 31 DLLs (1179 exports) · 779/779 RDNA2 ops · 11 PCs</text>
     <line x1="28" y1="82" x2="872" y2="82" stroke="#21262d" stroke-width="1"/>
     <text class="name" x="28" y="118">Xbox RDNA2 Shader Translator</text>
     <text class="desc" x="28" y="135">779/779 GFX10.3 opcodes, 3,120-shader corpus, HS/DS/GS, DXR SBT &amp; Wave64-on-32</text>
@@ -45,13 +45,13 @@
     <rect x="648" y="222" width="167" height="10" rx="5" fill="#2ea043"/>
     <text class="pct" x="872" y="231" text-anchor="end">95%</text>
     <line x1="28" y1="252" x2="872" y2="252" stroke="#161b22" stroke-width="1"/>
-    <text class="name" x="28" y="274">Xbox Live, GDK &amp; OS Shims (30 DLLs)</text>
-    <text class="desc" x="28" y="291">16 high-coverage, 4 partial, 10 stub DLLs — 292/292 thunks, WinRT &amp; offline auth</text>
+    <text class="name" x="28" y="274">Xbox Live, GDK &amp; OS Shims (31 DLLs)</text>
+    <text class="desc" x="28" y="291">18 high-coverage, 5 partial, 8 stub DLLs — 292/292 thunks, WinRT &amp; offline auth</text>
     <rect x="498" y="268" width="132" height="22" rx="11" fill="#2ea043"/>
-    <text class="pill" x="564" y="283" text-anchor="middle">16/30 Full DLLs</text>
+    <text class="pill" x="564" y="283" text-anchor="middle">18/31 Full DLLs</text>
     <rect x="648" y="274" width="176" height="10" rx="5" fill="#21262d"/>
-    <rect x="648" y="274" width="148" height="10" rx="5" fill="#2ea043"/>
-    <text class="pct" x="872" y="283" text-anchor="end">84%</text>
+    <rect x="648" y="274" width="155" height="10" rx="5" fill="#2ea043"/>
+    <text class="pct" x="872" y="283" text-anchor="end">88%</text>
     <line x1="28" y1="304" x2="872" y2="304" stroke="#161b22" stroke-width="1"/>
     <text class="name" x="28" y="326">Audio, Video &amp; Texture Codecs</text>
     <text class="desc" x="28" y="343">mfplat H.264/HEVC, 64+ XAudio2 voices, Bink2 streaming, GameInput &amp; FSR 1.0</text>
@@ -78,12 +78,12 @@
     <text class="pct" x="872" y="439" text-anchor="end">98%</text>
     <line x1="28" y1="460" x2="872" y2="460" stroke="#161b22" stroke-width="1"/>
     <text class="name" x="28" y="482">Real-World Game Compatibility</text>
-    <text class="desc" x="28" y="499">Freedoom 60 FPS, 3D GDK scene &amp; samples work — retail games: 0 so far</text>
-    <rect x="498" y="476" width="132" height="22" rx="11" fill="#8957e5"/>
-    <text class="pill" x="564" y="491" text-anchor="middle">Early Alpha</text>
+    <text class="desc" x="28" y="499">6/6 untouched GDKX samples &amp; Freedoom live · Minecraft &amp; UE5 in bring-up</text>
+    <rect x="498" y="476" width="132" height="22" rx="11" fill="#d29922"/>
+    <text class="pill" x="564" y="491" text-anchor="middle">Active Bring-Up</text>
     <rect x="648" y="482" width="176" height="10" rx="5" fill="#21262d"/>
-    <rect x="648" y="482" width="35" height="10" rx="5" fill="#8957e5"/>
-    <text class="pct" x="872" y="491" text-anchor="end">20%</text>
+    <rect x="648" y="482" width="70" height="10" rx="5" fill="#d29922"/>
+    <text class="pct" x="872" y="491" text-anchor="end">40%</text>
   </g>
   <rect x="0.5" y="0.5" width="899" height="541" rx="12" fill="none" stroke="#30363d" stroke-width="1"/>
 </svg>

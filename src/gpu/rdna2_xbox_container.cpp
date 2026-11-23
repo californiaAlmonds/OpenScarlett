@@ -171,7 +171,8 @@ uint32_t ParseSignatureChunk(
     const uint8_t* data,
     size_t size,
     uint32_t expected_stride,
-    std::vector<XboxSignatureParamDesc>& out_params) {
+    std::vector<XboxSignatureParamDesc>& out_params,
+    bool allow_non_strict_fallback = true) {
     if (!data || size < 8u) return 0u;
     const uint32_t count = ReadLe32(data + 0u);
     uint32_t table_off = ReadLe32(data + 4u);
@@ -195,8 +196,8 @@ uint32_t ParseSignatureChunk(
             return alt;
         }
     }
-    // Non-strict fallback for synthetic chunks without string table entries (still strictly bounds-checked)
-    if (TryParseSignatureChunkWithStride(data, size, count, table_off, expected_stride, false, out_params)) {
+    if (allow_non_strict_fallback &&
+        TryParseSignatureChunkWithStride(data, size, count, table_off, expected_stride, false, out_params)) {
         return expected_stride;
     }
     return 0u;
@@ -1439,10 +1440,18 @@ Status ParseFullXboxShaderContainer(const void* data, size_t size, XboxParsedSha
             }
         } else if (std::memcmp(chunk.fourcc, "ISG1", 4u) == 0) {
             out_parsed.input_sig_element_stride =
-                ParseSignatureChunk(chunk.data.data(), chunk.data.size(), 32u, out_parsed.input_signature);
+                ParseSignatureChunk(chunk.data.data(), chunk.data.size(), 32u, out_parsed.input_signature, false);
+            if (out_parsed.input_sig_element_stride == 0u) {
+                return Status::Error(StatusCode::ParseError,
+                                     "Incomplete or truncated DXBC ISG1 input signature chunk");
+            }
         } else if (std::memcmp(chunk.fourcc, "ISGN", 4u) == 0 && out_parsed.input_signature.empty()) {
             out_parsed.input_sig_element_stride =
-                ParseSignatureChunk(chunk.data.data(), chunk.data.size(), 24u, out_parsed.input_signature);
+                ParseSignatureChunk(chunk.data.data(), chunk.data.size(), 24u, out_parsed.input_signature, false);
+            if (out_parsed.input_sig_element_stride == 0u) {
+                return Status::Error(StatusCode::ParseError,
+                                     "Incomplete or truncated DXBC ISGN input signature chunk");
+            }
         } else if (std::memcmp(chunk.fourcc, "OSG1", 4u) == 0) {
             out_parsed.output_sig_element_stride =
                 ParseSignatureChunk(chunk.data.data(), chunk.data.size(), 32u, out_parsed.output_signature);
