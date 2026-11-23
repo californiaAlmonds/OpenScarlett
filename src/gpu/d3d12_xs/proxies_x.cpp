@@ -437,7 +437,13 @@ HRESULT STDMETHODCALLTYPE ResourceXProxy::ReadFromSubresource(
 HRESULT STDMETHODCALLTYPE ResourceXProxy::GetHeapProperties(
     D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS* pHeapFlags) {
     if (host_res_) {
-        return host_res_->GetHeapProperties(pHeapProperties, pHeapFlags);
+        const HRESULT hr = host_res_->GetHeapProperties(pHeapProperties, pHeapFlags);
+        if (SUCCEEDED(hr) && l0_spilled_from_default_ && pHeapProperties) {
+            pHeapProperties->Type = D3D12_HEAP_TYPE_DEFAULT;
+            pHeapProperties->CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+            pHeapProperties->MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        }
+        return hr;
     }
     if (!has_cached_heap_props_) return E_FAIL;
     if (pHeapProperties) *pHeapProperties = cached_heap_props_;
@@ -532,7 +538,13 @@ HeapXProxy::HeapXProxy(DeviceX* parent_device, ID3D12Heap* host_heap, uint64_t x
                 self = static_cast<HeapXProxy*>(arg1);
             }
             if (out && self) {
-                *out = self->HostHeap() ? self->HostHeap()->GetDesc() : D3D12_HEAP_DESC{};
+                D3D12_HEAP_DESC d = self->HostHeap() ? self->HostHeap()->GetDesc() : D3D12_HEAP_DESC{};
+                if (self->IsL0SpilledFromDefault()) {
+                    d.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+                    d.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+                    d.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+                }
+                *out = d;
             }
             return out;
         };
@@ -622,6 +634,11 @@ D3D12_HEAP_DESC* STDMETHODCALLTYPE HeapXProxy::GetDesc(D3D12_HEAP_DESC* pRet) {
     if (!pRet) return nullptr;
     if (host_heap_) {
         host_heap_->GetDesc(pRet);
+        if (l0_spilled_from_default_) {
+            pRet->Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+            pRet->Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+            pRet->Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        }
     } else {
         std::memset(pRet, 0, sizeof(*pRet));
     }
@@ -629,8 +646,13 @@ D3D12_HEAP_DESC* STDMETHODCALLTYPE HeapXProxy::GetDesc(D3D12_HEAP_DESC* pRet) {
 }
 #else
 D3D12_HEAP_DESC STDMETHODCALLTYPE HeapXProxy::GetDesc() {
-    D3D12_HEAP_DESC empty{};
-    return host_heap_ ? host_heap_->GetDesc() : empty;
+    D3D12_HEAP_DESC d = host_heap_ ? host_heap_->GetDesc() : D3D12_HEAP_DESC{};
+    if (l0_spilled_from_default_) {
+        d.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        d.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        d.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    }
+    return d;
 }
 #endif
 

@@ -11264,8 +11264,17 @@ XGameResult OPENSCARLETT_GDK_CALL QueryApiImpl(
         if (!com_obj) {
             const std::string sym =
                 "QueryApiImpl(clsid=" + FormatXgrGuid(*clsid) + ",iid=" + FormatXgrGuid(*iid) + ")";
-            std::fprintf(stderr, "[OpenScarlett][xgameruntime] UNIMPL %s\n", sym.c_str());
-            std::fflush(stderr);
+#if defined(_WIN32)
+            static const bool trace_retail = []() {
+                char v[16]{};
+                const DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_RETAIL", v, static_cast<DWORD>(sizeof(v)));
+                return n > 0u && v[0] != '0';
+            }();
+            if (trace_retail) {
+                std::fprintf(stderr, "[OpenScarlett][xgameruntime] UNIMPL %s\n", sym.c_str());
+                std::fflush(stderr);
+            }
+#endif
             openscarlett::CallTelemetry::Global().Record(
                 kModName, sym, openscarlett::CallOutcome::NotImplemented, XGR_E_NOINTERFACE, -1);
             return XGR_E_NOINTERFACE;

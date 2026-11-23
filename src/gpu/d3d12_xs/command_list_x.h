@@ -588,6 +588,7 @@ private:
     // Sprint 12 live AAA island state (tracked per command list)
     ID3D12RootSignature* last_host_compute_rs_ = nullptr;
     ID3D12PipelineState* last_host_pso_ = nullptr;
+    bool last_pso_is_standin_ = false;
     ID3D12DescriptorHeap* bound_cbv_srv_uav_heap_ = nullptr;
     ID3D12DescriptorHeap* bound_sampler_heap_ = nullptr;
     mutable std::mutex aaa_rec_mutex_;
@@ -633,6 +634,7 @@ public:
     static const char* DiagTraceLogPath() noexcept;
     void AppendDiagOp(std::string op);
     std::vector<std::string> CopyDiagOps() const;
+    void ExtractTransientResources(std::vector<ID3D12Resource*>& out);
     bool LastCloseFailed() const noexcept { return last_close_failed_.load(std::memory_order_acquire); }
 
 private:

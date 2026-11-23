@@ -128,6 +128,8 @@ public:
     ResourceXProxy& operator=(const ResourceXProxy&) = delete;
 
     ID3D12Resource* HostResource() const noexcept { return host_res_; }
+    bool IsL0SpilledFromDefault() const noexcept { return l0_spilled_from_default_; }
+    void SetL0SpilledFromDefault(bool v) noexcept { l0_spilled_from_default_ = v; }
     D3D12_GPU_VIRTUAL_ADDRESS TrackedXboxGpuVa() const noexcept { return xbox_gpu_va_; }
     void SetTrackedXboxGpuVa(D3D12_GPU_VIRTUAL_ADDRESS va) noexcept { xbox_gpu_va_ = va; }
 
@@ -211,6 +213,7 @@ private:
     std::mutex uma_map_mutex_;
     std::vector<uint8_t> uma_cpu_shadow_;
     bool uma_shadow_mapped_ = false;
+    bool l0_spilled_from_default_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -230,6 +233,8 @@ public:
     HeapXProxy& operator=(const HeapXProxy&) = delete;
 
     ID3D12Heap* HostHeap() const noexcept { return host_heap_; }
+    bool IsL0SpilledFromDefault() const noexcept { return l0_spilled_from_default_; }
+    void SetL0SpilledFromDefault(bool v) noexcept { l0_spilled_from_default_ = v; }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
     ULONG STDMETHODCALLTYPE AddRef() override;
@@ -272,6 +277,7 @@ private:
     ID3D12Heap1* host_heap1_ = nullptr;
 #endif
     uint64_t xbox_va_ = 0ull;
+    bool l0_spilled_from_default_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -348,6 +354,8 @@ public:
     PipelineStateXProxy& operator=(const PipelineStateXProxy&) = delete;
 
     ID3D12PipelineState* HostPipelineState() const noexcept { return host_pso_; }
+    bool IsStandinPso() const noexcept { return is_standin_pso_; }
+    void SetStandinPso(bool v) noexcept { is_standin_pso_ = v; }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
     ULONG STDMETHODCALLTYPE AddRef() override;
@@ -375,6 +383,7 @@ private:
     std::atomic<ULONG> ref_count_{1u};
     DeviceX* device_x_ = nullptr;
     ID3D12PipelineState* host_pso_ = nullptr;
+    bool is_standin_pso_ = false;
 };
 
 // ---------------------------------------------------------------------------

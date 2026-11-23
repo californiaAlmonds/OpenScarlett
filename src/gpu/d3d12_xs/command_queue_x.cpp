@@ -1131,7 +1131,51 @@ HWND CommandQueueX::ResolveTargetOutputWindowLocked(
     return nullptr;
 }
 
+void CommandQueueX::PumpPendingRetirementsLocked() noexcept {
+    if (!retire_fence_ || pending_retirements_.empty()) return;
+    const uint64_t completed = retire_fence_->GetCompletedValue();
+    if (completed == UINT64_MAX) return;
+    size_t erase_n = 0u;
+    while (erase_n < pending_retirements_.size() &&
+           pending_retirements_[erase_n].first <= completed) {
+        for (ID3D12Resource* r : pending_retirements_[erase_n].second) {
+            if (r) r->Release();
+        }
+        ++erase_n;
+    }
+    if (erase_n > 0u) {
+        pending_retirements_.erase(
+            pending_retirements_.begin(),
+            pending_retirements_.begin() + static_cast<ptrdiff_t>(erase_n));
+    }
+}
+
 CommandQueueX::~CommandQueueX() {
+    {
+        std::lock_guard<std::mutex> rlk(retire_mutex_);
+        if (retire_fence_ && !pending_retirements_.empty()) {
+            const uint64_t target = pending_retirements_.back().first;
+            if (retire_fence_->GetCompletedValue() < target) {
+                HANDLE ev = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (ev) {
+                    if (SUCCEEDED(retire_fence_->SetEventOnCompletion(target, ev))) {
+                        ::WaitForSingleObject(ev, 2000u);
+                    }
+                    ::CloseHandle(ev);
+                }
+            }
+        }
+        for (auto& batch : pending_retirements_) {
+            for (ID3D12Resource* r : batch.second) {
+                if (r) r->Release();
+            }
+        }
+        pending_retirements_.clear();
+        if (retire_fence_) {
+            retire_fence_->Release();
+            retire_fence_ = nullptr;
+        }
+    }
     {
         auto& reg = GetQueueRegistry();
         std::unique_lock<std::shared_mutex> lock(reg.mutex);
@@ -1360,6 +1404,7 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     std::vector<uint64_t> pending_writeback_vas;
     std::vector<DeferredCpuWrite32> deferred_writes;
     std::vector<DeferredCpuWait> deferred_waits;
+    std::vector<ID3D12Resource*> batch_transients;
     UINT valid_list_count = 0u;
     for (UINT i = 0; i < NumCommandLists; ++i) {
         if (CommandListX* clx = CommandListX::TryFromCommandList(ppCommandLists[i])) {
@@ -1368,6 +1413,7 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
             }
             clx->ExtractPendingMirrorWritebacks(pending_writeback_vas);
             clx->ExtractDeferredCpuOps(deferred_writes, deferred_waits);
+            clx->ExtractTransientResources(batch_transients);
         }
         raw_lists[valid_list_count++] = CommandListX::UnwrapHostList(ppCommandLists[i]);
     }
@@ -1388,6 +1434,31 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
 
     if (valid_list_count > 0u) {
         host_queue_->ExecuteCommandLists(valid_list_count, raw_lists);
+    }
+    if (!batch_transients.empty() || !pending_retirements_.empty()) {
+        std::lock_guard<std::mutex> rlk(retire_mutex_);
+        if (!batch_transients.empty() && device_x_ && device_x_->HostDevice()) {
+            if (!retire_fence_) {
+                (void)device_x_->HostDevice()->CreateFence(
+                    0ull, D3D12_FENCE_FLAG_NONE, OS_D3D12_IID(ID3D12Fence),
+                    reinterpret_cast<void**>(&retire_fence_));
+            }
+            if (retire_fence_) {
+                const uint64_t fv = ++retire_fence_val_;
+                if (SUCCEEDED(host_queue_->Signal(retire_fence_, fv))) {
+                    pending_retirements_.emplace_back(fv, std::move(batch_transients));
+                } else {
+                    for (ID3D12Resource* r : batch_transients) {
+                        if (r) r->Release();
+                    }
+                }
+            } else {
+                for (ID3D12Resource* r : batch_transients) {
+                    if (r) r->Release();
+                }
+            }
+        }
+        PumpPendingRetirementsLocked();
     }
     if (device_x_ && CommandListX::IsDiagTraceEnabled() && device_x_->HostDevice()) {
         // Flush this submission immediately so GetDeviceRemovedReason pinpoints the exact offending list.

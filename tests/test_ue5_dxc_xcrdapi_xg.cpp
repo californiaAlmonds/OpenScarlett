@@ -207,16 +207,6 @@ void TestXCrdApiDStorageForwarding() {
 // ---------------------------------------------------------------------------
 // 3. Live xg_xs.dll -> XGCreateTextureComputer (+ 1D/2D/3D + OptimalTileMode)
 // ---------------------------------------------------------------------------
-struct TestXgGuid {
-    uint32_t Data1;
-    uint16_t Data2;
-    uint16_t Data3;
-    uint8_t Data4[8];
-};
-
-constexpr TestXgGuid kTestIidIUnknown = {
-    0x00000000u, 0x0000u, 0x0000u, {0xC0u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x46u}};
-
 struct TestXgResourceDesc {
     uint32_t Dimension;         // 2=1D, 3=2D, 4=3D
     uint64_t Alignment;
@@ -261,11 +251,60 @@ struct TestXgSubresourceTiling {
     uint32_t StartTileIndexInOverallResource;
 };
 
+struct TestXgMipLevelLayoutXbox {
+    uint64_t SizeBytes;
+    uint64_t OffsetBytes;
+    uint64_t Slice2DSizeBytes;
+    uint32_t PitchPixels;
+    uint32_t PitchBytes;
+    uint32_t AlignmentBytes;
+    uint32_t PaddedWidthElements;
+    uint32_t PaddedHeightElements;
+    uint32_t PaddedDepthOrArraySize;
+    uint32_t WidthElements;
+    uint32_t HeightElements;
+    uint32_t DepthOrArraySize;
+    uint32_t SampleCount;
+    uint64_t MipTailOffsetBytes;
+    uint32_t BankRotation;
+    uint32_t PipeSwizzle;
+    uint32_t Flags;
+    uint32_t ReservedMid[4];
+    uint32_t TileMode;
+    uint32_t ReservedEnd[2];
+};
+static_assert(sizeof(TestXgMipLevelLayoutXbox) == 0x70u, "XG_MIPLEVEL_LAYOUT_XBOX must be 0x70 bytes");
+
+struct TestXgPlaneLayoutXbox {
+    uint32_t Usage;
+    uint32_t Reserved0;
+    uint64_t SizeBytes;
+    uint64_t Slice2DSizeBytes;
+    uint64_t BaseOffsetBytes;
+    uint64_t BaseAlignmentBytes;
+    uint32_t BytesPerElement;
+    uint32_t Reserved1;
+    uint32_t MipTailStartLevel;
+    uint32_t Reserved2;
+    TestXgMipLevelLayoutXbox MipLayout[15];
+};
+static_assert(sizeof(TestXgPlaneLayoutXbox) == 0x6C8u, "XG_PLANE_LAYOUT_XBOX must be 0x6C8 bytes");
+
+struct TestXgResourceLayoutXbox {
+    uint64_t SizeBytes;
+    uint64_t BaseAlignmentBytes;
+    uint32_t MipLevels;
+    uint32_t Planes;
+    TestXgPlaneLayoutXbox Plane[4];
+    uint32_t Dimension;
+    uint32_t Flags;
+};
+static_assert(sizeof(TestXgResourceLayoutXbox) == 0x1B40u, "XG_RESOURCE_LAYOUT_XBOX must be 0x1B40 bytes");
+
 struct TestXGTextureAddressComputer {
-    virtual int32_t __stdcall QueryInterface(const TestXgGuid* riid, void** ppvObject) = 0;
     virtual uint32_t __stdcall AddRef() = 0;
     virtual uint32_t __stdcall Release() = 0;
-    virtual int32_t __stdcall GetResourceLayout(XG_RESOURCE_LAYOUT* pLayout) const = 0;
+    virtual int32_t __stdcall GetResourceLayout(TestXgResourceLayoutXbox* pLayout) const = 0;
     virtual uint64_t __stdcall GetResourceSizeBytes() const = 0;
     virtual uint64_t __stdcall GetResourceBaseAlignmentBytes() const = 0;
     virtual uint64_t __stdcall GetMipLevelOffsetBytes(uint32_t plane, uint32_t mipLevel) const = 0;
@@ -360,18 +399,39 @@ void TestXgCreateTextureComputerLive() {
         TestXGTextureAddressComputer* comp = nullptr;
         OS_REQUIRE(fn_create(&desc, &comp) == 0 && comp != nullptr);
 
-        // Verify COM IUnknown QueryInterface / AddRef / Release
-        void* unk = nullptr;
-        OS_REQUIRE(comp->QueryInterface(&kTestIidIUnknown, &unk) == 0 && unk == comp);
+        // Verify retail Xbox xg_xs.h refcount vtable (AddRef=0, Release=1, GetResourceLayout=2)
+        OS_REQUIRE(comp->AddRef() == 2u);
         OS_REQUIRE(comp->Release() == 1u);
 
-        XG_RESOURCE_LAYOUT layout{};
+        TestXgResourceLayoutXbox layout{};
         OS_REQUIRE(comp->GetResourceLayout(&layout) == 0);
         const uint64_t size_bytes = comp->GetResourceSizeBytes();
         const uint64_t align_bytes = comp->GetResourceBaseAlignmentBytes();
         OS_REQUIRE(size_bytes == layout.SizeBytes && size_bytes >= 256ull * 256ull * 4ull);
         OS_REQUIRE(align_bytes == layout.BaseAlignmentBytes && align_bytes == 65536ull);
-        OS_REQUIRE(layout.MipLevels == 5u);
+        OS_REQUIRE(layout.MipLevels == 5u && layout.Planes == 1u);
+        OS_REQUIRE(layout.Plane[0].MipLayout[0].TileMode == 9u);  // SW_64KB_S
+
+        // Also verify real Matrix Awakens Xbox layout=0x105 (SW_4KB_S) 843x5 B8G8R8A8_TYPELESS
+        {
+            TestXgResourceDesc mdesc{};
+            mdesc.Dimension = 3u;
+            mdesc.Width = 843u;
+            mdesc.Height = 5u;
+            mdesc.DepthOrArraySize = 1u;
+            mdesc.MipLevels = 1u;
+            mdesc.Format = 90u;  // DXGI_FORMAT_B8G8R8A8_TYPELESS
+            mdesc.SampleCount = 1u;
+            mdesc.Layout = 0x105u;  // Xbox D3D12_TEXTURE_LAYOUT | ADDR_SW_4KB_S
+            TestXGTextureAddressComputer* mcomp = nullptr;
+            OS_REQUIRE(fn_create(&mdesc, &mcomp) == 0 && mcomp != nullptr);
+            TestXgResourceLayoutXbox mlay{};
+            OS_REQUIRE(mcomp->GetResourceLayout(&mlay) == 0);
+            OS_REQUIRE(mlay.BaseAlignmentBytes == 4096ull);
+            OS_REQUIRE(mlay.SizeBytes == 0x1B000ull);  // 27 * 4 KiB tiles
+            OS_REQUIRE(mlay.Plane[0].MipLayout[0].TileMode == 5u);
+            mcomp->Release();
+        }
 
         // Verify mip offsets & texel offset <-> coordinate inverse round-trip
         for (uint32_t m = 0u; m < desc.MipLevels; ++m) {

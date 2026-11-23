@@ -60,7 +60,6 @@ struct XA2_OPUSWAVEFORMAT {
     uint16_t PreSkip;
     uint16_t Version;
 };
-#pragma pack(pop)
 
 struct XAUDIO2_BUFFER {
     uint32_t Flags;
@@ -129,6 +128,7 @@ struct XAUDIO2_DEBUG_CONFIGURATION {
     int32_t LogFunctionName;
     int32_t LogTiming;
 };
+#pragma pack(pop)
 
 struct IXAudio2VoiceCallback {
     virtual void XA2_COMPAT_CALL OnVoiceProcessingPassStart(uint32_t BytesRequired) = 0;
@@ -149,11 +149,36 @@ struct IXAudio2EngineCallback {
 struct IXAudio2Voice {
     virtual void XA2_COMPAT_CALL GetVoiceDetails(XAUDIO2_VOICE_DETAILS* pVoiceDetails) = 0;
     virtual HRESULT XA2_COMPAT_CALL SetOutputVoices(const XAUDIO2_VOICE_SENDS* pSendList) = 0;
+    virtual HRESULT XA2_COMPAT_CALL SetEffectChain(const void* pEffectChain) = 0;
+    virtual HRESULT XA2_COMPAT_CALL EnableEffect(
+        uint32_t EffectIndex, uint32_t OperationSet = XAUDIO2_COMMIT_NOW) = 0;
+    virtual HRESULT XA2_COMPAT_CALL DisableEffect(
+        uint32_t EffectIndex, uint32_t OperationSet = XAUDIO2_COMMIT_NOW) = 0;
+    virtual void XA2_COMPAT_CALL GetEffectState(uint32_t EffectIndex, int32_t* pEnabled) = 0;
+    virtual HRESULT XA2_COMPAT_CALL SetEffectParameters(
+        uint32_t EffectIndex, const void* pParameters, uint32_t ParametersByteSize,
+        uint32_t OperationSet = XAUDIO2_COMMIT_NOW) = 0;
+    virtual HRESULT XA2_COMPAT_CALL GetEffectParameters(
+        uint32_t EffectIndex, void* pParameters, uint32_t ParametersByteSize) = 0;
+    virtual HRESULT XA2_COMPAT_CALL SetFilterParameters(
+        const void* pParameters, uint32_t OperationSet = XAUDIO2_COMMIT_NOW) = 0;
+    virtual void XA2_COMPAT_CALL GetFilterParameters(void* pParameters) = 0;
+    virtual HRESULT XA2_COMPAT_CALL SetOutputFilterParameters(
+        IXAudio2Voice* pDestinationVoice, const void* pParameters,
+        uint32_t OperationSet = XAUDIO2_COMMIT_NOW) = 0;
+    virtual void XA2_COMPAT_CALL GetOutputFilterParameters(
+        IXAudio2Voice* pDestinationVoice, void* pParameters) = 0;
     virtual HRESULT XA2_COMPAT_CALL SetVolume(float Volume, uint32_t OperationSet = XAUDIO2_COMMIT_NOW) = 0;
     virtual void XA2_COMPAT_CALL GetVolume(float* pVolume) = 0;
     virtual HRESULT XA2_COMPAT_CALL SetChannelVolumes(
         uint32_t Channels, const float* pVolumes, uint32_t OperationSet = XAUDIO2_COMMIT_NOW) = 0;
     virtual void XA2_COMPAT_CALL GetChannelVolumes(uint32_t Channels, float* pVolumes) = 0;
+    virtual HRESULT XA2_COMPAT_CALL SetOutputMatrix(
+        IXAudio2Voice* pDestinationVoice, uint32_t SourceChannels, uint32_t DestinationChannels,
+        const float* pLevelMatrix, uint32_t OperationSet = XAUDIO2_COMMIT_NOW) = 0;
+    virtual void XA2_COMPAT_CALL GetOutputMatrix(
+        IXAudio2Voice* pDestinationVoice, uint32_t SourceChannels, uint32_t DestinationChannels,
+        float* pLevelMatrix) = 0;
     virtual void XA2_COMPAT_CALL DestroyVoice() = 0;
 };
 

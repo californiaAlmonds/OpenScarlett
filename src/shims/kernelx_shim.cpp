@@ -1444,11 +1444,20 @@ public:
                         phys.physical_id, 0u, commit_gran, prot, mem_flags, slot_ptr, alias);
                     if (!mst.ok()) {
                         (void)memory_.FreePhysicalPages(phys.physical_id);
-                        std::fprintf(stderr,
-                            "[OpenScarlett][kernelx] Placeholder commit FAILED at %p (req=%p size=%zu ph=%p+%zu): %s\n",
-                            slot_ptr, baseAddress, size, reinterpret_cast<void*>(ph_base), ph_size,
-                            mst.message.c_str());
-                        std::fflush(stderr);
+#if defined(_WIN32)
+                        static const bool trace_retail = []() {
+                            char v[16]{};
+                            const DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_RETAIL", v, static_cast<DWORD>(sizeof(v)));
+                            return n > 0u && v[0] != '0';
+                        }();
+                        if (trace_retail) {
+                            std::fprintf(stderr,
+                                "[OpenScarlett][kernelx] Placeholder commit FAILED at %p (req=%p size=%zu ph=%p+%zu): %s\n",
+                                slot_ptr, baseAddress, size, reinterpret_cast<void*>(ph_base), ph_size,
+                                mst.message.c_str());
+                            std::fflush(stderr);
+                        }
+#endif
                         SetHostLastError(487u);
                         return nullptr;
                     }

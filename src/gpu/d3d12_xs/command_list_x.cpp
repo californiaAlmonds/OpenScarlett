@@ -650,9 +650,27 @@ std::vector<std::string> CommandListX::CopyDiagOps() const {
     return diag_ops_;
 }
 
+void CommandListX::ExtractTransientResources(std::vector<ID3D12Resource*>& out) {
+    std::lock_guard<std::mutex> lk(tiled_transient_mutex_);
+    if (!tiled_transient_resources_.empty()) {
+        out.insert(out.end(), tiled_transient_resources_.begin(), tiled_transient_resources_.end());
+        tiled_transient_resources_.clear();
+    }
+}
+
 HRESULT STDMETHODCALLTYPE CommandListX::Reset(
     ID3D12CommandAllocator* pAllocator, ID3D12PipelineState* pInitialState) {
     last_close_failed_.store(false, std::memory_order_release);
+    last_pso_is_standin_ = false;
+    if (pInitialState && IsKnownProxyPointer(pInitialState)) {
+        IOpenScarlettProxyInspect* insp = nullptr;
+        if (SUCCEEDED(pInitialState->QueryInterface(IID_IOpenScarlettProxyInspect, reinterpret_cast<void**>(&insp))) && insp) {
+            if (insp->GetProxyKind() == D3D12XProxyKind::PipelineState) {
+                last_pso_is_standin_ = static_cast<PipelineStateXProxy*>(pInitialState)->IsStandinPso();
+            }
+            insp->Release();
+        }
+    }
     if (IsDiagTraceEnabled()) {
         std::lock_guard<std::mutex> lk(diag_ops_mutex_);
         diag_ops_.clear();
@@ -789,7 +807,13 @@ void STDMETHODCALLTYPE CommandListX::DrawInstanced(
         skip_host = vk_cur_pso_is_spirv_;
         if (!skip_host) vk_batch_.has_host_commands = true;
     }
-    if (!skip_host) {
+    if (IsDiagTraceEnabled()) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "DrawInstanced(v=%u, i=%u, standin=%d)",
+                      VertexCountPerInstance, InstanceCount, last_pso_is_standin_ ? 1 : 0);
+        AppendDiagOp(buf);
+    }
+    if (!skip_host && !last_pso_is_standin_) {
         host_list_->DrawInstanced(
             VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
     }
@@ -834,7 +858,13 @@ void STDMETHODCALLTYPE CommandListX::DrawIndexedInstanced(
         skip_host = vk_cur_pso_is_spirv_;
         if (!skip_host) vk_batch_.has_host_commands = true;
     }
-    if (!skip_host) {
+    if (IsDiagTraceEnabled()) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "DrawIndexedInstanced(idx=%u, i=%u, standin=%d)",
+                      IndexCountPerInstance, InstanceCount, last_pso_is_standin_ ? 1 : 0);
+        AppendDiagOp(buf);
+    }
+    if (!skip_host && !last_pso_is_standin_) {
         host_list_->DrawIndexedInstanced(
             IndexCountPerInstance, InstanceCount, StartIndexLocation,
             BaseVertexLocation, StartInstanceLocation);
@@ -867,7 +897,14 @@ void STDMETHODCALLTYPE CommandListX::Dispatch(
         skip_host = vk_cur_pso_is_spirv_;
         if (!skip_host) vk_batch_.has_host_commands = true;
     }
-    if (!skip_host) {
+    if (IsDiagTraceEnabled()) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "Dispatch(%u,%u,%u standin=%d)",
+                      ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ,
+                      last_pso_is_standin_ ? 1 : 0);
+        AppendDiagOp(buf);
+    }
+    if (!skip_host && !last_pso_is_standin_) {
         host_list_->Dispatch(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
     }
     RecordList("ID3D12GraphicsCommandListX::Dispatch", 14, S_OK);
@@ -1419,6 +1456,16 @@ void STDMETHODCALLTYPE CommandListX::SetPipelineState(ID3D12PipelineState* pPipe
     }
     ID3D12PipelineState* host_pso = UnwrapPipelineState(pPipelineState);
     last_host_pso_ = host_pso;
+    last_pso_is_standin_ = false;
+    if (pPipelineState && IsKnownProxyPointer(pPipelineState)) {
+        IOpenScarlettProxyInspect* insp = nullptr;
+        if (SUCCEEDED(pPipelineState->QueryInterface(IID_IOpenScarlettProxyInspect, reinterpret_cast<void**>(&insp))) && insp) {
+            if (insp->GetProxyKind() == D3D12XProxyKind::PipelineState) {
+                last_pso_is_standin_ = static_cast<PipelineStateXProxy*>(pPipelineState)->IsStandinPso();
+            }
+            insp->Release();
+        }
+    }
     if (!skip_host) {
         host_list_->SetPipelineState(host_pso);
     }
@@ -2357,6 +2404,18 @@ void STDMETHODCALLTYPE CommandListX::ClearUnorderedAccessViewUint(
             }
         }
     }
+    if (host_res && (host_res->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
+        RecordList("ID3D12GraphicsCommandListX::ClearUnorderedAccessViewUint[NoUavFlagSkip]", 49, S_OK);
+        return;
+    }
+    if (IsDiagTraceEnabled()) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "ClearUavUint(res=%p, gpu=0x%llX, cpu=0x%llX)",
+                      static_cast<void*>(host_res),
+                      static_cast<unsigned long long>(ViewGPUHandleInCurrentHeap.ptr),
+                      static_cast<unsigned long long>(ViewCPUHandle.ptr));
+        AppendDiagOp(buf);
+    }
     host_list_->ClearUnorderedAccessViewUint(
         ViewGPUHandleInCurrentHeap, ViewCPUHandle, host_res, Values, NumRects, pRects);
     RecordList("ID3D12GraphicsCommandListX::ClearUnorderedAccessViewUint", 49, S_OK);
@@ -2366,8 +2425,21 @@ void STDMETHODCALLTYPE CommandListX::ClearUnorderedAccessViewFloat(
     D3D12_GPU_DESCRIPTOR_HANDLE ViewGPUHandleInCurrentHeap,
     D3D12_CPU_DESCRIPTOR_HANDLE ViewCPUHandle, ID3D12Resource* pResource,
     const FLOAT Values[4], UINT NumRects, const D3D12_RECT* pRects) {
+    ID3D12Resource* host_res = UnwrapResource(pResource);
+    if (host_res && (host_res->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
+        RecordList("ID3D12GraphicsCommandListX::ClearUnorderedAccessViewFloat[NoUavFlagSkip]", 50, S_OK);
+        return;
+    }
+    if (IsDiagTraceEnabled()) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "ClearUavFloat(res=%p, gpu=0x%llX, cpu=0x%llX)",
+                      static_cast<void*>(host_res),
+                      static_cast<unsigned long long>(ViewGPUHandleInCurrentHeap.ptr),
+                      static_cast<unsigned long long>(ViewCPUHandle.ptr));
+        AppendDiagOp(buf);
+    }
     host_list_->ClearUnorderedAccessViewFloat(
-        ViewGPUHandleInCurrentHeap, ViewCPUHandle, UnwrapResource(pResource), Values, NumRects, pRects);
+        ViewGPUHandleInCurrentHeap, ViewCPUHandle, host_res, Values, NumRects, pRects);
     RecordList("ID3D12GraphicsCommandListX::ClearUnorderedAccessViewFloat", 50, S_OK);
 }
 
@@ -2512,6 +2584,22 @@ void STDMETHODCALLTYPE CommandListX::ExecuteIndirect(
         flush_indirect_buf(host_cnt);
     }
 
+    if (IsDiagTraceEnabled()) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "ExecuteIndirect(max=%u, arg=%p+%llu, cnt=%p+%llu, standin=%d)",
+                      MaxCommandCount,
+                      static_cast<void*>(host_arg),
+                      static_cast<unsigned long long>(ArgumentBufferOffset),
+                      static_cast<void*>(host_cnt),
+                      static_cast<unsigned long long>(CountBufferOffset),
+                      last_pso_is_standin_ ? 1 : 0);
+        AppendDiagOp(buf);
+    }
+    if (last_pso_is_standin_) {
+        RecordList("ID3D12GraphicsCommandListX::ExecuteIndirect[StandinSkip]", 59, S_OK);
+        return;
+    }
     host_list_->ExecuteIndirect(
         UnwrapCommandSignature(pCommandSignature), MaxCommandCount,
         host_arg, ArgumentBufferOffset, host_cnt, CountBufferOffset);
@@ -2942,7 +3030,14 @@ void STDMETHODCALLTYPE CommandListX::DispatchMesh(
     }
     const bool host_mesh_supported =
         !device_x_ || device_x_->AdapterInfo().mesh_shader_tier > 0u;
-    if (!skip_host && host_list6_ && host_mesh_supported) {
+    if (IsDiagTraceEnabled()) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "DispatchMesh(%u,%u,%u standin=%d)",
+                      ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ,
+                      last_pso_is_standin_ ? 1 : 0);
+        AppendDiagOp(buf);
+    }
+    if (!skip_host && !last_pso_is_standin_ && host_list6_ && host_mesh_supported) {
         // Respect D3D12 per-axis limit (65535) while dispatching all X, Y, Z dimensions cleanly.
         constexpr UINT kMaxDim = 65535u;
         const UINT gx = std::min<UINT>(ThreadGroupCountX, kMaxDim);
@@ -2950,7 +3045,7 @@ void STDMETHODCALLTYPE CommandListX::DispatchMesh(
         const UINT gz = std::min<UINT>(ThreadGroupCountZ, kMaxDim);
         host_list6_->DispatchMesh(gx, gy, gz);
         RecordList("ID3D12GraphicsCommandListX::DispatchMesh", 79, S_OK);
-    } else if (skip_host) {
+    } else if (skip_host || last_pso_is_standin_) {
         RecordList("ID3D12GraphicsCommandListX::DispatchMesh", 79, S_OK);
     } else {
         RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::DispatchMesh", 79);

@@ -400,6 +400,13 @@ private:
     bool vk_swapchain_headless_ = false;
 
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
+
+    // GPU-fence-tracked transient resource retirement (keeps staging buffers alive until GPU finishes)
+    std::mutex retire_mutex_;
+    ID3D12Fence* retire_fence_ = nullptr;
+    uint64_t retire_fence_val_ = 0ull;
+    std::vector<std::pair<uint64_t, std::vector<ID3D12Resource*>>> pending_retirements_;
+    void PumpPendingRetirementsLocked() noexcept;
 };
 
 }  // namespace openscarlett::d3d12_xs

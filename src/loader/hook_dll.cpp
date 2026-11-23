@@ -1995,50 +1995,6 @@ HANDLE WINAPI Hook_CreateFile2(LPCWSTR lpFileName,
                                DWORD dwShareMode,
                                DWORD dwCreationDisposition,
                                LPCREATEFILE2_EXTENDED_PARAMETERS pCreateExParams) {
-    if (tl_vfs_hook_depth == 0 &&
-        !g_shutting_down.load(std::memory_order_acquire) &&
-        lpFileName != nullptr &&
-        openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None &&
-        !ShouldPassThroughHostDDriveW(lpFileName)) {
-        ScopedVfsHookGuard guard;
-        std::wstring host_path;
-        bool passthrough = false;
-        DWORD resolve_err = ERROR_SUCCESS;
-        if (!ResolveVirtualCreatePathW(lpFileName, "CreateFile2", dwDesiredAccess, dwCreationDisposition,
-                                       host_path, passthrough, resolve_err)) {
-            if (!passthrough) {
-                ::SetLastError(resolve_err);
-                return INVALID_HANDLE_VALUE;
-            }
-        } else {
-            HANDLE h = g_real_CreateFile2(host_path.c_str(),
-                                          dwDesiredAccess,
-                                          dwShareMode,
-                                          dwCreationDisposition,
-                                          pCreateExParams);
-            DWORD err = ::GetLastError();
-            openscarlett::CallTelemetry::Global().Record(
-                "vfs",
-                "CreateFile2",
-                h != INVALID_HANDLE_VALUE ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
-                h != INVALID_HANDLE_VALUE ? 0 : static_cast<int32_t>(err),
-                -1);
-            ::SetLastError(err);
-            return h;
-        }
-    }
-    return g_real_CreateFile2(lpFileName,
-                              dwDesiredAccess,
-                              dwShareMode,
-                              dwCreationDisposition,
-                              pCreateExParams);
-}
-
-HANDLE WINAPI Hook_CreateFile2(LPCWSTR lpFileName,
-                               DWORD dwDesiredAccess,
-                               DWORD dwShareMode,
-                               DWORD dwCreationDisposition,
-                               LPCREATEFILE2_EXTENDED_PARAMETERS pCreateExParams) {
     LPSECURITY_ATTRIBUTES sec_attrs = nullptr;
     HANDLE h_template = nullptr;
     DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
@@ -2052,7 +2008,8 @@ HANDLE WINAPI Hook_CreateFile2(LPCWSTR lpFileName,
             pCreateExParams->dwSecurityQosFlags;
     }
 
-    if (!g_shutting_down.load(std::memory_order_acquire) &&
+    if (tl_vfs_hook_depth == 0 &&
+        !g_shutting_down.load(std::memory_order_acquire) &&
         lpFileName != nullptr &&
         openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None &&
         !ShouldPassThroughHostDDriveW(lpFileName)) {

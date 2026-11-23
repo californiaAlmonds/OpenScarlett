@@ -3292,6 +3292,11 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateGraphicsPipelineState(
         RecordDev("ID3D12DeviceX::CreateGraphicsPipelineState", 10, E_OUTOFMEMORY);
         return E_OUTOFMEMORY;
     }
+    if (retail_scarlett_abi_ &&
+        (IsXboxXdatDxbcBlob(lifted_desc.VS.pShaderBytecode, lifted_desc.VS.BytecodeLength) ||
+         IsXboxXdatDxbcBlob(lifted_desc.PS.pShaderBytecode, lifted_desc.PS.BytecodeLength))) {
+        proxy->SetStandinPso(true);
+    }
     if (vulkan_routing_active_ && (lift_vs || lift_ps)) {
         VulkanPipelineInfo vk_pi{};
         vk_pi.is_spirv_direct = false;
@@ -3420,6 +3425,9 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateComputePipelineState(
         }
     }
     if (FAILED(hr) || !host_pso) {
+        if (retail_scarlett_abi_ && hr == DXGI_ERROR_DEVICE_REMOVED) {
+            (void)GetDeviceRemovedReason();
+        }
         RecordDev("ID3D12DeviceX::CreateComputePipelineState", 11, hr);
         return hr;
     }
@@ -3428,6 +3436,9 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateComputePipelineState(
     if (!proxy) {
         RecordDev("ID3D12DeviceX::CreateComputePipelineState", 11, E_OUTOFMEMORY);
         return E_OUTOFMEMORY;
+    }
+    if (cs_is_xdat) {
+        proxy->SetStandinPso(true);
     }
     if (vulkan_routing_active_ && cs_is_xbox) {
         VulkanPipelineInfo vk_pi{};
@@ -4313,6 +4324,9 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
         RecordDev("ID3D12DeviceX::CreateCommittedResource", 27, E_OUTOFMEMORY);
         return E_OUTOFMEMORY;
     }
+    if (did_l0_spill) {
+        proxy->SetL0SpilledFromDefault(true);
+    }
     hr = proxy->QueryInterface(riidResource, ppvResource);
     proxy->Release();
     RecordDev("ID3D12DeviceX::CreateCommittedResource", 27, hr);
@@ -4382,6 +4396,9 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateHeap(
     if (!proxy) {
         RecordDev("ID3D12DeviceX::CreateHeap", 28, E_OUTOFMEMORY);
         return E_OUTOFMEMORY;
+    }
+    if (did_l0_spill) {
+        proxy->SetL0SpilledFromDefault(true);
     }
     hr = proxy->QueryInterface(riid, ppvHeap);
     proxy->Release();
@@ -4601,6 +4618,16 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResource(
     if (!proxy) {
         RecordDev("ID3D12DeviceX::CreatePlacedResource", 29, E_OUTOFMEMORY);
         return E_OUTOFMEMORY;
+    }
+    if (pHeap && IsKnownProxyPointer(pHeap)) {
+        IOpenScarlettProxyInspect* insp = nullptr;
+        if (SUCCEEDED(pHeap->QueryInterface(IID_IOpenScarlettProxyInspect, reinterpret_cast<void**>(&insp))) && insp) {
+            if (insp->GetProxyKind() == D3D12XProxyKind::Heap &&
+                static_cast<HeapXProxy*>(pHeap)->IsL0SpilledFromDefault()) {
+                proxy->SetL0SpilledFromDefault(true);
+            }
+            insp->Release();
+        }
     }
     hr = proxy->QueryInterface(riid, ppvResource);
     proxy->Release();
@@ -4876,7 +4903,12 @@ HRESULT STDMETHODCALLTYPE DeviceX::GetDeviceRemovedReason() {
     if (FAILED(host_hr)) {
         const HRESULT prev = device_removed_reason_.exchange(host_hr, std::memory_order_acq_rel);
         if (SUCCEEDED(prev)) {
-            if (retail_scarlett_abi_ && host_dev_) {
+            static const bool trace_retail = []() {
+                char v[16]{};
+                const DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_RETAIL", v, static_cast<DWORD>(sizeof(v)));
+                return n > 0u && v[0] != '0';
+            }();
+            if (retail_scarlett_abi_ && host_dev_ && (trace_retail || CommandListX::IsDiagTraceEnabled())) {
                 std::fprintf(stderr,
                     "[OpenScarlett][d3d12_xs] DEVICE_REMOVED reason=0x%08lX\n",
                     static_cast<unsigned long>(host_hr));
@@ -5949,6 +5981,9 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
     if (!proxy) {
         RecordDev("ID3D12DeviceX::CreatePipelineState", 47, E_OUTOFMEMORY);
         return E_OUTOFMEMORY;
+    }
+    if (retail_scarlett_abi_ && stream_has_xdat) {
+        proxy->SetStandinPso(true);
     }
     if (vulkan_routing_active_ && has_xbox_shader) {
         VulkanPipelineInfo vk_pi = std::move(spirv_stream_pi);

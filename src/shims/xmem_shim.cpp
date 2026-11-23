@@ -327,7 +327,7 @@ void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemVirtualAlloc(
             lpAddress, dwSize, flAllocationType, dwMemoryType, flProtect, ptr);
         std::fflush(stderr);
     }
-    if (!ptr) {
+    if (!ptr && trace_xmem) {
         std::fprintf(stderr,
             "[OpenScarlett][xmem] XMemVirtualAlloc FAILED addr=%p size=%zu alloc=0x%X memType=0x%X prot=0x%X err=%lu\n",
             lpAddress, dwSize, flAllocationType, dwMemoryType, flProtect,

@@ -1038,7 +1038,13 @@ public:
     }
     virtual void STDMETHODCALLTYPE RSSetShadingRateImage(ID3D12Resource* r) { inner_->RSSetShadingRateImage(r); }
     virtual void STDMETHODCALLTYPE DispatchMesh(UINT x, UINT y, UINT z) { inner_->DispatchMesh(x, y, z); }
-    virtual void STDMETHODCALLTYPE Slot125() { RecordClUnimpl(125); }
+    // Slot 125 (+0x3E8): Xbox GPU profiler / cache control helper (called from UE5 FD3DGPUProfiler & RHIEndDrawingViewport)
+    virtual void STDMETHODCALLTYPE WriteTimestampToBufferX(
+        UINT /*Flags*/, D3D12_GPU_VIRTUAL_ADDRESS /*DstAddress*/) {
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailCmdList::WriteTimestampToBufferX",
+            openscarlett::CallOutcome::Ok, S_OK, 125);
+    }
     virtual void STDMETHODCALLTYPE Slot126() { RecordClUnimpl(126); }
     virtual void STDMETHODCALLTYPE Slot127() { RecordClUnimpl(127); }
     virtual void STDMETHODCALLTYPE Slot128() { RecordClUnimpl(128); }
@@ -1899,7 +1905,16 @@ HRESULT CreateWrappedDeviceInternal(
             return DXGI_ERROR_UNSUPPORTED;
         }
     }
-    if (retail_scarlett_vtable) {
+    if (enable_debug_layer && host_dev) {
+        ID3D12InfoQueue* iq = nullptr;
+        if (SUCCEEDED(host_dev->QueryInterface(IID_PPV_ARGS(&iq))) && iq) {
+            iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, FALSE);
+            iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, FALSE);
+            iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, FALSE);
+            iq->Release();
+        }
+    }
+    if (retail_scarlett_vtable && ScarlettRetailDeviceProxy::IsRetailTraceEnabled()) {
         std::fprintf(stderr, "[OpenScarlett][d3d12_xs] Retail device created on '%s' (VRAM=%lluMB, FL=0x%X, SM=0x%X, RT=%u, Mesh=%u, pAdapter=%p)\n",
             info.description.c_str(),
             static_cast<unsigned long long>(info.dedicated_video_memory_mb),
