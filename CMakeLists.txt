@@ -41,6 +41,14 @@ if(MSVC)
     # remain ABI-compatible with all msvcp140.dll versions (< 14.40) and never crash
     # with 0xC0000005 inside _Mtx_lock when an older VC++ runtime is loaded.
     add_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+
+    # All sources are UTF-8 (without BOM) and a number of them contain non-ASCII
+    # bytes. Without /utf-8, MSVC decodes them with the host ANSI code page
+    # (936/zh-CN, 1252/en-US, ...), which raises C4819 under /W4 and hard C2001
+    # "newline in string constant" errors as soon as such a byte lands inside a
+    # string literal. Force UTF-8 for both source and execution charset so the
+    # build is host-locale independent.
+    add_compile_options(/utf-8)
 endif()
 
 add_library(openscarlett_core STATIC
