@@ -1973,7 +1973,23 @@ void STDMETHODCALLTYPE CommandListX::Dispatch(
         AppendDiagOp(buf);
     }
     if (!skip_host && !last_pso_is_standin_ && !pso_missing) {
-        host_list_->Dispatch(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+        constexpr UINT kMaxDim = 65535u;
+        if (ThreadGroupCountX <= kMaxDim &&
+            ThreadGroupCountY <= kMaxDim &&
+            ThreadGroupCountZ <= kMaxDim) {
+            host_list_->Dispatch(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+        } else {
+            for (UINT z = 0u; z < ThreadGroupCountZ; z += kMaxDim) {
+                const UINT cz = std::min<UINT>(ThreadGroupCountZ - z, kMaxDim);
+                for (UINT y = 0u; y < ThreadGroupCountY; y += kMaxDim) {
+                    const UINT cy = std::min<UINT>(ThreadGroupCountY - y, kMaxDim);
+                    for (UINT x = 0u; x < ThreadGroupCountX; x += kMaxDim) {
+                        const UINT cx = std::min<UINT>(ThreadGroupCountX - x, kMaxDim);
+                        host_list_->Dispatch(cx, cy, cz);
+                    }
+                }
+            }
+        }
     }
     RecordList("ID3D12GraphicsCommandListX::Dispatch", 14, S_OK);
 }

@@ -481,6 +481,14 @@ UINT SanitizeOrTranslateXboxShader4ComponentMapping(UINT m, DXGI_FORMAT srv_fmt)
     return D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 }
 
+// 16-bit packed render-target / UAV stand-in helpers (adapted from R0Y00/Xbox2Windows
+// src/startup_stubs/packed_target_format.h, MIT License).
+constexpr bool IsPacked16TargetFormat(DXGI_FORMAT fmt) noexcept {
+    return fmt == DXGI_FORMAT_B5G5R5A1_UNORM ||
+           fmt == DXGI_FORMAT_B4G4R4A4_UNORM ||
+           fmt == DXGI_FORMAT_B5G6R5_UNORM;
+}
+
 DXGI_FORMAT ResolveCompatibleSrvFormat(DXGI_FORMAT td_fmt, DXGI_FORMAT req_fmt) noexcept {
     if (req_fmt == DXGI_FORMAT_UNKNOWN || req_fmt == td_fmt) {
         return MapTypelessFormatForSrv(td_fmt);
@@ -490,6 +498,7 @@ DXGI_FORMAT ResolveCompatibleSrvFormat(DXGI_FORMAT td_fmt, DXGI_FORMAT req_fmt) 
         case DXGI_FORMAT_R8G8B8A8_UNORM:
         case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
             if (req_fmt == DXGI_FORMAT_R8G8B8A8_UNORM || req_fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                (td_fmt == DXGI_FORMAT_R8G8B8A8_UNORM && IsPacked16TargetFormat(req_fmt)) ||
                 (td_fmt == DXGI_FORMAT_R8G8B8A8_TYPELESS &&
                  (req_fmt == DXGI_FORMAT_R8G8B8A8_UINT || req_fmt == DXGI_FORMAT_R8G8B8A8_SNORM ||
                   req_fmt == DXGI_FORMAT_R8G8B8A8_SINT))) {
@@ -6860,6 +6869,9 @@ void STDMETHODCALLTYPE DeviceX::CreateShaderResourceView(
                 san_fmt = DXGI_FORMAT_R8_UNORM;
                 remap_a8_to_r8 = true;
             }
+        } else if (IsPacked16TargetFormat(san_fmt) && host_res != nullptr &&
+                   host_res->GetDesc().Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+            san_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
         }
         const UINT san_map = remap_a8_to_r8
             ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
@@ -7007,6 +7019,9 @@ void STDMETHODCALLTYPE DeviceX::CreateUnorderedAccessView(
             if (rdf == DXGI_FORMAT_R8_UNORM || rdf == DXGI_FORMAT_R8_TYPELESS) {
                 san_fmt = DXGI_FORMAT_R8_UNORM;
             }
+        } else if (IsPacked16TargetFormat(san_fmt) && host_res != nullptr &&
+                   host_res->GetDesc().Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+            san_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
         }
         // Unify 1D UAV views onto TEXTURE2D (Width x 1) when backing resource is TEXTURE2D.
         const bool promote_1d_to_2d =
@@ -7168,7 +7183,11 @@ void STDMETHODCALLTYPE DeviceX::CreateRenderTargetView(
         rw_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         desc_ptr = &rw_desc;
     } else if (pDesc != nullptr) {
-        const DXGI_FORMAT san_fmt = SanitizeXboxDxgiFormat(pDesc->Format);
+        DXGI_FORMAT san_fmt = SanitizeXboxDxgiFormat(pDesc->Format);
+        if (IsPacked16TargetFormat(san_fmt) && host_res != nullptr &&
+            host_res->GetDesc().Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+            san_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+        }
         if (san_fmt != pDesc->Format) {
             rw_desc = *pDesc;
             rw_desc.Format = san_fmt;
@@ -7685,6 +7704,12 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
                 clean_clear.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
                 clear_ptr = &clean_clear;
             }
+        } else if (pOptimizedClearValue &&
+                   clean_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+                   IsPacked16TargetFormat(pOptimizedClearValue->Format)) {
+            clean_clear = *pOptimizedClearValue;
+            clean_clear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            clear_ptr = &clean_clear;
         }
         desc_ptr = &clean_desc;
     }
@@ -7964,6 +7989,12 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResource(
                 clean_clear.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
                 clear_ptr = &clean_clear;
             }
+        } else if (pOptimizedClearValue &&
+                   clean_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+                   IsPacked16TargetFormat(pOptimizedClearValue->Format)) {
+            clean_clear = *pOptimizedClearValue;
+            clean_clear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            clear_ptr = &clean_clear;
         }
         desc_ptr = &clean_desc;
     }
@@ -11720,6 +11751,12 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource1(
                 clean_clear.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
                 clear_ptr = &clean_clear;
             }
+        } else if (pOptimizedClearValue &&
+                   clean_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+                   IsPacked16TargetFormat(pOptimizedClearValue->Format)) {
+            clean_clear = *pOptimizedClearValue;
+            clean_clear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            clear_ptr = &clean_clear;
         }
         desc_ptr = &clean_desc;
     }
@@ -12918,6 +12955,12 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
             clean_clear.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
             clear_ptr = &clean_clear;
         }
+    } else if (clear_ptr &&
+               clean_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+               IsPacked16TargetFormat(clear_ptr->Format)) {
+        clean_clear = *clear_ptr;
+        clean_clear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        clear_ptr = &clean_clear;
     }
 
     // On Xbox Series X, color textures (e.g. video decode output targets) may be bound as RTVs
@@ -18884,6 +18927,28 @@ D3D12_RESOURCE_DESC DeviceX::SanitizeAndClampResourceDesc(const D3D12_RESOURCE_D
             out.Format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
         }
     }
+    if (host_dev_ &&
+        out.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        out.DepthOrArraySize >= 1u &&
+        out.DepthOrArraySize <= D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION &&
+        out.SampleDesc.Count == 1u &&
+        IsPacked16TargetFormat(out.Format) &&
+        (out.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) != 0 &&
+        (out.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) == 0) {
+        UINT req_sup = 0u;
+        if ((out.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0) {
+            req_sup |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
+        }
+        if ((out.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0) {
+            req_sup |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+        }
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{};
+        fs.Format = out.Format;
+        if (FAILED(host_dev_->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) ||
+            (static_cast<UINT>(fs.Support1) & req_sup) != req_sup) {
+            out.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        }
+    }
     bool stripped_layout = false;
     if (static_cast<uint32_t>(out.Layout) > static_cast<uint32_t>(D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE)) {
         out.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -18912,6 +18977,28 @@ D3D12_RESOURCE_DESC1 DeviceX::SanitizeAndClampResourceDesc1(const D3D12_RESOURCE
             out.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
         } else if (out.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
             out.Format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+        }
+    }
+    if (host_dev_ &&
+        out.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        out.DepthOrArraySize >= 1u &&
+        out.DepthOrArraySize <= D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION &&
+        out.SampleDesc.Count == 1u &&
+        IsPacked16TargetFormat(out.Format) &&
+        (out.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) != 0 &&
+        (out.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) == 0) {
+        UINT req_sup = 0u;
+        if ((out.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0) {
+            req_sup |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
+        }
+        if ((out.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0) {
+            req_sup |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+        }
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{};
+        fs.Format = out.Format;
+        if (FAILED(host_dev_->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) ||
+            (static_cast<UINT>(fs.Support1) & req_sup) != req_sup) {
+            out.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         }
     }
     bool stripped_layout = false;

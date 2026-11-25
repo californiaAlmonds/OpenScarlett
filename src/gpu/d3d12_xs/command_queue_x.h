@@ -333,12 +333,17 @@ private:
     bool readback_capture_enabled_ = true;
 
     static constexpr uint32_t kPresentRingSlots = 3u;
+    static constexpr uint32_t kReadbackRingSlots = 4u;
     ID3D12CommandAllocator* present_alloc_ = nullptr;
     ID3D12GraphicsCommandList* present_cmd_ = nullptr;
     ID3D12CommandAllocator* present_ring_allocs_[kPresentRingSlots]{};
     ID3D12GraphicsCommandList* present_ring_cmds_[kPresentRingSlots]{};
     uint64_t present_ring_fences_[kPresentRingSlots]{};
     uint32_t present_ring_idx_ = 0u;
+    ID3D12CommandAllocator* rb_ring_allocs_[kReadbackRingSlots]{};
+    ID3D12GraphicsCommandList* rb_ring_cmds_[kReadbackRingSlots]{};
+    uint64_t rb_ring_fences_[kReadbackRingSlots]{};
+    uint32_t rb_ring_idx_ = 0u;
     ID3D12Fence* present_fence_ = nullptr;
     HANDLE present_fence_event_ = nullptr;
     uint64_t present_fence_val_ = 0;

@@ -2101,32 +2101,39 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
             pending_writeback_vas.end());
         std::lock_guard<std::mutex> lock(present_mutex_);
         if (SUCCEEDED(EnsurePresentHelperObjectsLocked())) {
-            // Wait for any previous use of present_alloc_ before resetting it.
-            if (present_fence_->GetCompletedValue() < present_fence_val_) {
-                if (SUCCEEDED(present_fence_->SetEventOnCompletion(present_fence_val_, present_fence_event_))) {
+            PumpMirrorReadbackCompletionLocked();
+            const uint32_t rb_slot = rb_ring_idx_ % kReadbackRingSlots;
+            rb_ring_idx_ = (rb_ring_idx_ + 1u) % kReadbackRingSlots;
+            const uint64_t slot_wait = rb_ring_fences_[rb_slot];
+            if (slot_wait > 0ull && present_fence_->GetCompletedValue() < slot_wait) {
+                if (SUCCEEDED(present_fence_->SetEventOnCompletion(slot_wait, present_fence_event_))) {
                     WaitForSingleObject(present_fence_event_, 15000u);
                 }
                 PumpMirrorReadbackCompletionLocked();
             }
-            if (SUCCEEDED(present_alloc_->Reset()) &&
-                SUCCEEDED(present_cmd_->Reset(present_alloc_, nullptr))) {
+            ID3D12CommandAllocator* rb_alloc = rb_ring_allocs_[rb_slot];
+            ID3D12GraphicsCommandList* rb_cmd = rb_ring_cmds_[rb_slot];
+            if (rb_alloc && rb_cmd &&
+                SUCCEEDED(rb_alloc->Reset()) &&
+                SUCCEEDED(rb_cmd->Reset(rb_alloc, nullptr))) {
                 const uint64_t rb_fence = ++present_fence_val_;
                 uint32_t scheduled = 0u;
                 for (uint64_t va : pending_writeback_vas) {
                     openscarlett::TitleVaRegionInfo rinfo{};
                     if (device_x_->GetTitleVaMirror().LookupRegion(va, rinfo)) {
                         if (device_x_->GetTitleVaMirror().ScheduleGpuReadback(
-                                present_cmd_, va, rb_fence, 0ull, 0ull, rinfo.current_state).ok()) {
+                                rb_cmd, va, rb_fence, 0ull, 0ull, rinfo.current_state).ok()) {
                             ++scheduled;
                         }
                     }
                 }
-                if (scheduled > 0u && SUCCEEDED(present_cmd_->Close())) {
-                    ID3D12CommandList* rb_lists[] = {present_cmd_};
+                if (scheduled > 0u && SUCCEEDED(rb_cmd->Close())) {
+                    ID3D12CommandList* rb_lists[] = {rb_cmd};
                     host_queue_->ExecuteCommandLists(1u, rb_lists);
                     host_queue_->Signal(present_fence_, rb_fence);
+                    rb_ring_fences_[rb_slot] = rb_fence;
                 } else {
-                    present_cmd_->Close();
+                    rb_cmd->Close();
                 }
             }
         }
@@ -3049,7 +3056,8 @@ HRESULT CommandQueueX::EnsurePresentHelperObjectsLocked() {
     }
 
     if (present_alloc_ && present_cmd_ && present_fence_ && present_fence_event_ &&
-        present_ring_allocs_[kPresentRingSlots - 1u] && present_ring_cmds_[kPresentRingSlots - 1u]) {
+        present_ring_allocs_[kPresentRingSlots - 1u] && present_ring_cmds_[kPresentRingSlots - 1u] &&
+        rb_ring_allocs_[kReadbackRingSlots - 1u] && rb_ring_cmds_[kReadbackRingSlots - 1u]) {
         return S_OK;
     }
     ID3D12Device* dev = device_x_->HostDevice();
@@ -3075,6 +3083,18 @@ HRESULT CommandQueueX::EnsurePresentHelperObjectsLocked() {
                 0, list_type, present_ring_allocs_[i], nullptr, IID_PPV_ARGS(&present_ring_cmds_[i]));
             if (FAILED(hr)) return hr;
             present_ring_cmds_[i]->Close();
+        }
+    }
+    for (uint32_t i = 0u; i < kReadbackRingSlots; ++i) {
+        if (!rb_ring_allocs_[i]) {
+            HRESULT hr = dev->CreateCommandAllocator(list_type, IID_PPV_ARGS(&rb_ring_allocs_[i]));
+            if (FAILED(hr)) return hr;
+        }
+        if (!rb_ring_cmds_[i]) {
+            HRESULT hr = dev->CreateCommandList(
+                0, list_type, rb_ring_allocs_[i], nullptr, IID_PPV_ARGS(&rb_ring_cmds_[i]));
+            if (FAILED(hr)) return hr;
+            rb_ring_cmds_[i]->Close();
         }
     }
     if (!present_fence_) {
@@ -3782,6 +3802,12 @@ void CommandQueueX::ReleasePresentObjectsLocked() {
         present_ring_fences_[i] = 0ull;
     }
     present_ring_idx_ = 0u;
+    for (uint32_t i = 0u; i < kReadbackRingSlots; ++i) {
+        if (rb_ring_cmds_[i]) { rb_ring_cmds_[i]->Release(); rb_ring_cmds_[i] = nullptr; }
+        if (rb_ring_allocs_[i]) { rb_ring_allocs_[i]->Release(); rb_ring_allocs_[i] = nullptr; }
+        rb_ring_fences_[i] = 0ull;
+    }
+    rb_ring_idx_ = 0u;
     if (present_cmd_) { present_cmd_->Release(); present_cmd_ = nullptr; }
     if (present_alloc_) { present_alloc_->Release(); present_alloc_ = nullptr; }
     if (present_fence_) { present_fence_->Release(); present_fence_ = nullptr; }
