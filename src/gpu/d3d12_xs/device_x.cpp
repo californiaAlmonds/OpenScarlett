@@ -8929,10 +8929,11 @@ HRESULT DeviceX::CreateDerivedGraphicsPipelineStateX(
     }
     SanitizeGraphicsPsoDescForDesktop(derived);
 
+    const auto& primary_src_blob = src_pd->is_mesh ? src_pd->ms_blob : src_pd->vs_blob;
     const bool src_is_xs2 =
-        !src_pd->vs_blob.empty() &&
-        !IsXboxXdatDxbcBlob(src_pd->vs_blob.data(), src_pd->vs_blob.size()) &&
-        openscarlett::IsXboxShaderContainerBlob(src_pd->vs_blob.data(), src_pd->vs_blob.size());
+        !primary_src_blob.empty() &&
+        !IsXboxXdatDxbcBlob(primary_src_blob.data(), primary_src_blob.size()) &&
+        openscarlett::IsXboxShaderContainerBlob(primary_src_blob.data(), primary_src_blob.size());
     if (src_is_xs2) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC standin_desc = derived;
         standin_desc.VS = {};
@@ -8948,12 +8949,14 @@ HRESULT DeviceX::CreateDerivedGraphicsPipelineStateX(
             auto* dst_proxy = static_cast<PipelineStateXProxy*>(out_pso);
             auto pd = std::make_unique<PendingXdatGfxDesc>();
             pd->is_compute = false;
+            pd->is_mesh = src_pd->is_mesh;
             if (src_pd->from_slot57) {
                 pd->from_slot57 = true;
                 pd->has_slot57_stencil_ref = src_pd->has_slot57_stencil_ref;
                 pd->slot57_stencil_ref = src_pd->slot57_stencil_ref;
                 pd->vs_cbv_slot_mask = src_pd->vs_cbv_slot_mask;
                 pd->ps_cbv_slot_mask = src_pd->ps_cbv_slot_mask;
+                pd->ms_cbv_slot_mask = src_pd->ms_cbv_slot_mask;
             }
             pd->gpso = derived;
             pd->host_rs = src_pd->host_rs;
@@ -8963,6 +8966,8 @@ HRESULT DeviceX::CreateDerivedGraphicsPipelineStateX(
             pd->hs_blob = src_pd->hs_blob;
             pd->ds_blob = src_pd->ds_blob;
             pd->gs_blob = src_pd->gs_blob;
+            pd->ms_blob = src_pd->ms_blob;
+            pd->as_blob = src_pd->as_blob;
             pd->il_names = src_pd->il_names;
             pd->il_elems = src_pd->il_elems;
             for (size_t i = 0u; i < pd->il_elems.size() && i < pd->il_names.size(); ++i) {
@@ -9143,9 +9148,11 @@ HRESULT DeviceX::DeserializeGraphicsPipelineStateX(
     void** ppPipelineState) {
     if (!pDesc || !ppPipelineState) return E_POINTER;
     *ppPipelineState = nullptr;
-    uint64_t q[13]{};
+    uint64_t q[17]{};
     if (!SafeMemcpyPoolIsa(q, pDesc, sizeof(q))) {
-        if (!SafeMemcpyPoolIsa(q, pDesc, 9u * sizeof(uint64_t)) &&
+        if (!SafeMemcpyPoolIsa(q, pDesc, 15u * sizeof(uint64_t)) &&
+            !SafeMemcpyPoolIsa(q, pDesc, 13u * sizeof(uint64_t)) &&
+            !SafeMemcpyPoolIsa(q, pDesc, 9u * sizeof(uint64_t)) &&
             !SafeMemcpyPoolIsa(q, pDesc, sizeof(uint64_t))) {
             return E_INVALIDARG;
         }
@@ -9432,15 +9439,20 @@ HRESULT DeviceX::DeserializeGraphicsPipelineStateX(
         return ::GetEnvironmentVariableA("OPENSCARLETT_DISABLE_SLOT57_LIFT", v, sizeof(v)) > 0 && v[0] == '1';
     }();
     ID3D12RootSignature* host_rs = UnwrapRootSignature(guest_rs);
-    if (!s_disable_s57 && host_rs && IsKnownProxyPointer(out_pso) && q[9] >= 0x10000ull && q[10] >= 40ull) {
+    const bool has_s57_vs = (q[9] >= 0x10000ull && q[10] >= 40ull);
+    const bool has_s57_ms = (!has_s57_vs && q[13] >= 0x10000ull && q[14] >= 40ull);
+    if (!s_disable_s57 && host_rs && IsKnownProxyPointer(out_pso) && (has_s57_vs || has_s57_ms)) {
         std::vector<uint8_t> vs_xs2;
+        std::vector<uint8_t> ms_xs2;
         std::vector<uint8_t> ps_xs2;
-        const bool vs_ok = ExtractRetailFssmPoolIsa(
+        const bool vs_ok = !has_s57_vs || ExtractRetailFssmPoolIsa(
             q[9], q[10], openscarlett::ShaderStage::Vertex, 1u, 1u, 1u, vs_xs2);
+        const bool ms_ok = !has_s57_ms || ExtractRetailFssmPoolIsa(
+            q[13], q[14], openscarlett::ShaderStage::Mesh, 128u, 1u, 1u, ms_xs2);
         const bool has_ps = (q[5] >= 0x10000ull && q[6] >= 40ull);
         const bool ps_ok = !has_ps || ExtractRetailFssmPoolIsa(
             q[5], q[6], openscarlett::ShaderStage::Pixel, 1u, 1u, 1u, ps_xs2);
-        if (vs_ok && ps_ok) {
+        if (vs_ok && ms_ok && ps_ok) {
             auto parse_stage_cbv_mask = [](uint64_t addr, uint64_t sz) noexcept -> uint32_t {
                 if (addr < 0x10000ull || sz < 48ull || sz > 0x4000ull) return 0xFFFFu;
                 uint8_t mbuf[4096]{};
@@ -9481,16 +9493,19 @@ HRESULT DeviceX::DeserializeGraphicsPipelineStateX(
             auto* proxy = static_cast<PipelineStateXProxy*>(out_pso);
             auto pd = std::make_unique<PendingXdatGfxDesc>();
             pd->is_compute = false;
+            pd->is_mesh = has_s57_ms;
             pd->from_slot57 = true;
             pd->has_slot57_stencil_ref = has_b1_stencil_ref;
             pd->slot57_stencil_ref = b1_stencil_ref;
-            pd->vs_cbv_slot_mask = parse_stage_cbv_mask(q[11], q[12]);
+            pd->vs_cbv_slot_mask = has_s57_vs ? parse_stage_cbv_mask(q[11], q[12]) : 0xFFFFu;
+            pd->ms_cbv_slot_mask = has_s57_ms ? parse_stage_cbv_mask(q[15], q[16]) : 0xFFFFu;
             pd->ps_cbv_slot_mask = has_ps ? parse_stage_cbv_mask(q[7], q[8]) : 0xFFFFu;
             pd->gpso = gdesc;
             pd->gpso.pRootSignature = host_rs;
             pd->host_rs = host_rs;
             pd->host_rs->AddRef();
             pd->vs_blob = std::move(vs_xs2);
+            pd->ms_blob = std::move(ms_xs2);
             pd->ps_blob = std::move(ps_xs2);
             pd->il_names = std::move(il_names);
             pd->il_elems = std::move(il_elems);
@@ -9510,11 +9525,95 @@ HRESULT DeviceX::DeserializeGraphicsPipelineStateX(
     return qhr;
 }
 
+HRESULT BuildHostMeshPipelineState(
+    ID3D12Device2* host_dev2,
+    ID3D12RootSignature* host_rs,
+    const std::vector<uint8_t>& ms_dxil,
+    const std::vector<uint8_t>& as_dxil,
+    const std::vector<uint8_t>& ps_dxil,
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC& gpso,
+    ID3D12PipelineState** out_pso) {
+    if (!host_dev2 || !host_rs || ms_dxil.empty() || !out_pso) return E_INVALIDARG;
+    *out_pso = nullptr;
+
+    std::vector<uint8_t> stream_bytes;
+    stream_bytes.reserve(640u);
+    auto append_subobj = [&](auto subobj) {
+        const size_t aligned = (stream_bytes.size() + sizeof(void*) - 1u) & ~(sizeof(void*) - 1u);
+        if (aligned > stream_bytes.size()) stream_bytes.resize(aligned, 0u);
+        const size_t off = stream_bytes.size();
+        stream_bytes.resize(off + sizeof(subobj), 0u);
+        std::memcpy(stream_bytes.data() + off, &subobj, sizeof(subobj));
+    };
+
+    StreamSubobjLayout<ID3D12RootSignature*> s_rs{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, host_rs};
+    append_subobj(s_rs);
+
+    if (!as_dxil.empty()) {
+        StreamSubobjLayout<D3D12_SHADER_BYTECODE> s_as{
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, {as_dxil.data(), as_dxil.size()}};
+        append_subobj(s_as);
+    }
+
+    StreamSubobjLayout<D3D12_SHADER_BYTECODE> s_ms{
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, {ms_dxil.data(), ms_dxil.size()}};
+    append_subobj(s_ms);
+
+    if (!ps_dxil.empty()) {
+        StreamSubobjLayout<D3D12_SHADER_BYTECODE> s_ps{
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {ps_dxil.data(), ps_dxil.size()}};
+        append_subobj(s_ps);
+    }
+
+    StreamSubobjLayout<D3D12_BLEND_DESC> s_blend{
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, gpso.BlendState};
+    append_subobj(s_blend);
+
+    StreamSubobjLayout<UINT> s_smask{
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, gpso.SampleMask ? gpso.SampleMask : UINT_MAX};
+    append_subobj(s_smask);
+
+    StreamSubobjLayout<D3D12_RASTERIZER_DESC> s_rast{
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, gpso.RasterizerState};
+    append_subobj(s_rast);
+
+    StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC> s_ds{
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, gpso.DepthStencilState};
+    append_subobj(s_ds);
+
+    D3D12_RT_FORMAT_ARRAY rta{};
+    rta.NumRenderTargets = std::min<UINT>(gpso.NumRenderTargets, 8u);
+    for (UINT i = 0u; i < rta.NumRenderTargets; ++i) {
+        rta.RTFormats[i] = gpso.RTVFormats[i];
+    }
+    StreamSubobjLayout<D3D12_RT_FORMAT_ARRAY> s_rts{
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, rta};
+    append_subobj(s_rts);
+
+    StreamSubobjLayout<DXGI_FORMAT> s_dsv{
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, gpso.DSVFormat};
+    append_subobj(s_dsv);
+
+    StreamSubobjLayout<DXGI_SAMPLE_DESC> s_samp{
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC,
+        gpso.SampleDesc.Count ? gpso.SampleDesc : DXGI_SAMPLE_DESC{1u, 0u}};
+    append_subobj(s_samp);
+
+    const size_t words = (stream_bytes.size() + sizeof(uint64_t) - 1u) / sizeof(uint64_t);
+    std::vector<uint64_t> aligned_words(words, 0ull);
+    std::memcpy(aligned_words.data(), stream_bytes.data(), stream_bytes.size());
+    D3D12_PIPELINE_STATE_STREAM_DESC sd{};
+    sd.SizeInBytes = stream_bytes.size();
+    sd.pPipelineStateSubobjectStream = aligned_words.data();
+    return host_dev2->CreatePipelineState(
+        &sd, OS_D3D12_IID(ID3D12PipelineState), reinterpret_cast<void**>(out_pso));
+}
+
 void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
     if (!proxy || !host_dev_) return;
     PendingXdatGfxDesc* pd = proxy->PendingXdatDesc();
     if (!pd || !pd->host_rs) return;
-    if (pd->is_compute ? pd->cs_blob.empty() : pd->vs_blob.empty()) return;
+    if (pd->is_compute ? pd->cs_blob.empty() : (pd->is_mesh ? pd->ms_blob.empty() : pd->vs_blob.empty())) return;
 
     static const bool s_disable_cs_lift = []() {
         char v[16]{};
@@ -9542,7 +9641,9 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
     }();
     auto lift_stage = [&](const std::vector<uint8_t>& blob, std::vector<uint8_t>& out_dxil,
                           std::string& out_err, bool is_vs_stage = false,
-                          bool rectlist_zero_ia = false) -> bool {
+                          bool rectlist_zero_ia = false, bool is_ms_stage = false,
+                          uint32_t max_ms_params = 0xFFFFFFFFu,
+                          uint32_t* out_ps_param_in_count = nullptr) -> bool {
         if (blob.empty()) return true;
         const bool is_xdat = IsXboxXdatDxbcBlob(blob.data(), blob.size());
         const bool is_xs2 = !is_xdat && openscarlett::IsXboxShaderContainerBlob(blob.data(), blob.size());
@@ -9559,10 +9660,18 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
             h ^= 0x524543544C495354ull;
             h *= 1099511628211ull;
         }
+        if (is_ms_stage) {
+            h ^= (static_cast<uint64_t>(max_ms_params) << 12u) ^
+                 (pd->as_blob.empty() ? 0x4D5330ull : 0x4D5331ull);
+            h *= 1099511628211ull;
+        }
         const uint32_t stage_cbv_mask =
             pd->is_compute
                 ? 0u
-                : (pd->from_slot57 ? (is_vs_stage ? pd->vs_cbv_slot_mask : pd->ps_cbv_slot_mask) : 0xFFFFu);
+                : (pd->from_slot57
+                       ? (is_vs_stage ? pd->vs_cbv_slot_mask
+                                      : (is_ms_stage ? pd->ms_cbv_slot_mask : pd->ps_cbv_slot_mask))
+                       : 0xFFFFu);
         if (is_xs2 && pd->is_compute) {
             h ^= (static_cast<uint64_t>(pd->cs_user_sgpr_count) << 8u) ^
                  (static_cast<uint64_t>(pd->cs_tgid_en_mask) << 16u) ^
@@ -9582,7 +9691,7 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
                 h *= 1099511628211ull;
             }
         }
-        {
+        if (!out_ps_param_in_count) {
             std::lock_guard<std::mutex> lk(s_xdat_cache_mu);
             auto it = s_xdat_dxil_cache.find(h);
             if (it != s_xdat_dxil_cache.end()) {
@@ -9590,9 +9699,9 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
                 return !out_dxil.empty();
             }
         }
-        if (!s_disk_cache_dir.empty()) {
+        if (!out_ps_param_in_count && !s_disk_cache_dir.empty()) {
             char cpath[320]{};
-            std::snprintf(cpath, sizeof(cpath), "%s\\v24_%016llx.dxil",
+            std::snprintf(cpath, sizeof(cpath), "%s\\v25_%016llx.dxil",
                           s_disk_cache_dir.c_str(), static_cast<unsigned long long>(h));
             FILE* cf = nullptr;
             if (::fopen_s(&cf, cpath, "rb") == 0 && cf) {
@@ -9619,6 +9728,10 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
         lo.lift_options.compile_dxil_with_dxc = true;
         if (is_vs_stage && rectlist_zero_ia) {
             lo.lift_options.stage_contract.rectlist_zero_ia_vs = true;
+        }
+        if (is_ms_stage) {
+            lo.lift_options.mesh_has_payload = !pd->as_blob.empty();
+            lo.lift_options.stage_contract.max_param_outputs = max_ms_params;
         }
         if (is_xs2) {
             auto& pb = lo.lift_options.stage_contract.psv0_bindings;
@@ -9760,11 +9873,25 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
         }
         const auto st = openscarlett::LiftXboxShaderContainer(blob.data(), blob.size(), lr, lo);
         const bool ok = st.ok() && !lr.lift.pc_dxil.empty();
+        if (ok && out_ps_param_in_count) {
+            uint32_t max_p = 0u;
+            bool saw_si = false;
+            for (const auto& bb : lr.lift.ir.blocks) {
+                for (const auto& ins : bb.instructions) {
+                    if (ins.op == openscarlett::IrOp::StageInput) {
+                        saw_si = true;
+                        const uint32_t ps = (ins.imm_u32 >> 2u) & 31u;
+                        if (ps + 1u > max_p) max_p = ps + 1u;
+                    }
+                }
+            }
+            *out_ps_param_in_count = saw_si ? std::max(1u, max_p) : 0u;
+        }
         if (!ok) {
             out_err = st.message;
         } else if (!s_disk_cache_dir.empty()) {
             char cpath[320]{};
-            std::snprintf(cpath, sizeof(cpath), "%s\\v24_%016llx.dxil",
+            std::snprintf(cpath, sizeof(cpath), "%s\\v25_%016llx.dxil",
                           s_disk_cache_dir.c_str(), static_cast<unsigned long long>(h));
             FILE* cf = nullptr;
             if (::fopen_s(&cf, cpath, "wb") == 0 && cf) {
@@ -9835,6 +9962,96 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
                          seq, static_cast<unsigned long long>(::GetTickCount64() - lift_t0_ms),
                          static_cast<void*>(proxy), static_cast<void*>(pd->host_rs),
                          pd->cs_blob.size(), cs_dxil.size(), static_cast<unsigned long>(chr));
+            std::fflush(stderr);
+        }
+        return;
+    }
+
+    if (pd->is_mesh) {
+        if (!host_dev2_ || adapter_info_.mesh_shader_tier == 0u) {
+            return;
+        }
+        std::vector<uint8_t> ps_dxil, as_dxil, ms_dxil;
+        std::string ps_err, as_err, ms_err;
+        uint32_t ps_param_in_count = 0u;
+        const bool ps_ok = lift_stage(pd->ps_blob, ps_dxil, ps_err, false, false, false, 0xFFFFFFFFu,
+                                      pd->ps_blob.empty() ? nullptr : &ps_param_in_count);
+        const bool as_ok = lift_stage(pd->as_blob, as_dxil, as_err);
+        const uint32_t max_ms_params = pd->ps_blob.empty() ? 0u : ps_param_in_count;
+        const bool ms_ok = lift_stage(pd->ms_blob, ms_dxil, ms_err, false, false, /*is_ms_stage=*/true, max_ms_params);
+        lazy_lift_count_.fetch_add(1u, std::memory_order_release);
+        if (!ms_ok || !as_ok || !ps_ok || ms_dxil.empty()) {
+            if (seq < 96u) {
+                std::fprintf(stderr,
+                             "[OpenScarlett][d3d12_xs] LAZY-LIFT-MS #%u FAIL pso=%p ms(%zuB ok=%d '%s') ps(%zuB ok=%d '%s')\n",
+                             seq, static_cast<void*>(proxy),
+                             pd->ms_blob.size(), ms_ok ? 1 : 0, ms_err.c_str(),
+                             pd->ps_blob.size(), ps_ok ? 1 : 0, ps_err.c_str());
+                std::fflush(stderr);
+            }
+            return;
+        }
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC gpso = pd->gpso;
+        gpso.DSVFormat = SanitizePsoDsvFormat(gpso.DSVFormat);
+        if (gpso.DSVFormat == DXGI_FORMAT_UNKNOWN) {
+            gpso.DepthStencilState.DepthEnable = FALSE;
+            gpso.DepthStencilState.StencilEnable = FALSE;
+            gpso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        }
+        if (gpso.NumRenderTargets > 8u) gpso.NumRenderTargets = 8u;
+        for (UINT r = 0u; r < gpso.NumRenderTargets; ++r) {
+            gpso.RTVFormats[r] = SanitizeXboxDxgiFormat(gpso.RTVFormats[r]);
+            if (gpso.RTVFormats[r] == DXGI_FORMAT_UNKNOWN && r == 0u && !ps_dxil.empty()) {
+                gpso.RTVFormats[r] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            }
+        }
+        for (UINT r = gpso.NumRenderTargets; r < 8u; ++r) gpso.RTVFormats[r] = DXGI_FORMAT_UNKNOWN;
+        SanitizeGraphicsPsoDescForDesktop(gpso);
+
+        ID3D12PipelineState* lifted_ms_pso = nullptr;
+        HRESULT mhr = BuildHostMeshPipelineState(
+            host_dev2_, pd->host_rs, ms_dxil, as_dxil, ps_dxil, gpso, &lifted_ms_pso);
+        if (FAILED(mhr) && gpso.NumRenderTargets == 0u && gpso.DSVFormat == DXGI_FORMAT_UNKNOWN && !ps_dxil.empty()) {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC retry_gpso = gpso;
+            retry_gpso.NumRenderTargets = 1u;
+            retry_gpso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            mhr = BuildHostMeshPipelineState(
+                host_dev2_, pd->host_rs, ms_dxil, as_dxil, ps_dxil, retry_gpso, &lifted_ms_pso);
+            if (SUCCEEDED(mhr)) gpso = retry_gpso;
+        }
+        if (FAILED(mhr)) {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC safe_gpso = gpso;
+            safe_gpso.SampleDesc = {1u, 0u};
+            safe_gpso.SampleMask = UINT_MAX;
+            safe_gpso.RasterizerState.ForcedSampleCount = 0u;
+            safe_gpso.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+            safe_gpso.RasterizerState.MultisampleEnable = FALSE;
+            safe_gpso.RasterizerState.AntialiasedLineEnable = FALSE;
+            safe_gpso.BlendState.AlphaToCoverageEnable = FALSE;
+            safe_gpso.BlendState.IndependentBlendEnable = FALSE;
+            mhr = BuildHostMeshPipelineState(
+                host_dev2_, pd->host_rs, ms_dxil, as_dxil, ps_dxil, safe_gpso, &lifted_ms_pso);
+            if (SUCCEEDED(mhr)) gpso = safe_gpso;
+        }
+        if (SUCCEEDED(mhr) && lifted_ms_pso) {
+            pd->lifted_gpso = gpso;
+            pd->lifted_ms_dxil = std::move(ms_dxil);
+            pd->lifted_as_dxil = std::move(as_dxil);
+            pd->lifted_ps_dxil = std::move(ps_dxil);
+            pd->has_lifted_gfx_dxil = true;
+            proxy->AdoptLiftedHostPso(lifted_ms_pso);
+            lifted_ms_pso->Release();
+        }
+        if (seq < 96u) {
+            std::fprintf(stderr,
+                         "[OpenScarlett][d3d12_xs] LAZY-LIFT-MS #%u (%llums) pso=%p rs=%p (raw ms=%zuB ps=%zuB params<=%u -> dxil ms=%zuB ps=%zuB rts=%u fmt0=%d dsv=%d) -> hr=0x%08lX\n",
+                         seq, static_cast<unsigned long long>(::GetTickCount64() - lift_t0_ms),
+                         static_cast<void*>(proxy), static_cast<void*>(pd->host_rs),
+                         pd->ms_blob.size(), pd->ps_blob.size(), max_ms_params,
+                         pd->lifted_ms_dxil.size(), pd->lifted_ps_dxil.size(),
+                         gpso.NumRenderTargets,
+                         gpso.NumRenderTargets > 0u ? static_cast<int>(gpso.RTVFormats[0]) : 0,
+                         static_cast<int>(gpso.DSVFormat), static_cast<unsigned long>(mhr));
             std::fflush(stderr);
         }
         return;
@@ -10082,12 +10299,38 @@ ID3D12PipelineState* DeviceX::CreateGraphicsPsoTargetVariant(
     DXGI_FORMAT dsv_format) {
     if (!proxy || !host_dev_) return nullptr;
     PendingXdatGfxDesc* pd = proxy->PendingXdatDesc();
-    if (!pd || !pd->has_lifted_gfx_dxil || !pd->host_rs || pd->lifted_vs_dxil.empty()) {
+    if (!pd || !pd->has_lifted_gfx_dxil || !pd->host_rs ||
+        (pd->is_mesh ? pd->lifted_ms_dxil.empty() : pd->lifted_vs_dxil.empty())) {
         return nullptr;
     }
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC vdesc = pd->lifted_gpso;
     vdesc.pRootSignature = pd->host_rs;
+    if (pd->is_mesh) {
+        vdesc.NumRenderTargets = std::min<UINT>(num_rtvs, 8u);
+        for (UINT r = 0u; r < 8u; ++r) {
+            vdesc.RTVFormats[r] =
+                (r < vdesc.NumRenderTargets && rtv_formats)
+                    ? SanitizeXboxDxgiFormat(rtv_formats[r])
+                    : DXGI_FORMAT_UNKNOWN;
+        }
+        vdesc.DSVFormat = SanitizePsoDsvFormat(dsv_format);
+        if (vdesc.DSVFormat == DXGI_FORMAT_UNKNOWN) {
+            vdesc.DepthStencilState.DepthEnable = FALSE;
+            vdesc.DepthStencilState.StencilEnable = FALSE;
+            vdesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        }
+        SanitizeGraphicsPsoDescForDesktop(vdesc);
+        ID3D12PipelineState* var_ms_pso = nullptr;
+        if (host_dev2_ &&
+            SUCCEEDED(BuildHostMeshPipelineState(
+                host_dev2_, pd->host_rs, pd->lifted_ms_dxil, pd->lifted_as_dxil, pd->lifted_ps_dxil,
+                vdesc, &var_ms_pso)) &&
+            var_ms_pso) {
+            return var_ms_pso;
+        }
+        return nullptr;
+    }
     vdesc.VS = {pd->lifted_vs_dxil.data(), pd->lifted_vs_dxil.size()};
     vdesc.PS = pd->lifted_ps_dxil.empty()
                    ? D3D12_SHADER_BYTECODE{nullptr, 0u}
@@ -10795,9 +11038,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
             std::memcpy(&bc, raw_stream + ent.src_offset + kBytecodeOffset, sizeof(bc));
             if (IsXboxXdatDxbcBlob(bc.pShaderBytecode, bc.BytecodeLength)) {
                 stream_has_xdat = true;
-                if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS ||
-                    ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS ||
-                    ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) {
+                if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) {
                     stream_has_xdat_cs = true;
                 }
             }
@@ -10805,13 +11046,9 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
         if (stream_has_xdat && stream_has_xdat_cs) {
             auto pd = std::make_unique<PendingXdatGfxDesc>();
             pd->is_compute = true;
-            bool has_ms_as = false;
             for (const auto& ent : entries) {
                 if (ent.drop_subobject) continue;
-                if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS ||
-                    ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) {
-                    has_ms_as = true;
-                } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) {
+                if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) {
                     ID3D12RootSignature* rs = nullptr;
                     std::memcpy(&rs, raw_stream + ent.src_offset + kRootSigOffset, sizeof(rs));
                     ID3D12RootSignature* hrs = UnwrapRootSignature(rs);
@@ -10829,7 +11066,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
                     }
                 }
             }
-            if (!has_ms_as && !pd->cs_blob.empty() && pd->host_rs) {
+            if (!pd->cs_blob.empty() && pd->host_rs) {
                 pending_xdat = std::move(pd);
             }
         } else if (stream_has_xdat && !stream_has_xdat_cs) {
@@ -10887,6 +11124,22 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
                     if (bc.pShaderBytecode && bc.BytecodeLength > 0u) {
                         const auto* bp = static_cast<const uint8_t*>(bc.pShaderBytecode);
                         pd->gs_blob.assign(bp, bp + bc.BytecodeLength);
+                    }
+                } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) {
+                    D3D12_SHADER_BYTECODE bc{};
+                    std::memcpy(&bc, raw_stream + ent.src_offset + kBytecodeOffset, sizeof(bc));
+                    if (bc.pShaderBytecode && bc.BytecodeLength > 0u) {
+                        const auto* bp = static_cast<const uint8_t*>(bc.pShaderBytecode);
+                        pd->ms_blob.assign(bp, bp + bc.BytecodeLength);
+                        pd->is_mesh = true;
+                    }
+                } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) {
+                    D3D12_SHADER_BYTECODE bc{};
+                    std::memcpy(&bc, raw_stream + ent.src_offset + kBytecodeOffset, sizeof(bc));
+                    if (bc.pShaderBytecode && bc.BytecodeLength > 0u) {
+                        const auto* bp = static_cast<const uint8_t*>(bc.pShaderBytecode);
+                        pd->as_blob.assign(bp, bp + bc.BytecodeLength);
+                        pd->is_mesh = true;
                     }
                 } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) {
                     if (ent.src_offset + sizeof(StreamSubobjLayout<D3D12_INPUT_LAYOUT_DESC>) <= total_bytes) {
@@ -11040,7 +11293,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
                 pd->gpso.DepthStencilState.DepthEnable = FALSE;
                 pd->gpso.DepthStencilState.StencilEnable = FALSE;
             }
-            if (!pd->vs_blob.empty() && pd->host_rs) {
+            if ((!pd->vs_blob.empty() || !pd->ms_blob.empty()) && pd->host_rs) {
                 pending_xdat = std::move(pd);
             }
         }

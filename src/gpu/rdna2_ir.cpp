@@ -1572,7 +1572,7 @@ Status BuildRdna2Ir(
     IrValueId zero_f32_val = kInvalidIrValue;
     IrValueId true_bool_val = kInvalidIrValue;
     IrValueId false_bool_val = kInvalidIrValue;
-    std::array<IrValueId, 16> ps_inputs{};
+    std::array<IrValueId, 128> ps_inputs{};
     std::unordered_map<uint32_t, IrValueId> root_const_vals;
 
     // Detect unpacked vs packed (GFX10.3 10-bit X/Y/Z in v0) SV_GroupThreadID for FSSM Compute shaders:
@@ -1750,12 +1750,13 @@ Status BuildRdna2Ir(
     };
 
     auto get_ps_input = [&](uint32_t ch, uint32_t param_slot = 0u) -> IrValueId {
-        const uint32_t slot = (param_slot & 3u) * 4u + (ch & 3u);
-        if (slot < 16u && ps_inputs[slot] == kInvalidIrValue) {
-            const uint32_t imm = (ch & 3u) | ((param_slot & 3u) << 2);
+        const uint32_t pslot = param_slot & 31u;
+        const uint32_t slot = pslot * 4u + (ch & 3u);
+        if (slot < ps_inputs.size() && ps_inputs[slot] == kInvalidIrValue) {
+            const uint32_t imm = (ch & 3u) | (pslot << 2);
             ps_inputs[slot] = register_preamble(IrOp::StageInput, IrType::F32, imm, 0.0f);
         }
-        return slot < 16u ? ps_inputs[slot] : get_zero_f32();
+        return slot < ps_inputs.size() ? ps_inputs[slot] : get_zero_f32();
     };
 
     auto get_root_const = [&](uint32_t idx) -> IrValueId {
@@ -6558,10 +6559,10 @@ Status BuildRdna2Ir(
 
                     if (inst.exp_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos0)) {
                         out_module.exports_pos0 = true;
-                    } else if (inst.exp_target == static_cast<uint8_t>(Rdna2ExportTarget::Mrt0)) {
+                    } else if (inst.exp_target <= static_cast<uint8_t>(Rdna2ExportTarget::Mrt7)) {
                         out_module.exports_mrt0 = true;
                     } else if (inst.exp_target >= static_cast<uint8_t>(Rdna2ExportTarget::Param0) &&
-                               inst.exp_target <= static_cast<uint8_t>(Rdna2ExportTarget::Param3)) {
+                               inst.exp_target <= static_cast<uint8_t>(Rdna2ExportTarget::Param31)) {
                         out_module.exports_param0 = true;
                         const size_t pidx = static_cast<size_t>(
                             inst.exp_target - static_cast<uint8_t>(Rdna2ExportTarget::Param0));

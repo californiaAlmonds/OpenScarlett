@@ -1592,6 +1592,16 @@ void ParsePsv0Chunk(const uint8_t* data, size_t size, XboxPsv0Info& out_psv) {
     out_psv.max_wave_lane_count = ReadLe32(data + 24u);
     if (runtime_info_size >= 36u && size >= 40u) {
         out_psv.shader_stage = data[28u];
+        if (out_psv.shader_stage == 13u) {
+            out_psv.payload_size_in_bytes = ReadLe32(data + 12u);
+            out_psv.max_output_vertices =
+                static_cast<uint16_t>(static_cast<uint16_t>(data[16u]) | (static_cast<uint16_t>(data[17u]) << 8u));
+            out_psv.max_output_primitives =
+                static_cast<uint16_t>(static_cast<uint16_t>(data[18u]) | (static_cast<uint16_t>(data[19u]) << 8u));
+            out_psv.mesh_output_topology = data[31u];
+        } else if (out_psv.shader_stage == 14u) {
+            out_psv.payload_size_in_bytes = ReadLe32(data + 4u);
+        }
     }
     if (runtime_info_size >= 48u && size >= 52u) {
         out_psv.num_threads_x = ReadLe32(data + 40u);

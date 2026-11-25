@@ -386,7 +386,7 @@ uint32_t ModuleParamOutputCount(const Rdna2IrModule& ir) noexcept {
         for (const auto& inst : bb.instructions) {
             if (inst.op == IrOp::Export &&
                 inst.export_target >= static_cast<uint8_t>(Rdna2ExportTarget::Param0) &&
-                inst.export_target <= static_cast<uint8_t>(Rdna2ExportTarget::Param3)) {
+                inst.export_target <= static_cast<uint8_t>(Rdna2ExportTarget::Param31)) {
                 const uint32_t slot = static_cast<uint32_t>(
                     inst.export_target - static_cast<uint8_t>(Rdna2ExportTarget::Param0));
                 if (slot + 1u > count) count = slot + 1u;
@@ -394,12 +394,15 @@ uint32_t ModuleParamOutputCount(const Rdna2IrModule& ir) noexcept {
         }
     }
     if (count > 0u && ir.output_interp_modes.size() > count) {
-        count = std::min<uint32_t>(4u, static_cast<uint32_t>(ir.output_interp_modes.size()));
+        count = std::min<uint32_t>(32u, static_cast<uint32_t>(ir.output_interp_modes.size()));
     }
     if (ir.stage_contract.min_param_outputs > count) {
         count = ir.stage_contract.min_param_outputs;
     }
-    return std::min<uint32_t>(4u, count);
+    if (count > ir.stage_contract.max_param_outputs) {
+        count = ir.stage_contract.max_param_outputs;
+    }
+    return std::min<uint32_t>(32u, count);
 }
 
 uint32_t ModuleParamInputCount(const Rdna2IrModule& ir) noexcept {
@@ -407,12 +410,26 @@ uint32_t ModuleParamInputCount(const Rdna2IrModule& ir) noexcept {
     for (const auto& bb : ir.blocks) {
         for (const auto& inst : bb.instructions) {
             if (inst.op == IrOp::StageInput) {
-                const uint32_t slot = (inst.imm_u32 >> 2) & 3u;
+                const uint32_t slot = (inst.imm_u32 >> 2) & 31u;
                 if (slot + 1u > count) count = slot + 1u;
             }
         }
     }
-    return std::min<uint32_t>(4u, count);
+    return std::min<uint32_t>(32u, count);
+}
+
+uint32_t ModuleMrtOutputCount(const Rdna2IrModule& ir) noexcept {
+    uint32_t count = 1u;
+    for (const auto& bb : ir.blocks) {
+        for (const auto& inst : bb.instructions) {
+            if (inst.op == IrOp::Export &&
+                inst.export_target <= static_cast<uint8_t>(Rdna2ExportTarget::Mrt7)) {
+                const uint32_t slot = static_cast<uint32_t>(inst.export_target);
+                if (slot + 1u > count) count = slot + 1u;
+            }
+        }
+    }
+    return std::min<uint32_t>(8u, count);
 }
 
 Rdna2InterpMode SafeInterpMode(const std::vector<Rdna2InterpMode>& modes, uint32_t slot) noexcept {
@@ -1635,9 +1652,10 @@ public:
                    "}\n";
         }
 
-        const uint32_t param_out_count = ModuleParamOutputCount(ir_);
+        uint32_t param_out_count = ModuleParamOutputCount(ir_);
         const uint32_t param_in_count = uses_stage_in ? std::max(1u, ModuleParamInputCount(ir_)) : 0u;
         param_in_count_ = param_in_count;
+        mrt_out_count_ = (ir_.stage == ShaderStage::Pixel) ? ModuleMrtOutputCount(ir_) : 1u;
         uses_viewport_idx_ =
             (ir_.stage == ShaderStage::Vertex || ir_.stage == ShaderStage::Geometry || ir_.stage == ShaderStage::Mesh)
                 ? ModuleUsesViewportArrayIndex(ir_)
@@ -1646,6 +1664,20 @@ public:
             (ir_.stage == ShaderStage::Vertex || ir_.stage == ShaderStage::Geometry || ir_.stage == ShaderStage::Mesh)
                 ? ModuleCullDistanceCount(ir_)
                 : 0u;
+        if (ir_.stage == ShaderStage::Mesh) {
+            const uint32_t m_max_v = std::max(1u, ir_.mesh_max_vertices ? ir_.mesh_max_vertices : 64u);
+            const uint32_t m_max_p = ir_.mesh_max_primitives ? ir_.mesh_max_primitives : 64u;
+            const uint32_t fixed_rows =
+                1u + (uses_viewport_idx_ ? 1u : 0u) +
+                (cull_dist_count_ > 4u ? 2u : (cull_dist_count_ > 0u ? 1u : 0u));
+            const uint32_t prim_bytes = ir_.uses_mesh_cull ? (m_max_p * 16u) : 0u;
+            const uint32_t avail_v_bytes = (32768u > prim_bytes) ? (32768u - prim_bytes) : 16384u;
+            const uint32_t max_rows_per_v = avail_v_bytes / (m_max_v * 16u);
+            const uint32_t max_fit_params =
+                (max_rows_per_v > fixed_rows) ? (max_rows_per_v - fixed_rows) : 0u;
+            param_out_count = std::min(param_out_count, max_fit_params);
+        }
+        param_out_count_ = param_out_count;
 
         switch (ir_.stage) {
             case ShaderStage::Compute:
@@ -1733,8 +1765,19 @@ public:
                         << "float4 param" << p << " : TEXCOORD" << p << ";\n";
                 }
                 hdr << "};\n";
-                hdr << "float4 main(PSIn _in) : SV_TARGET0 {\n";
-                hdr << "    float4 _mrt0 = float4(0.0, 0.0, 0.0, 1.0);\n";
+                if (mrt_out_count_ > 1u) {
+                    hdr << "struct PSOut {\n";
+                    for (uint32_t m = 0u; m < mrt_out_count_; ++m) {
+                        hdr << "    float4 mrt" << m << " : SV_TARGET" << m << ";\n";
+                    }
+                    hdr << "};\n";
+                    hdr << "PSOut main(PSIn _in) {\n";
+                    hdr << "    PSOut _ps_out = (PSOut)0;\n";
+                    hdr << "    _ps_out.mrt0 = float4(0.0, 0.0, 0.0, 1.0);\n";
+                } else {
+                    hdr << "float4 main(PSIn _in) : SV_TARGET0 {\n";
+                    hdr << "    float4 _mrt0 = float4(0.0, 0.0, 0.0, 1.0);\n";
+                }
                 if (ir_.uses_wave64_emulation && use_sm65_) {
                     hdr << "    uint _w64_lane = WaveGetLaneIndex();\n";
                 }
@@ -2004,7 +2047,7 @@ public:
                 if (ir_.stage == ShaderStage::Vertex) {
                     hdr << "    return _out;\n";
                 } else if (ir_.stage == ShaderStage::Pixel) {
-                    hdr << "    return _mrt0;\n";
+                    hdr << (mrt_out_count_ > 1u ? "    return _ps_out;\n" : "    return _mrt0;\n");
                 }
             }
         }
@@ -2228,7 +2271,7 @@ private:
     std::string EmitReturnStmt() const {
         if (bounded_wave64_dispatcher_ || mesh_wave32_split_) return "continue;";
         if (ir_.stage == ShaderStage::Vertex) return "return _out;";
-        if (ir_.stage == ShaderStage::Pixel) return "return _mrt0;";
+        if (ir_.stage == ShaderStage::Pixel) return (mrt_out_count_ > 1u) ? "return _ps_out;" : "return _mrt0;";
         if (ir_.stage == ShaderStage::Amplification) return "break;";
         return "return;";
     }
@@ -3940,16 +3983,18 @@ private:
                             }
                         }
                     } else if (inst.export_target >= static_cast<uint8_t>(Rdna2ExportTarget::Param0) &&
-                               inst.export_target <= static_cast<uint8_t>(Rdna2ExportTarget::Param3)) {
+                               inst.export_target <= static_cast<uint8_t>(Rdna2ExportTarget::Param31)) {
                         const uint32_t pslot = static_cast<uint32_t>(
                             inst.export_target - static_cast<uint8_t>(Rdna2ExportTarget::Param0));
-                        if (ir_.stage == ShaderStage::Vertex) {
-                            os << ind << "_out.param" << pslot << " = " << vec << ";\n";
-                        } else if (ir_.stage == ShaderStage::Mesh) {
-                            os << ind << "if (" << mesh_idx << " < _mesh_vcnt) { _verts["
-                               << mesh_idx << "].param" << pslot << " = " << vec << "; }\n";
-                        } else if (ir_.stage == ShaderStage::Geometry) {
-                            os << ind << "_gs_out.param" << pslot << " = " << vec << ";\n";
+                        if (pslot < param_out_count_) {
+                            if (ir_.stage == ShaderStage::Vertex) {
+                                os << ind << "_out.param" << pslot << " = " << vec << ";\n";
+                            } else if (ir_.stage == ShaderStage::Mesh) {
+                                os << ind << "if (" << mesh_idx << " < _mesh_vcnt) { _verts["
+                                   << mesh_idx << "].param" << pslot << " = " << vec << "; }\n";
+                            } else if (ir_.stage == ShaderStage::Geometry) {
+                                os << ind << "_gs_out.param" << pslot << " = " << vec << ";\n";
+                            }
                         }
                     } else if ((inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos2) ||
                                 inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos3)) &&
@@ -3966,9 +4011,16 @@ private:
                         } else if (ir_.stage == ShaderStage::Geometry) {
                             os << ind << "_gs_out." << field << " = " << vec << ";\n";
                         }
-                    } else if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Mrt0) &&
+                    } else if (inst.export_target <= static_cast<uint8_t>(Rdna2ExportTarget::Mrt7) &&
                                ir_.stage == ShaderStage::Pixel) {
-                        os << ind << "_mrt0 = " << vec << ";\n";
+                        const uint32_t mslot = static_cast<uint32_t>(inst.export_target);
+                        if (mrt_out_count_ > 1u) {
+                            if (mslot < mrt_out_count_) {
+                                os << ind << "_ps_out.mrt" << mslot << " = " << vec << ";\n";
+                            }
+                        } else if (mslot == 0u) {
+                            os << ind << "_mrt0 = " << vec << ";\n";
+                        }
                     }
                     break;
                 }
@@ -4162,7 +4214,9 @@ private:
     uint32_t orig_tg_total_ = 1u;
     bool hoisted_mesh_counts_ = false;
     bool uses_viewport_idx_ = false;
+    uint32_t param_out_count_ = 0u;
     uint32_t param_in_count_ = 0u;
+    uint32_t mrt_out_count_ = 1u;
     uint32_t cull_dist_count_ = 0u;
     std::unordered_map<IrValueId, const IrInstruction*> defs_;
 };
@@ -4424,8 +4478,8 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     uint32_t var_dm_x = 0;
     uint32_t var_dm_y = 0;
     uint32_t var_dm_z = 0;
-    uint32_t var_param_out[4] = {0u, 0u, 0u, 0u};
-    uint32_t var_param_in[4] = {0u, 0u, 0u, 0u};
+    uint32_t var_param_out[32] = {};
+    uint32_t var_param_in[32] = {};
     uint32_t var_mrt0 = 0;
     const uint32_t param_out_count = ModuleParamOutputCount(ir);
     const uint32_t param_in_count = ModuleUsesStageInput(ir) ? std::max(1u, ModuleParamInputCount(ir)) : 0u;
@@ -5706,9 +5760,9 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     break;
                 }
                 case IrOp::StageInput: {
-                    const uint32_t pslot = (inst.imm_u32 >> 2) & 3u;
+                    const uint32_t pslot = (inst.imm_u32 >> 2) & 31u;
                     const uint32_t comp = inst.imm_u32 & 3u;
-                    const uint32_t vin = (pslot < 4u) ? var_param_in[pslot] : 0u;
+                    const uint32_t vin = (pslot < 32u) ? var_param_in[pslot] : 0u;
                     if (vin == 0u) {
                         // Default unmapped PS input attributes to (0, 0, 0, 1) (xbox-emulator #181)
                         EmitSpvInst(sec_fn, SpvOpFAdd, {t_f32, res, (comp == 3u) ? c_f32_1 : c_f32_0, c_f32_0});
@@ -8427,10 +8481,10 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                         }
                         EmitSpvInst(sec_fn, SpvOpStore, {ptr_pos, vec_id});
                     } else if (inst.export_target >= static_cast<uint8_t>(Rdna2ExportTarget::Param0) &&
-                               inst.export_target <= static_cast<uint8_t>(Rdna2ExportTarget::Param3)) {
+                               inst.export_target <= static_cast<uint8_t>(Rdna2ExportTarget::Param31)) {
                         const uint32_t pslot = static_cast<uint32_t>(
                             inst.export_target - static_cast<uint8_t>(Rdna2ExportTarget::Param0));
-                        const uint32_t vout = var_param_out[pslot];
+                        const uint32_t vout = (pslot < 32u) ? var_param_out[pslot] : 0u;
                         if (vout != 0u) {
                             if (is_mesh_stage) {
                                 uint32_t lidx = alloc_id();
@@ -9081,6 +9135,8 @@ Status LiftRdna2Xs2Shader(
          !eff_opts.stage_contract.pixel_inputs.empty() ||
          !eff_opts.stage_contract.vs_ia_inputs.empty() ||
          eff_opts.stage_contract.min_param_outputs > 0u ||
+         eff_opts.stage_contract.max_param_outputs != 0xFFFFFFFFu ||
+         eff_opts.stage_contract.rectlist_zero_ia_vs ||
          eff_opts.stage_contract.psv0_bindings.enabled ||
          eff_opts.stage_contract.texture_srv_format != Rdna2TextureFormat::Float4)
             ? &eff_opts.stage_contract
@@ -9091,6 +9147,14 @@ Status LiftRdna2Xs2Shader(
         return st;
     }
     out_result.ir.mesh_has_payload = options.mesh_has_payload;
+    if (full_info.psv0.present && full_info.psv0.shader_stage == 13u) {
+        if (full_info.psv0.max_output_vertices > 0u && full_info.psv0.max_output_vertices <= 256u) {
+            out_result.ir.mesh_max_vertices = full_info.psv0.max_output_vertices;
+        }
+        if (full_info.psv0.max_output_primitives > 0u && full_info.psv0.max_output_primitives <= 256u) {
+            out_result.ir.mesh_max_primitives = full_info.psv0.max_output_primitives;
+        }
+    }
 
     if (auto st = OptimizeRdna2Ir(out_result.ir); !st.ok()) {
         CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -4);

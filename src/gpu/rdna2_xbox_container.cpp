@@ -3422,6 +3422,9 @@ Status LiftXboxShaderContainer(
         (!eff_opts.stage_contract.vertex_fetches.empty() ||
          !eff_opts.stage_contract.pixel_inputs.empty() ||
          !eff_opts.stage_contract.vs_ia_inputs.empty() ||
+         eff_opts.stage_contract.min_param_outputs > 0u ||
+         eff_opts.stage_contract.max_param_outputs != 0xFFFFFFFFu ||
+         eff_opts.stage_contract.rectlist_zero_ia_vs ||
          eff_opts.stage_contract.psv0_bindings.enabled ||
          eff_opts.stage_contract.texture_srv_format != Rdna2TextureFormat::Float4)
             ? &eff_opts.stage_contract
@@ -3432,6 +3435,16 @@ Status LiftXboxShaderContainer(
         return st;
     }
     out_result.lift.ir.mesh_has_payload = eff_opts.mesh_has_payload;
+    if (out_result.parsed.psv0.present && out_result.parsed.psv0.shader_stage == 13u) {
+        if (out_result.parsed.psv0.max_output_vertices > 0u &&
+            out_result.parsed.psv0.max_output_vertices <= 256u) {
+            out_result.lift.ir.mesh_max_vertices = out_result.parsed.psv0.max_output_vertices;
+        }
+        if (out_result.parsed.psv0.max_output_primitives > 0u &&
+            out_result.parsed.psv0.max_output_primitives <= 256u) {
+            out_result.lift.ir.mesh_max_primitives = out_result.parsed.psv0.max_output_primitives;
+        }
+    }
 
     // Optional paired VS<->PS interpolation linkage reconciliation
     if (options.paired_other_stage != nullptr) {

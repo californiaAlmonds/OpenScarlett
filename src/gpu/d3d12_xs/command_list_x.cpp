@@ -4799,6 +4799,19 @@ void STDMETHODCALLTYPE CommandListX::ExecuteIndirect(
     // If this is a virtual DispatchMesh fallback on WARP / MeshTier=0 (host_sig == nullptr),
     // skip the native host ExecuteIndirect call safely after validation & Vulkan routing.
     if (host_sig != nullptr && !(vk_routed && vk_cur_pso_is_spirv_)) {
+        if (sig_proxy && sig_proxy->PrimaryActionType() != D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH &&
+            last_pso_proxy_ != nullptr) {
+            ID3D12PipelineState* target_pso = last_pso_proxy_->GetHostPsoForTargets(
+                last_bound_rtv_count_, last_bound_rtv_formats_, last_bound_dsv_format_, false);
+            if (target_pso && target_pso != last_host_pso_) {
+                host_list_->SetPipelineState(target_pso);
+                last_host_pso_ = target_pso;
+            }
+            uint8_t s57_ref = 0u;
+            if (!guest_set_stencil_ref_ && last_pso_proxy_->HasSlot57StencilRef(s57_ref)) {
+                host_list_->OMSetStencilRef(s57_ref);
+            }
+        }
         UINT host_max_count = effective_max_count;
         ID3D12Resource* exec_cnt_buf = host_cnt;
         UINT64 exec_cnt_offset = CountBufferOffset;
@@ -5470,6 +5483,18 @@ void STDMETHODCALLTYPE CommandListX::DispatchMesh(
         AppendDiagOp(buf);
     }
     if (!skip_host && !last_pso_is_standin_ && !pso_missing && host_list6_ && host_mesh_supported) {
+        if (last_pso_proxy_ != nullptr) {
+            ID3D12PipelineState* target_pso = last_pso_proxy_->GetHostPsoForTargets(
+                last_bound_rtv_count_, last_bound_rtv_formats_, last_bound_dsv_format_, false);
+            if (target_pso && target_pso != last_host_pso_) {
+                host_list_->SetPipelineState(target_pso);
+                last_host_pso_ = target_pso;
+            }
+            uint8_t s57_ref = 0u;
+            if (!guest_set_stencil_ref_ && last_pso_proxy_->HasSlot57StencilRef(s57_ref)) {
+                host_list_->OMSetStencilRef(s57_ref);
+            }
+        }
         // Respect D3D12 per-axis limit (65535) while dispatching all X, Y, Z dimensions cleanly.
         constexpr UINT kMaxDim = 65535u;
         const UINT gx = std::min<UINT>(ThreadGroupCountX, kMaxDim);

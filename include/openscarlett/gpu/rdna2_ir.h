@@ -327,6 +327,7 @@ struct StageContractTable {
     Rdna2TextureFormat texture_srv_format = Rdna2TextureFormat::Float4;
     std::vector<VsIaInputBinding> vs_ia_inputs;
     uint32_t min_param_outputs = 0u;
+    uint32_t max_param_outputs = 0xFFFFFFFFu;
     bool rectlist_zero_ia_vs = false;
     Psv0HlslBindingOverrides psv0_bindings{};
 };

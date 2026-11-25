@@ -356,6 +356,7 @@ private:
 // ---------------------------------------------------------------------------
 struct PendingXdatGfxDesc {
     bool is_compute = false;
+    bool is_mesh = false;
     bool from_slot57 = false;
     bool has_slot57_stencil_ref = false;
     bool has_cs_rsrc2 = false;
@@ -364,11 +365,14 @@ struct PendingXdatGfxDesc {
     uint32_t cs_tgid_en_mask = 0x7u;
     uint32_t vs_cbv_slot_mask = 0u;
     uint32_t ps_cbv_slot_mask = 0u;
+    uint32_t ms_cbv_slot_mask = 0u;
     std::vector<uint8_t> vs_blob;
     std::vector<uint8_t> ps_blob;
     std::vector<uint8_t> hs_blob;
     std::vector<uint8_t> ds_blob;
     std::vector<uint8_t> gs_blob;
+    std::vector<uint8_t> ms_blob;
+    std::vector<uint8_t> as_blob;
     std::vector<uint8_t> cs_blob;
     ID3D12RootSignature* host_rs = nullptr;
     std::vector<std::string> il_names;
@@ -382,6 +386,8 @@ struct PendingXdatGfxDesc {
     std::vector<uint8_t> lifted_hs_dxil;
     std::vector<uint8_t> lifted_ds_dxil;
     std::vector<uint8_t> lifted_gs_dxil;
+    std::vector<uint8_t> lifted_ms_dxil;
+    std::vector<uint8_t> lifted_as_dxil;
 
     ~PendingXdatGfxDesc() {
         if (host_rs) host_rs->Release();

@@ -129,6 +129,10 @@ struct XboxPsv0Info {
     uint32_t min_wave_lane_count = 0;  // 0 = unspecified, 32, 64
     uint32_t max_wave_lane_count = 0;  // 0 or 0xFFFFFFFF = unspecified/unbounded, 32, 64
     uint8_t shader_stage = 0;          // DXIL PSV shader stage ID
+    uint8_t mesh_output_topology = 0;  // Mesh stage PSV0[31] (1=line, 2=triangle)
+    uint16_t max_output_vertices = 0;  // Mesh stage PSV0[16..17]
+    uint16_t max_output_primitives = 0;// Mesh stage PSV0[18..19]
+    uint32_t payload_size_in_bytes = 0;// Mesh/Amp stage payload bytes
     uint32_t num_threads_x = 0;
     uint32_t num_threads_y = 0;
     uint32_t num_threads_z = 0;
@@ -783,6 +787,7 @@ enum class Rdna2ExportTarget : uint8_t {
     Param1 = 33,
     Param2 = 34,
     Param3 = 35,
+    Param31 = 63,
 };
 
 enum class Rdna2OperandWidth : uint8_t {
