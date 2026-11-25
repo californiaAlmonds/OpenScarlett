@@ -1522,26 +1522,45 @@ public:
                     break;
                 }
             }
+            if (!valid_placeholder) {
+                void* ph_base = nullptr;
+                size_t ph_sz = 0u, ph_gr = 0u;
+                bool ph_mapped = false;
+                if (memory_.LookupPlaceholderByHostPtr(virtualAddress, ph_base, ph_sz, ph_gr, ph_mapped) &&
+                    ph_base != nullptr) {
+                    valid_placeholder = true;
+                }
+            }
 #if defined(_WIN32)
             if (!valid_placeholder) {
                 uintptr_t cur = req;
                 const uintptr_t req_end = req + total_bytes;
-                bool all_reserved_private = true;
+                bool all_valid_target = true;
                 while (cur < req_end) {
+                    UnifiedMemoryAlias ex_alias{};
+                    void* ph_b = nullptr;
+                    size_t ph_s = 0u, ph_g = 0u;
+                    bool ph_m = false;
+                    if (mappings_.find(cur) != mappings_.end() ||
+                        memory_.LookupAliasByHostPtr(reinterpret_cast<const void*>(cur), ex_alias) ||
+                        memory_.LookupPlaceholderByHostPtr(reinterpret_cast<const void*>(cur), ph_b, ph_s, ph_g, ph_m)) {
+                        cur += page_bytes;
+                        continue;
+                    }
                     MEMORY_BASIC_INFORMATION mbi{};
                     if (VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi)) == 0u ||
                         mbi.State != MEM_RESERVE || mbi.Type != MEM_PRIVATE || mbi.RegionSize == 0u) {
-                        all_reserved_private = false;
+                        all_valid_target = false;
                         break;
                     }
                     const uintptr_t seg_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
                     if (seg_end <= cur) {
-                        all_reserved_private = false;
+                        all_valid_target = false;
                         break;
                     }
                     cur = seg_end;
                 }
-                if (all_reserved_private) {
+                if (all_valid_target) {
                     valid_placeholder = true;
                 }
             }
@@ -1551,6 +1570,32 @@ public:
                 return nullptr;
             }
 
+            {
+                void* ph_base = nullptr;
+                size_t ph_sz = 0u, ph_gr = 0u;
+                bool ph_mapped = false;
+                if (!memory_.LookupPlaceholderByHostPtr(virtualAddress, ph_base, ph_sz, ph_gr, ph_mapped)) {
+                    (void)memory_.PromoteReservedRangeToPlaceholder(virtualAddress, total_bytes);
+                }
+            }
+
+            auto unmap_single_slot_locked = [&](uintptr_t slot_va) {
+                auto ex_it = mappings_.find(slot_va);
+                if (ex_it != mappings_.end() && ex_it->second.size_bytes == page_bytes &&
+                    !ex_it->second.owns_placeholder) {
+                    for (void* ap : ex_it->second.alias_ptrs) {
+                        (void)memory_.UnmapPhysicalAlias(ap);
+                    }
+                    for (uint64_t pfn : ex_it->second.pfns) {
+                        auto pit = pfn_table_.find(pfn);
+                        if (pit != pfn_table_.end() && pit->second.map_refcount > 0) {
+                            --pit->second.map_refcount;
+                        }
+                    }
+                    mappings_.erase(ex_it);
+                }
+            };
+
             auto map_slot_with_retry = [&](uint64_t phys_id,
                                            size_t phys_off,
                                            size_t bytes,
@@ -1559,6 +1604,11 @@ public:
                 Status st = memory_.MapPhysicalAlias(
                     phys_id, phys_off, bytes, prot, mem_flags, slot, out_alias);
 #if defined(_WIN32)
+                if (!st.ok()) {
+                    (void)memory_.PromoteReservedRangeToPlaceholder(slot, bytes);
+                    st = memory_.MapPhysicalAlias(
+                        phys_id, phys_off, bytes, prot, mem_flags, slot, out_alias);
+                }
                 if (!st.ok()) {
                     void* sp_base = nullptr;
                     size_t sp_size = 0u;
@@ -1577,39 +1627,47 @@ public:
                 return st;
             };
 
-            bool mapped_whole = false;
-            if (is_contiguous_single_pool) {
+            // Map placeholder targets at individual page granularity (64 KiB / 4 MiB) so subsequent
+            // XMemMapPhysicalPagesScatter or partial XMemUnmapPhysicalPages calls can atomically
+            // remap or unmap any subset of pages without disturbing adjacent mapped pages.
+            base_va = virtualAddress;
+            std::vector<uintptr_t> newly_mapped_slots;
+            newly_mapped_slots.reserve(static_cast<size_t>(numberOfPages));
+            for (uint64_t i = 0; i < numberOfPages; ++i) {
+                const uintptr_t slot_va = req + static_cast<size_t>(i) * page_bytes;
+                void* slot = reinterpret_cast<void*>(slot_va);
+                unmap_single_slot_locked(slot_va);
+
                 UnifiedMemoryAlias alias{};
-                const size_t phys_off = static_cast<size_t>(frames[0].page_index) * page_bytes;
                 Status st = map_slot_with_retry(
-                    frames[0].physical_id, phys_off, total_bytes, virtualAddress, alias);
-                if (st.ok()) {
-                    base_va = alias.host_ptr;
-                    mapped_ptrs.push_back(alias.host_ptr);
-                    mapped_whole = true;
-                }
-            }
-            if (!mapped_whole) {
-                base_va = virtualAddress;
-                for (uint64_t i = 0; i < numberOfPages; ++i) {
-                    void* slot = static_cast<uint8_t*>(virtualAddress) + static_cast<size_t>(i) * page_bytes;
-                    UnifiedMemoryAlias alias{};
-                    Status st = map_slot_with_retry(
-                        frames[i].physical_id,
-                        static_cast<size_t>(frames[i].page_index) * page_bytes,
-                        page_bytes,
-                        slot,
-                        alias);
-                    if (!st.ok()) {
-                        for (void* p : mapped_ptrs) {
-                            (void)memory_.UnmapPhysicalAlias(p);
-                        }
-                        SetHostLastError(487u);
-                        return nullptr;
+                    frames[i].physical_id,
+                    static_cast<size_t>(frames[i].page_index) * page_bytes,
+                    page_bytes,
+                    slot,
+                    alias);
+                if (!st.ok()) {
+                    for (uintptr_t prev_va : newly_mapped_slots) {
+                        unmap_single_slot_locked(prev_va);
                     }
-                    mapped_ptrs.push_back(alias.host_ptr);
+                    SetHostLastError(487u);
+                    return nullptr;
                 }
+
+                ActiveTitleMapping page_map{};
+                page_map.base_va = slot_va;
+                page_map.size_bytes = page_bytes;
+                page_map.page_size_bytes = page_bytes;
+                page_map.primary_physical_id = frames[i].physical_id;
+                page_map.alloc_flags = flAllocationType | frames[i].alloc_flags;
+                page_map.win32_protect = flProtect;
+                page_map.owns_placeholder = false;
+                page_map.pfns.push_back(pPageArray[i]);
+                page_map.alias_ptrs.push_back(alias.host_ptr);
+                ++pfn_table_[pPageArray[i]].map_refcount;
+                mappings_[slot_va] = std::move(page_map);
+                newly_mapped_slots.push_back(slot_va);
             }
+            return base_va;
         } else if (UnifiedMemoryManager::SupportsOsPlaceholders()) {
             // Reserve a properly aligned OS virtual placeholder (64 KiB or 4 MiB granule)
             // and map physical pages via MapViewOfFile3(MEM_REPLACE_PLACEHOLDER).
@@ -1706,35 +1764,74 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         const uintptr_t key = reinterpret_cast<uintptr_t>(virtualAddress);
         auto it = mappings_.find(key);
-        if (it == mappings_.end()) {
-            SetHostLastError(87u);
-            return 0;
-        }
-        if (numberOfPages != 0 && numberOfPages != it->second.pfns.size()) {
-            SetHostLastError(87u);
-            return 0;
+        if (it != mappings_.end() &&
+            (numberOfPages == 0u || numberOfPages == it->second.pfns.size())) {
+            for (void* alias_ptr : it->second.alias_ptrs) {
+                Status st = memory_.UnmapPhysicalAlias(alias_ptr);
+                if (!st.ok()) {
+                    SetHostLastError(87u);
+                    return 0;
+                }
+            }
+            if (it->second.owns_placeholder) {
+                (void)memory_.ReleaseVirtualPlaceholder(virtualAddress);
+            }
+            for (uint64_t pfn : it->second.pfns) {
+                auto pit = pfn_table_.find(pfn);
+                if (pit != pfn_table_.end() && pit->second.map_refcount > 0) {
+                    --pit->second.map_refcount;
+                }
+            }
+            mappings_.erase(it);
+            return 1;
         }
 
-        for (void* alias_ptr : it->second.alias_ptrs) {
-            Status st = memory_.UnmapPhysicalAlias(alias_ptr);
-            if (!st.ok()) {
-                SetHostLastError(87u);
-                return 0;
+        if (numberOfPages > 0u) {
+            size_t page_bytes = 0u;
+            if (it != mappings_.end() && it->second.page_size_bytes > 0u) {
+                page_bytes = it->second.page_size_bytes;
+            } else {
+                void* ph_base = nullptr;
+                size_t ph_sz = 0u, ph_gr = 0u;
+                bool ph_mapped = false;
+                if (memory_.LookupPlaceholderByHostPtr(virtualAddress, ph_base, ph_sz, ph_gr, ph_mapped) &&
+                    ph_gr >= kPage64KB) {
+                    page_bytes = ph_gr;
+                } else {
+                    page_bytes = kPage64KB;
+                }
+            }
+            bool unmapped_any = false;
+            for (uint64_t p = 0u; p < numberOfPages; ++p) {
+                const uintptr_t slot_va = key + static_cast<size_t>(p) * page_bytes;
+                auto sit = mappings_.find(slot_va);
+                if (sit == mappings_.end() || sit->second.owns_placeholder) continue;
+                for (void* alias_ptr : sit->second.alias_ptrs) {
+                    (void)memory_.UnmapPhysicalAlias(alias_ptr);
+                }
+                for (uint64_t pfn : sit->second.pfns) {
+                    auto pit = pfn_table_.find(pfn);
+                    if (pit != pfn_table_.end() && pit->second.map_refcount > 0) {
+                        --pit->second.map_refcount;
+                    }
+                }
+                mappings_.erase(sit);
+                unmapped_any = true;
+            }
+            if (unmapped_any) {
+                return 1;
+            }
+            void* ph_base = nullptr;
+            size_t ph_sz = 0u, ph_gr = 0u;
+            bool ph_mapped = false;
+            if (memory_.LookupPlaceholderByHostPtr(virtualAddress, ph_base, ph_sz, ph_gr, ph_mapped) &&
+                ph_base != nullptr) {
+                return 1;
             }
         }
-        if (it->second.owns_placeholder) {
-            (void)memory_.ReleaseVirtualPlaceholder(virtualAddress);
-        }
 
-        for (uint64_t pfn : it->second.pfns) {
-            auto pit = pfn_table_.find(pfn);
-            if (pit != pfn_table_.end() && pit->second.map_refcount > 0) {
-                --pit->second.map_refcount;
-            }
-        }
-
-        mappings_.erase(it);
-        return 1;
+        SetHostLastError(87u);
+        return 0;
     }
 
     int32_t QueryPhysicalPages(const void* virtualAddress,
@@ -1810,40 +1907,50 @@ public:
 
         // MEM_RESERVE | (MEM_GRAPHICS or MEM_PHYSICAL or MEM_RESERVE_PLACEHOLDER) creates a real OS
         // virtual placeholder so VirtualFree(MEM_PRESERVE_PLACEHOLDER) splits, MEM_REPLACE_PLACEHOLDER,
-        // and MapTitlePhysicalPages / XMemMapPhysicalPages(va, ...) work natively.
-        if (reserve_only && (is_graphics || is_physical || is_reserve_placeholder) && baseAddress == nullptr &&
+        // and MapTitlePhysicalPages / XMemMapPhysicalPages(va, ...) work natively (including fixed-base
+        // reservations such as 0xE0000000).
+        if (reserve_only && (is_graphics || is_physical || is_reserve_placeholder) &&
             UnifiedMemoryManager::SupportsOsPlaceholders()) {
             const MemoryPageSize granule = is_large ? MemoryPageSize::Page4MB : MemoryPageSize::Page64KB;
             const size_t gran_bytes = is_large ? kPage4MB : kPage64KB;
-            if (size > (SIZE_MAX - (gran_bytes - 1u))) {
-                SetHostLastError(8u);
-                return nullptr;
+            const bool base_aligned =
+                (baseAddress == nullptr) ||
+                ((reinterpret_cast<uintptr_t>(baseAddress) & (gran_bytes - 1u)) == 0u);
+            if (base_aligned) {
+                if (size > (SIZE_MAX - (gran_bytes - 1u))) {
+                    SetHostLastError(8u);
+                    return nullptr;
+                }
+                const size_t aligned = AlignUp(size, gran_bytes);
+                // MEM_RESERVE-only VA placeholders consume virtual address space, not physical RAM.
+                // Retail Scarlett titles routinely reserve 24-64 GiB VA windows for sparse physical mapping;
+                // only cap obviously absurd/corrupt reservations (> 1 TiB) rather than the 13.5 GiB physical budget.
+                constexpr size_t kMaxVirtualReserveBytes = static_cast<size_t>(1024ull) * 1024ull * 1024ull * 1024ull;
+                if (aligned > kMaxVirtualReserveBytes) {
+                    SetHostLastError(8u);
+                    return nullptr;
+                }
+                void* base = nullptr;
+                Status st = (baseAddress != nullptr)
+                                ? memory_.ReserveVirtualPlaceholderAt(baseAddress, aligned, base, granule)
+                                : memory_.ReserveVirtualPlaceholder(aligned, base, granule);
+                if (st.ok() && base != nullptr) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    AppVirtualAllocRecord rec{};
+                    rec.base = reinterpret_cast<uintptr_t>(base);
+                    rec.size = aligned;
+                    rec.committed_bytes = 0;
+                    rec.alloc_flags = allocationType;
+                    rec.protection = protection;
+                    rec.is_placeholder = true;
+                    app_allocs_.emplace(rec.base, rec);
+                    return base;
+                }
+                if (baseAddress == nullptr) {
+                    SetHostLastError(8u);
+                    return nullptr;
+                }
             }
-            const size_t aligned = AlignUp(size, gran_bytes);
-            // MEM_RESERVE-only VA placeholders consume virtual address space, not physical RAM.
-            // Retail Scarlett titles routinely reserve 24-64 GiB VA windows for sparse physical mapping;
-            // only cap obviously absurd/corrupt reservations (> 1 TiB) rather than the 13.5 GiB physical budget.
-            constexpr size_t kMaxVirtualReserveBytes = static_cast<size_t>(1024ull) * 1024ull * 1024ull * 1024ull;
-            if (aligned > kMaxVirtualReserveBytes) {
-                SetHostLastError(8u);
-                return nullptr;
-            }
-            void* base = nullptr;
-            Status st = memory_.ReserveVirtualPlaceholder(aligned, base, granule);
-            if (!st.ok()) {
-                SetHostLastError(8u);
-                return nullptr;
-            }
-            std::lock_guard<std::mutex> lock(mutex_);
-            AppVirtualAllocRecord rec{};
-            rec.base = reinterpret_cast<uintptr_t>(base);
-            rec.size = aligned;
-            rec.committed_bytes = 0;
-            rec.alloc_flags = allocationType;
-            rec.protection = protection;
-            rec.is_placeholder = true;
-            app_allocs_.emplace(rec.base, rec);
-            return base;
         }
 
         const size_t align = is_large ? kPage4MB : ((is_graphics || is_physical) ? kPage64KB : kPage4KB);
@@ -1867,11 +1974,11 @@ public:
             return nullptr;
         }
 
-        // Physical-reserve (MEM_REPLACE_PLACEHOLDER | MEM_PHYSICAL without MEM_COMMIT) inside a
+        // Sub-placeholder reserve (MEM_REPLACE_PLACEHOLDER without MEM_COMMIT) inside a
         // known placeholder MUST remain an OS placeholder so XMemMapPhysicalPages /
         // XMemMapPhysicalPagesScatter can bind physical pages into it via MapViewOfFile3.
         if (baseAddress != nullptr && is_replace_placeholder &&
-            (allocationType & MEM_COMMIT) == 0u && is_physical) {
+            (allocationType & MEM_COMMIT) == 0u) {
             if (size > (SIZE_MAX - (kPage64KB - 1u))) {
                 SetHostLastError(8u);
                 return nullptr;
@@ -1890,6 +1997,15 @@ public:
                         in_known_placeholder = true;
                         break;
                     }
+                }
+            }
+            if (!in_known_placeholder) {
+                void* ph_base = nullptr;
+                size_t ph_sz = 0u, ph_gr = 0u;
+                bool ph_mapped = false;
+                if (memory_.LookupPlaceholderByHostPtr(baseAddress, ph_base, ph_sz, ph_gr, ph_mapped) &&
+                    ph_base != nullptr) {
+                    in_known_placeholder = true;
                 }
             }
 #if defined(_WIN32)
@@ -1920,6 +2036,9 @@ public:
                 SetHostLastError(487u);
                 return nullptr;
             }
+
+            (void)memory_.PromoteReservedRangeToPlaceholder(baseAddress, rep_size);
+            (void)memory_.SplitVirtualPlaceholder(baseAddress, rep_size);
 
             {
                 std::lock_guard<std::mutex> lock(mutex_);

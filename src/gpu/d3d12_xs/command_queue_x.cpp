@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <d3dcompiler.h>
 #include <dxgi1_4.h>
 #include <psapi.h>
 #include <shared_mutex>
@@ -376,6 +377,26 @@ HRESULT ToggleBorderlessFullscreenForWindow(HWND hwnd, WindowCallbackState& stat
     return S_OK;
 }
 
+bool IsBackgroundKeepActiveEnabled() noexcept {
+    static const bool s_keep_active = []() {
+        const char* vars[] = {
+            "OPENSCARLETT_GAMEINPUT_BACKGROUND",
+            "OPENSCARLETT_AUTONAV",
+            "OPENSCARLETT_LIVE_INPUT_FILE",
+            "OPENSCARLETT_RECORD_WAV",
+        };
+        for (const char* v : vars) {
+            char buf[32]{};
+            const DWORD n = GetEnvironmentVariableA(v, buf, static_cast<DWORD>(sizeof(buf)));
+            if (n > 0u && buf[0] != '0') {
+                return true;
+            }
+        }
+        return false;
+    }();
+    return s_keep_active;
+}
+
 LRESULT CALLBACK SubclassWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     std::shared_ptr<WindowCallbackState> state;
     WNDPROC orig_proc = nullptr;
@@ -391,6 +412,16 @@ LRESULT CALLBACK SubclassWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
     if (state) {
         switch (msg) {
+            case WM_ERASEBKGND: {
+                HDC hdc = reinterpret_cast<HDC>(wParam);
+                if (hdc) {
+                    RECT rc{};
+                    if (GetClientRect(hwnd, &rc) != FALSE) {
+                        FillRect(hdc, &rc, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+                    }
+                }
+                return 1;
+            }
             case WM_SIZE: {
                 const uint32_t new_w = static_cast<uint32_t>(LOWORD(lParam));
                 const uint32_t new_h = static_cast<uint32_t>(HIWORD(lParam));
@@ -403,6 +434,11 @@ LRESULT CALLBACK SubclassWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             }
             case WM_ACTIVATE: {
                 const bool active = (LOWORD(wParam) != WA_INACTIVE);
+                if (!active && IsBackgroundKeepActiveEnabled()) {
+                    state->is_active.store(true, std::memory_order_release);
+                    BroadcastWindowEventToGameInput(hwnd, kGiWinEventFocus, 1, 0);
+                    return 0;
+                }
                 state->is_active.store(active, std::memory_order_release);
                 if (active) {
                     TryRegisterRawMouseForWindow(hwnd, *state);
@@ -414,6 +450,11 @@ LRESULT CALLBACK SubclassWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             }
             case WM_ACTIVATEAPP: {
                 const bool active = (wParam != FALSE);
+                if (!active && IsBackgroundKeepActiveEnabled()) {
+                    state->is_active.store(true, std::memory_order_release);
+                    BroadcastWindowEventToGameInput(hwnd, kGiWinEventFocus, 1, 0);
+                    return 0;
+                }
                 state->is_active.store(active, std::memory_order_release);
                 if (active) {
                     TryRegisterRawMouseForWindow(hwnd, *state);
@@ -430,6 +471,11 @@ LRESULT CALLBACK SubclassWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 break;
             }
             case WM_KILLFOCUS: {
+                if (IsBackgroundKeepActiveEnabled()) {
+                    state->is_active.store(true, std::memory_order_release);
+                    BroadcastWindowEventToGameInput(hwnd, kGiWinEventFocus, 1, 0);
+                    return 0;
+                }
                 state->is_active.store(false, std::memory_order_release);
                 if (state->cursor_clipped.exchange(false, std::memory_order_acq_rel)) {
                     ClipCursor(nullptr);
@@ -1717,6 +1763,29 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     } exec_prof_guard{exec_t0_qpc};
     // Auto-sync all dirty/modified unified-memory textures, unified heap buffers, & TitleVAMirror
     // pages BEFORE submitting host command lists so GPU shaders never sample stale CPU memory.
+    auto dump_host_info_queue = [](ID3D12Device* host_dev, const char* tag) {
+        if (!host_dev) return;
+        ID3D12InfoQueue* iq = nullptr;
+        if (FAILED(host_dev->QueryInterface(IID_PPV_ARGS(&iq))) || !iq) return;
+        const UINT64 nmsg = iq->GetNumStoredMessagesAllowedByRetrievalFilter();
+        for (UINT64 mi = 0u; mi < nmsg && mi < 64u; ++mi) {
+            SIZE_T len = 0u;
+            iq->GetMessage(mi, nullptr, &len);
+            if (len > 0u) {
+                std::vector<uint8_t> mb(len);
+                auto* msg = reinterpret_cast<D3D12_MESSAGE*>(mb.data());
+                if (SUCCEEDED(iq->GetMessage(mi, msg, &len)) && msg->pDescription &&
+                    msg->Severity <= D3D12_MESSAGE_SEVERITY_WARNING) {
+                    std::fprintf(stderr, "[OpenScarlett][%s][D3D12-IQ sev=%d id=%d] %s\n",
+                                 tag, static_cast<int>(msg->Severity),
+                                 static_cast<int>(msg->ID), msg->pDescription);
+                }
+            }
+        }
+        iq->ClearStoredMessages();
+        iq->Release();
+        std::fflush(stderr);
+    };
     if (device_x_ && host_queue_) {
         const HRESULT pre_rem = (device_x_->IsRetailScarlettAbi() && device_x_->HostDevice())
                                     ? device_x_->HostDevice()->GetDeviceRemovedReason()
@@ -1726,6 +1795,7 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
             if (!s_pre_rem.exchange(true)) {
                 std::fprintf(stderr, "[OpenScarlett][EXEC-PRE-REMOVED] rem=0x%08lX n=%u qtype=%d\n",
                              static_cast<unsigned long>(pre_rem), NumCommandLists, static_cast<int>(queue_type_));
+                dump_host_info_queue(device_x_->HostDevice(), "EXEC-PRE-REMOVED");
                 std::fflush(stderr);
             }
         }
@@ -1739,6 +1809,7 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
                 if (!s_mid_rem.exchange(true)) {
                     std::fprintf(stderr, "[OpenScarlett][EXEC-POST-SYNC-REMOVED] rem=0x%08lX n=%u qtype=%d\n",
                                  static_cast<unsigned long>(mid_rem), NumCommandLists, static_cast<int>(queue_type_));
+                    dump_host_info_queue(device_x_->HostDevice(), "EXEC-POST-SYNC-REMOVED");
                     std::fflush(stderr);
                 }
             }
@@ -1800,6 +1871,18 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
 
     if (valid_list_count > 0u) {
         host_queue_->ExecuteCommandLists(valid_list_count, raw_lists);
+        if (device_x_ && device_x_->IsRetailScarlettAbi() && device_x_->HostDevice()) {
+            const HRESULT post_rem = device_x_->HostDevice()->GetDeviceRemovedReason();
+            if (FAILED(post_rem)) {
+                static std::atomic<bool> s_post_rem{false};
+                if (!s_post_rem.exchange(true)) {
+                    std::fprintf(stderr, "[OpenScarlett][EXEC-POST-SUBMIT-REMOVED] rem=0x%08lX valid=%u qtype=%d\n",
+                                 static_cast<unsigned long>(post_rem), valid_list_count, static_cast<int>(queue_type_));
+                    dump_host_info_queue(device_x_->HostDevice(), "EXEC-POST-SUBMIT-REMOVED");
+                    std::fflush(stderr);
+                }
+            }
+        }
     }
     if (!batch_transients.empty() || !pending_retirements_.empty()) {
         std::lock_guard<std::mutex> rlk(retire_mutex_);
@@ -2789,6 +2872,10 @@ D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE CommandQueueX::GetDesc() {
 
 // Window subclass management
 void CommandQueueX::AttachWindowSubclassLocked(HWND hwnd) {
+    if (hwnd && IsWindow(hwnd) != FALSE) {
+        SetClassLongPtrW(
+            hwnd, GCLP_HBRBACKGROUND, reinterpret_cast<LONG_PTR>(GetStockObject(BLACK_BRUSH)));
+    }
     if (subclassed_hwnd_ == hwnd) {
         return;
     }
@@ -2833,6 +2920,13 @@ void CommandQueueX::AttachWindowSubclassLocked(HWND hwnd) {
     if (IsWindowVisible(hwnd) != FALSE &&
         BroadcastWindowEventToGameInput(hwnd, kGiWinEventTargetHwnd, 0, 0)) {
         window_state_->gi_target_hwnd_sent.store(true, std::memory_order_release);
+    }
+    if (IsBackgroundKeepActiveEnabled()) {
+        window_state_->is_active.store(true, std::memory_order_release);
+        BroadcastWindowEventToGameInput(hwnd, kGiWinEventFocus, 1, 0);
+        PostMessageW(hwnd, WM_ACTIVATEAPP, TRUE, 0);
+        PostMessageW(hwnd, WM_ACTIVATE, WA_ACTIVE, 0);
+        PostMessageW(hwnd, WM_SETFOCUS, 0, 0);
     }
 }
 
@@ -3533,27 +3627,67 @@ float4 PSMain(VSOut i) : SV_Target0 {
             float2 uv1 = SrcUvRect.xy + rel * SrcUvRect.zw;
             float4 over = Plane1Tex.SampleLevel(LinearClamp, uv1, 0.0);
             float a = saturate(over.a);
-            float max_c = max(over.r, max(over.g, over.b));
-            float3 over_premul = (a > 0.0 && max_c > a + (1.0 / 255.0)) ? (over.rgb * a) : over.rgb;
+            float3 over_premul = float3(0.0, 0.0, 0.0);
+            if (a > (0.5 / 255.0)) {
+                if (Flags.y == 1u) {
+                    over_premul = over.rgb * a;
+                } else if (Flags.y == 2u) {
+                    over_premul = over.rgb;
+                } else {
+                    float max_c = max(over.r, max(over.g, over.b));
+                    over_premul = (max_c > a + (1.0 / 255.0)) ? (over.rgb * a) : over.rgb;
+                }
+            }
             base.rgb = over_premul + base.rgb * (1.0 - a);
-            base.a = saturate(a + base.a * (1.0 - a));
-        } else {
-            base.a = 1.0;
         }
-    } else {
-        base.a = 1.0;
     }
+    if (Flags.z != 0u) {
+        float3 c = saturate(base.rgb);
+        float3 lin = (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);
+        base.rgb = pow(max(lin, 0.0), 1.0 / 2.2);
+    }
+    base.a = 1.0;
     return base;
 }
 )";
                 std::string diag;
-                const auto vst = openscarlett::CompileHlslWithDxc(
+                auto vst = openscarlett::CompileHlslInProcessDxc(
                     kCompHlsl, "vs_6_0", "VSMain", s_vs_dxil, diag);
-                const auto pst = vst.ok()
-                                     ? openscarlett::CompileHlslWithDxc(
-                                           kCompHlsl, "ps_6_0", "PSMain", s_ps_dxil, diag)
-                                     : vst;
-                if (vst.ok() && pst.ok() && !s_vs_dxil.empty() && !s_ps_dxil.empty()) {
+                if (!vst.ok() || s_vs_dxil.empty()) {
+                    vst = openscarlett::CompileHlslWithDxc(
+                        kCompHlsl, "vs_6_0", "VSMain", s_vs_dxil, diag);
+                }
+                auto pst = vst.ok()
+                               ? openscarlett::CompileHlslInProcessDxc(
+                                     kCompHlsl, "ps_6_0", "PSMain", s_ps_dxil, diag)
+                               : vst;
+                if (vst.ok() && (!pst.ok() || s_ps_dxil.empty())) {
+                    pst = openscarlett::CompileHlslWithDxc(
+                        kCompHlsl, "ps_6_0", "PSMain", s_ps_dxil, diag);
+                }
+                if ((!vst.ok() || !pst.ok() || s_vs_dxil.empty() || s_ps_dxil.empty())) {
+                    ID3DBlob* vs_b = nullptr;
+                    ID3DBlob* ps_b = nullptr;
+                    const HRESULT vhr = D3DCompile(
+                        kCompHlsl, std::strlen(kCompHlsl), "PresentXCompVS",
+                        nullptr, nullptr, "VSMain", "vs_5_0",
+                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0u, &vs_b, nullptr);
+                    const HRESULT phr_fx = SUCCEEDED(vhr)
+                        ? D3DCompile(
+                              kCompHlsl, std::strlen(kCompHlsl), "PresentXCompPS",
+                              nullptr, nullptr, "PSMain", "ps_5_0",
+                              D3DCOMPILE_OPTIMIZATION_LEVEL3, 0u, &ps_b, nullptr)
+                        : E_FAIL;
+                    if (SUCCEEDED(vhr) && SUCCEEDED(phr_fx) && vs_b && ps_b) {
+                        const auto* vp = static_cast<const uint8_t*>(vs_b->GetBufferPointer());
+                        const auto* pp = static_cast<const uint8_t*>(ps_b->GetBufferPointer());
+                        s_vs_dxil.assign(vp, vp + vs_b->GetBufferSize());
+                        s_ps_dxil.assign(pp, pp + ps_b->GetBufferSize());
+                    }
+                    if (vs_b) vs_b->Release();
+                    if (ps_b) ps_b->Release();
+                }
+                if (!s_vs_dxil.empty() && !s_ps_dxil.empty()) {
                     s_compiled = true;
                 } else {
                     s_failed = true;
@@ -3894,15 +4028,19 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     last_presented_color_space_ = effective_cs;
 
     const std::string capture_png_path = ReadEnvStringA("OPENSCARLETT_PRESENTX_CAPTURE_PNG");
-    const std::string capture_dir_path = ReadEnvStringA("OPENSCARLETT_CAPTURE_DIR");
-    const uint64_t capture_interval_ms = []() -> uint64_t {
-        const uint64_t v = ReadEnvUint64A("OPENSCARLETT_CAPTURE_INTERVAL_MS");
-        return (v > 0ull) ? v : 1000ull;
-    }();
+    const std::string diag_capture_dir_path = ReadEnvStringA("OPENSCARLETT_DIAG_CAPTURE_DIR");
+    const std::string legacy_capture_dir_path = ReadEnvStringA("OPENSCARLETT_CAPTURE_DIR");
+    const std::string& capture_dir_path =
+        !diag_capture_dir_path.empty() ? diag_capture_dir_path : legacy_capture_dir_path;
+    const uint64_t explicit_capture_interval_ms = ReadEnvUint64A("OPENSCARLETT_CAPTURE_INTERVAL_MS");
+    const uint64_t capture_interval_ms =
+        (explicit_capture_interval_ms > 0ull) ? explicit_capture_interval_ms : 1000ull;
     static uint64_t s_cap_t0_ms = 0ull;
     static uint64_t s_cap_last_ms = 0ull;
+    static uint64_t s_cap_last_numbered_ms = 0ull;
     static uint64_t s_cap_last_frame = 0ull;
     static uint32_t s_cap_seq = 0u;
+    static uint32_t s_cap_numbered_seq = 0u;
     const uint64_t now_cap_ms = GetTickCount64();
     if (s_cap_t0_ms == 0ull) s_cap_t0_ms = now_cap_ms;
     const bool want_periodic_capture =
@@ -3953,8 +4091,15 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
 
     const DXGI_FORMAT comp_rt_fmt = NormalizeSwapChainFormat(src_desc.Format);
     const bool need_gpu_scale = (out_width != width || out_height != height);
+    const bool need_sdr_srgb_to_g22 =
+        (device_x_ && device_x_->IsRetailScarlettAbi()) &&
+        static_cast<DXGI_COLOR_SPACE_TYPE>(effective_cs) != DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 &&
+        static_cast<DXGI_COLOR_SPACE_TYPE>(effective_cs) != DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 &&
+        (comp_rt_fmt == DXGI_FORMAT_R8G8B8A8_UNORM ||
+         comp_rt_fmt == DXGI_FORMAT_B8G8R8A8_UNORM ||
+         comp_rt_fmt == DXGI_FORMAT_R10G10B10A2_UNORM);
     const bool use_gpu_plane_composite =
-        ((overlay_tex != nullptr) || need_gpu_scale) && !vk_routing_active &&
+        ((overlay_tex != nullptr) || need_gpu_scale || need_sdr_srgb_to_g22) && !vk_routing_active &&
         SUCCEEDED(EnsureCompositeObjectsLocked(out_width, out_height, comp_rt_fmt));
     if (!use_gpu_plane_composite) {
         out_width = width;
@@ -4180,7 +4325,22 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
                 }
             }
             const uint32_t has_overlay_flag = (overlay_tex != nullptr) ? 1u : 0u;
+            const uint32_t plane1_alpha_mode = [this]() -> uint32_t {
+                std::string mode = ReadEnvStringA("OPENSCARLETT_PLANE1_ALPHA");
+                for (char& ch : mode) {
+                    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                }
+                if (mode == "auto" || mode == "0") return 0u;
+                if (mode == "straight" || mode == "1") return 1u;
+                if (mode == "premul" || mode == "premultiplied" || mode == "2") return 2u;
+                // Xbox hardware DCN MPO composites Plane 1 using premultiplied alpha
+                // Out.rgb = Plane1.rgb + Plane0.rgb * (1 - Plane1.a) (with a <= 0.5/255 -> 0).
+                return (device_x_ && device_x_->IsRetailScarlettAbi()) ? 2u : 0u;
+            }();
+            const uint32_t sdr_srgb_g22_flag = need_sdr_srgb_to_g22 ? 1u : 0u;
             std::memcpy(&comp_consts[8], &has_overlay_flag, sizeof(uint32_t));
+            std::memcpy(&comp_consts[9], &plane1_alpha_mode, sizeof(uint32_t));
+            std::memcpy(&comp_consts[10], &sdr_srgb_g22_flag, sizeof(uint32_t));
 
             const D3D12_CPU_DESCRIPTOR_HANDLE rtv_h = composite_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
             D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(out_width), static_cast<float>(out_height), 0.0f, 1.0f};
@@ -4802,10 +4962,34 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
                 for (size_t a_off = 3u; a_off < out_fb.pixels.size(); a_off += 4u) {
                     out_fb.pixels[a_off] = 255u;
                 }
-                char png_name[MAX_PATH]{};
-                std::snprintf(png_name, sizeof(png_name), "%s\\sec_%04u_%llums.png",
-                              capture_dir_path.c_str(), seq, static_cast<unsigned long long>(elapsed_ms));
-                (void)out_fb.WritePng(png_name);
+                (void)::CreateDirectoryA(capture_dir_path.c_str(), nullptr);
+                static const uint32_t kMaxNumberedCaptureFrames = []() {
+                    char mbuf[32]{};
+                    if (::GetEnvironmentVariableA("OPENSCARLETT_CAPTURE_MAX_FRAMES", mbuf, sizeof(mbuf)) > 0) {
+                        const unsigned long v = std::strtoul(mbuf, nullptr, 10);
+                        if (v > 0ul && v <= 100000ul) return static_cast<uint32_t>(v);
+                    }
+                    return 2400u;
+                }();
+                if (explicit_capture_interval_ms > 0ull) {
+                    if (s_cap_numbered_seq < kMaxNumberedCaptureFrames &&
+                        (s_cap_last_numbered_ms == 0ull ||
+                         (now_cap_ms - s_cap_last_numbered_ms) >= explicit_capture_interval_ms)) {
+                        s_cap_last_numbered_ms = now_cap_ms;
+                        const uint32_t fseq = ++s_cap_numbered_seq;
+                        char png_name[MAX_PATH]{};
+                        std::snprintf(png_name, sizeof(png_name), "%s\\frame_%04u_%llums.png",
+                                      capture_dir_path.c_str(), fseq,
+                                      static_cast<unsigned long long>(elapsed_ms));
+                        (void)out_fb.WritePng(png_name);
+                    }
+                } else if (diag_capture_dir_path.empty() && seq <= kMaxNumberedCaptureFrames) {
+                    char png_name[MAX_PATH]{};
+                    std::snprintf(png_name, sizeof(png_name), "%s\\sec_%04u_%llums.png",
+                                  capture_dir_path.c_str(), seq,
+                                  static_cast<unsigned long long>(elapsed_ms));
+                    (void)out_fb.WritePng(png_name);
+                }
                 const std::string latest_path = capture_dir_path + "\\latest.png";
                 (void)out_fb.WritePng(latest_path);
             } catch (const std::bad_alloc&) {

@@ -3493,6 +3493,32 @@ HRESULT CreateWrappedDeviceInternal(
             iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, FALSE);
             iq->Release();
         }
+#ifdef __ID3D12InfoQueue1_INTERFACE_DEFINED__
+        ID3D12InfoQueue1* iq1 = nullptr;
+        if (SUCCEEDED(host_dev->QueryInterface(IID_PPV_ARGS(&iq1))) && iq1) {
+            DWORD cb_cookie = 0u;
+            (void)iq1->RegisterMessageCallback(
+                [](D3D12_MESSAGE_CATEGORY /*cat*/,
+                   D3D12_MESSAGE_SEVERITY sev,
+                   D3D12_MESSAGE_ID id,
+                   LPCSTR desc,
+                   void* /*ctx*/) {
+                    if (sev <= D3D12_MESSAGE_SEVERITY_WARNING && desc != nullptr) {
+                        static std::atomic<uint32_t> s_cb_cnt{0u};
+                        const uint32_t n = s_cb_cnt.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                        if (n <= 64u) {
+                            std::fprintf(stderr, "[OpenScarlett][D3D12-CB #%u sev=%d id=%d] %s\n",
+                                         n, static_cast<int>(sev), static_cast<int>(id), desc);
+                            std::fflush(stderr);
+                        }
+                    }
+                },
+                D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+                nullptr,
+                &cb_cookie);
+            iq1->Release();
+        }
+#endif
     }
     if (retail_scarlett_vtable) {
         static std::once_flag s_crash_veh_once;
@@ -3503,6 +3529,45 @@ HRESULT CreateWrappedDeviceInternal(
                 }
                 const DWORD code = ep->ExceptionRecord->ExceptionCode;
                 const auto* rip = reinterpret_cast<const uint8_t*>(ep->ContextRecord->Rip);
+                if (code == 0x0000087Du) {
+                    static std::atomic<uint32_t> s_87d_cnt{0u};
+                    const uint32_t hit = s_87d_cnt.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                    if (hit <= 8u) {
+                        std::fprintf(stderr, "[OpenScarlett][D3D12-0x87D] #%u tid=%lu flags=0x%lX rsp=0x%llX\n",
+                                     hit, ::GetCurrentThreadId(),
+                                     static_cast<unsigned long>(ep->ExceptionRecord->ExceptionFlags),
+                                     static_cast<unsigned long long>(ep->ContextRecord->Rsp));
+                        const uintptr_t rsp = static_cast<uintptr_t>(ep->ContextRecord->Rsp);
+                        uint32_t bt_printed = 0u;
+                        for (size_t si = 0u; si < 64u && bt_printed < 16u; ++si) {
+                            const uintptr_t slot_addr = rsp + si * sizeof(uint64_t);
+                            if (!IsReadableRetailRange(slot_addr, sizeof(uint64_t))) break;
+                            uint64_t q = 0ull;
+                            std::memcpy(&q, reinterpret_cast<const void*>(slot_addr), sizeof(q));
+                            if (q < 0x10000000ull) continue;
+                            HMODULE smod = nullptr;
+                            if (::GetModuleHandleExA(
+                                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                    reinterpret_cast<LPCSTR>(static_cast<uintptr_t>(q)), &smod) && smod) {
+                                MEMORY_BASIC_INFORMATION smbi{};
+                                if (::VirtualQuery(reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(q)), &smbi, sizeof(smbi)) != 0 &&
+                                    (smbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0u) {
+                                    char spath[MAX_PATH]{};
+                                    ::GetModuleFileNameA(smod, spath, sizeof(spath));
+                                    const char* base = std::strrchr(spath, '\\');
+                                    const uintptr_t srva = static_cast<uintptr_t>(q) - reinterpret_cast<uintptr_t>(smod);
+                                    std::fprintf(stderr, "  [0x87D-BT sp+0x%03zX] %s+0x%llX\n",
+                                                 si * sizeof(uint64_t),
+                                                 base ? (base + 1) : spath,
+                                                 static_cast<unsigned long long>(srva));
+                                    ++bt_printed;
+                                }
+                            }
+                        }
+                        std::fflush(stderr);
+                    }
+                    return EXCEPTION_CONTINUE_SEARCH;
+                }
                 // Retail console hang-watchdog pattern: mov dword ptr [0], 0; int 3
                 // (C7 04 25 00 00 00 00 00 00 00 00 CC). Console titles set a strict ~30s QPC
                 // budget calibrated for Xbox NVMe + precompiled shaders; on PC cold storage /
@@ -3529,6 +3594,37 @@ HRESULT CreateWrappedDeviceInternal(
                         }
                         ep->ContextRecord->Rip += 12ull;
                         return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                }
+                // Guard post-FTUE Scaleform slab teardown non-canonical pointer dereference
+                // (`and dword ptr [rbx+rax*4+8], edx` = `21 54 83 08` at RVA +0x550A5F6) ->
+                // unwind cleanly via the function epilogue (+0x550A733 / +0x550A742).
+                if (code == EXCEPTION_ACCESS_VIOLATION &&
+                    IsReadableRetailRange(reinterpret_cast<uintptr_t>(rip), 8u) &&
+                    rip[0] == 0x21u && rip[1] == 0x54u && rip[2] == 0x83u && rip[3] == 0x08u) {
+                    HMODULE hit_mod = nullptr;
+                    const HMODULE main_exe = ::GetModuleHandleW(nullptr);
+                    if (main_exe &&
+                        ::GetModuleHandleExA(
+                            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(rip), &hit_mod) &&
+                        hit_mod == main_exe) {
+                        const uintptr_t base = reinterpret_cast<uintptr_t>(main_exe);
+                        const uintptr_t rva = reinterpret_cast<uintptr_t>(rip) - base;
+                        if (rva == 0x550A5F6u &&
+                            IsReadableRetailRange(base + 0x550A733u, 24u)) {
+                            const uintptr_t rsp = static_cast<uintptr_t>(ep->ContextRecord->Rsp);
+                            if (IsReadableRetailRange(rsp + 0x50u, 16u)) {
+                                std::memcpy(&ep->ContextRecord->Xmm6,
+                                            reinterpret_cast<const void*>(rsp + 0x50u), 16u);
+                            }
+                            if (IsReadableRetailRange(static_cast<uintptr_t>(ep->ContextRecord->Rdi) + 0x20u, 8u)) {
+                                ep->ContextRecord->Rip = base + 0x550A733u;
+                            } else {
+                                ep->ContextRecord->Rip = base + 0x550A742u;
+                            }
+                            return EXCEPTION_CONTINUE_EXECUTION;
+                        }
                     }
                 }
                 return EXCEPTION_CONTINUE_SEARCH;

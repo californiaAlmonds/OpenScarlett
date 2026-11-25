@@ -2177,16 +2177,61 @@ std::vector<uint8_t> BuildFullXboxDxbcContainer(const XboxFullDxbcBuildDesc& des
 void ApplyXboxContainerToLiftOptions(const XboxParsedShaderContainer& container, Rdna2LiftOptions& opts) {
     if (container.xs2.stage == ShaderStage::Pixel) {
         opts.stage_contract.pixel_inputs.clear();
-        uint32_t param_loc = 0u;
-        for (const auto& inp : container.input_signature) {
-            if (IsSystemValueSemantic(inp.semantic_name)) continue;
-            FssmPixelInputEntry entry{};
-            entry.param_slot = param_loc;
-            entry.semantic_location = param_loc;
-            entry.interp_mode = ResolvePsInputInterpMode(inp, container.reg_setup);
-            entry.component_mask = inp.mask;
-            opts.stage_contract.pixel_inputs.push_back(entry);
-            ++param_loc;
+        if (container.fssm.present && !container.fssm.ps_interps.empty()) {
+            // Retail XDAT/FSSM Pixel Shaders map each hardware V_INTERP/LDS attr slot
+            // (pe.table_index = 0..N-1) to a specific ISG1 register_index (pe.reg), skipping
+            // unused VS outputs (e.g. bound_12_ps skips COLOR0 at reg=1 and maps attr0 -> reg=2 TEXCOORD0).
+            for (const auto& pe : container.fssm.ps_interps) {
+                uint32_t non_sys_idx = 0u;
+                uint32_t sys_before_reg = 0u;
+                bool matched = false;
+                uint32_t sem_loc = pe.table_index;
+                Rdna2InterpMode mode = ((pe.flags & 0x3u) == 1u)
+                                           ? Rdna2InterpMode::Flat
+                                           : Rdna2InterpMode::Perspective;
+                uint8_t comp_mask = pe.mask ? pe.mask : 0xFu;
+                for (const auto& inp : container.input_signature) {
+                    if (IsSystemValueSemantic(inp.semantic_name)) {
+                        if (inp.register_index < pe.reg) {
+                            ++sys_before_reg;
+                        }
+                        continue;
+                    }
+                    if (inp.register_index == pe.reg) {
+                        sem_loc = non_sys_idx;
+                        if ((pe.flags & 0x3u) != 1u) {
+                            mode = ResolvePsInputInterpMode(inp, container.reg_setup);
+                        }
+                        if (pe.mask == 0u && inp.mask != 0u) {
+                            comp_mask = inp.mask;
+                        }
+                        matched = true;
+                        break;
+                    }
+                    ++non_sys_idx;
+                }
+                if (!matched) {
+                    sem_loc = (pe.reg >= sys_before_reg) ? (pe.reg - sys_before_reg) : pe.table_index;
+                }
+                FssmPixelInputEntry entry{};
+                entry.param_slot = pe.table_index;
+                entry.semantic_location = sem_loc;
+                entry.interp_mode = mode;
+                entry.component_mask = comp_mask;
+                opts.stage_contract.pixel_inputs.push_back(entry);
+            }
+        } else {
+            uint32_t param_loc = 0u;
+            for (const auto& inp : container.input_signature) {
+                if (IsSystemValueSemantic(inp.semantic_name)) continue;
+                FssmPixelInputEntry entry{};
+                entry.param_slot = param_loc;
+                entry.semantic_location = param_loc;
+                entry.interp_mode = ResolvePsInputInterpMode(inp, container.reg_setup);
+                entry.component_mask = inp.mask;
+                opts.stage_contract.pixel_inputs.push_back(entry);
+                ++param_loc;
+            }
         }
     }
     if (container.xs2.stage == ShaderStage::Vertex && container.sgpr_map.uses_vertex_buffer_table) {
@@ -2217,8 +2262,10 @@ void ApplyXboxContainerToLiftOptions(const XboxParsedShaderContainer& container,
     }
     if (container.shader_payload_fourcc == "XDAT") {
         auto& pb = opts.stage_contract.psv0_bindings;
+        const uint32_t saved_s2_cbv_mask = pb.space2_cbv_slot_mask;
         pb = Psv0HlslBindingOverrides{};
         pb.enabled = true;
+        pb.space2_cbv_slot_mask = saved_s2_cbv_mask;
         if (container.xs2.stage == ShaderStage::Compute) {
             pb.cs_fssm_abi = true;
             pb.cs_user_sgpr_count = container.fssm.present ? container.fssm.user_sgpr_count : 16u;
@@ -2349,37 +2396,48 @@ void ApplyXboxContainerToLiftOptions(const XboxParsedShaderContainer& container,
             pb.rwimg_u32_space = pb.uav_textures[u32_idx].space;
             pb.rwimg_u32_res_kind = pb.uav_textures[u32_idx].res_kind;
         }
-        if (container.xs2.stage == ShaderStage::Pixel && !container.fssm.ps_interps.empty()) {
-            for (const auto& pe : container.fssm.ps_interps) {
-                if (pe.table_index < opts.stage_contract.pixel_inputs.size()) {
-                    if ((pe.flags & 0x3u) == 1u) {
-                        opts.stage_contract.pixel_inputs[pe.table_index].interp_mode = Rdna2InterpMode::Flat;
+        if (container.xs2.stage == ShaderStage::Vertex) {
+            if (opts.stage_contract.vs_ia_inputs.empty()) {
+                // On AMD RDNA2 / Xbox Scarlett, hardware VS system VGPRs occupy v0..v3
+                // (v0=VertexID, v1..v2=step rates, v3=InstanceID); runtime fetch shaders
+                // invoked via s_swappc_b64 return fetched IA attributes per the FSSM +0x138
+                // fetch table (exact first_vgpr) or default 4-VGPR slots v[4+4r..7+4r].
+                uint32_t non_sys_idx = 0u;
+                for (const auto& inp : container.input_signature) {
+                    if (IsSystemValueSemantic(inp.semantic_name)) continue;
+                    VsIaInputBinding ib{};
+                    ib.semantic_name = inp.semantic_name;
+                    ib.semantic_index = inp.semantic_index;
+                    ib.mask = inp.mask ? inp.mask : 0xFu;
+                    ib.component_type = static_cast<uint8_t>(inp.component_type);
+                    ib.dst_vgpr_base = static_cast<uint8_t>(4u + non_sys_idx * 4u);
+                    for (const auto& fe : container.fssm.vs_fetches) {
+                        if (fe.attr_reg == inp.register_index) {
+                            ib.dst_vgpr_base = fe.first_vgpr;
+                            break;
+                        }
+                    }
+                    ++non_sys_idx;
+                    opts.stage_contract.vs_ia_inputs.push_back(std::move(ib));
+                }
+            } else if (!container.fssm.vs_fetches.empty()) {
+                // Preserve caller-supplied DXGI_FORMAT byte sizes while applying exact FSSM first_vgpr.
+                for (auto& ib : opts.stage_contract.vs_ia_inputs) {
+                    const std::string ib_sem_u = ToUpperAscii(ib.semantic_name);
+                    for (const auto& inp : container.input_signature) {
+                        if (IsSystemValueSemantic(inp.semantic_name)) continue;
+                        if (ToUpperAscii(inp.semantic_name) == ib_sem_u &&
+                            inp.semantic_index == ib.semantic_index) {
+                            for (const auto& fe : container.fssm.vs_fetches) {
+                                if (fe.attr_reg == inp.register_index) {
+                                    ib.dst_vgpr_base = fe.first_vgpr;
+                                    break;
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
-            }
-        }
-        if (container.xs2.stage == ShaderStage::Vertex && opts.stage_contract.vs_ia_inputs.empty()) {
-            // On AMD RDNA2 / Xbox Scarlett, hardware VS system VGPRs occupy v0..v3
-            // (v0=VertexID, v1..v2=step rates, v3=InstanceID); runtime fetch shaders
-            // invoked via s_swappc_b64 return fetched IA attributes per the FSSM +0x138
-            // fetch table (exact first_vgpr) or default 4-VGPR slots v[4+4r..7+4r].
-            uint32_t non_sys_idx = 0u;
-            for (const auto& inp : container.input_signature) {
-                if (IsSystemValueSemantic(inp.semantic_name)) continue;
-                VsIaInputBinding ib{};
-                ib.semantic_name = inp.semantic_name;
-                ib.semantic_index = inp.semantic_index;
-                ib.mask = inp.mask ? inp.mask : 0xFu;
-                ib.component_type = static_cast<uint8_t>(inp.component_type);
-                ib.dst_vgpr_base = static_cast<uint8_t>(4u + non_sys_idx * 4u);
-                for (const auto& fe : container.fssm.vs_fetches) {
-                    if (fe.attr_reg == inp.register_index) {
-                        ib.dst_vgpr_base = fe.first_vgpr;
-                        break;
-                    }
-                }
-                ++non_sys_idx;
-                opts.stage_contract.vs_ia_inputs.push_back(std::move(ib));
             }
         }
     }

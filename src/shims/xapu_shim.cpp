@@ -28,6 +28,7 @@
 #include <vector>
 
 #if defined(_WIN32)
+#  include <intrin.h>
 #  include <malloc.h>
 #  include <windows.h>
 #endif
@@ -51,26 +52,35 @@ bool IsReadablePointer(const void* ptr, size_t bytes) {
         return false;
     }
     const uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
-    if (start + bytes < start) {
+    const uintptr_t end = start + bytes;
+    if (end < start) {
         return false;
     }
 #if defined(_WIN32)
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (::VirtualQuery(ptr, &mbi, sizeof(mbi)) == 0) {
-        return false;
+    uintptr_t cur = start;
+    for (uint32_t hop = 0u; hop < 8u && cur < end; ++hop) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (::VirtualQuery(reinterpret_cast<const void*>(cur), &mbi, sizeof(mbi)) == 0) {
+            return false;
+        }
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) {
+            return false;
+        }
+        const DWORD prot = mbi.Protect & 0xFFu;
+        const bool readable =
+            (prot == PAGE_READONLY || prot == PAGE_READWRITE || prot == PAGE_WRITECOPY ||
+             prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE ||
+             prot == PAGE_EXECUTE_WRITECOPY);
+        if (!readable) {
+            return false;
+        }
+        const uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (region_end <= cur) {
+            return false;
+        }
+        cur = region_end;
     }
-    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) {
-        return false;
-    }
-    const DWORD prot = mbi.Protect & 0xFFu;
-    const bool readable = (prot == PAGE_READONLY || prot == PAGE_READWRITE || prot == PAGE_WRITECOPY ||
-                           prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE ||
-                           prot == PAGE_EXECUTE_WRITECOPY);
-    if (!readable) {
-        return false;
-    }
-    const uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-    return start + bytes <= region_end;
+    return cur >= end;
 #else
     return true;
 #endif
@@ -81,25 +91,34 @@ bool IsWritablePointer(void* ptr, size_t bytes) {
         return false;
     }
     const uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
-    if (start + bytes < start) {
+    const uintptr_t end = start + bytes;
+    if (end < start) {
         return false;
     }
 #if defined(_WIN32)
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (::VirtualQuery(ptr, &mbi, sizeof(mbi)) == 0) {
-        return false;
+    uintptr_t cur = start;
+    for (uint32_t hop = 0u; hop < 8u && cur < end; ++hop) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (::VirtualQuery(reinterpret_cast<const void*>(cur), &mbi, sizeof(mbi)) == 0) {
+            return false;
+        }
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) {
+            return false;
+        }
+        const DWORD prot = mbi.Protect & 0xFFu;
+        const bool writable =
+            (prot == PAGE_READWRITE || prot == PAGE_WRITECOPY ||
+             prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY);
+        if (!writable) {
+            return false;
+        }
+        const uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (region_end <= cur) {
+            return false;
+        }
+        cur = region_end;
     }
-    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) {
-        return false;
-    }
-    const DWORD prot = mbi.Protect & 0xFFu;
-    const bool writable = (prot == PAGE_READWRITE || prot == PAGE_WRITECOPY ||
-                           prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY);
-    if (!writable) {
-        return false;
-    }
-    const uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-    return start + bytes <= region_end;
+    return cur >= end;
 #else
     return true;
 #endif
@@ -200,6 +219,7 @@ struct XApuQueuedCommand {
 struct XApuStreamState {
     bool active = false;
     bool stop_pending = false;
+    bool decoder_drained = false;
     uint32_t channels = 2u;
     float current_pitch = 1.0f;
     double frac_pos = 0.0;
@@ -239,6 +259,43 @@ struct XApuConnectionState {
 #endif
     }
 };
+
+inline bool IsInConnectionSharedMem(
+    const XApuConnectionState& state,
+    const void* ptr,
+    size_t bytes) noexcept {
+    if (!ptr || !state.shared_mem_base || bytes == 0u || state.reserved_shared_bytes == 0u) {
+        return false;
+    }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(state.shared_mem_base);
+    const uintptr_t end = base + state.reserved_shared_bytes;
+    const uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+    return end >= base && p >= base && bytes <= (end - p);
+}
+
+inline uint32_t ComputeProduciblePendingFrames(
+    uint32_t process_type,
+    const XApuStreamState& stream,
+    bool flush_end) noexcept {
+    const uint32_t ch = std::clamp<uint32_t>(stream.channels, 1u, 2u);
+    const uint32_t raw_pending = static_cast<uint32_t>(stream.pending_pcm.size() / ch);
+    if (raw_pending == 0u || process_type == XApuProcessType_DecodeOpus) {
+        return raw_pending;
+    }
+    const double clamped_pos = (stream.frac_pos > 0.0) ? stream.frac_pos : 0.0;
+    const double floor_pos = std::floor(clamped_pos);
+    const uint32_t idx0 = static_cast<uint32_t>(floor_pos);
+    if (idx0 >= raw_pending) {
+        return 0u;
+    }
+    const float alpha = static_cast<float>(clamped_pos - floor_pos);
+    if (idx0 + 1u >= raw_pending && !flush_end && alpha > 0.0f) {
+        // Only the 1-sample cross-packet interpolation history frame remains; cannot emit
+        // further output until the next input packet arrives.
+        return 0u;
+    }
+    return raw_pending - idx0;
+}
 
 bool EnsureOpusDecoderInitialized(XApuStreamState& stream, bool reset_existing) {
     if (stream.decoder && stream.decoder->IsInitialized() &&
@@ -549,20 +606,24 @@ public:
         }
 
         if (state->xbox_retail_mode) {
-            const bool full_writable = IsWritablePointer(result_buffer, sizeof(XApuRetailResult));
-            const bool partial_writable =
-                !full_writable &&
-                result_buffer_size > 0u &&
-                result_buffer_size < sizeof(XApuRetailResult) &&
-                IsWritablePointer(result_buffer, result_buffer_size);
-
             uint32_t empty_polls = 0u;
+            bool full_writable = false;
+            bool partial_writable = false;
             XApuRetailResult completed{};
             {
                 openscarlett::audio::SrwLockGuard lk(state->queue_lock);
                 if (state->xbox_result_queue.empty()) {
                     empty_polls = ++state->consecutive_empty_polls;
                 } else {
+                    full_writable =
+                        IsInConnectionSharedMem(*state, result_buffer, sizeof(XApuRetailResult)) ||
+                        IsWritablePointer(result_buffer, sizeof(XApuRetailResult));
+                    partial_writable =
+                        !full_writable &&
+                        result_buffer_size > 0u &&
+                        result_buffer_size < sizeof(XApuRetailResult) &&
+                        (IsInConnectionSharedMem(*state, result_buffer, result_buffer_size) ||
+                         IsWritablePointer(result_buffer, result_buffer_size));
                     if (!full_writable && !partial_writable) {
                         return XAPU_E_POINTER;
                     }
@@ -575,19 +636,28 @@ public:
                         if (it != state->streams.end() && it->second.stop_pending) {
                             it->second.active = false;
                             it->second.stop_pending = false;
+                            it->second.decoder_drained = false;
                             it->second.pending_pcm.clear();
                             it->second.frac_pos = 0.0;
-                            it->second.decoder.reset();
+                            if (it->second.decoder) {
+                                it->second.decoder->Reset();
+                            }
                         }
                     }
                 }
             }
 
             if (empty_polls > 0u) {
+                // NEVER call Sleep() here: Windows default timer granularity (~15.625 ms) stalls
+                // real-time game audio mixer threads across empty XApu connection polls, causing
+                // ~18 Hz helicopter audio chopping. Spin-hint with _mm_pause() instead.
 #if defined(_WIN32)
-                if (empty_polls >= 4u) {
-                    ::Sleep(1u);
+                _mm_pause();
+                if (empty_polls >= 4096u && (empty_polls & 4095u) == 0u) {
+                    ::SwitchToThread();
                 }
+#elif defined(__x86_64__) || defined(__i386__)
+                __builtin_ia32_pause();
 #endif
                 return kXboxXApuQueueEmpty;
             }
@@ -814,6 +884,7 @@ private:
                 stream.frac_pos = 0.0;
                 stream.pending_pcm.clear();
                 stream.stop_pending = false;
+                stream.decoder_drained = false;
                 stream.active = true;
 
                 if (state.process_type == XApuProcessType_DecodeOpus ||
@@ -829,7 +900,7 @@ private:
                     it->second.stop_pending = true;
                     res.currentPitch = it->second.current_pitch;
                     const uint32_t pending_frames =
-                        static_cast<uint32_t>(it->second.pending_pcm.size() / it->second.channels);
+                        ComputeProduciblePendingFrames(state.process_type, it->second, false);
                     res.state = (pending_frames == 0u) ? 2u : 4u;
                     res.stateData[3] = ClampU16(pending_frames);
                 } else {
@@ -840,6 +911,7 @@ private:
                 if (it != state.streams.end()) {
                     it->second.pending_pcm.clear();
                     it->second.frac_pos = 0.0;
+                    it->second.decoder_drained = false;
                     if ((hdr.options & 4u) != 0u && it->second.decoder) {
                         it->second.decoder->Reset();
                     }
@@ -918,13 +990,26 @@ private:
         const bool flush_end = (hdr.options & 2u) != 0u;
 
         // 1. Decode / ingest input audio
+        const bool in_readable =
+            (input_data_len > 0u) &&
+            (IsInConnectionSharedMem(state, in_ptr, input_data_len) ||
+             IsReadablePointer(in_ptr, input_data_len));
+        const bool out_writable =
+            (max_output_len > 0u) &&
+            (IsInConnectionSharedMem(state, out_ptr, max_output_len) ||
+             IsWritablePointer(out_ptr, max_output_len));
+
         if (state.process_type == XApuProcessType_DecodeOpus ||
             state.process_type == XApuProcessType_DecodeConvertOpus) {
             if (!EnsureOpusDecoderInitialized(stream, false)) {
                 res.hresult = XAPU_E_FAIL;
             } else {
                 std::vector<float> decoded;
-                if (input_data_len > 0u && IsReadablePointer(in_ptr, input_data_len)) {
+                if (in_readable) {
+                    if (stream.decoder_drained) {
+                        stream.decoder->Reset();
+                        stream.decoder_drained = false;
+                    }
                     const auto* in_u8 = static_cast<const uint8_t*>(in_ptr);
                     // Retail XApu Data commands pass a single raw RFC 6716 Opus packet
                     // (caller strips any 2-byte length prefix). Try DecodePacket directly
@@ -942,8 +1027,9 @@ private:
                         input_bytes_consumed = input_data_len;
                     }
                 }
-                if (flush_end && res.hresult == XAPU_S_OK) {
+                if (flush_end && res.hresult == XAPU_S_OK && !stream.decoder_drained) {
                     (void)stream.decoder->Drain(decoded);
+                    stream.decoder_drained = true;
                 }
 
                 // Normalize decoded channel count to stream.channels so MFT channel mismatches
@@ -987,7 +1073,7 @@ private:
                 }
             }
         } else if (state.process_type == XApuProcessType_ConvertPCM) {
-            if (input_data_len > 0u && IsReadablePointer(in_ptr, input_data_len)) {
+            if (in_readable) {
                 const uint32_t total_in_frames =
                     input_data_len / (ch * static_cast<uint32_t>(sizeof(float)));
                 const uint32_t skip = (std::min)(first_frame, total_in_frames);
@@ -1031,7 +1117,7 @@ private:
         bool saturated = false;
         std::vector<float> out_interleaved;
 
-        if (max_output_len > 0u && IsWritablePointer(out_ptr, max_output_len)) {
+        if (out_writable) {
             const uint32_t max_out_frames =
                 max_output_len / (ch * static_cast<uint32_t>(sizeof(float)));
             if (max_out_frames == 0u) {
@@ -1162,7 +1248,7 @@ private:
         }
 
         const uint32_t remaining_pending_frames =
-            static_cast<uint32_t>(stream.pending_pcm.size() / ch);
+            ComputeProduciblePendingFrames(state.process_type, stream, flush_end);
         res.state = (out_frames > 0u ? 1u : 0u) |
                     (remaining_pending_frames == 0u ? 2u : 0u) |
                     (remaining_pending_frames > 0u ? 4u : 0u) |

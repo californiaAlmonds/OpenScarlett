@@ -11,16 +11,20 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <deque>
+#include <filesystem>
 #include <memory>
 #include <new>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #if defined(_WIN32)
+#  include <share.h>
 #  include <windows.h>
 #  include <audioclient.h>
 #  include <mmdeviceapi.h>
@@ -135,6 +139,373 @@ bool IsNullAudioForced() {
     const std::string v = GetEnvString("OPENSCARLETT_AUDIO_NULL");
     return v == "1" || v == "true" || v == "TRUE" || v == "yes";
 }
+
+// ===========================================================================
+// Direct Crash-Safe RIFF WAVE PCM16 Stereo Recorder (OPENSCARLETT_RECORD_WAV)
+// ===========================================================================
+std::filesystem::path GetRecordWavEnvPath() {
+#if defined(_WIN32)
+    wchar_t buf[2048]{};
+    const DWORD len = ::GetEnvironmentVariableW(
+        L"OPENSCARLETT_RECORD_WAV", buf, static_cast<DWORD>(std::size(buf)));
+    if (len == 0u || len >= std::size(buf)) {
+        return {};
+    }
+    std::wstring raw(buf, len);
+    if (raw.size() >= 2u && raw.front() == L'"' && raw.back() == L'"') {
+        raw = raw.substr(1u, raw.size() - 2u);
+    }
+    return raw.empty() ? std::filesystem::path{} : std::filesystem::path(raw);
+#else
+    const std::string raw = GetEnvString("OPENSCARLETT_RECORD_WAV");
+    if (raw.empty()) {
+        return {};
+    }
+    return std::filesystem::path(raw);
+#endif
+}
+
+FILE* OpenSharedFile(const std::filesystem::path& path, const wchar_t* wmode, const char* amode) {
+#if defined(_WIN32)
+    (void)amode;
+    return ::_wfsopen(path.c_str(), wmode, _SH_DENYNO);
+#else
+    (void)wmode;
+    return std::fopen(path.string().c_str(), amode);
+#endif
+}
+
+class WavRecorderManager {
+public:
+    static WavRecorderManager& Instance() {
+        static WavRecorderManager mgr;
+        return mgr;
+    }
+
+    ~WavRecorderManager() {
+        SrwLockGuard lk(lock_);
+        if (fp_) {
+            FlushLocked();
+            std::fclose(fp_);
+            fp_ = nullptr;
+        }
+        has_open_file_.store(false, std::memory_order_release);
+    }
+
+    void OnEngineCreated() noexcept {
+        active_engines_.fetch_add(1u, std::memory_order_acq_rel);
+    }
+
+    void OnEngineDestroyed() noexcept {
+        const uint32_t prev = active_engines_.fetch_sub(1u, std::memory_order_acq_rel);
+        SrwLockGuard lk(lock_);
+        if (fp_) {
+            FlushLocked();
+            if (prev <= 1u) {
+                std::fclose(fp_);
+                fp_ = nullptr;
+                has_open_file_.store(false, std::memory_order_release);
+            }
+        }
+    }
+
+    void Flush() noexcept {
+        if (!has_open_file_.load(std::memory_order_acquire)) {
+            return;
+        }
+        SrwLockGuard lk(lock_);
+        if (fp_) {
+            FlushLocked();
+        }
+    }
+
+    void AppendFrames(
+        const float* interleaved,
+        uint32_t frames,
+        uint32_t channels,
+        uint32_t sample_rate) {
+        if (!interleaved || frames == 0u || channels == 0u) {
+            return;
+        }
+        const std::filesystem::path req_path = GetRecordWavEnvPath();
+        if (req_path.empty()) {
+            if (has_open_file_.load(std::memory_order_acquire) ||
+                env_session_active_.load(std::memory_order_acquire)) {
+                SrwLockGuard lk(lock_);
+                if (fp_) {
+                    FlushLocked();
+                    std::fclose(fp_);
+                    fp_ = nullptr;
+                }
+                has_open_file_.store(false, std::memory_order_release);
+                env_session_active_.store(false, std::memory_order_release);
+                session_path_.clear();
+            }
+            return;
+        }
+
+        SrwLockGuard lk(lock_);
+        if (!EnsureOpenLocked(req_path, sample_rate)) {
+            return;
+        }
+
+        pcm16_scratch_.resize(static_cast<size_t>(frames) * 2u);
+        for (uint32_t f = 0u; f < frames; ++f) {
+            const float* row = interleaved + static_cast<size_t>(f) * channels;
+            float left = 0.0f;
+            float right = 0.0f;
+            if (channels == 1u) {
+                left = row[0];
+                right = row[0];
+            } else if (channels == 2u) {
+                left = row[0];
+                right = row[1];
+            } else {
+                // Fold standard 5.1/7.1 Front Center (+0.7071) and Back L/R into stereo.
+                const float fc = (channels >= 3u) ? (0.70710678f * row[2]) : 0.0f;
+                const float bl = (channels >= 5u) ? (0.70710678f * row[4]) : 0.0f;
+                const float br = (channels >= 6u) ? (0.70710678f * row[5]) : 0.0f;
+                left = row[0] + fc + bl;
+                right = row[1] + fc + br;
+            }
+            left = std::clamp(left, -1.0f, 1.0f);
+            right = std::clamp(right, -1.0f, 1.0f);
+
+            const float frame_peak = (std::max)(std::fabs(left), std::fabs(right));
+            if (frame_peak > peak_abs_) {
+                peak_abs_ = frame_peak;
+            }
+            if (frame_peak > cur_win_peak_) {
+                cur_win_peak_ = frame_peak;
+            }
+            if (++cur_win_frames_ >= window_frames_) {
+                const bool is_active = (cur_win_peak_ > 1e-4f);
+                if (is_active) {
+                    if (seen_any_active_window_ &&
+                        current_silent_run_windows_ > 0u &&
+                        current_silent_run_windows_ <= 20u) {
+                        silent_holes_in_bursts_ += current_silent_run_windows_;
+                    }
+                    seen_any_active_window_ = true;
+                    current_silent_run_windows_ = 0u;
+                    ++active_10ms_windows_;
+                } else if (seen_any_active_window_) {
+                    ++current_silent_run_windows_;
+                }
+                cur_win_frames_ = 0u;
+                cur_win_peak_ = 0.0f;
+            }
+
+            pcm16_scratch_[static_cast<size_t>(f) * 2u + 0u] =
+                static_cast<int16_t>(std::lround(left * 32767.0f));
+            pcm16_scratch_[static_cast<size_t>(f) * 2u + 1u] =
+                static_cast<int16_t>(std::lround(right * 32767.0f));
+        }
+
+        const size_t written =
+            std::fwrite(pcm16_scratch_.data(), sizeof(int16_t) * 2u, frames, fp_);
+        total_frames_ += static_cast<uint64_t>(written);
+        frames_since_flush_ += static_cast<uint64_t>(written);
+
+        const uint64_t flush_interval_frames =
+            static_cast<uint64_t>(std::max<uint32_t>(1u, sample_rate_ / 2u));
+        if (frames_since_flush_ >= flush_interval_frames) {
+            FlushLocked();
+        }
+    }
+
+private:
+    void ResetCountersLocked(uint32_t sample_rate) noexcept {
+        sample_rate_ = std::max<uint32_t>(8000u, sample_rate);
+        window_frames_ = std::max<uint32_t>(1u, sample_rate_ / 100u);
+        total_frames_ = 0ull;
+        frames_since_flush_ = 0ull;
+        peak_abs_ = 0.0f;
+        cur_win_frames_ = 0u;
+        cur_win_peak_ = 0.0f;
+        seen_any_active_window_ = false;
+        current_silent_run_windows_ = 0u;
+        active_10ms_windows_ = 0ull;
+        silent_holes_in_bursts_ = 0ull;
+    }
+
+    bool OpenFreshTruncateLocked(const std::filesystem::path& path, uint32_t sample_rate) {
+        std::error_code ec;
+        if (path.has_parent_path()) {
+            std::filesystem::create_directories(path.parent_path(), ec);
+        }
+        fp_ = OpenSharedFile(path, L"w+b", "w+b");
+        if (!fp_) {
+            has_open_file_.store(false, std::memory_order_release);
+            return false;
+        }
+        ResetCountersLocked(sample_rate);
+        active_path_ = path;
+        session_path_ = path;
+        env_session_active_.store(true, std::memory_order_release);
+        has_open_file_.store(true, std::memory_order_release);
+        WriteFullHeaderAtStartLocked();
+        std::fflush(fp_);
+        WriteJsonSidecarLocked();
+        return true;
+    }
+
+    bool EnsureOpenLocked(const std::filesystem::path& req_path, uint32_t sample_rate) {
+        if (!env_session_active_.load(std::memory_order_relaxed) || req_path != session_path_) {
+            if (fp_) {
+                FlushLocked();
+                std::fclose(fp_);
+                fp_ = nullptr;
+            }
+            return OpenFreshTruncateLocked(req_path, sample_rate);
+        }
+        if (fp_) {
+            return true;
+        }
+        if (total_frames_ > 0ull) {
+            fp_ = OpenSharedFile(req_path, L"r+b", "r+b");
+            if (fp_) {
+#if defined(_WIN32)
+                ::_fseeki64(fp_, 0LL, SEEK_END);
+#else
+                std::fseek(fp_, 0L, SEEK_END);
+#endif
+                active_path_ = req_path;
+                has_open_file_.store(true, std::memory_order_release);
+                return true;
+            }
+        }
+        return OpenFreshTruncateLocked(req_path, sample_rate);
+    }
+
+    void ComputeSizesLocked(uint32_t& out_riff_size, uint32_t& out_data_size) const noexcept {
+        const uint64_t data_bytes64 = total_frames_ * 4ull;
+        out_data_size = (data_bytes64 > 0xFFFFFFFFull - 36ull)
+                            ? (0xFFFFFFFFu - 36u)
+                            : static_cast<uint32_t>(data_bytes64);
+        out_riff_size = 36u + out_data_size;
+    }
+
+    void WriteFullHeaderAtStartLocked() noexcept {
+        if (!fp_) return;
+        uint32_t riff_size = 36u;
+        uint32_t data_size = 0u;
+        ComputeSizesLocked(riff_size, data_size);
+
+        uint8_t hdr[44]{};
+        std::memcpy(hdr + 0, "RIFF", 4);
+        std::memcpy(hdr + 4, &riff_size, 4);
+        std::memcpy(hdr + 8, "WAVE", 4);
+        std::memcpy(hdr + 12, "fmt ", 4);
+        const uint32_t fmt_size = 16u;
+        const uint16_t audio_fmt = 1u;  // PCM
+        const uint16_t num_ch = 2u;     // Stereo
+        const uint32_t sr = sample_rate_;
+        const uint32_t byte_rate = sr * 4u;
+        const uint16_t block_align = 4u;
+        const uint16_t bits_per_sample = 16u;
+        std::memcpy(hdr + 16, &fmt_size, 4);
+        std::memcpy(hdr + 20, &audio_fmt, 2);
+        std::memcpy(hdr + 22, &num_ch, 2);
+        std::memcpy(hdr + 24, &sr, 4);
+        std::memcpy(hdr + 28, &byte_rate, 4);
+        std::memcpy(hdr + 32, &block_align, 2);
+        std::memcpy(hdr + 34, &bits_per_sample, 2);
+        std::memcpy(hdr + 36, "data", 4);
+        std::memcpy(hdr + 40, &data_size, 4);
+
+        std::fseek(fp_, 0L, SEEK_SET);
+        (void)std::fwrite(hdr, 1u, sizeof(hdr), fp_);
+    }
+
+    void WriteJsonSidecarLocked() noexcept {
+        if (active_path_.empty()) {
+            return;
+        }
+        std::filesystem::path json_path = active_path_;
+        json_path += L".json";
+
+        uint64_t eff_active_wins = active_10ms_windows_;
+        uint64_t eff_holes = silent_holes_in_bursts_;
+        if (cur_win_frames_ > 0u && cur_win_peak_ > 1e-4f) {
+            ++eff_active_wins;
+            if (seen_any_active_window_ &&
+                current_silent_run_windows_ > 0u &&
+                current_silent_run_windows_ <= 20u) {
+                eff_holes += current_silent_run_windows_;
+            }
+        }
+
+        FILE* jfp = OpenSharedFile(json_path, L"wb", "wb");
+        if (!jfp) {
+            return;
+        }
+        char buf[512]{};
+        const int n = std::snprintf(
+            buf,
+            sizeof(buf),
+            "{\n"
+            "  \"sample_rate\": %u,\n"
+            "  \"channels\": 2,\n"
+            "  \"total_frames\": %llu,\n"
+            "  \"peak_abs\": %.6f,\n"
+            "  \"active_10ms_windows\": %llu,\n"
+            "  \"silent_holes_in_bursts\": %llu\n"
+            "}\n",
+            sample_rate_,
+            static_cast<unsigned long long>(total_frames_),
+            static_cast<double>(peak_abs_),
+            static_cast<unsigned long long>(eff_active_wins),
+            static_cast<unsigned long long>(eff_holes));
+        if (n > 0) {
+            (void)std::fwrite(buf, 1u, static_cast<size_t>(std::min<int>(n, sizeof(buf) - 1)), jfp);
+        }
+        std::fflush(jfp);
+        std::fclose(jfp);
+    }
+
+    void FlushLocked() noexcept {
+        if (!fp_) {
+            return;
+        }
+        uint32_t riff_size = 36u;
+        uint32_t data_size = 0u;
+        ComputeSizesLocked(riff_size, data_size);
+
+        std::fseek(fp_, 4L, SEEK_SET);
+        (void)std::fwrite(&riff_size, sizeof(uint32_t), 1u, fp_);
+        std::fseek(fp_, 40L, SEEK_SET);
+        (void)std::fwrite(&data_size, sizeof(uint32_t), 1u, fp_);
+#if defined(_WIN32)
+        ::_fseeki64(fp_, 0LL, SEEK_END);
+#else
+        std::fseek(fp_, 0L, SEEK_END);
+#endif
+        std::fflush(fp_);
+        frames_since_flush_ = 0ull;
+        WriteJsonSidecarLocked();
+    }
+
+    SrwLock lock_;
+    std::atomic<uint32_t> active_engines_{0u};
+    std::atomic<bool> has_open_file_{false};
+    std::atomic<bool> env_session_active_{false};
+    std::filesystem::path active_path_;
+    std::filesystem::path session_path_;
+    FILE* fp_ = nullptr;
+    uint32_t sample_rate_ = 48000u;
+    uint32_t window_frames_ = 480u;
+    uint64_t total_frames_ = 0ull;
+    uint64_t frames_since_flush_ = 0ull;
+    float peak_abs_ = 0.0f;
+    uint32_t cur_win_frames_ = 0u;
+    float cur_win_peak_ = 0.0f;
+    bool seen_any_active_window_ = false;
+    uint32_t current_silent_run_windows_ = 0u;
+    uint64_t active_10ms_windows_ = 0ull;
+    uint64_t silent_holes_in_bursts_ = 0ull;
+    std::vector<int16_t> pcm16_scratch_;
+};
 
 // ===========================================================================
 // Windows MMDevice Endpoint ID Validation & Normalization
@@ -1595,11 +1966,17 @@ public:
                                    std::fmod(overshoot, static_cast<double>(cur->loop_length));
                 out_cbs.loop_ended.push_back(cur->context);
             } else if (cur->play_cursor >= static_cast<double>(cur->total_frames)) {
+                const double overshoot =
+                    cur->play_cursor - static_cast<double>(cur->total_frames);
                 const bool eos = cur->end_of_stream;
                 out_cbs.ended.push_back(cur->context);
                 delete cur;
                 DecrementQueuedCount();
                 cur = buffer_queue_.TryDequeue();
+                if (cur && !eos && overshoot > 0.0 &&
+                    overshoot < static_cast<double>(cur->total_frames)) {
+                    cur->play_cursor = overshoot;
+                }
                 if (!cur && discontinuity_requested_.exchange(false, std::memory_order_acq_rel)) {
                     out_cbs.stream_ended = true;
                 }
@@ -1713,6 +2090,7 @@ public:
         for (auto& mv : master_ch_vol_atomic_) {
             mv.store(1.0f, std::memory_order_relaxed);
         }
+        WavRecorderManager::Instance().OnEngineCreated();
     }
 
     ~XAudio2Impl() {
@@ -1728,9 +2106,12 @@ public:
                 delete v;
             }
         }
-        SrwLockGuard lk(mutex_);
-        submix_voices_.clear();
-        mastering_voice_.reset();
+        {
+            SrwLockGuard lk(mutex_);
+            submix_voices_.clear();
+            mastering_voice_.reset();
+        }
+        WavRecorderManager::Instance().OnEngineDestroyed();
     }
 
     int32_t OPENSCARLETT_XAUDIO2_CALL QueryInterface(
@@ -2092,7 +2473,8 @@ public:
         float* out_frames,
         uint32_t frame_count,
         uint32_t override_channels = 0,
-        uint32_t override_sample_rate = 0) {
+        uint32_t override_sample_rate = 0,
+        bool from_wasapi = false) {
         if (!out_frames || frame_count == 0) {
             return OS_XAUDIO2_E_INVALIDARG;
         }
@@ -2129,6 +2511,12 @@ public:
 
         if (override_channels != 0) out_ch = override_channels;
         if (override_sample_rate != 0) out_sr = override_sample_rate;
+
+        // Fire OnProcessingPassStart strictly outside internal locks BEFORE mixing voices so
+        // real-time game callbacks can submit buffers for the upcoming quantum with zero latency.
+        for (auto* ecb : eng_cbs) {
+            if (ecb) ecb->OnProcessingPassStart();
+        }
 
         std::fill_n(out_frames, static_cast<size_t>(frame_count) * out_ch, 0.0f);
 
@@ -2203,12 +2591,13 @@ public:
             }
         }
 
+        if (from_wasapi || IsNullAudioForced()) {
+            WavRecorderManager::Instance().AppendFrames(out_frames, frame_count, out_ch, out_sr);
+        }
+
         total_frames_mixed_.fetch_add(frame_count, std::memory_order_release);
 
-        // Deliver callbacks strictly outside internal locks.
-        for (auto* ecb : eng_cbs) {
-            if (ecb) ecb->OnProcessingPassStart();
-        }
+        // Deliver voice & pass-end callbacks strictly outside internal locks.
         for (const auto& dcb : voice_cbs) {
             if (dcb.pass_started) {
                 dcb.cb->OnVoiceProcessingPassStart(dcb.bytes_required);
@@ -2332,6 +2721,7 @@ private:
             }
         }
 #endif
+        WavRecorderManager::Instance().Flush();
     }
 
 #if defined(_WIN32)
@@ -2344,6 +2734,7 @@ private:
     }
 
     void WasapiRenderLoop() {
+        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         EnsureComMtaInitialized();
         const HRESULT co_hr = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         const bool co_init = SUCCEEDED(co_hr);
@@ -2365,6 +2756,7 @@ private:
 
         auto cleanup = [&]() {
             wasapi_active_.store(false, std::memory_order_release);
+            WavRecorderManager::Instance().Flush();
             signal_once();
             if (client) client->Stop();
             if (ready_event) CloseHandle(ready_event);
@@ -2422,49 +2814,110 @@ private:
             return;
         }
 
-        REFERENCE_TIME default_period = 200000;  // 20 ms default
+        REFERENCE_TIME default_period = 100000;  // 10 ms fallback
         REFERENCE_TIME min_period = 0;
         (void)client->GetDevicePeriod(&default_period, &min_period);
-        if (default_period <= 0) default_period = 200000;
+        if (default_period <= 0) default_period = 100000;
 
-        bool event_driven = false;
-        ready_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (ready_event) {
-            hr = client->Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                default_period,
-                0,
-                mix_fmt,
-                nullptr);
-            if (SUCCEEDED(hr)) {
-                hr = client->SetEventHandle(ready_event);
-                if (SUCCEEDED(hr)) {
-                    event_driven = true;
+        // Guarantee at least 60 ms (600,000 100-ns units) shared-mode ring buffer so GPU/DXC
+        // shader lifting CPU spikes never cause WASAPI underruns or zero-fill dropouts.
+        constexpr REFERENCE_TIME kMinSharedBufferDuration = 600000;  // 60 ms
+        const REFERENCE_TIME target_buffer_duration =
+            std::max<REFERENCE_TIME>(default_period * 4, kMinSharedBufferDuration);
+
+        bool mix_is_float32 =
+            (mix_fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT && mix_fmt->wBitsPerSample == 32u);
+        if (mix_fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE && mix_fmt->cbSize >= 22) {
+            const auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(mix_fmt);
+            mix_is_float32 = (ext->SubFormat.Data1 == 0x00000003u && mix_fmt->wBitsPerSample == 32u);
+        }
+
+        const uint32_t desired_sr =
+            std::max<uint32_t>(8000u, master_sr_atomic_.load(std::memory_order_acquire));
+        WAVEFORMATEX custom_float_fmt{};
+        custom_float_fmt.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+        custom_float_fmt.nChannels = std::clamp<WORD>(mix_fmt->nChannels, 1u, 8u);
+        custom_float_fmt.nSamplesPerSec = desired_sr;
+        custom_float_fmt.wBitsPerSample = 32u;
+        custom_float_fmt.nBlockAlign = static_cast<WORD>(custom_float_fmt.nChannels * 4u);
+        custom_float_fmt.nAvgBytesPerSec =
+            custom_float_fmt.nSamplesPerSec * custom_float_fmt.nBlockAlign;
+        custom_float_fmt.cbSize = 0u;
+
+        constexpr DWORD kAutoConvertFlags = 0x80000000u | 0x08000000u;  // AUTOCONVERTPCM | SRC_DEFAULT_QUALITY
+        bool client_used = false;
+        auto try_initialize = [&](const WAVEFORMATEX* fmt, DWORD stream_flags, bool use_event) -> bool {
+            if (client_used) {
+                if (client) {
+                    client->Release();
+                    client = nullptr;
                 }
-            }
-            if (!event_driven) {
-                // Re-activate fresh IAudioClient for polling fallback (Initialize is single-use).
-                client->Release();
-                client = nullptr;
-                CloseHandle(ready_event);
-                ready_event = nullptr;
                 hr = device->Activate(kIidIAudioClient, CLSCTX_ALL, nullptr,
                                       reinterpret_cast<void**>(&client));
                 if (FAILED(hr) || !client) {
                     wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
-                    cleanup();
-                    return;
+                    return false;
                 }
+            }
+            client_used = true;
+            hr = client->Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                stream_flags,
+                target_buffer_duration,
+                0,
+                fmt,
+                nullptr);
+            wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
+            if (FAILED(hr)) {
+                return false;
+            }
+            if (use_event) {
+                hr = client->SetEventHandle(ready_event);
+                wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
+                if (FAILED(hr)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        const WAVEFORMATEX* active_fmt = mix_fmt;
+        bool event_driven = false;
+        bool initialized_ok = false;
+        ready_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+        // When host endpoint rate differs from game master rate (e.g. 44100 Hz laptop vs 48000 Hz
+        // game voices), prefer WASAPI polyphase SRC (AUTOCONVERTPCM | SRC_DEFAULT_QUALITY) so
+        // 48 kHz voices mix 1:1 with exact integer quanta.
+        const bool want_autoconvert =
+            (mix_fmt->nSamplesPerSec != desired_sr) || !mix_is_float32;
+
+        if (ready_event) {
+            if (want_autoconvert &&
+                try_initialize(&custom_float_fmt,
+                               AUDCLNT_STREAMFLAGS_EVENTCALLBACK | kAutoConvertFlags,
+                               true)) {
+                active_fmt = &custom_float_fmt;
+                event_driven = true;
+                initialized_ok = true;
+            } else if (try_initialize(mix_fmt, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, true)) {
+                active_fmt = mix_fmt;
+                event_driven = true;
+                initialized_ok = true;
+            } else {
+                CloseHandle(ready_event);
+                ready_event = nullptr;
             }
         }
 
-        if (!event_driven) {
-            constexpr REFERENCE_TIME kPollBufferDuration = 500000;  // 50 ms
-            hr = client->Initialize(
-                AUDCLNT_SHAREMODE_SHARED, 0, kPollBufferDuration, 0, mix_fmt, nullptr);
-            wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
-            if (FAILED(hr)) {
+        if (!initialized_ok) {
+            if (want_autoconvert && try_initialize(&custom_float_fmt, kAutoConvertFlags, false)) {
+                active_fmt = &custom_float_fmt;
+                initialized_ok = true;
+            } else if (try_initialize(mix_fmt, 0u, false)) {
+                active_fmt = mix_fmt;
+                initialized_ok = true;
+            } else {
                 cleanup();
                 return;
             }
@@ -2486,15 +2939,15 @@ private:
             return;
         }
 
-        const uint32_t out_ch = std::max<uint32_t>(1u, mix_fmt->nChannels);
-        const uint32_t out_sr = std::max<uint32_t>(1u, mix_fmt->nSamplesPerSec);
-        bool is_float = (mix_fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
-        if (mix_fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE && mix_fmt->cbSize >= 22) {
-            const auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(mix_fmt);
+        const uint32_t out_ch = std::max<uint32_t>(1u, active_fmt->nChannels);
+        const uint32_t out_sr = std::max<uint32_t>(1u, active_fmt->nSamplesPerSec);
+        const uint32_t quantum_frames = std::max<uint32_t>(128u, out_sr / 100u);  // 10 ms XAudio2 quantum
+        bool is_float = (active_fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
+        if (active_fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE && active_fmt->cbSize >= 22) {
+            const auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(active_fmt);
             is_float = (ext->SubFormat.Data1 == 0x00000003u);
         }
 
-        // Pre-fill initial buffer with silence/mix before Start() to prevent startup glitches.
         std::vector<float> mix_buf;
         auto pump_available = [&]() -> bool {
             UINT32 padding = 0;
@@ -2513,24 +2966,37 @@ private:
                 wasapi_last_hr_.store(static_cast<int32_t>(buf_hr), std::memory_order_release);
                 return buf_hr != AUDCLNT_E_DEVICE_INVALIDATED;
             }
+
             mix_buf.resize(static_cast<size_t>(avail) * out_ch);
-            RenderMixFrames(mix_buf.data(), avail, out_ch, out_sr);
-            if (is_float && mix_fmt->wBitsPerSample == 32u) {
+            uint32_t offset_frames = 0u;
+            while (offset_frames < avail) {
+                const uint32_t step_frames =
+                    std::min<uint32_t>(avail - offset_frames, quantum_frames);
+                RenderMixFrames(
+                    mix_buf.data() + static_cast<size_t>(offset_frames) * out_ch,
+                    step_frames,
+                    out_ch,
+                    out_sr,
+                    true);
+                offset_frames += step_frames;
+            }
+
+            if (is_float && active_fmt->wBitsPerSample == 32u) {
                 std::memcpy(dst, mix_buf.data(), mix_buf.size() * sizeof(float));
-            } else if (mix_fmt->wBitsPerSample == 16u) {
+            } else if (active_fmt->wBitsPerSample == 16u) {
                 auto* out16 = reinterpret_cast<int16_t*>(dst);
                 for (size_t i = 0u; i < mix_buf.size(); ++i) {
                     const float clamped = std::clamp(mix_buf[i], -1.0f, 1.0f);
                     out16[i] = static_cast<int16_t>(std::lround(clamped * 32767.0f));
                 }
-            } else if (mix_fmt->wBitsPerSample == 32u) {
+            } else if (active_fmt->wBitsPerSample == 32u) {
                 auto* out32 = reinterpret_cast<int32_t*>(dst);
                 for (size_t i = 0u; i < mix_buf.size(); ++i) {
                     const float clamped = std::clamp(mix_buf[i], -1.0f, 1.0f);
                     out32[i] = static_cast<int32_t>(static_cast<double>(clamped) * 2147483647.0);
                 }
             } else {
-                std::memset(dst, 0, static_cast<size_t>(avail) * mix_fmt->nBlockAlign);
+                std::memset(dst, 0, static_cast<size_t>(avail) * active_fmt->nBlockAlign);
             }
             const HRESULT rel_hr = render_client->ReleaseBuffer(avail, 0);
             if (SUCCEEDED(rel_hr)) {
@@ -2541,7 +3007,17 @@ private:
             return rel_hr != AUDCLNT_E_DEVICE_INVALIDATED;
         };
 
-        (void)pump_available();
+        // Pre-fill the full 60 ms WASAPI endpoint buffer with hardware silence before Start()
+        // so the DAC starts with a 60 ms underrun-proof cushion and subsequent wakeups pull
+        // strictly at 1.0x real-time pace (~10 ms per wakeup) without over-draining streaming voices.
+        {
+            BYTE* prefill_dst = nullptr;
+            if (SUCCEEDED(render_client->GetBuffer(buffer_frames, &prefill_dst))) {
+                if (SUCCEEDED(render_client->ReleaseBuffer(buffer_frames, AUDCLNT_BUFFERFLAGS_SILENT))) {
+                    wasapi_frames_rendered_.fetch_add(buffer_frames, std::memory_order_relaxed);
+                }
+            }
+        }
 
         hr = client->Start();
         wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
@@ -2553,7 +3029,7 @@ private:
         wasapi_event_driven_.store(event_driven, std::memory_order_release);
         wasapi_sample_rate_.store(out_sr, std::memory_order_release);
         wasapi_channels_.store(out_ch, std::memory_order_release);
-        wasapi_bits_per_sample_.store(mix_fmt->wBitsPerSample, std::memory_order_release);
+        wasapi_bits_per_sample_.store(active_fmt->wBitsPerSample, std::memory_order_release);
         wasapi_buffer_frames_.store(buffer_frames, std::memory_order_release);
         wasapi_active_.store(true, std::memory_order_release);
         signal_once();
@@ -2561,16 +3037,16 @@ private:
         while (!wasapi_stop_.load(std::memory_order_acquire)) {
             if (event_driven && ready_event && wasapi_stop_event_) {
                 HANDLE wait_handles[2] = {wasapi_stop_event_, ready_event};
-                const DWORD wr = WaitForMultipleObjects(2u, wait_handles, FALSE, 50u);
+                const DWORD wr = WaitForMultipleObjects(2u, wait_handles, FALSE, 20u);
                 if (wr == WAIT_OBJECT_0 || wasapi_stop_.load(std::memory_order_acquire)) {
                     break;
                 }
             } else if (wasapi_stop_event_) {
-                if (WaitForSingleObject(wasapi_stop_event_, 10u) == WAIT_OBJECT_0) {
+                if (WaitForSingleObject(wasapi_stop_event_, 5u) == WAIT_OBJECT_0) {
                     break;
                 }
             } else {
-                ::Sleep(10u);
+                ::Sleep(5u);
             }
             if (!pump_available()) {
                 break;

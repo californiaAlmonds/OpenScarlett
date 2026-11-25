@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <string>
 #include <vector>
 
 #if defined(_WIN32)
@@ -59,7 +61,7 @@ static_assert(sizeof(XApuRetailStartCommand) == 0x2C, "XApuRetailStartCommand mu
 #pragma pack(pop)
 
 void TestXApuRetailEngine() {
-    std::printf("[1/4] Testing xapu.dll retail engine (DecodeOpus, bad packet, ConvertPCM, Stop/Reset/Util)...\n");
+    std::printf("[1/5] Testing xapu.dll retail engine (DecodeOpus, bad packet, ConvertPCM, Stop/Reset/Util)...\n");
 
     const fs::path dll_path = GetExeDir() / L"xapu.dll";
     HMODULE mod = ::LoadLibraryW(dll_path.c_str());
@@ -357,6 +359,85 @@ void TestXApuRetailEngine() {
             peak = (std::max)(peak, std::fabs(out_pcm[i]));
         }
         OS_REQUIRE(peak > 0.001f);
+
+        // 1D. Verify 100 consecutive empty XApuDequeueResult polls complete in < 5 ms total
+        //     (proving the 15.625 ms Windows Sleep(1) mixer thread stall is completely gone).
+        LARGE_INTEGER qpc_freq{}, qpc_t0{}, qpc_t1{};
+        OS_REQUIRE(::QueryPerformanceFrequency(&qpc_freq) != FALSE && qpc_freq.QuadPart > 0);
+        OS_REQUIRE(::QueryPerformanceCounter(&qpc_t0) != FALSE);
+        for (uint32_t poll = 0u; poll < 100u; ++poll) {
+            OS_REQUIRE(p_dequeue(conn, &res, sizeof(res), nullptr) == XAPU_E_QUEUE_EMPTY);
+        }
+        OS_REQUIRE(::QueryPerformanceCounter(&qpc_t1) != FALSE);
+        const double empty_poll_ms =
+            static_cast<double>(qpc_t1.QuadPart - qpc_t0.QuadPart) * 1000.0 /
+            static_cast<double>(qpc_freq.QuadPart);
+        std::printf("  XApuDequeueResult 100 consecutive empty polls: %.3f ms (< 5.0 ms)\n", empty_poll_ms);
+        OS_REQUIRE(empty_poll_ms < 5.0);
+
+        // 1E. Verify multi-packet Opus continuity & post-flush_end recovery on the same stream
+        for (uint32_t pkt_idx = 0u; pkt_idx < 3u; ++pkt_idx) {
+            const auto next_pkt = openscarlett::BuildOpusTestPacket(1u, 20u + pkt_idx, 64u);
+            std::fill(out_pcm.begin(), out_pcm.end(), 0.0f);
+            data_cmd.header.sequence = 10u + pkt_idx;
+            data_cmd.header.options = (pkt_idx == 1u) ? 2u : 0u;  // drain on pkt 1, then continue on pkt 2!
+            data_cmd.firstFrame = 0u;
+            data_cmd.frameCount = 0x3C0u;
+            data_cmd.inputDataLength = static_cast<uint32_t>(next_pkt.size());
+            data_cmd.inputDataPtr = reinterpret_cast<uint64_t>(next_pkt.data());
+            OS_REQUIRE(p_enqueue(conn, &data_cmd, 0u) == XAPU_S_OK);
+            OS_REQUIRE(p_dequeue(conn, &res, sizeof(res), nullptr) == XAPU_S_OK);
+            OS_REQUIRE(res.hresult == XAPU_S_OK);
+            OS_REQUIRE(res.outputFrameCount == 960u);
+            OS_REQUIRE((res.state & 2u) != 0u && (res.state & 4u) == 0u);
+        }
+
+        OS_REQUIRE(p_disconnect(conn) == XAPU_S_OK);
+    }
+
+    // 1F. Pitched DecodeConvertOpus mid-stream state check (1-sample interpolation lookahead
+    //     must report state & 2 [need input], NOT state & 4 [stuck pending output]).
+    {
+        XApuConnectInput in{};
+        in.processType = XApuProcessType_DecodeConvertOpus;
+        in.streamCount = 2u;
+        in.commandQueueDepth = 8u;
+        in.sharedMemoryBytes = 0x10000u;
+        in.options = 0u;
+
+        XApuConnectOutput out{};
+        XAPU_CONNECTION_HANDLE conn = nullptr;
+        OS_REQUIRE(p_connect(&in, &out, &conn) == XAPU_S_OK);
+
+        XApuRetailStartCommand start_cmd{};
+        start_cmd.header.type = XApuRetailCommand_Start;
+        start_cmd.header.streamIndex = 0u;
+        start_cmd.channels = 2u;
+        start_cmd.startPitch = 1.05f;
+        OS_REQUIRE(p_enqueue(conn, &start_cmd, 0u) == XAPU_S_OK);
+        XApuRetailResult res{};
+        OS_REQUIRE(p_dequeue(conn, &res, sizeof(res), nullptr) == XAPU_S_OK);
+
+        const auto pkt = openscarlett::BuildOpusTestPacket(2u, 33u, 64u);
+        std::vector<float> out_pcm(1024u * 2u, 0.0f);
+        XApuRetailDataCommand data_cmd{};
+        data_cmd.header.type = XApuRetailCommand_Data;
+        data_cmd.header.streamIndex = 0u;
+        data_cmd.header.options = 0u;  // mid-stream (not flush_end)
+        data_cmd.targetPitch = 1.05f;
+        data_cmd.firstFrame = 0u;
+        data_cmd.frameCount = 0xFFFFFFFFu;
+        data_cmd.inputDataLength = static_cast<uint32_t>(pkt.size());
+        data_cmd.inputDataPtr = reinterpret_cast<uint64_t>(pkt.data());
+        data_cmd.maxOutputDataLength = static_cast<uint32_t>(out_pcm.size() * sizeof(float));
+        data_cmd.outputDataPtr = reinterpret_cast<uint64_t>(out_pcm.data());
+
+        OS_REQUIRE(p_enqueue(conn, &data_cmd, 0u) == XAPU_S_OK);
+        OS_REQUIRE(p_dequeue(conn, &res, sizeof(res), nullptr) == XAPU_S_OK);
+        OS_REQUIRE(res.hresult == XAPU_S_OK);
+        OS_REQUIRE(res.outputFrameCount > 900u && res.outputFrameCount < 960u);
+        OS_REQUIRE((res.state & 2u) != 0u);
+        OS_REQUIRE((res.state & 4u) == 0u);
         OS_REQUIRE(p_disconnect(conn) == XAPU_S_OK);
     }
 
@@ -389,7 +470,7 @@ static_assert(sizeof(ChadDspCommand) == 32, "ChadDspCommand must be 32 bytes");
 #pragma pack(pop)
 
 void TestChadDspEngine() {
-    std::printf("[2/4] Testing chad.dll DSP engine (Cartesian/Polar FFT<->IFFT, Partitioned Convolution)...\n");
+    std::printf("[2/5] Testing chad.dll DSP engine (Cartesian/Polar FFT<->IFFT, Partitioned Convolution)...\n");
 
     const fs::path dll_path = GetExeDir() / L"chad.dll";
     HMODULE mod = ::LoadLibraryW(dll_path.c_str());
@@ -664,7 +745,7 @@ struct IXboxRetailAcpHal {
 };
 
 void TestAcpHalRetailEngine() {
-    std::printf("[3/4] Testing AcpHal.dll retail SHAPE & 12-slot IAcpHal XMA2 decode engine...\n");
+    std::printf("[3/5] Testing AcpHal.dll retail SHAPE & 12-slot IAcpHal XMA2 decode engine...\n");
 
     const fs::path dll_path = GetExeDir() / L"AcpHal.dll";
     HMODULE mod = ::LoadLibraryW(dll_path.c_str());
@@ -790,7 +871,7 @@ void TestAcpHalRetailEngine() {
     }
     OS_REQUIRE(peak_i16 > 50);
 
-    // Message queue verification
+    // Message queue & smooth 48 kHz QPC audioClockSamples verification
     OS_REQUIRE(hal->GetNumMessages() == 1u);
     XboxAcpMessage msg{};
     OS_REQUIRE(hal->PopMessage(&msg));
@@ -798,6 +879,23 @@ void TestAcpHalRetailEngine() {
     OS_REQUIRE(msg.commandId == kCmdId);
     OS_REQUIRE(msg.audioClockSamples > 0ull);
     OS_REQUIRE(hal->GetNumMessages() == 0u);
+
+    const uint64_t clk_before_burst = msg.audioClockSamples;
+    for (uint32_t b = 0u; b < 10u; ++b) {
+        OS_REQUIRE(hal->SubmitCommand(1u, 0x2000ull + b, b, nullptr, 0u) == ACPHAL_S_OK);
+    }
+    OS_REQUIRE(hal->GetNumMessages() == 10u);
+    XboxAcpMessage burst_msg{};
+    for (uint32_t b = 0u; b < 10u; ++b) {
+        OS_REQUIRE(hal->PopMessage(&burst_msg));
+    }
+    // Rapid burst must NOT artificially jump by 10*128 samples independent of QPC time
+    OS_REQUIRE(burst_msg.audioClockSamples >= clk_before_burst);
+    ::Sleep(25u);
+    OS_REQUIRE(hal->SubmitCommand(1u, 0x3000ull, 11u, nullptr, 0u) == ACPHAL_S_OK);
+    XboxAcpMessage delayed_msg{};
+    OS_REQUIRE(hal->PopMessage(&delayed_msg));
+    OS_REQUIRE(delayed_msg.audioClockSamples >= burst_msg.audioClockSamples + 800ull);
 
     // Unsupported slots 6..10
     OS_REQUIRE(hal->UnsupportedSlot6() == static_cast<int32_t>(0x8AC80F0Eu));
@@ -905,7 +1003,7 @@ DWORD WINAPI XAudio2ConsoleThreadProc(LPVOID param) {
         if (binfo.wasapi_active != 0u) {
             OS_REQUIRE(binfo.wasapi_sample_rate >= 8000u);
             OS_REQUIRE(binfo.wasapi_channels >= 1u);
-            OS_REQUIRE(binfo.wasapi_buffer_frames > 0u);
+            OS_REQUIRE(binfo.wasapi_buffer_frames >= (binfo.wasapi_sample_rate * 50u) / 1000u);
             OS_REQUIRE(binfo.wasapi_frames_rendered > 0ull);
         } else {
             // Graceful fallback when host has no active WASAPI render endpoint
@@ -921,7 +1019,7 @@ DWORD WINAPI XAudio2ConsoleThreadProc(LPVOID param) {
 }
 
 void TestXAudio2ConsoleAndWasapiParity() {
-    std::printf("[4/4] Testing XAudio2_9.dll console flags, implicit COM MTA, and WASAPI/NULL parity...\n");
+    std::printf("[4/5] Testing XAudio2_9.dll console flags, implicit COM MTA, and WASAPI/NULL parity...\n");
 
     char prev_env[64]{};
     const DWORD prev_len = ::GetEnvironmentVariableA("OPENSCARLETT_AUDIO_NULL", prev_env, sizeof(prev_env));
@@ -941,6 +1039,224 @@ void TestXAudio2ConsoleAndWasapiParity() {
     std::printf("  PASS: XAudio2_9.dll console compatibility & WASAPI/NULL parity.\n");
 }
 
+// ===========================================================================
+// 5. Direct WAV Recorder (OPENSCARLETT_RECORD_WAV + .wav.json Dropout Audit)
+// ===========================================================================
+void TestDirectWavRecorder() {
+    std::printf("[5/5] Testing OPENSCARLETT_RECORD_WAV crash-safe RIFF WAVE + .wav.json dropout metrics...\n");
+
+    wchar_t prev_wav[2048]{};
+    const DWORD prev_wav_len =
+        ::GetEnvironmentVariableW(L"OPENSCARLETT_RECORD_WAV", prev_wav, 2048u);
+    const bool had_prev_wav = (prev_wav_len > 0u && prev_wav_len < 2048u);
+
+    char prev_null[64]{};
+    const DWORD prev_null_len =
+        ::GetEnvironmentVariableA("OPENSCARLETT_AUDIO_NULL", prev_null, sizeof(prev_null));
+    const bool had_prev_null = (prev_null_len > 0u && prev_null_len < sizeof(prev_null));
+
+    const fs::path rec_dir = GetExeDir() / L"test_wav_recorder_out";
+    const fs::path wav_path = rec_dir / L"sub" / L"retail_mix_capture.wav";
+    fs::path json_path = wav_path;
+    json_path += L".json";
+
+    std::error_code ec;
+    fs::remove_all(rec_dir, ec);
+
+    ::SetEnvironmentVariableA("OPENSCARLETT_AUDIO_NULL", "1");
+    ::SetEnvironmentVariableW(L"OPENSCARLETT_RECORD_WAV", wav_path.c_str());
+
+    constexpr uint32_t kSampleRate = 48000u;
+    constexpr uint32_t kQuantumFrames = 480u;  // 10 ms
+    constexpr uint32_t kNumQuanta = 60u;       // 600 ms (> 0.5s periodic flush threshold!)
+    constexpr uint32_t kTotalFrames = kQuantumFrames * kNumQuanta;
+
+    {
+        IXAudio2* xa = nullptr;
+        OS_REQUIRE(XAudio2Create(&xa, 0u, OS_XAUDIO2_DEFAULT_PROCESSOR) == OS_XAUDIO2_S_OK && xa != nullptr);
+
+        IXAudio2MasteringVoice* master = nullptr;
+        OS_REQUIRE(xa->CreateMasteringVoice(&master, 2u, kSampleRate) == OS_XAUDIO2_S_OK && master != nullptr);
+
+        OS_WAVEFORMATEX fmt{};
+        fmt.wFormatTag = OS_WAVE_FORMAT_IEEE_FLOAT;
+        fmt.nChannels = 2u;
+        fmt.nSamplesPerSec = kSampleRate;
+        fmt.wBitsPerSample = 32u;
+        fmt.nBlockAlign = 8u;
+        fmt.nAvgBytesPerSec = kSampleRate * 8u;
+
+        IXAudio2SourceVoice* src = nullptr;
+        OS_REQUIRE(xa->CreateSourceVoice(&src, &fmt) == OS_XAUDIO2_S_OK && src != nullptr);
+
+        std::vector<float> tone(kTotalFrames * 2u, 0.0f);
+        for (uint32_t i = 0u; i < kTotalFrames; ++i) {
+            tone[i * 2u + 0u] = 0.5f * std::sin(2.0f * kPi * 440.0f * static_cast<float>(i) / 48000.0f);
+            tone[i * 2u + 1u] = 0.4f * std::cos(2.0f * kPi * 660.0f * static_cast<float>(i) / 48000.0f);
+        }
+
+        OS_XAUDIO2_BUFFER buf{};
+        buf.Flags = OS_XAUDIO2_END_OF_STREAM;
+        buf.AudioBytes = static_cast<uint32_t>(tone.size() * sizeof(float));
+        buf.pAudioData = reinterpret_cast<const uint8_t*>(tone.data());
+        OS_REQUIRE(src->SubmitSourceBuffer(&buf) == OS_XAUDIO2_S_OK);
+        OS_REQUIRE(src->Start() == OS_XAUDIO2_S_OK);
+
+        std::vector<float> mix_q(kQuantumFrames * 2u, 0.0f);
+        for (uint32_t q = 0u; q < kNumQuanta; ++q) {
+            OS_REQUIRE(OpenScarlettXAudio2RenderMixForTest(xa, mix_q.data(), kQuantumFrames) ==
+                       OS_XAUDIO2_S_OK);
+            if (q == 52u) {
+                // Verify periodic ~0.5s crash-safe header + sidecar flush BEFORE engine teardown!
+                OS_REQUIRE(fs::exists(wav_path) && fs::exists(json_path));
+                std::ifstream live_in(wav_path, std::ios::binary);
+                OS_REQUIRE(live_in.good());
+                uint8_t live_hdr[44]{};
+                live_in.read(reinterpret_cast<char*>(live_hdr), 44);
+                OS_REQUIRE(live_in.gcount() == 44);
+                uint32_t mid_data_sz = 0u;
+                std::memcpy(&mid_data_sz, live_hdr + 40, 4u);
+                OS_REQUIRE(mid_data_sz >= 24000u * 4u);
+            }
+        }
+
+        src->DestroyVoice();
+        master->DestroyVoice();
+        xa->Release();
+    }
+
+    ::SetEnvironmentVariableW(L"OPENSCARLETT_RECORD_WAV", had_prev_wav ? prev_wav : nullptr);
+    ::SetEnvironmentVariableA("OPENSCARLETT_AUDIO_NULL", had_prev_null ? prev_null : nullptr);
+
+    OS_REQUIRE(fs::exists(wav_path));
+    OS_REQUIRE(fs::exists(json_path));
+
+    // Validate 44-byte RIFF WAVE PCM16 stereo header + audio payload
+    {
+        std::ifstream wf(wav_path, std::ios::binary | std::ios::ate);
+        OS_REQUIRE(wf.good());
+        const auto file_bytes = static_cast<uint64_t>(wf.tellg());
+        const uint32_t expected_data_bytes = kTotalFrames * 4u;
+        OS_REQUIRE(file_bytes == 44ull + expected_data_bytes);
+
+        wf.seekg(0, std::ios::beg);
+        uint8_t hdr[44]{};
+        wf.read(reinterpret_cast<char*>(hdr), 44);
+        OS_REQUIRE(wf.gcount() == 44);
+        OS_REQUIRE(std::memcmp(hdr + 0, "RIFF", 4) == 0);
+        OS_REQUIRE(std::memcmp(hdr + 8, "WAVE", 4) == 0);
+        OS_REQUIRE(std::memcmp(hdr + 12, "fmt ", 4) == 0);
+        OS_REQUIRE(std::memcmp(hdr + 36, "data", 4) == 0);
+
+        uint32_t riff_sz = 0u, fmt_sz = 0u, sr = 0u, byte_rate = 0u, data_sz = 0u;
+        uint16_t audio_fmt = 0u, num_ch = 0u, block_align = 0u, bps = 0u;
+        std::memcpy(&riff_sz, hdr + 4, 4u);
+        std::memcpy(&fmt_sz, hdr + 16, 4u);
+        std::memcpy(&audio_fmt, hdr + 20, 2u);
+        std::memcpy(&num_ch, hdr + 22, 2u);
+        std::memcpy(&sr, hdr + 24, 4u);
+        std::memcpy(&byte_rate, hdr + 28, 4u);
+        std::memcpy(&block_align, hdr + 32, 2u);
+        std::memcpy(&bps, hdr + 34, 2u);
+        std::memcpy(&data_sz, hdr + 40, 4u);
+
+        OS_REQUIRE(riff_sz == 36u + expected_data_bytes);
+        OS_REQUIRE(fmt_sz == 16u && audio_fmt == 1u && num_ch == 2u);
+        OS_REQUIRE(sr == kSampleRate && byte_rate == kSampleRate * 4u);
+        OS_REQUIRE(block_align == 4u && bps == 16u);
+        OS_REQUIRE(data_sz == expected_data_bytes);
+
+        std::vector<int16_t> samples(kTotalFrames * 2u, 0);
+        wf.read(reinterpret_cast<char*>(samples.data()), expected_data_bytes);
+        OS_REQUIRE(static_cast<uint32_t>(wf.gcount()) == expected_data_bytes);
+
+        int32_t max_pcm = 0;
+        for (int16_t s : samples) {
+            max_pcm = (std::max)(max_pcm, std::abs(static_cast<int32_t>(s)));
+        }
+        OS_REQUIRE(max_pcm > 15000 && max_pcm < 17000);
+    }
+
+    // Validate .wav.json sidecar metrics
+    {
+        std::ifstream jf(json_path);
+        OS_REQUIRE(jf.good());
+        const std::string json_txt(
+            (std::istreambuf_iterator<char>(jf)), std::istreambuf_iterator<char>());
+        OS_REQUIRE(json_txt.find("\"sample_rate\": 48000") != std::string::npos);
+        OS_REQUIRE(json_txt.find("\"channels\": 2") != std::string::npos);
+        OS_REQUIRE(json_txt.find("\"total_frames\": 28800") != std::string::npos);
+        OS_REQUIRE(json_txt.find("\"active_10ms_windows\": 60") != std::string::npos);
+        OS_REQUIRE(json_txt.find("\"silent_holes_in_bursts\": 0") != std::string::npos);
+    }
+
+    // Also verify live WasapiRenderLoop recording when a host audio endpoint is available
+    {
+        const fs::path live_wav = rec_dir / L"live_wasapi_capture.wav";
+        fs::path live_json = live_wav;
+        live_json += L".json";
+        ::SetEnvironmentVariableA("OPENSCARLETT_AUDIO_NULL", nullptr);
+        ::SetEnvironmentVariableW(L"OPENSCARLETT_RECORD_WAV", live_wav.c_str());
+
+        IXAudio2* xa = nullptr;
+        OS_REQUIRE(XAudio2Create(&xa, 0u, OS_XAUDIO2_DEFAULT_PROCESSOR) == OS_XAUDIO2_S_OK && xa != nullptr);
+        IXAudio2MasteringVoice* master = nullptr;
+        OS_REQUIRE(xa->CreateMasteringVoice(&master, 2u, kSampleRate) == OS_XAUDIO2_S_OK && master != nullptr);
+        OS_REQUIRE(master->SetVolume(0.02f) == OS_XAUDIO2_S_OK);
+
+        OS_WAVEFORMATEX fmt{};
+        fmt.wFormatTag = OS_WAVE_FORMAT_IEEE_FLOAT;
+        fmt.nChannels = 2u;
+        fmt.nSamplesPerSec = kSampleRate;
+        fmt.wBitsPerSample = 32u;
+        fmt.nBlockAlign = 8u;
+        fmt.nAvgBytesPerSec = kSampleRate * 8u;
+
+        IXAudio2SourceVoice* src = nullptr;
+        OS_REQUIRE(xa->CreateSourceVoice(&src, &fmt) == OS_XAUDIO2_S_OK && src != nullptr);
+
+        constexpr uint32_t kLiveFrames = 4800u;  // 100 ms continuous tone
+        std::vector<float> live_tone(kLiveFrames * 2u, 0.0f);
+        for (uint32_t i = 0u; i < kLiveFrames; ++i) {
+            const float s = 0.5f * std::sin(2.0f * kPi * 440.0f * static_cast<float>(i) / 48000.0f);
+            live_tone[i * 2u + 0u] = s;
+            live_tone[i * 2u + 1u] = s;
+        }
+
+        OS_XAUDIO2_BUFFER buf{};
+        buf.Flags = OS_XAUDIO2_END_OF_STREAM;
+        buf.AudioBytes = static_cast<uint32_t>(live_tone.size() * sizeof(float));
+        buf.pAudioData = reinterpret_cast<const uint8_t*>(live_tone.data());
+        OS_REQUIRE(src->SubmitSourceBuffer(&buf) == OS_XAUDIO2_S_OK);
+        OS_REQUIRE(src->Start() == OS_XAUDIO2_S_OK);
+
+        ::Sleep(80u);
+
+        OS_XAUDIO2_BACKEND_INFO binfo{};
+        OS_REQUIRE(OpenScarlettXAudio2GetBackendInfo(xa, &binfo) == OS_XAUDIO2_S_OK);
+        const bool wasapi_ok = (binfo.wasapi_active != 0u);
+
+        src->DestroyVoice();
+        master->DestroyVoice();
+        xa->Release();
+
+        ::SetEnvironmentVariableW(L"OPENSCARLETT_RECORD_WAV", had_prev_wav ? prev_wav : nullptr);
+        ::SetEnvironmentVariableA("OPENSCARLETT_AUDIO_NULL", had_prev_null ? prev_null : nullptr);
+
+        if (wasapi_ok) {
+            OS_REQUIRE(fs::exists(live_wav) && fs::exists(live_json));
+            std::ifstream jf(live_json);
+            OS_REQUIRE(jf.good());
+            const std::string jtxt(
+                (std::istreambuf_iterator<char>(jf)), std::istreambuf_iterator<char>());
+            OS_REQUIRE(jtxt.find("\"silent_holes_in_bursts\": 0") != std::string::npos);
+        }
+    }
+
+    fs::remove_all(rec_dir, ec);
+    std::printf("  PASS: OPENSCARLETT_RECORD_WAV RIFF WAVE + .wav.json verified (0 dropouts).\n");
+}
+
 }  // namespace
 
 int main() {
@@ -948,6 +1264,7 @@ int main() {
     TestChadDspEngine();
     TestAcpHalRetailEngine();
     TestXAudio2ConsoleAndWasapiParity();
+    TestDirectWavRecorder();
     std::printf("ALL retail audio engine tests PASSED.\n");
     return 0;
 }

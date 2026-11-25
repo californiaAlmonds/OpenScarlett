@@ -218,10 +218,26 @@ Status TitleVAMirror::RegisterRegion(const TitleVaMappingDesc& desc,
     if (desc.existing_write_watch_cpu_ptr != nullptr) {
         entry.cpu_backing_ptr = desc.existing_write_watch_cpu_ptr;
         entry.owns_cpu_memory = false;
-        // Probe write-watch capability on the caller-supplied pointer.
-        const UINT reset_rc = ResetWriteWatch(
-            entry.cpu_backing_ptr, static_cast<SIZE_T>(entry.alloc_size_bytes));
-        entry.write_watch_enabled = (reset_rc == 0u);
+        const uintptr_t raw_base = reinterpret_cast<uintptr_t>(entry.cpu_backing_ptr);
+        const uintptr_t page_base = static_cast<uintptr_t>(AlignDown(raw_base, page_size_bytes_));
+        const uintptr_t page_end =
+            static_cast<uintptr_t>(AlignUp(raw_base + entry.size_bytes, page_size_bytes_));
+        const SIZE_T watch_bytes = static_cast<SIZE_T>(page_end - page_base);
+        if (desc.gpu_shadow_resource != nullptr) {
+            // Preserve pre-existing CPU dirty pages when attaching a newly-created external GPU
+            // shadow resource (e.g. CreatePlacedResourceX) so CPU-populated data uploads on first submit.
+            void* probe_page = nullptr;
+            ULONG_PTR probe_cnt = 1u;
+            DWORD probe_gran = static_cast<DWORD>(page_size_bytes_);
+            const UINT probe_rc = GetWriteWatch(
+                0u, reinterpret_cast<void*>(page_base), watch_bytes,
+                &probe_page, &probe_cnt, &probe_gran);
+            entry.write_watch_enabled = (probe_rc == 0u);
+        } else {
+            // Probe and reset write-watch capability on the caller-supplied pointer.
+            const UINT reset_rc = ResetWriteWatch(reinterpret_cast<void*>(page_base), watch_bytes);
+            entry.write_watch_enabled = (reset_rc == 0u);
+        }
         if (!entry.write_watch_enabled && entry.size_bytes > (256ull * 1024ull)) {
             const size_t num_chunks =
                 static_cast<size_t>((entry.size_bytes + kPageSize64KB - 1ull) / kPageSize64KB);
@@ -515,7 +531,10 @@ Status TitleVAMirror::QueryDirtyLocked(RegionEntry& entry,
 
     const DWORD flags = reset_watch ? WRITE_WATCH_FLAG_RESET : 0u;
     const uintptr_t base_addr = reinterpret_cast<uintptr_t>(entry.cpu_backing_ptr);
-    const uintptr_t end_addr = base_addr + static_cast<uintptr_t>(entry.alloc_size_bytes);
+    const uintptr_t byte_end_addr = base_addr + static_cast<uintptr_t>(entry.size_bytes);
+    const uintptr_t page_base_addr = static_cast<uintptr_t>(AlignDown(base_addr, page_size_bytes_));
+    const uintptr_t end_addr = static_cast<uintptr_t>(AlignUp(byte_end_addr, page_size_bytes_));
+    const SIZE_T watch_bytes = static_cast<SIZE_T>(end_addr - page_base_addr);
     DWORD granularity = static_cast<DWORD>(page_size_bytes_);
 
     // Fast path: probe with a fixed stack buffer first so clean or lightly-dirty regions
@@ -525,8 +544,8 @@ Status TitleVAMirror::QueryDirtyLocked(RegionEntry& entry,
     ULONG_PTR first_count = static_cast<ULONG_PTR>(kStackBatchCap);
     const UINT first_rc = GetWriteWatch(
         flags,
-        entry.cpu_backing_ptr,
-        static_cast<SIZE_T>(entry.alloc_size_bytes),
+        reinterpret_cast<void*>(page_base_addr),
+        watch_bytes,
         stack_batch,
         &first_count,
         &granularity);
@@ -546,10 +565,13 @@ Status TitleVAMirror::QueryDirtyLocked(RegionEntry& entry,
         out_clean_pages = (total_pages >= out_dirty_pages) ? (total_pages - out_dirty_pages) : 0ull;
         for (size_t i = 0; i < n; ++i) {
             const uintptr_t addr = reinterpret_cast<uintptr_t>(addrs[i]);
-            if (addr < base_addr || addr >= end_addr) continue;
-            const uint64_t raw_off = static_cast<uint64_t>(addr - base_addr);
-            if (raw_off >= entry.size_bytes) continue;
-            const uint64_t page_len = std::min<uint64_t>(gran, entry.size_bytes - raw_off);
+            const uintptr_t addr_end = addr + static_cast<uintptr_t>(gran);
+            if (addr_end <= base_addr || addr >= byte_end_addr) continue;
+            const uintptr_t clip_lo = std::max<uintptr_t>(addr, base_addr);
+            const uintptr_t clip_hi = std::min<uintptr_t>(addr_end, byte_end_addr);
+            const uint64_t raw_off = static_cast<uint64_t>(clip_lo - base_addr);
+            const uint64_t page_len = static_cast<uint64_t>(clip_hi - clip_lo);
+            if (page_len == 0ull || raw_off >= entry.size_bytes) continue;
             if (!out_ranges.empty() &&
                 out_ranges.back().offset + out_ranges.back().size == raw_off) {
                 out_ranges.back().size += page_len;
@@ -565,7 +587,7 @@ Status TitleVAMirror::QueryDirtyLocked(RegionEntry& entry,
         uintptr_t prev_addr = 0u;
         for (ULONG_PTR i = 0; i < first_count; ++i) {
             const uintptr_t addr = reinterpret_cast<uintptr_t>(stack_batch[i]);
-            if (addr >= base_addr && addr < end_addr) {
+            if (addr + static_cast<uintptr_t>(gran) > base_addr && addr < byte_end_addr) {
                 if (valid_n > 0u && addr <= prev_addr) {
                     strictly_sorted = false;
                 }
@@ -600,7 +622,7 @@ Status TitleVAMirror::QueryDirtyLocked(RegionEntry& entry,
         dirty_addrs.reserve(static_cast<size_t>(first_count) * 2u);
         for (ULONG_PTR i = 0; i < first_count; ++i) {
             const uintptr_t addr = reinterpret_cast<uintptr_t>(stack_batch[i]);
-            if (addr >= base_addr && addr < end_addr) {
+            if (addr + static_cast<uintptr_t>(gran) > base_addr && addr < byte_end_addr) {
                 dirty_addrs.push_back(stack_batch[i]);
             }
         }
@@ -610,8 +632,8 @@ Status TitleVAMirror::QueryDirtyLocked(RegionEntry& entry,
         ULONG_PTR count = static_cast<ULONG_PTR>(watch_scratch_.size());
         const UINT rc = GetWriteWatch(
             flags,
-            entry.cpu_backing_ptr,
-            static_cast<SIZE_T>(entry.alloc_size_bytes),
+            reinterpret_cast<void*>(page_base_addr),
+            watch_bytes,
             watch_scratch_.data(),
             &count,
             &granularity);
@@ -620,7 +642,7 @@ Status TitleVAMirror::QueryDirtyLocked(RegionEntry& entry,
         }
         for (ULONG_PTR i = 0; i < count; ++i) {
             const uintptr_t addr = reinterpret_cast<uintptr_t>(watch_scratch_[i]);
-            if (addr >= base_addr && addr < end_addr) {
+            if (addr + static_cast<uintptr_t>(gran) > base_addr && addr < byte_end_addr) {
                 dirty_addrs.push_back(watch_scratch_[i]);
             }
         }
@@ -674,8 +696,12 @@ Status TitleVAMirror::ResetDirtyTracking(uint64_t title_va) {
     }
     RegionEntry& entry = regions_[static_cast<size_t>(idx)];
     if (entry.cpu_backing_ptr && entry.write_watch_enabled) {
-        if (ResetWriteWatch(entry.cpu_backing_ptr,
-                            static_cast<SIZE_T>(entry.alloc_size_bytes)) != 0u) {
+        const uintptr_t raw_base = reinterpret_cast<uintptr_t>(entry.cpu_backing_ptr);
+        const uintptr_t page_base = static_cast<uintptr_t>(AlignDown(raw_base, page_size_bytes_));
+        const uintptr_t page_end =
+            static_cast<uintptr_t>(AlignUp(raw_base + entry.size_bytes, page_size_bytes_));
+        if (ResetWriteWatch(reinterpret_cast<void*>(page_base),
+                            static_cast<SIZE_T>(page_end - page_base)) != 0u) {
             return Status::Error(StatusCode::DeviceError, "Win32 ResetWriteWatch failed");
         }
     }

@@ -56,6 +56,7 @@ using PfnXMemSize = size_t(__stdcall*)(void*, uint64_t);
 using PfnMapTitleVirtualMemory = void*(__stdcall*)(
     void*, uint64_t, uint32_t, uint32_t, const uint64_t*);
 using PfnUnmapTitleVirtualMemory = int32_t(__stdcall*)(void*, uint64_t);
+using PfnKxVirtualAllocFromApp = void*(__stdcall*)(void*, size_t, uint32_t, uint32_t);
 using PfnXMemResolveCpuAliasVa = uint64_t(__stdcall*)(uint64_t);
 
 constexpr uint32_t kKxMemGraphics = 0x10000000u;
@@ -106,6 +107,7 @@ struct CachedKernelxExports {
     PfnXMemSize xmem_size = nullptr;
     PfnMapTitleVirtualMemory map_title_vm = nullptr;
     PfnUnmapTitleVirtualMemory unmap_title_vm = nullptr;
+    PfnKxVirtualAllocFromApp virtual_alloc_app = nullptr;
 };
 
 CachedKernelxExports GetKernelxExports() noexcept {
@@ -114,6 +116,7 @@ CachedKernelxExports GetKernelxExports() noexcept {
     static std::atomic<PfnXMemSize> s_xmem_size{nullptr};
     static std::atomic<PfnMapTitleVirtualMemory> s_map{nullptr};
     static std::atomic<PfnUnmapTitleVirtualMemory> s_unmap{nullptr};
+    static std::atomic<PfnKxVirtualAllocFromApp> s_valloc{nullptr};
     static std::atomic<uint64_t> s_next_probe_ms{0u};
 
     CachedKernelxExports out{};
@@ -121,6 +124,7 @@ CachedKernelxExports GetKernelxExports() noexcept {
     out.xmem_size = s_xmem_size.load(std::memory_order_acquire);
     out.map_title_vm = s_map.load(std::memory_order_acquire);
     out.unmap_title_vm = s_unmap.load(std::memory_order_acquire);
+    out.virtual_alloc_app = s_valloc.load(std::memory_order_acquire);
     if (s_mod.load(std::memory_order_acquire) != nullptr) {
         return out;
     }
@@ -141,10 +145,13 @@ CachedKernelxExports GetKernelxExports() noexcept {
             reinterpret_cast<void*>(::GetProcAddress(h_kx, "MapTitleVirtualMemory")));
         out.unmap_title_vm = reinterpret_cast<PfnUnmapTitleVirtualMemory>(
             reinterpret_cast<void*>(::GetProcAddress(h_kx, "UnmapTitleVirtualMemory")));
+        out.virtual_alloc_app = reinterpret_cast<PfnKxVirtualAllocFromApp>(
+            reinterpret_cast<void*>(::GetProcAddress(h_kx, "VirtualAllocFromApp")));
         if (out.query_phys) s_query.store(out.query_phys, std::memory_order_release);
         if (out.xmem_size) s_xmem_size.store(out.xmem_size, std::memory_order_release);
         if (out.map_title_vm) s_map.store(out.map_title_vm, std::memory_order_release);
         if (out.unmap_title_vm) s_unmap.store(out.unmap_title_vm, std::memory_order_release);
+        if (out.virtual_alloc_app) s_valloc.store(out.virtual_alloc_app, std::memory_order_release);
         s_mod.store(h_kx, std::memory_order_release);
     }
     return out;
@@ -335,6 +342,7 @@ int32_t ValidateAndClassifyDestination(
     if (cursor + dst_cap < cursor) {
         return OS_DSTORAGE_E_INVALIDARG;
     }
+    const CachedKernelxExports kx = GetKernelxExports();
     uintptr_t first_alloc_base = cursor;
     bool captured_first_base = false;
     size_t remaining = dst_cap;
@@ -342,6 +350,34 @@ int32_t ValidateAndClassifyDestination(
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi)) == 0u) {
             return OS_DSTORAGE_E_INVALIDARG;
+        }
+        if (mbi.State == MEM_RESERVE && mbi.Type == MEM_PRIVATE) {
+            // Retail Scarlett titles (e.g. RAGE9 post-FTUE world streaming) stream directly into
+            // MEM_RESERVE VA windows inside their physical/unified pool. Commit on demand.
+            const uintptr_t res_end =
+                reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            if (res_end > cursor) {
+                const uintptr_t page_base = cursor & ~static_cast<uintptr_t>(4095u);
+                const uintptr_t want_end = cursor + std::min(remaining, static_cast<size_t>(res_end - cursor));
+                const size_t commit_len =
+                    std::min<size_t>(((want_end - page_base) + 4095u) & ~size_t(4095u),
+                                     static_cast<size_t>(res_end - page_base));
+                void* committed = ::VirtualAlloc(
+                    reinterpret_cast<LPVOID>(page_base), commit_len, MEM_COMMIT, PAGE_READWRITE);
+                if (!committed && kx.virtual_alloc_app) {
+                    const uintptr_t gran_base = cursor & ~static_cast<uintptr_t>(65535u);
+                    if (gran_base >= reinterpret_cast<uintptr_t>(mbi.BaseAddress) && res_end > gran_base) {
+                        const size_t gran_len =
+                            std::min<size_t>(((want_end - gran_base) + 65535u) & ~size_t(65535u),
+                                             static_cast<size_t>(res_end - gran_base));
+                        committed = kx.virtual_alloc_app(
+                            reinterpret_cast<void*>(gran_base), gran_len, MEM_COMMIT, PAGE_READWRITE);
+                    }
+                }
+                if (committed) {
+                    (void)VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi));
+                }
+            }
         }
         if (mbi.State != MEM_COMMIT || !IsWin32ProtectWritable(mbi.Protect)) {
             return OS_DSTORAGE_E_INVALIDARG;
@@ -361,7 +397,6 @@ int32_t ValidateAndClassifyDestination(
         remaining -= step;
     }
 
-    const CachedKernelxExports kx = GetKernelxExports();
     if (kx.query_phys) {
         uint64_t phys_id = 0u;
         uint64_t map_size = 0u;
@@ -1092,10 +1127,17 @@ private:
 class DStorageStatusArrayImpl final : public IDStorageStatusArrayX {
 public:
     explicit DStorageStatusArrayImpl(uint32_t capacity)
-        : complete_(capacity, true), results_(capacity, OS_DSTORAGE_S_OK) {}
+        : capacity_(capacity),
+          complete_(capacity > 0u ? std::make_unique<std::atomic<uint8_t>[]>(capacity) : nullptr),
+          results_(capacity > 0u ? std::make_unique<std::atomic<int32_t>[]>(capacity) : nullptr) {
+        for (uint32_t i = 0u; i < capacity_; ++i) {
+            complete_[i].store(1u, std::memory_order_relaxed);
+            results_[i].store(OS_DSTORAGE_S_OK, std::memory_order_relaxed);
+        }
+    }
 
     uint32_t Capacity() const noexcept {
-        return static_cast<uint32_t>(complete_.size());
+        return capacity_;
     }
 
     int32_t OPENSCARLETT_DSTORAGE_CALL QueryInterface(
@@ -1132,42 +1174,59 @@ public:
     }
 
     bool OPENSCARLETT_DSTORAGE_CALL IsComplete(uint32_t index) override {
-        RecordOk("IDStorageStatusArrayX::IsComplete", 3);
-        std::lock_guard<std::mutex> lk(mutex_);
-        if (index >= complete_.size()) return false;
-        return complete_[index];
+        if (index >= capacity_) {
+            RecordOk("IDStorageStatusArrayX::IsComplete", 3);
+            return false;
+        }
+        const bool done = (complete_[index].load(std::memory_order_acquire) != 0u);
+        thread_local uint32_t tl_spin_polls = 0u;
+        if (done) {
+            tl_spin_polls = 0u;
+            RecordOk("IDStorageStatusArrayX::IsComplete", 3);
+            return true;
+        }
+        const uint32_t spins = ++tl_spin_polls;
+        if ((spins & 4095u) == 1u) {
+            RecordOk("IDStorageStatusArrayX::IsComplete", 3);
+        }
+#if defined(_WIN32)
+        if ((spins & 255u) == 0u) {
+            ::SwitchToThread();
+        } else {
+            YieldProcessor();
+        }
+#endif
+        return false;
     }
 
     int32_t OPENSCARLETT_DSTORAGE_CALL GetHResult(uint32_t index) override {
-        std::lock_guard<std::mutex> lk(mutex_);
-        if (index >= results_.size()) {
+        if (index >= capacity_) {
             return RecordHr("IDStorageStatusArrayX::GetHResult", OS_DSTORAGE_E_INVALIDARG, 4);
         }
-        const int32_t hr = complete_[index] ? results_[index] : OS_DSTORAGE_E_PENDING;
+        const bool done = (complete_[index].load(std::memory_order_acquire) != 0u);
+        const int32_t hr = done ? results_[index].load(std::memory_order_acquire) : OS_DSTORAGE_E_PENDING;
         return RecordHr("IDStorageStatusArrayX::GetHResult", hr, 4);
     }
 
     void MarkPending(uint32_t index) {
-        std::lock_guard<std::mutex> lk(mutex_);
-        if (index < complete_.size()) {
-            complete_[index] = false;
-            results_[index] = OS_DSTORAGE_E_PENDING;
+        if (index < capacity_) {
+            results_[index].store(OS_DSTORAGE_E_PENDING, std::memory_order_relaxed);
+            complete_[index].store(0u, std::memory_order_release);
         }
     }
 
     void MarkComplete(uint32_t index, int32_t hr) {
-        std::lock_guard<std::mutex> lk(mutex_);
-        if (index < complete_.size()) {
-            results_[index] = hr;
-            complete_[index] = true;
+        if (index < capacity_) {
+            results_[index].store(hr, std::memory_order_release);
+            complete_[index].store(1u, std::memory_order_release);
         }
     }
 
 private:
     std::atomic<uint32_t> ref_count_{1};
-    std::mutex mutex_;
-    std::vector<bool> complete_;
-    std::vector<int32_t> results_;
+    uint32_t capacity_ = 0u;
+    std::unique_ptr<std::atomic<uint8_t>[]> complete_;
+    std::unique_ptr<std::atomic<int32_t>[]> results_;
 };
 
 #if defined(_WIN32)
@@ -2171,6 +2230,108 @@ private:
         return OS_DSTORAGE_E_INVALIDARG;
     }
 
+    static bool TryResolveShiftedZlibSubChunk(
+        DStorageFileImpl* file_impl,
+        uint64_t shifted_off,
+        uint32_t src_sz,
+        size_t dst_sz,
+        size_t staging_limit,
+        const std::atomic<bool>* cancel_flag,
+        std::vector<uint8_t>& out_slice) {
+        if (!file_impl || src_sz < 6u || dst_sz == 0u) return false;
+
+        struct CachedChunk {
+            const DStorageFileImpl* file = nullptr;
+            uint64_t base_off = 0ull;
+            uint32_t src_sz = 0u;
+            uint64_t tick = 0ull;
+            std::vector<uint8_t> decompressed;
+        };
+        static std::mutex s_cache_mu;
+        static std::array<CachedChunk, 4> s_cache{};
+        static uint64_t s_cache_tick = 0ull;
+
+        {
+            std::lock_guard<std::mutex> lk(s_cache_mu);
+            for (auto& e : s_cache) {
+                if (e.file == file_impl && e.src_sz == src_sz && shifted_off >= e.base_off) {
+                    const uint64_t sub_off = shifted_off - e.base_off;
+                    if (sub_off <= e.decompressed.size() &&
+                        dst_sz <= e.decompressed.size() - static_cast<size_t>(sub_off)) {
+                        e.tick = ++s_cache_tick;
+                        out_slice.assign(
+                            e.decompressed.begin() + static_cast<std::ptrdiff_t>(sub_off),
+                            e.decompressed.begin() + static_cast<std::ptrdiff_t>(sub_off + dst_sz));
+                        return true;
+                    }
+                }
+            }
+        }
+
+        DSTORAGE_FILE_INFO finfo{};
+        if (file_impl->GetFileInformation(&finfo) < 0 || finfo.FileSize < src_sz) {
+            return false;
+        }
+        constexpr uint64_t kMaxSubChunkShift = 8ull * 1024ull * 1024ull;
+        const uint64_t min_sub =
+            (shifted_off + src_sz > finfo.FileSize)
+                ? (((shifted_off + src_sz - finfo.FileSize) + 0xFFull) & ~0xFFull)
+                : 0x100ull;
+        const uint64_t max_sub = std::min<uint64_t>(shifted_off & ~0xFFull, kMaxSubChunkShift);
+        if (min_sub == 0ull || min_sub > max_sub) {
+            return false;
+        }
+
+        const uint64_t win_start = shifted_off - max_sub;
+        const uint64_t win_end = std::min<uint64_t>(finfo.FileSize, (shifted_off - min_sub) + src_sz);
+        if (win_end <= win_start || (win_end - win_start) > (kMaxSubChunkShift + src_sz)) {
+            return false;
+        }
+        std::vector<uint8_t> win_buf;
+        if (file_impl->ReadAt(win_start, static_cast<uint32_t>(win_end - win_start), win_buf, cancel_flag) < 0 ||
+            win_buf.size() < src_sz) {
+            return false;
+        }
+
+        const size_t max_chunk_cap =
+            std::min<size_t>(staging_limit, std::max<size_t>(static_cast<size_t>(max_sub) + dst_sz, 16ull * 1024ull * 1024ull));
+        std::vector<uint8_t> full_dec;
+        for (uint64_t sub_off = min_sub; sub_off <= max_sub; sub_off += 0x100ull) {
+            if (cancel_flag && cancel_flag->load(std::memory_order_acquire)) return false;
+            const uint64_t cand_off = shifted_off - sub_off;
+            if (cand_off < win_start || (cand_off - win_start) + src_sz > win_buf.size()) {
+                continue;
+            }
+            const uint8_t* p = win_buf.data() + static_cast<size_t>(cand_off - win_start);
+            const uint8_t cmf = p[0];
+            const uint8_t flg = p[1];
+            if ((cmf & 0x0Fu) != 8u || ((cmf >> 4u) & 0x0Fu) > 7u || ((flg >> 5u) & 1u) != 0u ||
+                (((static_cast<uint32_t>(cmf) << 8u) | static_cast<uint32_t>(flg)) % 31u) != 0u) {
+                continue;
+            }
+            if (zlib_rfc1950::DecompressDeflateAttempt(
+                    p, src_sz, /*expect_rfc1950_wrapper=*/true, max_chunk_cap,
+                    /*allow_prefix_stop=*/false, full_dec) &&
+                full_dec.size() >= static_cast<size_t>(sub_off) + dst_sz) {
+                out_slice.assign(
+                    full_dec.begin() + static_cast<std::ptrdiff_t>(sub_off),
+                    full_dec.begin() + static_cast<std::ptrdiff_t>(sub_off + dst_sz));
+                std::lock_guard<std::mutex> lk(s_cache_mu);
+                size_t victim = 0u;
+                for (size_t i = 1u; i < s_cache.size(); ++i) {
+                    if (s_cache[i].tick < s_cache[victim].tick) victim = i;
+                }
+                s_cache[victim].file = file_impl;
+                s_cache[victim].base_off = cand_off;
+                s_cache[victim].src_sz = src_sz;
+                s_cache[victim].tick = ++s_cache_tick;
+                s_cache[victim].decompressed = std::move(full_dec);
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Executes a real Xbox 0x48-byte DSTORAGE_REQUEST honoring:
     //   - Options.ZlibDecompress (RFC 1950/1951 Zlib/Deflate)
     //   - Options.BcpackMode (BC1..BC7 hardware bitstream / BCPK)
@@ -2232,6 +2393,56 @@ private:
             src_ptr = buf_a.data();
             src_size = buf_a.size();
         } else {
+            if (dest_phys && req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE &&
+                req.Source.File.Source != nullptr) {
+                auto* file_impl = static_cast<DStorageFileImpl*>(req.Source.File.Source);
+                DSTORAGE_FILE_INFO finfo{};
+                if (file_impl->GetFileInformation(&finfo) >= 0 && finfo.FileSize > 0u &&
+                    (req.Source.File.Offset >= finfo.FileSize ||
+                     req.Source.File.Size > finfo.FileSize ||
+                     req.Source.File.Offset + static_cast<uint64_t>(req.Source.File.Size) > finfo.FileSize)) {
+                    if (use_zlib && bcpack_mode == 0u && swizzle_mode == 0u &&
+                        TryResolveShiftedZlibSubChunk(
+                            file_impl, req.Source.File.Offset, req.Source.File.Size,
+                            dst_size, staging_limit, cancel_flag, buf_b)) {
+                        const int32_t sh_hr = TransferPhysicalPageArray(
+                            title_va_mirror_.load(std::memory_order_acquire),
+                            static_cast<const uintptr_t*>(resolved_dst),
+                            item.xbox_dest_page_offset,
+                            static_cast<uint32_t>(dst_size),
+                            true,
+                            buf_b.data());
+                        if (sh_hr >= 0) {
+                            last_intermediate_size_.store(
+                                static_cast<uint32_t>(std::min<size_t>(dst_size, UINT32_MAX)),
+                                std::memory_order_release);
+                            GetRuntime().total_zlib_decompressions.fetch_add(1u, std::memory_order_relaxed);
+                            RecordOk("DirectStorage::XboxZlibDecompress");
+                            return OS_DSTORAGE_S_OK;
+                        }
+                        return sh_hr;
+                    }
+                    static std::atomic<uint32_t> s_oob_cnt{0u};
+                    const uint32_t on = s_oob_cnt.fetch_add(1u, std::memory_order_relaxed);
+                    if (on < 8u) {
+                        std::fprintf(stderr,
+                                     "[OpenScarlett][dstorage] OOB-ZEROFILL #%u off=0x%llX srcSz=0x%X fileSz=0x%llX dstSz=0x%zx\n",
+                                     on, static_cast<unsigned long long>(req.Source.File.Offset),
+                                     req.Source.File.Size,
+                                     static_cast<unsigned long long>(finfo.FileSize), dst_size);
+                        std::fflush(stderr);
+                    }
+                    buf_a.assign(dst_size, 0u);
+                    const int32_t zhr = TransferPhysicalPageArray(
+                        title_va_mirror_.load(std::memory_order_acquire),
+                        static_cast<const uintptr_t*>(resolved_dst),
+                        item.xbox_dest_page_offset,
+                        static_cast<uint32_t>(dst_size),
+                        true,
+                        buf_a.data());
+                    return (zhr < 0) ? zhr : OS_DSTORAGE_S_OK;
+                }
+            }
             const int32_t shr = AcquireSourceBytes(
                 req, staging_limit, buf_a, src_ptr, src_size, cancel_flag, false);
             if (shr < 0) return shr;
@@ -2250,8 +2461,64 @@ private:
             if (zlib_max == 0u) return OS_DSTORAGE_E_INVALIDARG;
             if (zlib_max > staging_limit) return OS_DSTORAGE_E_STAGING_BUFFER_TOO_SMALL;
             ReserveZlibOutputHint(buf_b, cur_size, (bcpack_mode == 0u) ? dst_size : zlib_max);
-            if (!zlib_rfc1950::Decompress(cur_ptr, cur_size, zlib_max, buf_b)) {
+            const bool allow_prefix =
+                (bcpack_mode == 0u && req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE);
+            bool z_ok = zlib_rfc1950::DecompressXboxStream(
+                cur_ptr, cur_size, zlib_max, buf_b, allow_prefix);
+            if (!z_ok && allow_prefix) {
+                // Retail RPF8/9 packfile readers occasionally request a sub-chunk prefix
+                // (e.g. DestinationSize = 16 KiB from a 64 KiB Zlib-compressed RPF chunk).
+                const size_t chunk_cap =
+                    std::min<size_t>(staging_limit, std::max<size_t>(dst_size * 16u, 262144u));
+                if (chunk_cap > zlib_max) {
+                    z_ok = zlib_rfc1950::DecompressXboxStream(
+                        cur_ptr, cur_size, chunk_cap, buf_b, true);
+                    if (z_ok && buf_b.size() > dst_size) {
+                        buf_b.resize(dst_size);
+                    }
+                }
+                // Retail RDS5 (.ttpf) packfile readers sub-slice multi-page Zlib chunks (e.g. 512 KiB
+                // chunk read in 128 KiB pages) where EnqueueChunksForRead added sub_offset to File.Offset.
+                if (!z_ok && req.Source.File.Source != nullptr) {
+                    z_ok = TryResolveShiftedZlibSubChunk(
+                        static_cast<DStorageFileImpl*>(req.Source.File.Source),
+                        req.Source.File.Offset,
+                        req.Source.File.Size,
+                        dst_size,
+                        staging_limit,
+                        cancel_flag,
+                        buf_b);
+                }
+            }
+            if (!z_ok) {
+                static const bool trace_zfail = []() {
+#if defined(_WIN32)
+                    char buf[16]{};
+                    return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_DSTORAGE", buf, sizeof(buf)) > 0 && buf[0] != '0';
+#else
+                    return false;
+#endif
+                }();
+                if (trace_zfail) {
+                    static std::atomic<uint32_t> s_zf{0u};
+                    if (s_zf.fetch_add(1u, std::memory_order_relaxed) < 16u) {
+                        char hex[64]{};
+                        int hp = 0;
+                        const size_t hn = std::min<size_t>(cur_size, 16u);
+                        for (size_t hi = 0u; hi < hn && hp + 4 < static_cast<int>(sizeof(hex)); ++hi) {
+                            hp += std::snprintf(hex + hp, sizeof(hex) - static_cast<size_t>(hp), "%02X ", cur_ptr[hi]);
+                        }
+                        std::fprintf(stderr,
+                                     "[OpenScarlett][dstorage] ZLIB-FAIL srcSz=0x%zX dstSz=0x%zX bc=%u hdr=[%s]\n",
+                                     cur_size, dst_size, static_cast<unsigned>(bcpack_mode), hex);
+                        std::fflush(stderr);
+                    }
+                }
                 return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
+            }
+            if (bcpack_mode == 0u && buf_b.size() > dst_size &&
+                req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE) {
+                buf_b.resize(dst_size);
             }
             if (bcpack_mode == 0u && buf_b.size() != dst_size) {
                 static const bool trace_ds_z = []() {
@@ -2299,6 +2566,24 @@ private:
             size_t written = 0u;
             auto st = openscarlett::BcPackHwDecodeBitstream(
                 fmt, cur_ptr, cur_size, bcpack_out.data(), bcpack_out.size(), &written);
+            if (!st.ok() && dst_size < 65536u) {
+                static constexpr size_t kCandidateChunkBytes[] = {
+                    4096u, 8192u, 12288u, 16384u, 32768u, 65536u};
+                std::vector<uint8_t> full_chunk;
+                for (size_t cand_bytes : kCandidateChunkBytes) {
+                    if (dst_size >= cand_bytes) continue;
+                    full_chunk.resize(cand_bytes);
+                    size_t cand_written = 0u;
+                    if (openscarlett::BcPackHwDecodeBitstream(
+                            fmt, cur_ptr, cur_size, full_chunk.data(), full_chunk.size(), &cand_written).ok() &&
+                        cand_written == cand_bytes) {
+                        std::memcpy(bcpack_out.data(), full_chunk.data(), dst_size);
+                        written = dst_size;
+                        st = openscarlett::Status::Ok();
+                        break;
+                    }
+                }
+            }
             if (!st.ok()) {
                 // Also accept a matching-format BCPK container if provided with exact size.
                 openscarlett::BcPackHeader hdr{};
@@ -2311,6 +2596,33 @@ private:
                 }
             }
             if (!st.ok() || written != dst_size) {
+                static const bool trace_ds_bcp = []() {
+#if defined(_WIN32)
+                    char buf[16]{};
+                    return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_DSTORAGE", buf, sizeof(buf)) > 0 && buf[0] != '0';
+#else
+                    return false;
+#endif
+                }();
+                if (trace_ds_bcp) {
+                    static std::atomic<uint32_t> s_bcp_log_cnt{0u};
+                    if (s_bcp_log_cnt.fetch_add(1u, std::memory_order_relaxed) < 16u) {
+                        char hex[96]{};
+                        size_t hp = 0u;
+                        for (size_t k = 0u; k < std::min<size_t>(cur_size, 24u) && hp + 4u < sizeof(hex); ++k) {
+                            hp += static_cast<size_t>(std::snprintf(hex + hp, sizeof(hex) - hp, "%02X ", cur_ptr[k]));
+                        }
+                        std::fprintf(stderr,
+                                     "[OpenScarlett][dstorage] BCPACK-FAIL mode=%llu src=%zu dst=%zu int=%u off=0x%llX hdr=[%s]\n",
+                                     static_cast<unsigned long long>(bcpack_mode),
+                                     cur_size, dst_size, item.xbox_intermediate_size,
+                                     req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE
+                                         ? static_cast<unsigned long long>(req.Source.File.Offset)
+                                         : 0ull,
+                                     hex);
+                        std::fflush(stderr);
+                    }
+                }
                 return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
             }
             cur_ptr = bcpack_out.data();
@@ -3209,8 +3521,14 @@ private:
         if (trace_ds) {
             static std::atomic<uint32_t> s_fail_log{0u};
             if (s_fail_log.fetch_add(1u, std::memory_order_relaxed) < 24u) {
+                const wchar_t* fpath = L"<mem>";
+                if (item.request.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE &&
+                    item.request.Source.File.Source) {
+                    const auto* fimpl = static_cast<const DStorageFileImpl*>(item.request.Source.File.Source);
+                    fpath = fimpl->FilePath().c_str();
+                }
                 std::fprintf(stderr,
-                             "[OpenScarlett][dstorage] FAIL hr=0x%08lX opts=0x%llX dst=%p dstSz=0x%X srcSz=0x%X off=0x%llX\n",
+                             "[OpenScarlett][dstorage] FAIL hr=0x%08lX opts=0x%llX dst=%p dstSz=0x%X srcSz=0x%X off=0x%llX file=%ls\n",
                              static_cast<unsigned long>(hr),
                              static_cast<unsigned long long>(item.xbox_options),
                              item.request.Destination.Memory.Buffer,
@@ -3220,7 +3538,8 @@ private:
                                  : item.request.Source.Memory.Size,
                              item.request.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE
                                  ? static_cast<unsigned long long>(item.request.Source.File.Offset)
-                                 : 0ull);
+                                 : 0ull,
+                             fpath);
                 std::fflush(stderr);
             }
         }
@@ -3505,6 +3824,181 @@ private:
 };
 
 // ===========================================================================
+// Retail Xbox GDK IDStorageQueueX / IDStorageQueueX2 Vtable Wrapper
+// Matches Microsoft dstorage_xs.h binary vtable order for IID_IDStorageQueueX_Xbox
+// ({A3F6649A-...}) and IID_IDStorageQueueX2_Xbox ({3C02CB0C-...}):
+//   Slot  3: EnqueueRequest(const DSTORAGE_REQUEST*)
+//   Slot  4: EnqueueStatus(IDStorageStatusArrayX*, uint32_t)
+//   Slot  5: EnqueueSignal(ID3D12Fence*, uint64_t)
+//   Slot  6: Submit()
+//   Slot  7: CancelRequestsWithTag(uint64_t, uint64_t)
+//   Slot  8: Close()
+//   Slot  9: GetErrorEvent()
+//   Slot 10: RetrieveErrorRecord(DSTORAGE_ERROR_RECORD*)
+//   Slot 11: Query(DSTORAGE_QUEUE_INFO*)
+//   Slot 12: EnqueueSetEvent(HANDLE)
+//   Slot 13: Query1(RetailXboxQueueInfo1*)
+// ===========================================================================
+struct RetailXboxQueueDesc1 {
+    DSTORAGE_REQUEST_SOURCE_TYPE SourceType;  // +0x00 (UINT64)
+    uint16_t Capacity;                        // +0x08
+    DSTORAGE_PRIORITY Priority;               // +0x0A (INT8)
+    const char* Name;                         // +0x10
+    uint64_t Options;                         // +0x18
+};
+static_assert(sizeof(RetailXboxQueueDesc1) == 0x20, "RetailXboxQueueDesc1 must be 0x20 bytes");
+
+struct RetailXboxQueueInfo1 {
+    RetailXboxQueueDesc1 Desc;                // +0x00..+0x1F
+    uint16_t EmptySlotCount;                  // +0x20
+    uint16_t RequestCountUntilAutoSubmit;     // +0x22
+    uint32_t Padding;                         // +0x24
+};
+static_assert(sizeof(RetailXboxQueueInfo1) == 0x28, "RetailXboxQueueInfo1 must be 0x28 bytes");
+
+struct IRetailXboxDStorageQueueVtbl {
+    virtual int32_t OPENSCARLETT_DSTORAGE_CALL QueryInterface(
+        const DStorageGuid* riid, void** ppvObject) = 0;
+    virtual uint32_t OPENSCARLETT_DSTORAGE_CALL AddRef() = 0;
+    virtual uint32_t OPENSCARLETT_DSTORAGE_CALL Release() = 0;
+    virtual void OPENSCARLETT_DSTORAGE_CALL EnqueueRequest(const DSTORAGE_REQUEST* request) = 0;
+    virtual void OPENSCARLETT_DSTORAGE_CALL EnqueueStatus(
+        IDStorageStatusArrayX* statusArray, uint32_t index) = 0;
+    virtual void OPENSCARLETT_DSTORAGE_CALL EnqueueSignal(void* fence, uint64_t value) = 0;
+    virtual void OPENSCARLETT_DSTORAGE_CALL Submit() = 0;
+    virtual void OPENSCARLETT_DSTORAGE_CALL CancelRequestsWithTag(
+        uint64_t mask, uint64_t value) = 0;
+    virtual void OPENSCARLETT_DSTORAGE_CALL Close() = 0;
+    virtual void* OPENSCARLETT_DSTORAGE_CALL GetErrorEvent() = 0;
+    virtual void OPENSCARLETT_DSTORAGE_CALL RetrieveErrorRecord(
+        DSTORAGE_ERROR_RECORD* record) = 0;
+    virtual void OPENSCARLETT_DSTORAGE_CALL Query(DSTORAGE_QUEUE_INFO* info) = 0;
+    virtual void OPENSCARLETT_DSTORAGE_CALL EnqueueSetEvent(void* handle) = 0;
+    virtual void OPENSCARLETT_DSTORAGE_CALL Query1(RetailXboxQueueInfo1* info) = 0;
+    virtual int32_t OPENSCARLETT_DSTORAGE_CALL SetAutoSubmitDisabled(bool disabled) = 0;
+    virtual bool OPENSCARLETT_DSTORAGE_CALL GetAutoSubmitDisabled() = 0;
+};
+
+class DStorageRetailXboxQueueImpl final : public IRetailXboxDStorageQueueVtbl {
+public:
+    explicit DStorageRetailXboxQueueImpl(std::shared_ptr<DStorageQueueCore> core)
+        : core_(std::move(core)) {}
+
+    virtual ~DStorageRetailXboxQueueImpl() = default;
+
+    int32_t OPENSCARLETT_DSTORAGE_CALL QueryInterface(
+        const DStorageGuid* riid, void** ppvObject) override {
+        if (!ppvObject) {
+            return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_E_POINTER, 0);
+        }
+        *ppvObject = nullptr;
+        if (!riid) {
+            return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_E_INVALIDARG, 0);
+        }
+        if (GuidEquals(riid, IID_OS_DStorage_IUnknown) ||
+            GuidEquals(riid, IID_IDStorageQueueX_Xbox) ||
+            GuidEquals(riid, IID_IDStorageQueueX2_Xbox)) {
+            AddRef();
+            *ppvObject = static_cast<IRetailXboxDStorageQueueVtbl*>(this);
+            return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_S_OK, 0);
+        }
+        if (GuidEquals(riid, IID_IDStorageQueueX) ||
+            GuidEquals(riid, IID_IDStorageQueueX1) ||
+            GuidEquals(riid, IID_IDStorageQueueX2)) {
+            auto* compat = new (std::nothrow) DStorageQueueImpl(core_);
+            if (!compat) {
+                return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_E_OUTOFMEMORY, 0);
+            }
+            *ppvObject = static_cast<IDStorageQueueX2*>(compat);
+            return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_S_OK, 0);
+        }
+        return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_E_NOINTERFACE, 0);
+    }
+
+    uint32_t OPENSCARLETT_DSTORAGE_CALL AddRef() override {
+        RecordOk("IDStorageQueueX::AddRef", 1);
+        return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    }
+
+    uint32_t OPENSCARLETT_DSTORAGE_CALL Release() override {
+        RecordOk("IDStorageQueueX::Release", 2);
+        const uint32_t rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+        if (rem == 0u) {
+            delete this;
+        }
+        return rem;
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL EnqueueRequest(const DSTORAGE_REQUEST* request) override {
+        core_->EnqueueRequest(request);
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL EnqueueStatus(
+        IDStorageStatusArrayX* statusArray, uint32_t index) override {
+        core_->EnqueueStatus(statusArray, index);
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL EnqueueSignal(void* fence, uint64_t value) override {
+        core_->EnqueueSignal(fence, value);
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL Submit() override {
+        core_->Submit();
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL CancelRequestsWithTag(
+        uint64_t mask, uint64_t value) override {
+        core_->CancelRequestsWithTag(mask, value);
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL Close() override {
+        core_->Close();
+    }
+
+    void* OPENSCARLETT_DSTORAGE_CALL GetErrorEvent() override {
+        return core_->GetErrorEvent();
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL RetrieveErrorRecord(DSTORAGE_ERROR_RECORD* record) override {
+        core_->RetrieveErrorRecord(record);
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL Query(DSTORAGE_QUEUE_INFO* info) override {
+        core_->Query(info);
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL EnqueueSetEvent(void* handle) override {
+        core_->EnqueueSetEvent(handle);
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL Query1(RetailXboxQueueInfo1* info) override {
+        if (!info) return;
+        DSTORAGE_QUEUE_INFO1 internal_info{};
+        core_->Query1(&internal_info);
+        info->Desc.SourceType = internal_info.Desc.SourceType;
+        info->Desc.Capacity = internal_info.Desc.Capacity;
+        info->Desc.Priority = internal_info.Desc.Priority;
+        info->Desc.Name = internal_info.Desc.Name;
+        info->Desc.Options = internal_info.Desc.Options;
+        info->EmptySlotCount = internal_info.EmptySlotCount;
+        info->RequestCountUntilAutoSubmit = internal_info.RequestCountUntilAutoSubmit;
+        info->Padding = 0u;
+    }
+
+    int32_t OPENSCARLETT_DSTORAGE_CALL SetAutoSubmitDisabled(bool disabled) override {
+        return core_->SetAutoSubmitDisabled(disabled);
+    }
+
+    bool OPENSCARLETT_DSTORAGE_CALL GetAutoSubmitDisabled() override {
+        return core_->GetAutoSubmitDisabled();
+    }
+
+private:
+    std::atomic<uint32_t> ref_count_{1};
+    std::shared_ptr<DStorageQueueCore> core_;
+};
+
+// ===========================================================================
 // Multi-Threaded DStoragePriorityScheduler Method Definitions
 // ===========================================================================
 void DStoragePriorityScheduler::RegisterQueue(
@@ -3716,6 +4210,15 @@ public:
         if (!core) {
             return RecordHr("IDStorageFactoryX::CreateQueue", OS_DSTORAGE_E_OUTOFMEMORY, 3);
         }
+        if (riid && (GuidEquals(riid, IID_IDStorageQueueX_Xbox) ||
+                     GuidEquals(riid, IID_IDStorageQueueX2_Xbox))) {
+            auto* rq = new (std::nothrow) DStorageRetailXboxQueueImpl(std::move(core));
+            if (!rq) {
+                return RecordHr("IDStorageFactoryX::CreateQueue", OS_DSTORAGE_E_OUTOFMEMORY, 3);
+            }
+            *ppv = static_cast<IRetailXboxDStorageQueueVtbl*>(rq);
+            return RecordHr("IDStorageFactoryX::CreateQueue", OS_DSTORAGE_S_OK, 3);
+        }
         auto* q = new (std::nothrow) DStorageQueueImpl(std::move(core));
         if (!q) {
             return RecordHr("IDStorageFactoryX::CreateQueue", OS_DSTORAGE_E_OUTOFMEMORY, 3);
@@ -3877,21 +4380,43 @@ public:
             !GuidEquals(riid, IID_OS_DStorage_IUnknown)) {
             return RecordHr("IDStorageFactoryX2::CreateQueue1", OS_DSTORAGE_E_NOINTERFACE, 10);
         }
+        const bool is_retail_xbox_iid =
+            riid && (GuidEquals(riid, IID_IDStorageQueueX_Xbox) ||
+                     GuidEquals(riid, IID_IDStorageQueueX2_Xbox));
         if (desc->SourceType != DSTORAGE_REQUEST_SOURCE_FILE &&
             desc->SourceType != DSTORAGE_REQUEST_SOURCE_MEMORY) {
             return RecordHr("IDStorageFactoryX2::CreateQueue1", OS_DSTORAGE_E_INVALIDARG, 10);
         }
-        if ((desc->Options & ~static_cast<uint32_t>(DSTORAGE_QUEUE_OPTIONS_DISABLE_AUTO_SUBMIT)) != 0u) {
-            return RecordHr("IDStorageFactoryX2::CreateQueue1", OS_DSTORAGE_E_INVALIDARG, 10);
-        }
         DSTORAGE_QUEUE_DESC base_desc{};
-        base_desc.SourceType = desc->SourceType;
-        base_desc.Capacity = desc->Capacity;
-        base_desc.Priority = desc->Priority;
-        base_desc.Name = desc->Name;
-        auto core = DStorageQueueCore::Create(base_desc, staging_size_, desc->Options);
+        uint32_t q_opts = DSTORAGE_QUEUE_OPTIONS_NONE;
+        if (is_retail_xbox_iid) {
+            const auto* rdesc = reinterpret_cast<const RetailXboxQueueDesc1*>(desc);
+            base_desc.SourceType = rdesc->SourceType;
+            base_desc.Capacity = rdesc->Capacity;
+            base_desc.Priority = rdesc->Priority;
+            base_desc.Name = rdesc->Name;
+            q_opts = static_cast<uint32_t>(rdesc->Options & DSTORAGE_QUEUE_OPTIONS_DISABLE_AUTO_SUBMIT);
+        } else {
+            if ((desc->Options & ~static_cast<uint32_t>(DSTORAGE_QUEUE_OPTIONS_DISABLE_AUTO_SUBMIT)) != 0u) {
+                return RecordHr("IDStorageFactoryX2::CreateQueue1", OS_DSTORAGE_E_INVALIDARG, 10);
+            }
+            base_desc.SourceType = desc->SourceType;
+            base_desc.Capacity = desc->Capacity;
+            base_desc.Priority = desc->Priority;
+            base_desc.Name = desc->Name;
+            q_opts = desc->Options;
+        }
+        auto core = DStorageQueueCore::Create(base_desc, staging_size_, q_opts);
         if (!core) {
             return RecordHr("IDStorageFactoryX2::CreateQueue1", OS_DSTORAGE_E_OUTOFMEMORY, 10);
+        }
+        if (is_retail_xbox_iid) {
+            auto* rq = new (std::nothrow) DStorageRetailXboxQueueImpl(std::move(core));
+            if (!rq) {
+                return RecordHr("IDStorageFactoryX2::CreateQueue1", OS_DSTORAGE_E_OUTOFMEMORY, 10);
+            }
+            *ppv = static_cast<IRetailXboxDStorageQueueVtbl*>(rq);
+            return RecordHr("IDStorageFactoryX2::CreateQueue1", OS_DSTORAGE_S_OK, 10);
         }
         auto* q = new (std::nothrow) DStorageQueueImpl(std::move(core));
         if (!q) {

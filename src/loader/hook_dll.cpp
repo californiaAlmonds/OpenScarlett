@@ -23,6 +23,7 @@
 #include "openscarlett/loader/pe_inspector.h"
 #include "openscarlett/loader/probe_veh.h"
 #include "openscarlett/loader/vfs_mounts.h"
+#include "spatial_audio_bridge.h"
 
 namespace {
 
@@ -366,6 +367,7 @@ using PfnRegGetValueW = LSTATUS(APIENTRY*)(HKEY, LPCWSTR, LPCWSTR, DWORD, LPDWOR
 using PfnRegGetValueA = LSTATUS(APIENTRY*)(HKEY, LPCSTR, LPCSTR, DWORD, LPDWORD, PVOID, LPDWORD);
 using PfnRegCloseKey = LSTATUS(APIENTRY*)(HKEY);
 using PfnWinHttpConnect = LPVOID(WINAPI*)(LPVOID, LPCWSTR, WORD, DWORD);
+using PfnCoCreateInstance = HRESULT(STDAPICALLTYPE*)(REFCLSID, LPVOID, DWORD, REFIID, LPVOID*);
 
 PfnLoadLibraryA g_real_LoadLibraryA = nullptr;
 PfnLoadLibraryW g_real_LoadLibraryW = nullptr;
@@ -436,6 +438,9 @@ PfnRegGetValueW g_advapi32_RegGetValueW = nullptr;
 PfnRegGetValueA g_advapi32_RegGetValueA = nullptr;
 PfnRegCloseKey g_advapi32_RegCloseKey = nullptr;
 PfnWinHttpConnect g_real_WinHttpConnect = nullptr;
+PfnCoCreateInstance g_real_CoCreateInstance = nullptr;
+PfnCoCreateInstance g_ole32_CoCreateInstance = nullptr;
+void EnsureComProcsResolved() noexcept;
 bool g_offline_block_winhttp = false;
 bool g_trace_ods = false;
 PfnNtCreateFile g_real_NtCreateFile = nullptr;
@@ -1643,6 +1648,7 @@ FARPROC WINAPI Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
             }
         }
         EnsureAdvapi32ProcsResolved();
+    EnsureComProcsResolved();
         if (hModule == g_kernel32_mod ||
             (g_kernelbase_mod != nullptr && hModule == g_kernelbase_mod) ||
             (g_advapi32_mod != nullptr && hModule == g_advapi32_mod)) {
@@ -5070,6 +5076,38 @@ LPVOID WINAPI Hook_WinHttpConnect(LPVOID hSession, LPCWSTR pswzServerName, WORD 
                : nullptr;
 }
 
+void EnsureComProcsResolved() noexcept {
+    if (g_real_CoCreateInstance == nullptr) {
+        HMODULE cb = ::GetModuleHandleW(L"combase.dll");
+        if (!cb) cb = ::LoadLibraryW(L"combase.dll");
+        if (cb) {
+            g_real_CoCreateInstance =
+                reinterpret_cast<PfnCoCreateInstance>(::GetProcAddress(cb, "CoCreateInstance"));
+        }
+        if (HMODULE ole = ::GetModuleHandleW(L"ole32.dll")) {
+            g_ole32_CoCreateInstance =
+                reinterpret_cast<PfnCoCreateInstance>(::GetProcAddress(ole, "CoCreateInstance"));
+            if (g_real_CoCreateInstance == nullptr) {
+                g_real_CoCreateInstance = g_ole32_CoCreateInstance;
+            }
+        }
+    }
+}
+
+HRESULT STDAPICALLTYPE Hook_CoCreateInstance(
+    REFCLSID rclsid, LPVOID pUnkOuter, DWORD dwClsContext, REFIID riid, LPVOID* ppv) {
+    EnsureComProcsResolved();
+    if (!g_real_CoCreateInstance) {
+        if (ppv) *ppv = nullptr;
+        return E_FAIL;
+    }
+    const HRESULT hr = g_real_CoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv);
+    if (SUCCEEDED(hr) && ppv != nullptr && *ppv != nullptr) {
+        openscarlett::loader::WrapMmDeviceEnumeratorIfNeeded(rclsid, riid, ppv);
+    }
+    return hr;
+}
+
 DWORD ReadNormalizedConsoleModeEnv(char (&out_buf)[64]) noexcept {
     out_buf[0] = '\0';
     DWORD len = ::GetEnvironmentVariableA(
@@ -5388,6 +5426,7 @@ LSTATUS APIENTRY Hook_RegOpenKeyW(HKEY hKey, LPCWSTR lpSubKey, PHKEY phkResult) 
         return ERROR_SUCCESS;
     }
     EnsureAdvapi32ProcsResolved();
+    EnsureComProcsResolved();
     if (g_real_RegOpenKeyW) {
         return g_real_RegOpenKeyW(hKey, lpSubKey, phkResult);
     }
@@ -5419,6 +5458,7 @@ LSTATUS APIENTRY Hook_RegOpenKeyA(HKEY hKey, LPCSTR lpSubKey, PHKEY phkResult) {
         return ERROR_SUCCESS;
     }
     EnsureAdvapi32ProcsResolved();
+    EnsureComProcsResolved();
     if (g_real_RegOpenKeyA) {
         return g_real_RegOpenKeyA(hKey, lpSubKey, phkResult);
     }
@@ -5982,40 +6022,186 @@ LONG CALLBACK Zen2IllegalInstructionVeh(PEXCEPTION_POINTERS ep) {
             }
         }
 
-        static const bool continue_int3 = []() {
+        static const int continue_int3_mode = []() {
             char buf[16]{};
-            return ::GetEnvironmentVariableA("OPENSCARLETT_CONTINUE_INT3", buf, sizeof(buf)) > 0 && buf[0] != '0';
+            if (::GetEnvironmentVariableA("OPENSCARLETT_CONTINUE_INT3", buf, sizeof(buf)) > 0) {
+                return (buf[0] == '0') ? 0 : 1;
+            }
+            return -1;  // Auto: continue single-byte inline __debugbreak() inside guest title EXE
         }();
-        if (continue_int3) {
-            MEMORY_BASIC_INFORMATION mbi{};
-            if (::VirtualQuery(p, &mbi, sizeof(mbi)) != 0u && mbi.State == MEM_COMMIT && *p == 0xCCu) {
-                static std::atomic<uint32_t> s_int3_cnt{0u};
-                const uint32_t n = s_int3_cnt.fetch_add(1u, std::memory_order_relaxed);
-                if (n < 16u || (n % 100u) == 0u) {
-                    HMODULE mod = nullptr;
-                    char mod_name[MAX_PATH]{};
-                    uintptr_t rva = 0u;
-                    if (::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+        static const std::string s_veh_log_path = []() {
+            char buf[MAX_PATH]{};
+            const DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_VEH_LOG", buf, sizeof(buf));
+            return (n > 0u && n < sizeof(buf)) ? std::string(buf, n) : std::string();
+        }();
+        {
+            static std::atomic<uint32_t> s_int3_diag_cnt{0u};
+            const uint32_t diag_n = s_int3_diag_cnt.fetch_add(1u, std::memory_order_relaxed);
+            if (diag_n < 16u) {
+                auto resolve_addr = [](uintptr_t addr, char* out_buf, size_t out_cap) {
+                    HMODULE m = nullptr;
+                    char mpath[MAX_PATH]{};
+                    if (addr >= 0x10000u &&
+                        ::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                                  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                             reinterpret_cast<LPCSTR>(ctx->Rip), &mod) &&
-                        mod) {
-                        ::GetModuleFileNameA(mod, mod_name, static_cast<DWORD>(sizeof(mod_name)));
-                        rva = static_cast<uintptr_t>(ctx->Rip) - reinterpret_cast<uintptr_t>(mod);
+                                             reinterpret_cast<LPCSTR>(addr), &m) &&
+                        m) {
+                        ::GetModuleFileNameA(m, mpath, static_cast<DWORD>(sizeof(mpath)));
+                        const char* base = std::strrchr(mpath, '\\');
+                        base = base ? (base + 1) : mpath;
+                        const uintptr_t off = addr - reinterpret_cast<uintptr_t>(m);
+                        std::snprintf(out_buf, out_cap, "%s+0x%llX", base, static_cast<unsigned long long>(off));
+                    } else {
+                        std::snprintf(out_buf, out_cap, "0x%llX", static_cast<unsigned long long>(addr));
                     }
-                    std::fprintf(stderr,
-                                 "[OpenScarlett][VEH-INT3] #%u rip=0x%llX (%s+0x%llX) rcx=0x%llX rdx=0x%llX r8=0x%llX r14=0x%llX\n",
-                                 n, static_cast<unsigned long long>(ctx->Rip), mod_name,
-                                 static_cast<unsigned long long>(rva),
-                                 static_cast<unsigned long long>(ctx->Rcx),
-                                 static_cast<unsigned long long>(ctx->Rdx),
-                                 static_cast<unsigned long long>(ctx->R8),
-                                 static_cast<unsigned long long>(ctx->R14));
-                    std::fflush(stderr);
+                };
+                auto peek_ascii = [](uintptr_t cand, char* out_s, size_t cap) -> bool {
+                    out_s[0] = '\0';
+                    if (cand < 0x10000u || cap < 8u) return false;
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    if (::VirtualQuery(reinterpret_cast<const void*>(cand), &mbi, sizeof(mbi)) == 0u ||
+                        mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0u) {
+                        return false;
+                    }
+                    const size_t avail = std::min<size_t>(
+                        cap - 1u,
+                        static_cast<size_t>(reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize - cand));
+                    if (avail < 4u) return false;
+                    const auto* s = reinterpret_cast<const unsigned char*>(cand);
+                    size_t k = 0u;
+                    for (; k < std::min<size_t>(avail, 120u); ++k) {
+                        if (s[k] == 0u) break;
+                        if (s[k] < 0x20u && s[k] != '\t' && s[k] != '\n' && s[k] != '\r') return false;
+                        if (s[k] > 0x7Eu) return false;
+                        out_s[k] = (s[k] == '\n' || s[k] == '\r') ? ' ' : static_cast<char>(s[k]);
+                    }
+                    out_s[k] = '\0';
+                    return k >= 4u;
+                };
+
+                char rip_sym[160]{};
+                resolve_addr(static_cast<uintptr_t>(ctx->Rip), rip_sym, sizeof(rip_sym));
+
+                std::string stack_syms;
+                MEMORY_BASIC_INFORMATION sp_mbi{};
+                if (ctx->Rsp >= 0x10000u &&
+                    ::VirtualQuery(reinterpret_cast<const void*>(ctx->Rsp), &sp_mbi, sizeof(sp_mbi)) != 0u &&
+                    sp_mbi.State == MEM_COMMIT && (sp_mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0u) {
+                    const uintptr_t sp_end =
+                        std::min<uintptr_t>(ctx->Rsp + 0x120u,
+                                            reinterpret_cast<uintptr_t>(sp_mbi.BaseAddress) + sp_mbi.RegionSize);
+                    int found_ret = 0;
+                    for (uintptr_t sp = (ctx->Rsp & ~uintptr_t(7u)); sp + 8u <= sp_end && found_ret < 10; sp += 8u) {
+                        const uintptr_t word = *reinterpret_cast<const uintptr_t*>(sp);
+                        HMODULE m = nullptr;
+                        if (word >= 0x10000u &&
+                            ::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                                     GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                                 reinterpret_cast<LPCSTR>(word), &m) &&
+                            m) {
+                            MEMORY_BASIC_INFORMATION cmbi{};
+                            if (::VirtualQuery(reinterpret_cast<const void*>(word), &cmbi, sizeof(cmbi)) != 0u &&
+                                (cmbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                                 PAGE_EXECUTE_WRITECOPY)) != 0u) {
+                                char sym[160]{};
+                                resolve_addr(word, sym, sizeof(sym));
+                                if (!stack_syms.empty()) stack_syms += " <- ";
+                                stack_syms += sym;
+                                ++found_ret;
+                            }
+                        }
+                    }
                 }
-                ctx->Rip += 1u;
-                return EXCEPTION_CONTINUE_EXECUTION;
+
+                std::string reg_strs;
+                const std::pair<const char*, uintptr_t> regs[] = {
+                    {"rcx", ctx->Rcx}, {"rdx", ctx->Rdx}, {"r8", ctx->R8}, {"r9", ctx->R9},
+                    {"rax", ctx->Rax}, {"rbx", ctx->Rbx}, {"rsi", ctx->Rsi}, {"rdi", ctx->Rdi}};
+                for (const auto& [rname, rval] : regs) {
+                    char sbuf[128]{};
+                    if (peek_ascii(rval, sbuf, sizeof(sbuf))) {
+                        reg_strs += std::string(" ") + rname + "=\"" + sbuf + "\"";
+                    }
+                }
+
+                char report[2048]{};
+                std::snprintf(
+                    report, sizeof(report),
+                    "[OpenScarlett][VEH-INT3] #%u tid=%lu rip=0x%llX (%s) rax=0x%llX rbx=0x%llX rcx=0x%llX "
+                    "rdx=0x%llX rsi=0x%llX rdi=0x%llX r8=0x%llX r9=0x%llX r14=0x%llX rsp=0x%llX%s\n"
+                    "  stack: %s\n",
+                    diag_n, static_cast<unsigned long>(::GetCurrentThreadId()),
+                    static_cast<unsigned long long>(ctx->Rip), rip_sym,
+                    static_cast<unsigned long long>(ctx->Rax), static_cast<unsigned long long>(ctx->Rbx),
+                    static_cast<unsigned long long>(ctx->Rcx), static_cast<unsigned long long>(ctx->Rdx),
+                    static_cast<unsigned long long>(ctx->Rsi), static_cast<unsigned long long>(ctx->Rdi),
+                    static_cast<unsigned long long>(ctx->R8), static_cast<unsigned long long>(ctx->R9),
+                    static_cast<unsigned long long>(ctx->R14), static_cast<unsigned long long>(ctx->Rsp),
+                    reg_strs.c_str(), stack_syms.empty() ? "<none>" : stack_syms.c_str());
+                std::fprintf(stderr, "%s", report);
+                std::fflush(stderr);
+                if (!s_veh_log_path.empty()) {
+                    FILE* vf = nullptr;
+                    if (::fopen_s(&vf, s_veh_log_path.c_str(), "ab") == 0 && vf) {
+                        std::fwrite(report, 1u, std::strlen(report), vf);
+                        std::fflush(vf);
+                        std::fclose(vf);
+                    }
+                }
             }
         }
+
+        if (continue_int3_mode != 0) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (::VirtualQuery(p, &mbi, sizeof(mbi)) != 0u && mbi.State == MEM_COMMIT && *p == 0xCCu) {
+                bool allow_continue = (continue_int3_mode > 0);
+                if (!allow_continue) {
+                    // In retail/master Xbox titles (e.g. game_scarlett_master.exe), non-fatal
+                    // Assertf/__debugbreak() sites emit a single 0xCC followed by valid recovery
+                    // instructions (not CC CC alignment padding).
+                    HMODULE hit_mod = nullptr;
+                    const HMODULE main_exe = ::GetModuleHandleW(nullptr);
+                    if (main_exe != nullptr &&
+                        ::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                             reinterpret_cast<LPCSTR>(p), &hit_mod) &&
+                        hit_mod == main_exe) {
+                        const uintptr_t reg_end =
+                            reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+                        if (reinterpret_cast<uintptr_t>(p) + 1u < reg_end && p[1] != 0xCCu) {
+                            // Detect leaf chunk-counter end-of-table cold assert (`je +0x38 -> CC EB C5`
+                            // with `C3` ret at `p - 16` when `rdx == r9`): return valid chunk count in `eax`
+                            // instead of jumping backward into out-of-bounds sentinel `[rdx + 8]`!
+                            if (reinterpret_cast<uintptr_t>(p) >=
+                                    reinterpret_cast<uintptr_t>(mbi.BaseAddress) + 16u &&
+                                reinterpret_cast<uintptr_t>(p) + 2u < reg_end &&
+                                p[1] == 0xEBu && p[2] == 0xC5u && p[-16] == 0xC3u &&
+                                ctx->Rdx == ctx->R9) {
+                                ctx->Rip = reinterpret_cast<uintptr_t>(p - 16);
+                                return EXCEPTION_CONTINUE_EXECUTION;
+                            }
+                            // Detect EnqueueChunksForRead end-of-table cold assert (`CC E9 A5 FD FF FF`
+                            // preceded by `31 C0 E9 3E FF FF FF` epilogue jump when `rdi == rdx`):
+                            // return valid chunk count in `eax` via epilogue instead of looping into OOB `[rdi]`.
+                            if (reinterpret_cast<uintptr_t>(p) >=
+                                    reinterpret_cast<uintptr_t>(mbi.BaseAddress) + 8u &&
+                                reinterpret_cast<uintptr_t>(p) + 5u < reg_end &&
+                                p[1] == 0xE9u && p[-7] == 0x31u && p[-6] == 0xC0u &&
+                                p[-5] == 0xE9u && ctx->Rdi == ctx->Rdx) {
+                                ctx->Rip = reinterpret_cast<uintptr_t>(p - 5);
+                                return EXCEPTION_CONTINUE_EXECUTION;
+                            }
+                            allow_continue = true;
+                        }
+                    }
+                }
+                if (allow_continue) {
+                    ctx->Rip += 1u;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
+        FlushTelemetryInternal(true);
         return EXCEPTION_CONTINUE_SEARCH;
     }
     if (exc_code != EXCEPTION_ILLEGAL_INSTRUCTION) {
@@ -6487,6 +6673,8 @@ void* ResolveHookForSymbol(const char* name) {
          reinterpret_cast<void**>(&g_real_RegCloseKey)},
         {"WinHttpConnect", reinterpret_cast<void*>(&Hook_WinHttpConnect),
          reinterpret_cast<void**>(&g_real_WinHttpConnect)},
+        {"CoCreateInstance", reinterpret_cast<void*>(&Hook_CoCreateInstance),
+         reinterpret_cast<void**>(&g_real_CoCreateInstance)},
         {"NtCreateFile", reinterpret_cast<void*>(&Hook_NtCreateFile),
          reinterpret_cast<void**>(&g_real_NtCreateFile)},
         {"NtOpenFile", reinterpret_cast<void*>(&Hook_NtOpenFile),
@@ -6544,6 +6732,7 @@ void* ResolveHookForRealAddress(ULONGLONG addr) {
     if (void* p = match(g_real_GlobalMemoryStatusEx, &Hook_GlobalMemoryStatusEx)) return p;
     if (void* p = match(g_kernelbase_GlobalMemoryStatusEx, &Hook_GlobalMemoryStatusEx)) return p;
     EnsureAdvapi32ProcsResolved();
+    EnsureComProcsResolved();
     if (void* p = match(g_real_RegOpenKeyW, &Hook_RegOpenKeyW)) return p;
     if (void* p = match(g_real_RegOpenKeyA, &Hook_RegOpenKeyA)) return p;
     if (void* p = match(g_real_RegOpenKeyExW, &Hook_RegOpenKeyExW)) return p;
@@ -6561,6 +6750,9 @@ void* ResolveHookForRealAddress(ULONGLONG addr) {
     if (void* p = match(g_real_RegCloseKey, &Hook_RegCloseKey)) return p;
     if (void* p = match(g_advapi32_RegCloseKey, &Hook_RegCloseKey)) return p;
     if (void* p = match(g_real_WinHttpConnect, &Hook_WinHttpConnect)) return p;
+    EnsureComProcsResolved();
+    if (void* p = match(g_real_CoCreateInstance, &Hook_CoCreateInstance)) return p;
+    if (void* p = match(g_ole32_CoCreateInstance, &Hook_CoCreateInstance)) return p;
     if (void* p = match(g_real_NtCreateFile, &Hook_NtCreateFile)) return p;
     if (void* p = match(g_real_NtOpenFile, &Hook_NtOpenFile)) return p;
     if (void* p = match(g_real_NtQueryAttributesFile, &Hook_NtQueryAttributesFile)) return p;
@@ -7286,6 +7478,7 @@ bool InitializeHookRuntime(HMODULE self_mod) {
         g_real_RegCloseKey = reinterpret_cast<PfnRegCloseKey>(::GetProcAddress(k32, "RegCloseKey"));
     }
     EnsureAdvapi32ProcsResolved();
+    EnsureComProcsResolved();
     {
         char off_buf[16]{};
         const DWORD off_len = ::GetEnvironmentVariableA("OPENSCARLETT_OFFLINE", off_buf, static_cast<DWORD>(sizeof(off_buf)));
@@ -7372,6 +7565,9 @@ bool InitializeHookRuntime(HMODULE self_mod) {
     const std::wstring default_vfs_root = openscarlett::ResolveDefaultVfsRootW(g_shim_dir_w);
     g_vfs.Configure(openscarlett::VfsMounts::BuildDefaultConfig(main_exe_dir, default_vfs_root));
     g_guest_dir_w = g_vfs.GetGameRoot().empty() ? main_exe_dir : g_vfs.GetGameRoot();
+    if (!g_guest_dir_w.empty()) {
+        ::SetEnvironmentVariableW(L"OPENSCARLETT_GUEST_DIR", g_guest_dir_w.c_str());
+    }
 
     const std::wstring virt_mod_env = ToLowerAsciiW(ReadEnvW(L"OPENSCARLETT_VIRTUALIZE_MODULE_PATHS"));
     g_virtualize_module_paths.store(
@@ -7520,6 +7716,14 @@ __declspec(dllexport) int __cdecl OpenScarlettHook_RegisterModuleExceptionTable(
             static_cast<int32_t>(count), -1);
     }
     return ok ? 1 : 0;
+}
+
+__declspec(dllexport) int __cdecl OpenScarlettHook_PatchModuleImports(HMODULE mod) {
+    if (!mod) {
+        return 0;
+    }
+    PatchModuleImports(mod);
+    return 1;
 }
 
 __declspec(dllexport) int __cdecl OpenScarlettHook_LoadDllsTopologically(

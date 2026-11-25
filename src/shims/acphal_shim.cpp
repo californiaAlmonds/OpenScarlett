@@ -17,10 +17,17 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <thread>
 
 #if defined(_WIN32)
 #  include <malloc.h>
+#  include <share.h>
 #  include <windows.h>
+#  include <mmdeviceapi.h>
+#  include <audioclient.h>
 #endif
 
 namespace {
@@ -928,6 +935,21 @@ static bool IsReadableAcpPtr(const void* ptr, size_t bytes) {
 #endif
 }
 
+inline void QueryQpcAndFreq(uint64_t& out_ticks, uint64_t& out_freq) noexcept {
+#if defined(_WIN32)
+    LARGE_INTEGER now{}, freq{};
+    if (::QueryPerformanceCounter(&now) != FALSE &&
+        ::QueryPerformanceFrequency(&freq) != FALSE &&
+        now.QuadPart >= 0 && freq.QuadPart > 0) {
+        out_ticks = static_cast<uint64_t>(now.QuadPart);
+        out_freq = static_cast<uint64_t>(freq.QuadPart);
+        return;
+    }
+#endif
+    out_ticks = 0ull;
+    out_freq = 10000000ull;
+}
+
 // Full 12-slot retail Xbox Series X|S IAcpHal vtable (does NOT inherit IUnknown).
 class XboxRetailAcpHalImpl {
 public:
@@ -943,7 +965,10 @@ public:
         SrwLockGuard lk(mutex_);
         connected_ = true;
         messages_.clear();
-        audio_clock_samples_ = 0ull;
+        max_messages_ = std::clamp<uint32_t>(
+            messageQueueLength != 0u ? messageQueueLength : 4096u, 256u, 16384u);
+        QueryQpcAndFreq(connect_qpc_, qpc_freq_);
+        audio_clock_samples_ = 128ull;
         xma_enabled_mask_.fill(0ull);
         return RecordHr("IAcpHal::Connect", ACPHAL_S_OK, 0);
     }
@@ -956,10 +981,14 @@ public:
         }
         SrwLockGuard lk(mutex_);
         connected_ = false;
+        const uint64_t clk = AdvanceAudioClockLocked();
         XboxAcpMessage msg{};
         msg.kind = 0x80u;  // ACP_MESSAGE_TYPE_DISCONNECTED
         msg.reserved = 0u;
-        msg.audioClockSamples = audio_clock_samples_;
+        msg.audioClockSamples = clk;
+        if (messages_.size() >= max_messages_) {
+            messages_.pop_front();
+        }
         messages_.push_back(msg);
         return RecordHr("IAcpHal::Disconnect", ACPHAL_S_OK, 1);
     }
@@ -1099,14 +1128,17 @@ public:
                 break;
         }
 
-        audio_clock_samples_ += 128ull;
+        const uint64_t clk = AdvanceAudioClockLocked();
         if (commandId != 0ull) {
             XboxAcpMessage msg{};
             msg.kind = 0x10u;  // ACP_MESSAGE_TYPE_COMMAND_COMPLETED
             msg.reserved = 0u;
-            msg.audioClockSamples = audio_clock_samples_;
+            msg.audioClockSamples = clk;
             msg.commandId = commandId;
             msg.extra = 0u;
+            if (messages_.size() >= max_messages_) {
+                messages_.pop_front();
+            }
             messages_.push_back(msg);
         }
         return RecordHr("IAcpHal::SubmitCommand", ACPHAL_S_OK, 2);
@@ -1411,14 +1443,329 @@ private:
         std::memcpy(ctx + 0x10, &dw4, sizeof(uint32_t));
     }
 
+    uint64_t AdvanceAudioClockLocked() noexcept {
+        uint64_t now_qpc = 0ull;
+        uint64_t freq = qpc_freq_;
+        QueryQpcAndFreq(now_qpc, freq);
+        if (connect_qpc_ == 0ull && now_qpc != 0ull) {
+            connect_qpc_ = now_qpc;
+            qpc_freq_ = freq;
+        }
+        uint64_t target = 128ull;
+        if (now_qpc >= connect_qpc_ && qpc_freq_ > 0ull) {
+            const uint64_t delta = now_qpc - connect_qpc_;
+            const uint64_t whole_sec = delta / qpc_freq_;
+            const uint64_t rem_ticks = delta % qpc_freq_;
+            const uint64_t elapsed_48k =
+                whole_sec * 48000ull + (rem_ticks * 48000ull) / qpc_freq_;
+            target = 128ull + elapsed_48k;
+        }
+        if (target > audio_clock_samples_) {
+            audio_clock_samples_ = target;
+        }
+        return audio_clock_samples_;
+    }
+
     SrwLock mutex_;
     bool connected_ = false;
     uint32_t last_config_ = 0u;
-    uint64_t audio_clock_samples_ = 0ull;
+    uint32_t max_messages_ = 4096u;
+    uint64_t connect_qpc_ = 0ull;
+    uint64_t qpc_freq_ = 10000000ull;
+    uint64_t audio_clock_samples_ = 128ull;
     std::array<uint64_t, 8> xma_enabled_mask_{};
     std::unordered_map<uint32_t, RetailXmaCtxState> xma_states_;
     std::deque<XboxAcpMessage> messages_;
 };
+
+}  // namespace
+
+namespace {
+
+#if defined(_WIN32)
+void StartRetailLoopbackWavRecorderOnce() noexcept {
+    static std::atomic<bool> s_started{false};
+    if (s_started.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    char null_buf[16]{};
+    if (::GetEnvironmentVariableA("OPENSCARLETT_AUDIO_NULL", null_buf, sizeof(null_buf)) > 0 &&
+        null_buf[0] != '0') {
+        return;
+    }
+    wchar_t wav_buf[2048]{};
+    const DWORD len = ::GetEnvironmentVariableW(
+        L"OPENSCARLETT_RECORD_WAV", wav_buf, static_cast<DWORD>(std::size(wav_buf)));
+    if (len == 0u || len >= std::size(wav_buf)) {
+        return;
+    }
+    std::wstring raw_path(wav_buf, len);
+    if (raw_path.size() >= 2u && raw_path.front() == L'"' && raw_path.back() == L'"') {
+        raw_path = raw_path.substr(1u, raw_path.size() - 2u);
+    }
+    if (raw_path.empty()) {
+        return;
+    }
+    std::thread([wav_path = std::filesystem::path(raw_path)]() {
+        const HRESULT hr_co = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const bool need_uninit = SUCCEEDED(hr_co);
+
+        // Give XAudio2_9 / SpatialAudioBridge a brief moment; if claimed or file already exists, skip.
+        ::Sleep(250u);
+        char claimed_buf[8]{};
+        if (::GetEnvironmentVariableA("OPENSCARLETT_SPATIAL_WAV_CLAIMED", claimed_buf, sizeof(claimed_buf)) > 0 &&
+            claimed_buf[0] == '1') {
+            if (need_uninit) ::CoUninitialize();
+            return;
+        }
+        std::error_code ec;
+        if (std::filesystem::exists(wav_path, ec) && std::filesystem::file_size(wav_path, ec) > 44u) {
+            if (need_uninit) ::CoUninitialize();
+            return;
+        }
+        if (wav_path.has_parent_path()) {
+            std::filesystem::create_directories(wav_path.parent_path(), ec);
+        }
+
+        IMMDeviceEnumerator* enumerator = nullptr;
+        IMMDevice* endpoint = nullptr;
+        IAudioClient* client = nullptr;
+        IAudioCaptureClient* capture = nullptr;
+        WAVEFORMATEX* mix_fmt = nullptr;
+
+        auto cleanup = [&]() {
+            if (mix_fmt) ::CoTaskMemFree(mix_fmt);
+            if (capture) capture->Release();
+            if (client) {
+                (void)client->Stop();
+                client->Release();
+            }
+            if (endpoint) endpoint->Release();
+            if (enumerator) enumerator->Release();
+            if (need_uninit) ::CoUninitialize();
+        };
+
+        if (FAILED(::CoCreateInstance(
+                __uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator))) ||
+            !enumerator) {
+            cleanup();
+            return;
+        }
+        if (FAILED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &endpoint)) || !endpoint) {
+            cleanup();
+            return;
+        }
+        if (FAILED(endpoint->Activate(
+                __uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&client))) ||
+            !client) {
+            cleanup();
+            return;
+        }
+        if (FAILED(client->GetMixFormat(&mix_fmt)) || !mix_fmt || mix_fmt->nSamplesPerSec == 0u ||
+            mix_fmt->nChannels == 0u) {
+            cleanup();
+            return;
+        }
+        // 100 ms shared-mode loopback capture buffer
+        if (FAILED(client->Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_LOOPBACK,
+                1000000LL,
+                0,
+                mix_fmt,
+                nullptr))) {
+            cleanup();
+            return;
+        }
+        if (FAILED(client->GetService(
+                __uuidof(IAudioCaptureClient), reinterpret_cast<void**>(&capture))) ||
+            !capture) {
+            cleanup();
+            return;
+        }
+
+        const uint32_t sr = mix_fmt->nSamplesPerSec;
+        const uint32_t src_ch = mix_fmt->nChannels;
+        const uint32_t bytes_per_frame = mix_fmt->nBlockAlign;
+        bool is_float = (mix_fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT && mix_fmt->wBitsPerSample == 32u);
+        if (!is_float && mix_fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE && mix_fmt->cbSize >= 22u) {
+            const auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(mix_fmt);
+            // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT = {00000003-0000-0010-8000-00aa00389b71}
+            if (ext->SubFormat.Data1 == 0x00000003u && mix_fmt->wBitsPerSample == 32u) {
+                is_float = true;
+            }
+        }
+        const bool is_pcm16 = (!is_float && mix_fmt->wBitsPerSample == 16u);
+        if (!is_float && !is_pcm16) {
+            cleanup();
+            return;
+        }
+
+        FILE* fp = ::_wfsopen(wav_path.c_str(), L"wb", _SH_DENYNO);
+        if (!fp) {
+            cleanup();
+            return;
+        }
+
+        auto write_wav_header = [&](uint64_t total_frames) {
+            const uint64_t data_bytes64 = std::min<uint64_t>(total_frames * 4ull, 0xFFFFFF00ull);
+            const uint32_t data_bytes = static_cast<uint32_t>(data_bytes64);
+            const uint32_t riff_bytes = 36u + data_bytes;
+            const uint32_t byte_rate = sr * 4u;
+            const uint16_t block_align = 4u;
+            const uint16_t bits = 16u;
+            const uint16_t ch = 2u;
+            const uint16_t pcm_tag = 1u;
+            const uint32_t fmt_sz = 16u;
+            uint8_t hdr[44]{};
+            std::memcpy(hdr + 0, "RIFF", 4);
+            std::memcpy(hdr + 4, &riff_bytes, 4);
+            std::memcpy(hdr + 8, "WAVEfmt ", 8);
+            std::memcpy(hdr + 16, &fmt_sz, 4);
+            std::memcpy(hdr + 20, &pcm_tag, 2);
+            std::memcpy(hdr + 22, &ch, 2);
+            std::memcpy(hdr + 24, &sr, 4);
+            std::memcpy(hdr + 28, &byte_rate, 4);
+            std::memcpy(hdr + 32, &block_align, 2);
+            std::memcpy(hdr + 34, &bits, 2);
+            std::memcpy(hdr + 36, "data", 4);
+            std::memcpy(hdr + 40, &data_bytes, 4);
+            ::_fseeki64(fp, 0, SEEK_SET);
+            (void)std::fwrite(hdr, 1u, sizeof(hdr), fp);
+            ::_fseeki64(fp, 0, SEEK_END);
+            std::fflush(fp);
+        };
+
+        write_wav_header(0ull);
+        if (FAILED(client->Start())) {
+            std::fclose(fp);
+            cleanup();
+            return;
+        }
+
+        const std::filesystem::path json_path(wav_path.wstring() + L".json");
+        const uint32_t win_target = std::max<uint32_t>(1u, sr / 100u);  // 10 ms window
+        uint32_t cur_win_frames = 0u;
+        float cur_win_peak = 0.0f;
+        bool seen_active = false;
+        uint32_t silent_run = 0u;
+        uint64_t active_10ms_windows = 0ull;
+        uint64_t silent_holes_in_bursts = 0ull;
+        uint64_t total_frames = 0ull;
+        float peak_abs = 0.0f;
+        double sum_sq = 0.0;
+        std::vector<int16_t> scratch;
+        uint64_t last_flush_ms = ::GetTickCount64();
+
+        auto flush_all = [&]() {
+            write_wav_header(total_frames);
+            FILE* jfp = ::_wfsopen(json_path.c_str(), L"wb", _SH_DENYNO);
+            if (jfp) {
+                const double rms = (total_frames > 0ull)
+                                       ? std::sqrt(sum_sq / static_cast<double>(total_frames * 2ull))
+                                       : 0.0;
+                char jbuf[640]{};
+                const int n = std::snprintf(
+                    jbuf, sizeof(jbuf),
+                    "{\n"
+                    "  \"source\": \"wasapi_loopback\",\n"
+                    "  \"sample_rate\": %u,\n"
+                    "  \"channels\": 2,\n"
+                    "  \"total_frames\": %llu,\n"
+                    "  \"duration_sec\": %.3f,\n"
+                    "  \"rms\": %.6f,\n"
+                    "  \"peak_abs\": %.6f,\n"
+                    "  \"active_10ms_windows\": %llu,\n"
+                    "  \"silent_holes_in_bursts\": %llu\n"
+                    "}\n",
+                    sr,
+                    static_cast<unsigned long long>(total_frames),
+                    static_cast<double>(total_frames) / static_cast<double>(sr),
+                    rms,
+                    static_cast<double>(peak_abs),
+                    static_cast<unsigned long long>(active_10ms_windows),
+                    static_cast<unsigned long long>(silent_holes_in_bursts));
+                if (n > 0) {
+                    (void)std::fwrite(jbuf, 1u, static_cast<size_t>(std::min<int>(n, sizeof(jbuf) - 1)), jfp);
+                }
+                std::fflush(jfp);
+                std::fclose(jfp);
+            }
+        };
+
+        for (;;) {
+            ::Sleep(5u);
+            char cl_buf[8]{};
+            if (::GetEnvironmentVariableA("OPENSCARLETT_SPATIAL_WAV_CLAIMED", cl_buf, sizeof(cl_buf)) > 0 &&
+                cl_buf[0] == '1') {
+                std::fclose(fp);
+                cleanup();
+                return;
+            }
+            UINT32 pkt_frames = 0u;
+            while (SUCCEEDED(capture->GetNextPacketSize(&pkt_frames)) && pkt_frames > 0u) {
+                BYTE* data = nullptr;
+                UINT32 num_frames = 0u;
+                DWORD flags = 0u;
+                if (FAILED(capture->GetBuffer(&data, &num_frames, &flags, nullptr, nullptr))) {
+                    break;
+                }
+                const bool silent_pkt = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0u || !data;
+                scratch.resize(static_cast<size_t>(num_frames) * 2u);
+                for (UINT32 f = 0u; f < num_frames; ++f) {
+                    float l = 0.0f;
+                    float r = 0.0f;
+                    if (!silent_pkt) {
+                        const BYTE* row = data + static_cast<size_t>(f) * bytes_per_frame;
+                        if (is_float) {
+                            const auto* flt = reinterpret_cast<const float*>(row);
+                            l = flt[0];
+                            r = (src_ch >= 2u) ? flt[1] : flt[0];
+                        } else {
+                            const auto* s16 = reinterpret_cast<const int16_t*>(row);
+                            l = static_cast<float>(s16[0]) / 32768.0f;
+                            r = static_cast<float>((src_ch >= 2u) ? s16[1] : s16[0]) / 32768.0f;
+                        }
+                    }
+                    l = std::clamp(l, -1.0f, 1.0f);
+                    r = std::clamp(r, -1.0f, 1.0f);
+                    const float p = std::max(std::fabs(l), std::fabs(r));
+                    if (p > peak_abs) peak_abs = p;
+                    if (p > cur_win_peak) cur_win_peak = p;
+                    sum_sq += static_cast<double>(l) * l + static_cast<double>(r) * r;
+                    if (++cur_win_frames >= win_target) {
+                        if (cur_win_peak > 1e-4f) {
+                            if (seen_active && silent_run > 0u && silent_run <= 20u) {
+                                silent_holes_in_bursts += silent_run;
+                            }
+                            seen_active = true;
+                            silent_run = 0u;
+                            ++active_10ms_windows;
+                        } else if (seen_active) {
+                            ++silent_run;
+                        }
+                        cur_win_frames = 0u;
+                        cur_win_peak = 0.0f;
+                    }
+                    scratch[static_cast<size_t>(f) * 2u + 0u] =
+                        static_cast<int16_t>(std::lround(l * 32767.0f));
+                    scratch[static_cast<size_t>(f) * 2u + 1u] =
+                        static_cast<int16_t>(std::lround(r * 32767.0f));
+                }
+                (void)capture->ReleaseBuffer(num_frames);
+                const size_t wr = std::fwrite(scratch.data(), sizeof(int16_t) * 2u, num_frames, fp);
+                total_frames += static_cast<uint64_t>(wr);
+            }
+            const uint64_t now_ms = ::GetTickCount64();
+            if (now_ms - last_flush_ms >= 1000ull) {
+                last_flush_ms = now_ms;
+                flush_all();
+            }
+        }
+    }).detach();
+}
+#endif
 
 }  // namespace
 
@@ -1438,6 +1785,9 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalCreate(IAcpHal** ppAcpHal) {
     }
     *ppAcpHal = nullptr;
     if (g_xbox_retail_acphal_mode.load(std::memory_order_acquire)) {
+#if defined(_WIN32)
+        StartRetailLoopbackWavRecorderOnce();
+#endif
         auto* obj = new (std::nothrow) XboxRetailAcpHalImpl();
         if (!obj) {
             return RecordHr("AcpHalCreate", ACPHAL_E_OUTOFMEMORY);
@@ -1478,6 +1828,9 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalAllocateShapeContexts(
 
     if (!is_synthetic_2arg) {
         g_xbox_retail_acphal_mode.store(true, std::memory_order_release);
+#if defined(_WIN32)
+        StartRetailLoopbackWavRecorderOnce();
+#endif
         auto* xbox_ctx = reinterpret_cast<XboxAcpShapeContexts*>(
             const_cast<AcpHalShapeContexts*>(pRequested));
 

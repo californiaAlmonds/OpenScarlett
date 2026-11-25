@@ -446,6 +446,15 @@ inline int32_t RecordMod(const char* sym, int32_t hr) {
 constexpr const wchar_t* kMinUserXClassName = L"OpenScarlettMinUserXWindowClass";
 
 LRESULT CALLBACK MinUserXWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_ERASEBKGND) {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        if (hdc) {
+            RECT rc{};
+            ::GetClientRect(hwnd, &rc);
+            ::FillRect(hdc, &rc, static_cast<HBRUSH>(::GetStockObject(BLACK_BRUSH)));
+        }
+        return 1;
+    }
     return ::DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
@@ -457,6 +466,8 @@ bool EnsureMinUserXClassRegisteredLocked(MinUserXState& st) {
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = &MinUserXWndProc;
     wc.hInstance = ::GetModuleHandleW(nullptr);
+    wc.hCursor = ::LoadCursorA(nullptr, IDC_ARROW);
+    wc.hbrBackground = static_cast<HBRUSH>(::GetStockObject(BLACK_BRUSH));
     wc.lpszClassName = kMinUserXClassName;
     if (::RegisterClassExW(&wc) != 0 || ::GetLastError() == ERROR_CLASS_ALREADY_EXISTS) {
         st.wnd_class_registered = true;

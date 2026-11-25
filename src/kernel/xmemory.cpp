@@ -568,6 +568,134 @@ Status UnifiedMemoryManager::ReserveVirtualPlaceholder(size_t size,
 #endif
 }
 
+Status UnifiedMemoryManager::ReserveVirtualPlaceholderAt(void* requested_base,
+                                                         size_t size,
+                                                         void*& out_base,
+                                                         MemoryPageSize granule) {
+    out_base = nullptr;
+    if (requested_base == nullptr) {
+        return ReserveVirtualPlaceholder(size, out_base, granule);
+    }
+    if (size == 0) {
+        return Status::Error(StatusCode::InvalidArgument, "Placeholder reservation size must be > 0");
+    }
+    const size_t gran = std::max<size_t>(static_cast<size_t>(granule), 65536u);
+    const uintptr_t req_addr = reinterpret_cast<uintptr_t>(requested_base);
+    if ((req_addr & (gran - 1u)) != 0u) {
+        return Status::Error(StatusCode::InvalidArgument, "Requested placeholder base is not granule-aligned");
+    }
+    const size_t aligned_size = AlignUp(size, gran);
+#if defined(_WIN32)
+    if (!PlaceholderApi().Available()) {
+        return Status::Error(StatusCode::NotImplemented, "VirtualAlloc2 placeholder API unavailable");
+    }
+    void* base = PlaceholderApi().virtual_alloc2(GetCurrentProcess(),
+                                                 requested_base,
+                                                 aligned_size,
+                                                 MEM_RESERVE | kMemReservePlaceholder,
+                                                 PAGE_NOACCESS,
+                                                 nullptr,
+                                                 0u);
+    if (!base) {
+        return Status::Error(StatusCode::OutOfMemory, "VirtualAlloc2 fixed-base placeholder reservation failed");
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    PlaceholderReservation res{};
+    res.base = reinterpret_cast<uintptr_t>(base);
+    res.total_size = aligned_size;
+    res.granule = gran;
+    res.spans.push_back({res.base, aligned_size, false});
+    placeholders_.emplace(res.base, std::move(res));
+    out_base = base;
+    return Status::Ok();
+#else
+    (void)aligned_size;
+    return Status::Error(StatusCode::NotImplemented, "OS placeholders require Windows 10+");
+#endif
+}
+
+Status UnifiedMemoryManager::PromoteReservedRangeToPlaceholder(void* target_addr, size_t min_bytes) {
+    if (!target_addr || min_bytes == 0u) {
+        return Status::Error(StatusCode::InvalidArgument, "Invalid target range for placeholder promotion");
+    }
+#if defined(_WIN32)
+    if (!PlaceholderApi().Available()) {
+        return Status::Error(StatusCode::NotImplemented, "VirtualAlloc2 placeholder API unavailable");
+    }
+    const uintptr_t req_start = reinterpret_cast<uintptr_t>(target_addr);
+    const size_t aligned_min = AlignUp(min_bytes, 65536u);
+    const uintptr_t req_end = req_start + aligned_min;
+    if ((req_start & 0xFFFFu) != 0u || req_end < req_start) {
+        return Status::Error(StatusCode::InvalidArgument, "Target address must be 64 KiB aligned");
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& [rbase, res] : placeholders_) {
+        (void)rbase;
+        if (req_start >= res.base && req_end <= res.base + res.total_size) {
+            return Status::Ok();
+        }
+    }
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(target_addr, &mbi, sizeof(mbi)) == 0u ||
+        mbi.State != MEM_RESERVE || mbi.Type != MEM_PRIVATE || mbi.AllocationBase == nullptr) {
+        return Status::Error(StatusCode::InvalidArgument, "Target range is not a private MEM_RESERVE allocation");
+    }
+
+    const uintptr_t alloc_base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
+    if ((alloc_base & 0xFFFFu) != 0u) {
+        return Status::Error(StatusCode::InvalidArgument, "AllocationBase is not 64 KiB aligned");
+    }
+
+    uintptr_t cur = alloc_base;
+    while (true) {
+        MEMORY_BASIC_INFORMATION seg{};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(cur), &seg, sizeof(seg)) == 0u ||
+            seg.AllocationBase != mbi.AllocationBase || seg.RegionSize == 0u) {
+            break;
+        }
+        if (seg.State != MEM_RESERVE || seg.Type != MEM_PRIVATE) {
+            return Status::Error(StatusCode::InvalidArgument,
+                                 "Cannot promote partially committed MEM_RESERVE allocation");
+        }
+        const uintptr_t next = reinterpret_cast<uintptr_t>(seg.BaseAddress) + seg.RegionSize;
+        if (next <= cur) break;
+        cur = next;
+    }
+
+    const size_t total_size = AlignUp(cur - alloc_base, 65536u);
+    if (total_size == 0u || req_end > alloc_base + total_size) {
+        return Status::Error(StatusCode::InvalidArgument, "Target range exceeds MEM_RESERVE allocation");
+    }
+
+    if (!VirtualFree(mbi.AllocationBase, 0u, MEM_RELEASE)) {
+        return Status::Error(StatusCode::DeviceError, "VirtualFree failed during placeholder promotion");
+    }
+    void* promoted = PlaceholderApi().virtual_alloc2(GetCurrentProcess(),
+                                                     mbi.AllocationBase,
+                                                     total_size,
+                                                     MEM_RESERVE | kMemReservePlaceholder,
+                                                     PAGE_NOACCESS,
+                                                     nullptr,
+                                                     0u);
+    if (!promoted) {
+        (void)VirtualAlloc(mbi.AllocationBase, total_size, MEM_RESERVE, PAGE_NOACCESS);
+        return Status::Error(StatusCode::OutOfMemory, "VirtualAlloc2 failed during placeholder promotion");
+    }
+
+    PlaceholderReservation res{};
+    res.base = reinterpret_cast<uintptr_t>(promoted);
+    res.total_size = total_size;
+    res.granule = 65536u;
+    res.spans.push_back({res.base, total_size, false});
+    placeholders_.emplace(res.base, std::move(res));
+    return Status::Ok();
+#else
+    return Status::Error(StatusCode::NotImplemented, "OS placeholders require Windows 10+");
+#endif
+}
+
 Status UnifiedMemoryManager::ReleaseVirtualPlaceholder(void* base) {
     if (!base) {
         return Status::Error(StatusCode::InvalidArgument, "Null placeholder base");
@@ -613,10 +741,30 @@ Status UnifiedMemoryManager::SplitSpanLocked(PlaceholderReservation& res,
     }
 
 #if defined(_WIN32)
-    // Windows VirtualFree(MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) requires the split
-    // region to touch either the beginning or the end of the placeholder.
-    // A middle split therefore uses two sequential edge splits.
-    if (req_start > orig.base && req_end < orig_end) {
+    // Reconcile against actual OS placeholder boundaries in case guest code split the
+    // placeholder directly via Win32 VirtualFree(MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER).
+    MEMORY_BASIC_INFORMATION mbi{};
+    const bool have_mbi =
+        (VirtualQuery(reinterpret_cast<LPCVOID>(req_start), &mbi, sizeof(mbi)) != 0u) &&
+        (mbi.State == MEM_RESERVE) && (mbi.Type == MEM_PRIVATE) && (mbi.AllocationBase != nullptr);
+    const uintptr_t os_base = have_mbi ? reinterpret_cast<uintptr_t>(mbi.AllocationBase) : orig.base;
+    const uintptr_t os_end =
+        have_mbi ? (reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize) : orig_end;
+
+    if (have_mbi && os_base == req_start && os_end == req_end) {
+        // Already split to exact [req_start, req_end) at the OS level.
+    } else if (have_mbi && os_base == req_start && os_end > req_end) {
+        if (!VirtualFree(reinterpret_cast<void*>(req_start), aligned_size, MEM_RELEASE | kMemPreservePlaceholder)) {
+            return Status::Error(StatusCode::OutOfMemory, "Failed trailing split of pre-split virtual placeholder");
+        }
+    } else if (have_mbi && os_base < req_start && os_end == req_end) {
+        if (!VirtualFree(reinterpret_cast<void*>(req_start), aligned_size, MEM_RELEASE | kMemPreservePlaceholder)) {
+            return Status::Error(StatusCode::OutOfMemory, "Failed edge split of pre-split virtual placeholder");
+        }
+    } else if (req_start > orig.base && req_end < orig_end) {
+        // Windows VirtualFree(MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) requires the split
+        // region to touch either the beginning or the end of the placeholder.
+        // A middle split therefore uses two sequential edge splits.
         const size_t lead_size = req_start - orig.base;
         if (!VirtualFree(reinterpret_cast<void*>(orig.base), lead_size, MEM_RELEASE | kMemPreservePlaceholder)) {
             return Status::Error(StatusCode::OutOfMemory, "Failed leading split of virtual placeholder");

@@ -867,12 +867,12 @@ XG_TILE_MODE ComputeOptimalTileMode(
     if ((bind_flags & XG_BIND_RENDER_TARGET) != 0u) {
         return XG_TILE_MODE_2D_THIN_64KB_R_X;
     }
-    const uint64_t elems_x = (width + info.block_width - 1u) / info.block_width;
-    const uint64_t elems_y = (height + info.block_height - 1u) / info.block_height;
-    const uint64_t raw_bytes = elems_x * elems_y * info.bytes_per_block;
-    if (raw_bytes <= 16384ull) {
-        return XG_TILE_MODE_2D_THIN_4KB_S;
-    }
+    // On Xbox Series X|S (GFX10 / RDNA2), D3D12_TEXTURE_LAYOUT_UNKNOWN (0) selects
+    // 64 KiB standard swizzle tiles (ADDR_SW_64KB_S) even for sub-64KB textures (e.g.
+    // 128x128 BC7 = 16 KiB logical -> 64 KiB physical tile), matching cooked RPF/BCPack
+    // 64 KiB tile chunks. Titles wanting 4 KiB tiles specify Layout = 0x105 explicitly.
+    (void)width;
+    (void)height;
     return XG_TILE_MODE_2D_THIN_64KB_S;
 }
 

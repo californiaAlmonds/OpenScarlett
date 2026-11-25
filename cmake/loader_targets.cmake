@@ -8,6 +8,7 @@ target_sources(openscarlett_core PRIVATE
 
 add_library(openscarlett_hook SHARED
     src/loader/hook_dll.cpp
+    src/loader/spatial_audio_bridge.cpp
 )
 set_target_properties(openscarlett_hook PROPERTIES
     PREFIX ""

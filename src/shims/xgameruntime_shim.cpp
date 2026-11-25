@@ -1475,6 +1475,23 @@ XGameResult OPENSCARLETT_GDK_CALL UserAddProvider(
             // which must never be nested under user_mutex, and the Created
             // callback fires outside all locks.
             RegisterHandleIfNeeded(raw, XSystemHandleType_User);
+            const XUserLocalId added_lid{raw ? raw->local_id : 1ull};
+            {
+                auto& rt = GetRuntime();
+                bool has_assoc_listeners = false;
+                {
+                    std::lock_guard<std::mutex> rlk(rt.reg_mutex);
+                    has_assoc_listeners = !rt.user_device_assoc_listeners.empty();
+                }
+                if (has_assoc_listeners) {
+                    XUserAppLocalDeviceId pad0{};
+                    pad0.value[0] = 0x4Fu;  // 'O'
+                    pad0.value[1] = 0x53u;  // 'S'
+                    pad0.value[2] = 0x00u;  // slot 0
+                    pad0.value[3] = 0x02u;  // GameInputFamilyXboxOne / controller
+                    (void)OpenScarlettGdkAssociateDeviceWithUser(&pad0, added_lid);
+                }
+            }
             ctx->user = raw;
             XAsyncComplete(data->async, XGR_S_OK, sizeof(XUserHandle));
             return XGR_E_PENDING;
@@ -7166,9 +7183,9 @@ XDisplayHdrModeResult OPENSCARLETT_GDK_CALL XDisplayTryEnableHdrMode(
             return XDisplayHdrModeResult_Enabled;
         }
         if (displayHdrModeInfo) {
-            displayHdrModeInfo->minToneMapLuminance = 0.05f;
-            displayHdrModeInfo->maxToneMapLuminance = 300.0f;
-            displayHdrModeInfo->maxFullFrameToneMapLuminance = 250.0f;
+            displayHdrModeInfo->minToneMapLuminance = 0.0f;
+            displayHdrModeInfo->maxToneMapLuminance = 0.0f;
+            displayHdrModeInfo->maxFullFrameToneMapLuminance = 0.0f;
         }
         return XDisplayHdrModeResult_Disabled;
     }
@@ -7182,9 +7199,9 @@ XDisplayHdrModeResult OPENSCARLETT_GDK_CALL XDisplayTryEnableHdrMode(
     }
 
     if (displayHdrModeInfo) {
-        displayHdrModeInfo->minToneMapLuminance = 0.05f;
-        displayHdrModeInfo->maxToneMapLuminance = 300.0f;
-        displayHdrModeInfo->maxFullFrameToneMapLuminance = 250.0f;
+        displayHdrModeInfo->minToneMapLuminance = 0.0f;
+        displayHdrModeInfo->maxToneMapLuminance = 0.0f;
+        displayHdrModeInfo->maxFullFrameToneMapLuminance = 0.0f;
     }
     return XDisplayHdrModeResult_Disabled;
 }
@@ -11184,18 +11201,71 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XErrorGetOptions(
     return RecordHr("XErrorGetOptions", XGR_S_OK);
 }
 
+#if defined(_WIN32)
+bool SafeReadBytesGameEvent(const void* src, void* dst, size_t len) noexcept {
+    if (!src || !dst || len == 0u) return false;
+    __try {
+        std::memcpy(dst, src, len);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+size_t SafeMeasureJsonArgGameEvent(const void* p) noexcept {
+    if (!p || reinterpret_cast<uintptr_t>(p) < 0x10000u) return 0u;
+    const auto* s = static_cast<const char*>(p);
+    size_t n = 0u;
+    __try {
+        while (n < 4096u && s[n] != '\0') {
+            ++n;
+        }
+        return n;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0u;
+    }
+}
+#else
+bool SafeReadBytesGameEvent(const void* src, void* dst, size_t len) noexcept {
+    if (!src || !dst || len == 0u) return false;
+    std::memcpy(dst, src, len);
+    return true;
+}
+size_t SafeMeasureJsonArgGameEvent(const void* p) noexcept {
+    return p ? std::strlen(static_cast<const char*>(p)) : 0u;
+}
+#endif
+
 uint32_t OPENSCARLETT_GDK_CALL XGameEventWrite(
     uint64_t regHandle,
     const XGameEventDescriptor* eventDescriptor,
     uint32_t userDataCount,
     XGameEventDataDescriptor* userData) {
-    if (userDataCount > 0u && !userData) {
+    if (userDataCount > 0u && userDataCount <= 256u && !userData) {
         RecordHr("XGameEventWrite", XGR_E_INVALIDARG);
         return 87u;  // ERROR_INVALID_PARAMETER
     }
     uint64_t total_bytes = 0u;
-    for (uint32_t i = 0u; i < userDataCount; ++i) {
-        total_bytes += static_cast<uint64_t>(userData[i].size);
+    uint32_t recorded_count = 0u;
+    if (userDataCount > 0u && userDataCount <= 256u && userData) {
+        bool valid_array = true;
+        for (uint32_t i = 0u; i < userDataCount; ++i) {
+            XGameEventDataDescriptor item{};
+            if (!SafeReadBytesGameEvent(&userData[i], &item, sizeof(item))) {
+                valid_array = false;
+                break;
+            }
+            total_bytes += static_cast<uint64_t>(item.size);
+        }
+        if (valid_array) {
+            recorded_count = userDataCount;
+        } else {
+            total_bytes = SafeMeasureJsonArgGameEvent(userData);
+        }
+    } else if (userDataCount > 256u) {
+        // Real GDK XGameEventWrite(user, serviceConfigId, playSessionId, eventName, dimsJson, measJson)
+        // passes string pointers in r8/r9 rather than an ETW descriptor array count.
+        total_bytes = SafeMeasureJsonArgGameEvent(userData);
     }
     {
         auto& rt = GetRuntime();
@@ -11205,13 +11275,16 @@ uint32_t OPENSCARLETT_GDK_CALL XGameEventWrite(
         GameEventRecord rec{};
         rec.seq = rt.event_total_count;
         rec.reg_handle = regHandle;
-        if (eventDescriptor) {
-            rec.event_id = eventDescriptor->id;
-            rec.version = eventDescriptor->version;
-            rec.level = eventDescriptor->level;
-            rec.keyword = eventDescriptor->keyword;
+        XGameEventDescriptor safe_desc{};
+        if (eventDescriptor &&
+            reinterpret_cast<uintptr_t>(eventDescriptor) >= 0x10000u &&
+            SafeReadBytesGameEvent(eventDescriptor, &safe_desc, sizeof(safe_desc))) {
+            rec.event_id = safe_desc.id;
+            rec.version = safe_desc.version;
+            rec.level = safe_desc.level;
+            rec.keyword = safe_desc.keyword;
         }
-        rec.data_count = userDataCount;
+        rec.data_count = recorded_count;
         rec.data_bytes = total_bytes;
         if (rt.event_ring.size() >= 256u) {
             rt.event_ring.pop_front();
@@ -11219,7 +11292,7 @@ uint32_t OPENSCARLETT_GDK_CALL XGameEventWrite(
         rt.event_ring.push_back(rec);
     }
     RecordOk("XGameEventWrite");
-    return 0u;  // ERROR_SUCCESS
+    return 0u;  // ERROR_SUCCESS / S_OK
 }
 
 XGameResult OPENSCARLETT_GDK_CALL OpenScarlettGdkGetGameEventStats(
@@ -12299,9 +12372,50 @@ const ComVtableSlot g_com_vtbl_system_analytics[] = {
 };
 
 // 19. CLSID={BBFBDCC7-BFE7-409B-A5CA-EDF054960B4D} IID={BBFBDCC7-BFE7-409B-A5CA-EDF054960B4D}
+uint32_t OPENSCARLETT_GDK_CALL ComThunk_XGameEventWrite(
+    void* /*self*/,
+    uint64_t a1,
+    const void* a2,
+    uintptr_t a3,
+    void* a4,
+    const void* a5,
+    const void* a6) {
+    if (a3 >= 0x10000u) {
+        // Real GDK IXGameEvent::Write(user, serviceConfigId, playSessionId, eventName, dimsJson, measJson)
+        const uint64_t payload_bytes =
+            static_cast<uint64_t>(SafeMeasureJsonArgGameEvent(a4)) +
+            static_cast<uint64_t>(SafeMeasureJsonArgGameEvent(a5)) +
+            static_cast<uint64_t>(SafeMeasureJsonArgGameEvent(a6));
+        {
+            auto& rt = GetRuntime();
+            std::lock_guard<std::mutex> lk(rt.event_mutex);
+            ++rt.event_total_count;
+            rt.event_total_bytes += payload_bytes;
+            GameEventRecord rec{};
+            rec.seq = rt.event_total_count;
+            rec.reg_handle = a1;
+            rec.data_count = 1u;
+            rec.data_bytes = payload_bytes;
+            if (rt.event_ring.size() >= 256u) {
+                rt.event_ring.pop_front();
+            }
+            rt.event_ring.push_back(rec);
+        }
+        RecordOk("XGameEventWrite");
+        return 0u;  // S_OK
+    }
+    return XGameEventWrite(
+        a1,
+        static_cast<const XGameEventDescriptor*>(a2),
+        static_cast<uint32_t>(a3),
+        static_cast<XGameEventDataDescriptor*>(a4));
+}
+
 const ComVtableSlot g_com_vtbl_game_event[] = {
     OS_COM_IUNKNOWN_SLOTS,
-    /*  3 */ OS_COM_SLOT(XGameEventWrite),
+    /*  3 */ reinterpret_cast<ComVtableSlot>(&ComThunk_XGameEventWrite),
+    OS_COM_UNIMPL(), OS_COM_UNIMPL(), OS_COM_UNIMPL(), OS_COM_UNIMPL(),
+    OS_COM_UNIMPL(), OS_COM_UNIMPL(), OS_COM_UNIMPL(), OS_COM_UNIMPL(),
 };
 
 // 20. CLSID={DFCD4649-4FF8-4043-BA07-35D607DF98B0} IID={72C4E70F-4A67-481B-BB84-AA72EDA14FE5}
@@ -12657,6 +12771,17 @@ XGameResult OPENSCARLETT_GDK_CALL InitializeApiImplEx(
     rt.api_impl_init_count.fetch_add(1, std::memory_order_acq_rel);
     SyncConsoleLsaPolicyFromConfig();
     return RecordHr("InitializeApiImplEx", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL InitializeApiImplEx2(
+    uint64_t /*versionHigh*/,
+    uint64_t /*versionLow*/,
+    uint64_t /*options*/,
+    void* /*extraContext*/) {
+    auto& rt = GetRuntime();
+    rt.api_impl_init_count.fetch_add(1, std::memory_order_acq_rel);
+    SyncConsoleLsaPolicyFromConfig();
+    return RecordHr("InitializeApiImplEx2", XGR_S_OK);
 }
 
 void OPENSCARLETT_GDK_CALL UninitializeApiImpl(void) {

@@ -359,4 +359,211 @@ inline bool Decompress(
     return true;
 }
 
+inline bool DecodeHuffmanBlockAllowPrefix(
+    BitStream& bs,
+    const HuffTable& litlen,
+    const HuffTable& dist,
+    size_t max_out_size,
+    bool allow_prefix_stop,
+    bool& hit_prefix_limit,
+    std::vector<uint8_t>& out) {
+    static constexpr std::array<uint16_t, 29> kLenBase = {
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+        35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+    static constexpr std::array<uint8_t, 29> kLenExtra = {
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+        3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+    static constexpr std::array<uint16_t, 30> kDistBase = {
+        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+        257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+    static constexpr std::array<uint8_t, 30> kDistExtra = {
+        0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+        7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+
+    for (;;) {
+        if (allow_prefix_stop && out.size() >= max_out_size) {
+            hit_prefix_limit = true;
+            return true;
+        }
+        uint32_t sym = 0u;
+        if (!litlen.Decode(bs, sym)) return false;
+        if (sym < 256u) {
+            if (out.size() >= max_out_size) {
+                if (allow_prefix_stop) {
+                    hit_prefix_limit = true;
+                    return true;
+                }
+                return false;
+            }
+            out.push_back(static_cast<uint8_t>(sym));
+        } else if (sym == 256u) {
+            return true;
+        } else if (sym <= 285u) {
+            const size_t lidx = sym - 257u;
+            uint32_t lextra = 0u;
+            if (!bs.ReadBits(kLenExtra[lidx], lextra)) return false;
+            const size_t match_len = static_cast<size_t>(kLenBase[lidx]) + lextra;
+
+            uint32_t dsym = 0u;
+            if (!dist.Decode(bs, dsym) || dsym >= 30u) return false;
+            uint32_t dextra = 0u;
+            if (!bs.ReadBits(kDistExtra[dsym], dextra)) return false;
+            const size_t distance = static_cast<size_t>(kDistBase[dsym]) + dextra;
+
+            if (distance == 0u || distance > out.size()) {
+                return false;
+            }
+            const size_t avail_out = max_out_size - out.size();
+            if (match_len > avail_out) {
+                if (!allow_prefix_stop) {
+                    return false;
+                }
+                const size_t copy_start = out.size() - distance;
+                for (size_t i = 0u; i < avail_out; ++i) {
+                    out.push_back(out[copy_start + i]);
+                }
+                hit_prefix_limit = true;
+                return true;
+            }
+            const size_t copy_start = out.size() - distance;
+            for (size_t i = 0u; i < match_len; ++i) {
+                out.push_back(out[copy_start + i]);
+            }
+        } else {
+            return false;
+        }
+    }
+}
+
+inline bool DecompressDeflateAttempt(
+    const uint8_t* src,
+    size_t src_size,
+    bool expect_rfc1950_wrapper,
+    size_t max_out_size,
+    bool allow_prefix_stop,
+    std::vector<uint8_t>& out) {
+    out.clear();
+    if (!src || max_out_size == 0u) return false;
+    if (expect_rfc1950_wrapper) {
+        if (src_size < 6u) return false;
+        const uint8_t cmf = src[0];
+        const uint8_t flg = src[1];
+        const uint32_t cm = cmf & 0x0Fu;
+        const uint32_t cinfo = (cmf >> 4u) & 0x0Fu;
+        const uint32_t fdict = (flg >> 5u) & 1u;
+        const uint32_t fcheck = (static_cast<uint32_t>(cmf) << 8u) | static_cast<uint32_t>(flg);
+        if (cm != 8u || cinfo > 7u || fdict != 0u || (fcheck % 31u) != 0u) {
+            return false;
+        }
+    } else if (src_size < 2u) {
+        return false;
+    }
+
+    BitStream bs{};
+    bs.data = expect_rfc1950_wrapper ? (src + 2u) : src;
+    bs.size = expect_rfc1950_wrapper ? (src_size - 2u) : src_size;
+    if (max_out_size <= 64u * 1024u * 1024u) {
+        out.reserve(std::min<size_t>(max_out_size, 1024u * 1024u));
+    }
+
+    bool hit_prefix_limit = false;
+    uint32_t bfinal = 0u;
+    do {
+        if (allow_prefix_stop && out.size() >= max_out_size) {
+            hit_prefix_limit = true;
+            break;
+        }
+        uint32_t btype = 0u;
+        if (!bs.ReadBits(1u, bfinal) || !bs.ReadBits(2u, btype)) {
+            out.clear();
+            return false;
+        }
+        if (btype == 0u) {
+            bs.FlushBufferedFullBytes();
+            if (4u > bs.size - bs.byte_pos) {
+                out.clear();
+                return false;
+            }
+            const uint16_t len = static_cast<uint16_t>(bs.data[bs.byte_pos]) |
+                                 static_cast<uint16_t>(static_cast<uint16_t>(bs.data[bs.byte_pos + 1u]) << 8u);
+            const uint16_t nlen = static_cast<uint16_t>(bs.data[bs.byte_pos + 2u]) |
+                                  static_cast<uint16_t>(static_cast<uint16_t>(bs.data[bs.byte_pos + 3u]) << 8u);
+            bs.byte_pos += 4u;
+            if ((len ^ 0xFFFFu) != nlen || len > bs.size - bs.byte_pos) {
+                out.clear();
+                return false;
+            }
+            const size_t avail_out = max_out_size - out.size();
+            if (len > avail_out) {
+                if (!allow_prefix_stop) {
+                    out.clear();
+                    return false;
+                }
+                out.insert(out.end(), bs.data + bs.byte_pos, bs.data + bs.byte_pos + avail_out);
+                bs.byte_pos += avail_out;
+                hit_prefix_limit = true;
+                break;
+            }
+            out.insert(out.end(), bs.data + bs.byte_pos, bs.data + bs.byte_pos + len);
+            bs.byte_pos += len;
+        } else if (btype == 1u) {
+            HuffTable ll{}, dt{};
+            if (!BuildFixedTrees(ll, dt) ||
+                !DecodeHuffmanBlockAllowPrefix(bs, ll, dt, max_out_size, allow_prefix_stop, hit_prefix_limit, out)) {
+                out.clear();
+                return false;
+            }
+        } else if (btype == 2u) {
+            HuffTable ll{}, dt{};
+            if (!DecodeDynamicTrees(bs, ll, dt) ||
+                !DecodeHuffmanBlockAllowPrefix(bs, ll, dt, max_out_size, allow_prefix_stop, hit_prefix_limit, out)) {
+                out.clear();
+                return false;
+            }
+        } else {
+            out.clear();
+            return false;
+        }
+    } while (bfinal == 0u && !hit_prefix_limit);
+
+    if (hit_prefix_limit) {
+        return true;
+    }
+
+    bs.FlushBufferedFullBytes();
+    if (expect_rfc1950_wrapper) {
+        if (4u > bs.size - bs.byte_pos) {
+            out.clear();
+            return false;
+        }
+        const uint8_t* tr = bs.data + bs.byte_pos;
+        const uint32_t expected_adler =
+            (static_cast<uint32_t>(tr[0]) << 24u) |
+            (static_cast<uint32_t>(tr[1]) << 16u) |
+            (static_cast<uint32_t>(tr[2]) << 8u) |
+            static_cast<uint32_t>(tr[3]);
+        const uint32_t actual_adler = ComputeAdler32(out.data(), out.size());
+        if (actual_adler != expected_adler) {
+            out.clear();
+            return false;
+        }
+    }
+    return true;
+}
+
+// Xbox MDU hardware Zlib/Deflate stream helper: supports trailing alignment padding after
+// the RFC 1950 4-byte Adler-32 trailer, clean prefix stops for sub-chunk reads, and raw
+// RFC 1951 deflate streams in packfiles.
+inline bool DecompressXboxStream(
+    const uint8_t* src,
+    size_t src_size,
+    size_t max_out_size,
+    std::vector<uint8_t>& out,
+    bool allow_prefix_stop) {
+    if (DecompressDeflateAttempt(src, src_size, true, max_out_size, allow_prefix_stop, out)) {
+        return true;
+    }
+    return DecompressDeflateAttempt(src, src_size, false, max_out_size, allow_prefix_stop, out);
+}
+
 }  // namespace openscarlett::zlib_rfc1950

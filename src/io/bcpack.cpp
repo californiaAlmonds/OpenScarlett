@@ -1,4 +1,5 @@
 #include "openscarlett/io/bcpack.h"
+#include "bcpack_xbox_mdu.h"
 #include "openscarlett/kernel/vram_residency_manager.h"
 
 #include <algorithm>
@@ -3670,7 +3671,11 @@ Status BcPackHwDecodeBitstream(
     if (out_written) *out_written = 0u;
     uint32_t block_count = 0u;
     if (!BcPackHwIsValidBitstreamHeader(format, src_bitstream, src_size, &block_count)) {
-        return Status::Error(StatusCode::ParseError, "Invalid hardware BCPack bitstream header");
+        if (src_bitstream && src_size >= 4u && ReadLe32(src_bitstream) == kBcPackHwMagic) {
+            return Status::Error(StatusCode::ParseError, "Invalid hardware BCPack bitstream header");
+        }
+        return BcPackDecodeXboxMduBitstream(
+            format, src_bitstream, src_size, dst_blocks, dst_size, out_written);
     }
     const uint32_t block_bytes = BcFormatBlockBytes(format);
     const uint64_t expected_bytes_64 = static_cast<uint64_t>(block_count) * static_cast<uint64_t>(block_bytes);

@@ -3576,6 +3576,11 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL InitializeApiImplEx(
     uint64_t versionHigh,
     uint64_t versionLow,
     uint64_t options);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL InitializeApiImplEx2(
+    uint64_t versionHigh,
+    uint64_t versionLow,
+    uint64_t options,
+    void* extraContext);
 OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL UninitializeApiImpl(void);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL QueryApiImpl(
     const XgrGuid* apiId,

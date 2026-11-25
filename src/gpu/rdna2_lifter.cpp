@@ -1009,6 +1009,38 @@ public:
         const bool in0_srv_aliased_to_s2 =
             needs_in0_decl && !in0_is_cbv && in0_is_srv && pb.in0_space == 2u && pb.in0_reg < 16u &&
             (((ir_.used_space2_srv_slots | ir_.used_space2_tex_slots) & (1u << pb.in0_reg)) != 0u);
+        bool in0_srv_collides_t_reg = false;
+        if (needs_in0_decl && !in0_is_cbv && in0_is_srv && !in0_srv_aliased_to_s2) {
+            if (needs_srv0_decl && pb.in0_reg == pb.srv0_reg && pb.in0_space == pb.srv0_space) {
+                in0_srv_collides_t_reg = true;
+            }
+            if (use_psv0_srv_texs_) {
+                for (size_t k = 0u; k < pb.srv_textures.size() && k < 31u; ++k) {
+                    if ((ir_.used_psv0_srv_tex_mask & (1u << static_cast<uint32_t>(k))) == 0u) continue;
+                    if (pb.in0_reg == pb.srv_textures[k].reg && pb.in0_space == pb.srv_textures[k].space) {
+                        in0_srv_collides_t_reg = true;
+                        break;
+                    }
+                }
+            } else if (ir_.uses_texture_srv) {
+                const uint32_t tex0_r = (pb.enabled && pb.has_tex0) ? pb.tex0_reg : 0u;
+                const uint32_t tex0_s = (pb.enabled && pb.has_tex0) ? pb.tex0_space : 0u;
+                if (pb.in0_reg == tex0_r && pb.in0_space == tex0_s) {
+                    in0_srv_collides_t_reg = true;
+                }
+            }
+            if (!in0_srv_collides_t_reg && pb.in0_space == 0u) {
+                const uint32_t base_t0 =
+                    (!use_psv0_srv_texs_ && ir_.uses_texture_srv && !(pb.enabled && pb.has_tex0)) ? 1u : 0u;
+                const uint32_t extra_t0 =
+                    (ir_.uses_texture3d_srv ? 1u : 0u) +
+                    (ir_.uses_texture_cube_srv ? 1u : 0u) +
+                    (uses_dyn_sample ? dyn_arr_len : 0u);
+                if (pb.in0_reg >= base_t0 && pb.in0_reg < base_t0 + extra_t0) {
+                    in0_srv_collides_t_reg = true;
+                }
+            }
+        }
         if (needs_in0_decl && !in0_cbv_aliased_to_s2 && !in0_srv_aliased_to_s2) {
             if (in0_is_cbv) {
                 hdr << "cbuffer _in0_cb : register(b" << pb.in0_reg << ", space" << pb.in0_space << ") {\n"
@@ -1022,13 +1054,18 @@ public:
                     << "    return (l == 0u) ? q.x : ((l == 1u) ? q.y : ((l == 2u) ? q.z : q.w));\n"
                     << "}\n";
             } else if (in0_is_srv) {
-                hdr << "ByteAddressBuffer _in0 : register(t" << pb.in0_reg << ", space" << pb.in0_space << ");\n";
+                const uint32_t in0_emit_space = in0_srv_collides_t_reg ? 98u : pb.in0_space;
+                hdr << "ByteAddressBuffer _in0 : register(t" << pb.in0_reg << ", space" << in0_emit_space << ");\n";
             } else {
                 hdr << "RWByteAddressBuffer _in0 : register(u0);\n";
             }
         }
         if (uses_dual_uav) {
-            hdr << "RWByteAddressBuffer _out0 : register(u1);\n";
+            if (pb.enabled && pb.cs_fssm_abi && pb.in0_space == 2u) {
+                hdr << "RWByteAddressBuffer _out0 : register(u0, space98);\n";
+            } else {
+                hdr << "RWByteAddressBuffer _out0 : register(u1);\n";
+            }
         }
         if (use_psv0_uav_bufs_) {
             for (size_t k = 0u; k < pb.uav_buffers.size() && k < 32u; ++k) {
@@ -1044,6 +1081,7 @@ public:
         // multi-texture / multi-CBV Scarlett shaders (e.g. YUV420 video, PBR G-buffer, post-FX).
         for (uint32_t s2 = 0u; s2 < 16u; ++s2) {
             const bool has_s2_tex = (ir_.used_space2_tex_slots & (1u << s2)) != 0u;
+            const bool has_s2_rwtex = (ir_.used_space2_rwtex_slots & (1u << s2)) != 0u;
             if (((ir_.used_space2_srv_slots & (1u << s2)) != 0u) && !has_s2_tex) {
                 hdr << "ByteAddressBuffer _srv_s" << s2 << " : register(t" << s2 << ", space2);\n";
             }
@@ -1061,7 +1099,12 @@ public:
             }
             if (has_s2_tex) {
                 const char* tex_elem = (ir_.texture_srv_format == Rdna2TextureFormat::Uint4) ? "uint4" : "float4";
-                hdr << "Texture2D<" << tex_elem << "> _tex_s" << s2 << " : register(t" << s2 << ", space2);\n";
+                const uint32_t s2_tk = ir_.space2_tex_res_kind[s2] ? ir_.space2_tex_res_kind[s2] : 2u;
+                hdr << HlslSrvTexType(s2_tk, tex_elem) << " _tex_s" << s2 << " : register(t" << s2 << ", space2);\n";
+            }
+            if (has_s2_rwtex) {
+                const uint32_t s2_rwk = ir_.space2_rwtex_res_kind[s2] ? ir_.space2_rwtex_res_kind[s2] : 2u;
+                hdr << HlslRwTexType(s2_rwk, "float4") << " _rwtex_s" << s2 << " : register(u" << s2 << ", space2);\n";
             }
         }
         if (in0_cbv_aliased_to_s2) {
@@ -1661,6 +1704,8 @@ public:
                     }
                     hdr << "};\n";
                     hdr << "VSOut main(VSIn _vsin, uint _vid : SV_VertexID) {\n";
+                } else if (ir_.stage_contract.rectlist_zero_ia_vs) {
+                    hdr << "VSOut _os_vs_core(uint _vid) {\n";
                 } else {
                     hdr << "VSOut main(uint _vid : SV_VertexID) {\n";
                 }
@@ -1855,9 +1900,11 @@ public:
         }
 
         // Pre-declare all SSA value locals so multi-block structured/fallback CFG always compiles cleanly.
+        std::unordered_set<IrValueId> declared_ids;
         for (const auto& bb : ir_.blocks) {
             for (const auto& inst : bb.instructions) {
                 if (inst.id == kInvalidIrValue) continue;
+                declared_ids.insert(inst.id);
                 if (inst.type == IrType::F32) {
                     hdr << "    float _v" << inst.id << " = 0.0;\n";
                 } else if (inst.type == IrType::Bool) {
@@ -1865,6 +1912,22 @@ public:
                 } else {
                     hdr << "    uint _v" << inst.id << " = 0u;\n";
                 }
+            }
+        }
+        auto ensure_ref_declared = [&](IrValueId ref_id) {
+            if (ref_id == kInvalidIrValue || declared_ids.count(ref_id) > 0u) return;
+            declared_ids.insert(ref_id);
+            hdr << "    uint _v" << ref_id << " = 0u;\n";
+        };
+        for (const auto& bb : ir_.blocks) {
+            for (const auto& inst : bb.instructions) {
+                for (IrValueId op_id : inst.operands) {
+                    ensure_ref_declared(op_id);
+                }
+                for (const auto& inc : inst.phi_incoming) {
+                    ensure_ref_declared(inc.second);
+                }
+                ensure_ref_declared(inst.exec_pred);
             }
         }
 
@@ -1962,6 +2025,54 @@ public:
             hdr << "    DispatchMesh(_dm_x, _dm_y, _dm_z, _payload);\n";
         }
         hdr << "}\n";
+        if (ir_.stage == ShaderStage::Vertex &&
+            ir_.stage_contract.vs_ia_inputs.empty() &&
+            ir_.stage_contract.rectlist_zero_ia_vs) {
+            hdr << "VSOut main(uint _vid : SV_VertexID) {\n";
+            hdr << "    uint _r = _vid / 6u;\n";
+            hdr << "    uint _k = _vid % 6u;\n";
+            hdr << "    uint _b = _r * 3u;\n";
+            hdr << "    if (_k < 3u) return _os_vs_core(_b + _k);\n";
+            hdr << "    VSOut _v0 = _os_vs_core(_b + 0u);\n";
+            hdr << "    VSOut _v1 = _os_vs_core(_b + 1u);\n";
+            hdr << "    VSOut _v2 = _os_vs_core(_b + 2u);\n";
+            hdr << "    float2 _p0 = _v0.pos.xy / max(abs(_v0.pos.w), 1e-6);\n";
+            hdr << "    float2 _p1 = _v1.pos.xy / max(abs(_v1.pos.w), 1e-6);\n";
+            hdr << "    float2 _p2 = _v2.pos.xy / max(abs(_v2.pos.w), 1e-6);\n";
+            hdr << "    float2 _e01 = _p1 - _p0;\n";
+            hdr << "    float2 _e02 = _p2 - _p0;\n";
+            hdr << "    float2 _e12 = _p2 - _p1;\n";
+            hdr << "    float _l01 = max(dot(_e01, _e01), 1e-20);\n";
+            hdr << "    float _l02 = max(dot(_e02, _e02), 1e-20);\n";
+            hdr << "    float _l12 = max(dot(_e12, _e12), 1e-20);\n";
+            hdr << "    float _d0 = dot(_e01, _e02);\n";
+            hdr << "    float _d1 = dot(-_e01, _e12);\n";
+            hdr << "    float _d2 = dot(-_e02, -_e12);\n";
+            hdr << "    float _c0 = (_d0 * _d0) / (_l01 * _l02);\n";
+            hdr << "    float _c1 = (_d1 * _d1) / (_l01 * _l12);\n";
+            hdr << "    float _c2 = (_d2 * _d2) / (_l02 * _l12);\n";
+            hdr << "    VSOut _va = _v1, _vb = _v2, _vc = _v0;\n";
+            hdr << "    if (_c1 <= _c0 && _c1 <= _c2) {\n";
+            hdr << "        if (_k == 3u) return _v0;\n";
+            hdr << "        if (_k == 4u) return _v2;\n";
+            hdr << "        _va = _v0; _vb = _v2; _vc = _v1;\n";
+            hdr << "    } else if (_c2 <= _c0 && _c2 <= _c1) {\n";
+            hdr << "        if (_k == 3u) return _v0;\n";
+            hdr << "        if (_k == 5u) return _v1;\n";
+            hdr << "        _va = _v0; _vb = _v1; _vc = _v2;\n";
+            hdr << "    } else {\n";
+            hdr << "        if (_k == 3u) return _v1;\n";
+            hdr << "        if (_k == 5u) return _v2;\n";
+            hdr << "    }\n";
+            hdr << "    VSOut _v3 = _va;\n";
+            hdr << "    _v3.pos = float4(_va.pos.xyz + _vb.pos.xyz - _vc.pos.xyz, _va.pos.w);\n";
+            for (uint32_t p = 0u; p < param_out_count; ++p) {
+                hdr << "    _v3.param" << p << " = _va.param" << p
+                    << " + _vb.param" << p << " - _vc.param" << p << ";\n";
+            }
+            hdr << "    return _v3;\n";
+            hdr << "}\n";
+        }
 
         out_hlsl = hdr.str();
         return Status::Ok();
@@ -2012,8 +2123,11 @@ private:
                            uint32_t dim_shift = 4u) const {
         const uint32_t t_s2 = (imm_u32 >> 24) & 0x1Fu;
         if (t_s2 > 0u) {
-            out_name = "_tex_s" + std::to_string(t_s2 - 1u);
-            out_kind = 2u;
+            const uint32_t s2_idx = t_s2 - 1u;
+            out_name = "_tex_s" + std::to_string(s2_idx);
+            out_kind = (s2_idx < 16u && ir_.space2_tex_res_kind[s2_idx] != 0u)
+                           ? ir_.space2_tex_res_kind[s2_idx]
+                           : ResKindFromMimgDim(imm_u32 >> dim_shift);
             return;
         }
         const auto& pb = ir_.stage_contract.psv0_bindings;
@@ -2936,11 +3050,21 @@ private:
                     break;
                 }
                 case IrOp::ImageStore: {
+                    const uint32_t rw_s2 = (inst.imm_u32 >> 24) & 0x1Fu;
                     const auto& pb_rw = ir_.stage_contract.psv0_bindings;
-                    const uint32_t rw_kind =
-                        (pb_rw.enabled && pb_rw.has_rwtex0 && pb_rw.rwtex0_res_kind != 0u)
-                            ? pb_rw.rwtex0_res_kind
-                            : ResKindFromMimgDim(inst.imm_u32 & 7u);
+                    uint32_t rw_kind = 0u;
+                    std::string rw_name = "_rwtex0";
+                    if (rw_s2 > 0u) {
+                        const uint32_t s2_idx = rw_s2 - 1u;
+                        rw_name = "_rwtex_s" + std::to_string(s2_idx);
+                        rw_kind = (s2_idx < 16u && ir_.space2_rwtex_res_kind[s2_idx] != 0u)
+                                      ? ir_.space2_rwtex_res_kind[s2_idx]
+                                      : ResKindFromMimgDim(inst.imm_u32 & 7u);
+                    } else {
+                        rw_kind = (pb_rw.enabled && pb_rw.has_rwtex0 && pb_rw.rwtex0_res_kind != 0u)
+                                      ? pb_rw.rwtex0_res_kind
+                                      : ResKindFromMimgDim(inst.imm_u32 & 7u);
+                    }
                     std::string idx_expr;
                     if (rw_kind == 1u) {
                         idx_expr = AsU32(inst.operands[0]);
@@ -2951,7 +3075,7 @@ private:
                     } else {
                         idx_expr = "uint2(" + AsU32(inst.operands[0]) + ", " + AsU32(inst.operands[1]) + ")";
                     }
-                    os << ind << "_rwtex0[" << idx_expr << "] = float4("
+                    os << ind << rw_name << "[" << idx_expr << "] = float4("
                        << AsF32(inst.operands[2]) << ", " << AsF32(inst.operands[3]) << ", "
                        << AsF32(inst.operands[4]) << ", " << AsF32(inst.operands[5]) << ");\n";
                     break;

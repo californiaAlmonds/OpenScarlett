@@ -947,6 +947,10 @@ PipelineStateXProxy::~PipelineStateXProxy() {
     if (device_x_) {
         device_x_->NotifyPipelineDestroyed(static_cast<ID3D12PipelineState*>(this));
     }
+    for (auto& kv : target_variants_) {
+        if (kv.second) kv.second->Release();
+    }
+    target_variants_.clear();
     pending_xdat_.reset();
     if (host_pso_) host_pso_->Release();
     if (device_x_) device_x_->Release();
@@ -977,6 +981,77 @@ void PipelineStateXProxy::EnsureLiftedOnBind() {
     lift_attempted_.store(true, std::memory_order_release);
     if (!pending_xdat_ || !device_x_) return;
     device_x_->LiftPendingXdatGraphicsPso(this);
+}
+
+ID3D12PipelineState* PipelineStateXProxy::GetHostPsoForTargets(
+    UINT num_rtvs,
+    const DXGI_FORMAT* rtv_formats,
+    DXGI_FORMAT dsv_format,
+    bool rectlist_zero_ia) {
+    if (!device_x_ || is_standin_pso_ || !pending_xdat_ || !pending_xdat_->has_lifted_gfx_dxil) {
+        return host_pso_;
+    }
+    const bool use_rect_vs =
+        rectlist_zero_ia && !pending_xdat_->lifted_rectlist_vs_dxil.empty();
+    const auto& base = pending_xdat_->lifted_gpso;
+    const bool has_ps = !pending_xdat_->lifted_ps_dxil.empty();
+    const UINT max_ps_rts = std::max<UINT>(1u, base.NumRenderTargets);
+    const UINT eff_num_rts =
+        (has_ps && num_rtvs > 0u && rtv_formats != nullptr)
+            ? std::min<UINT>(std::min<UINT>(num_rtvs, max_ps_rts), 8u)
+            : 0u;
+    DXGI_FORMAT eff_rtvs[8]{};
+    for (UINT r = 0u; r < eff_num_rts; ++r) {
+        eff_rtvs[r] = rtv_formats[r];
+    }
+    const bool wants_ds =
+        (base.DepthStencilState.DepthEnable != FALSE) ||
+        (base.DepthStencilState.StencilEnable != FALSE);
+    const DXGI_FORMAT eff_dsv = wants_ds ? dsv_format : DXGI_FORMAT_UNKNOWN;
+
+    bool matches_base =
+        !use_rect_vs && (eff_num_rts == base.NumRenderTargets) && (eff_dsv == base.DSVFormat);
+    if (matches_base) {
+        for (UINT r = 0u; r < eff_num_rts; ++r) {
+            if (eff_rtvs[r] != base.RTVFormats[r]) {
+                matches_base = false;
+                break;
+            }
+        }
+    }
+    if (matches_base) {
+        return host_pso_;
+    }
+
+    uint64_t key = 14695981039346656037ull;
+    auto mix_u32 = [&](uint32_t v) {
+        key ^= static_cast<uint64_t>(v);
+        key *= 1099511628211ull;
+    };
+    mix_u32(eff_num_rts);
+    mix_u32(static_cast<uint32_t>(eff_dsv));
+    for (UINT r = 0u; r < eff_num_rts; ++r) {
+        mix_u32(static_cast<uint32_t>(eff_rtvs[r]));
+    }
+    if (use_rect_vs) {
+        mix_u32(0x52454354u);
+    }
+
+    std::lock_guard<std::mutex> lk(lift_mutex_);
+    auto it = target_variants_.find(key);
+    if (it != target_variants_.end()) {
+        return it->second ? it->second : host_pso_;
+    }
+    if (use_rect_vs) {
+        std::swap(pending_xdat_->lifted_vs_dxil, pending_xdat_->lifted_rectlist_vs_dxil);
+    }
+    ID3D12PipelineState* var_pso =
+        device_x_->CreateGraphicsPsoTargetVariant(this, eff_num_rts, eff_rtvs, eff_dsv);
+    if (use_rect_vs) {
+        std::swap(pending_xdat_->lifted_vs_dxil, pending_xdat_->lifted_rectlist_vs_dxil);
+    }
+    target_variants_[key] = var_pso;  // adopts ref (or nullptr negative-cache fallback)
+    return var_pso ? var_pso : host_pso_;
 }
 
 HRESULT STDMETHODCALLTYPE PipelineStateXProxy::QueryInterface(REFIID riid, void** ppvObject) {

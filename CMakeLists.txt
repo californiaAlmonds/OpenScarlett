@@ -49,6 +49,7 @@ add_library(openscarlett_core STATIC
     src/loader/pe_inspector.cpp
     src/io/gdeflate.cpp
     src/io/bcpack.cpp
+    src/io/bcpack_xbox_mdu.cpp
     src/audio/xma2_decoder.cpp
     src/middleware/bink2_decoder.cpp
     src/gpu/vulkan_backend.cpp

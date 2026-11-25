@@ -174,6 +174,8 @@ CommandListRegistry& GetCommandListRegistry() {
 
 }  // namespace
 
+std::atomic<void*> g_bink_host_pso{nullptr};
+
 #if defined(__ID3D12GraphicsCommandList10_INTERFACE_DEFINED__)
 using CommandListExtendedBase = ID3D12GraphicsCommandList10;
 #elif defined(__ID3D12GraphicsCommandList9_INTERFACE_DEFINED__)
@@ -380,6 +382,10 @@ CommandListX::~CommandListX() {
     ReleaseAlignedStagingRing();
     ReleaseTiledTransientResources();
     ReleaseAllAlignTransientResources();
+    if (ei_sync_dummy_buf_) {
+        ei_sync_dummy_buf_->Release();
+        ei_sync_dummy_buf_ = nullptr;
+    }
     {
         auto& reg = GetCommandListRegistry();
         std::unique_lock<std::shared_mutex> lock(reg.mutex);
@@ -627,6 +633,10 @@ HRESULT STDMETHODCALLTYPE CommandListX::Close() {
         }
     }
     const HRESULT hr = host_list_->Close();
+    if (device_x_) {
+        device_x_->CheckCpuDeviceRemoved(
+            "CommandListX::Close", static_cast<uint64_t>(hr), static_cast<uint64_t>(list_type_));
+    }
     last_close_failed_.store(FAILED(hr), std::memory_order_release);
     if (IsDiagTraceEnabled()) {
         char buf[96];
@@ -715,6 +725,12 @@ HRESULT STDMETHODCALLTYPE CommandListX::Reset(
     last_pso_is_standin_ = false;
     last_gfx_rs_is_empty_ = false;
     last_cmp_rs_is_empty_ = false;
+    last_pso_proxy_ = nullptr;
+    last_bound_rtv_count_ = 0u;
+    std::memset(last_bound_rtv_formats_, 0, sizeof(last_bound_rtv_formats_));
+    last_bound_dsv_format_ = DXGI_FORMAT_UNKNOWN;
+    guest_set_stencil_ref_ = false;
+    guest_stencil_ref_ = 0u;
     if (pInitialState && IsKnownProxyPointer(pInitialState)) {
         IOpenScarlettProxyInspect* insp = nullptr;
         if (SUCCEEDED(pInitialState->QueryInterface(IID_IOpenScarlettProxyInspect, reinterpret_cast<void**>(&insp))) && insp) {
@@ -722,6 +738,7 @@ HRESULT STDMETHODCALLTYPE CommandListX::Reset(
                 auto* pso_proxy = static_cast<PipelineStateXProxy*>(pInitialState);
                 pso_proxy->EnsureLiftedOnBind();
                 last_pso_is_standin_ = pso_proxy->IsStandinPso();
+                last_pso_proxy_ = pso_proxy;
             }
             insp->Release();
         }
@@ -750,10 +767,48 @@ HRESULT STDMETHODCALLTYPE CommandListX::Reset(
     view_instance_mask_.store(0u, std::memory_order_relaxed);
     last_host_compute_rs_ = nullptr;
     last_host_graphics_rs_ = nullptr;
+    last_cmp_rs_is_empty_ = false;
+    last_gfx_rs_is_empty_ = false;
     last_bound_rtv0_res_ = nullptr;
-    last_host_pso_ = UnwrapPipelineState(pInitialState);
+    last_bound_rtv_count_ = 0u;
+    std::memset(last_bound_rtv_formats_, 0, sizeof(last_bound_rtv_formats_));
+    last_bound_dsv_format_ = DXGI_FORMAT_UNKNOWN;
+    guest_set_stencil_ref_ = false;
+    guest_stencil_ref_ = 0u;
+    last_pso_is_standin_ = false;
+    last_pso_proxy_ = nullptr;
+    ID3D12PipelineState* init_host_pso = nullptr;
+    if (pInitialState && IsKnownProxyPointer(pInitialState)) {
+        IOpenScarlettProxyInspect* insp = nullptr;
+        if (SUCCEEDED(pInitialState->QueryInterface(IID_IOpenScarlettProxyInspect, reinterpret_cast<void**>(&insp))) && insp) {
+            if (insp->GetProxyKind() == D3D12XProxyKind::PipelineState) {
+                auto* pso_proxy = static_cast<PipelineStateXProxy*>(pInitialState);
+                pso_proxy->EnsureLiftedOnBind();
+                last_pso_is_standin_ = pso_proxy->IsStandinPso();
+                last_pso_proxy_ = pso_proxy;
+                init_host_pso = pso_proxy->HostPipelineState();
+            }
+            insp->Release();
+        }
+    }
+    if (!init_host_pso) {
+        init_host_pso = UnwrapPipelineState(pInitialState);
+    }
+    last_host_pso_ = init_host_pso;
     bound_cbv_srv_uav_heap_ = nullptr;
     bound_sampler_heap_ = nullptr;
+    last_raw_topology_ = 0u;
+    last_vb0_raw_ = {};
+    last_vb0_host_ = {};
+    std::memset(last_vb_raw_, 0, sizeof(last_vb_raw_));
+    std::memset(last_vb_host_, 0, sizeof(last_vb_host_));
+    std::memset(last_vb_need_upload_, 0, sizeof(last_vb_need_upload_));
+    last_vb_valid_mask_ = 0u;
+    last_ib_raw_ = {};
+    last_ib_host_ = {};
+    last_ib_need_upload_ = false;
+    std::memset(last_gfx_root_srv_raw_, 0, sizeof(last_gfx_root_srv_raw_));
+    std::memset(last_gfx_root_srv_host_, 0, sizeof(last_gfx_root_srv_host_));
     {
         std::lock_guard<std::mutex> lock(aaa_rec_mutex_);
         written_mirrored_vas_.clear();
@@ -767,7 +822,7 @@ HRESULT STDMETHODCALLTYPE CommandListX::Reset(
         sample_positions_pixels_ = 0u;
         sample_positions_.clear();
     }
-    ID3D12PipelineState* host_pso = UnwrapPipelineState(pInitialState);
+    ID3D12PipelineState* host_pso = init_host_pso;
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         const bool is_spirv = device_x_->IsSpirvDirectPipeline(pInitialState);
         if (is_spirv) host_pso = nullptr;
@@ -889,6 +944,33 @@ void STDMETHODCALLTYPE CommandListX::ClearState(ID3D12PipelineState* pPipelineSt
     last_host_compute_rs_ = nullptr;
     last_host_graphics_rs_ = nullptr;
     last_bound_rtv0_res_ = nullptr;
+    last_bound_rtv_count_ = 0u;
+    std::memset(last_bound_rtv_formats_, 0, sizeof(last_bound_rtv_formats_));
+    last_bound_dsv_format_ = DXGI_FORMAT_UNKNOWN;
+    guest_set_stencil_ref_ = false;
+    guest_stencil_ref_ = 0u;
+    last_raw_topology_ = 0u;
+    last_vb0_raw_ = {};
+    last_vb0_host_ = {};
+    std::memset(last_vb_raw_, 0, sizeof(last_vb_raw_));
+    std::memset(last_vb_host_, 0, sizeof(last_vb_host_));
+    std::memset(last_vb_need_upload_, 0, sizeof(last_vb_need_upload_));
+    last_vb_valid_mask_ = 0u;
+    last_ib_raw_ = {};
+    last_ib_host_ = {};
+    last_ib_need_upload_ = false;
+    std::memset(last_gfx_root_srv_raw_, 0, sizeof(last_gfx_root_srv_raw_));
+    std::memset(last_gfx_root_srv_host_, 0, sizeof(last_gfx_root_srv_host_));
+    last_pso_proxy_ = nullptr;
+    if (pPipelineState && IsKnownProxyPointer(pPipelineState)) {
+        IOpenScarlettProxyInspect* insp = nullptr;
+        if (SUCCEEDED(pPipelineState->QueryInterface(IID_IOpenScarlettProxyInspect, reinterpret_cast<void**>(&insp))) && insp) {
+            if (insp->GetProxyKind() == D3D12XProxyKind::PipelineState) {
+                last_pso_proxy_ = static_cast<PipelineStateXProxy*>(pPipelineState);
+            }
+            insp->Release();
+        }
+    }
     last_host_pso_ = UnwrapPipelineState(pPipelineState);
     bound_cbv_srv_uav_heap_ = nullptr;
     bound_sampler_heap_ = nullptr;
@@ -937,8 +1019,142 @@ bool SafeCopyBytes(void* dst, const void* src, size_t len) noexcept {
     return true;
 #endif
 }
-bool SafeCopyBytes72(void* dst, const void* src) noexcept {
-    return SafeCopyBytes(dst, src, 72u);
+
+void ResolveRectListVertexLayout(
+    DeviceX* device_x,
+    ID3D12PipelineState* host_pso,
+    uint32_t vb_stride,
+    const uint8_t* sample_verts,
+    size_t sample_bytes,
+    uint32_t& out_pos_off,
+    uint32_t& out_pos_comps,
+    uint32_t& out_non_float_mask) noexcept {
+    out_pos_off = 0u;
+    out_pos_comps = (vb_stride == 24u) ? 3u : 2u;
+    out_non_float_mask = (vb_stride == 24u) ? (1u << 3u) : 0u;
+    if (device_x && device_x->LookupPsoVertexLayout(host_pso, out_pos_off, out_pos_comps, out_non_float_mask)) {
+        if (out_pos_off + 8u > vb_stride) out_pos_off = 0u;
+        return;
+    }
+    if (sample_verts && sample_bytes >= vb_stride) {
+        if (vb_stride == 20u) {
+            uint32_t w0 = 0u, w3 = 0u;
+            std::memcpy(&w0, sample_verts + 0u, 4u);
+            std::memcpy(&w3, sample_verts + 12u, 4u);
+            if ((w0 & 0x7F800000u) == 0x7F800000u && (w3 & 0x7F800000u) != 0x7F800000u) {
+                out_pos_off = 12u;
+                out_pos_comps = 2u;
+                out_non_float_mask = 0x1u;
+            }
+        } else if (vb_stride == 16u) {
+            uint32_t w0 = 0u, w2 = 0u;
+            std::memcpy(&w0, sample_verts + 0u, 4u);
+            std::memcpy(&w2, sample_verts + 8u, 4u);
+            if ((w0 & 0x7F800000u) == 0x7F800000u && (w2 & 0x7F800000u) != 0x7F800000u) {
+                out_pos_off = 8u;
+                out_pos_comps = 2u;
+                out_non_float_mask = 0x3u;
+            }
+        } else if (vb_stride == 12u) {
+            uint32_t w0 = 0u, w1 = 0u;
+            std::memcpy(&w0, sample_verts + 0u, 4u);
+            std::memcpy(&w1, sample_verts + 4u, 4u);
+            if ((w0 & 0x7F800000u) == 0x7F800000u && (w1 & 0x7F800000u) != 0x7F800000u) {
+                out_pos_off = 4u;
+                out_pos_comps = 2u;
+                out_non_float_mask = 0x1u;
+            }
+        }
+    }
+    if (out_pos_off + 8u > vb_stride) out_pos_off = 0u;
+}
+
+void ExpandRectListVerticesToTriangles(
+    const uint8_t* src_buf,
+    uint32_t num_rects,
+    uint32_t vb_stride,
+    uint32_t pos_off,
+    uint32_t pos_comps,
+    uint32_t non_float_mask,
+    std::vector<uint8_t>& dst_buf) {
+    dst_buf.resize(static_cast<size_t>(num_rects) * 6u * vb_stride);
+    for (uint32_t r = 0u; r < num_rects; ++r) {
+        const uint8_t* sv = src_buf + static_cast<size_t>(r) * 3u * vb_stride;
+        uint8_t* dv = dst_buf.data() + static_cast<size_t>(r) * 6u * vb_stride;
+        std::memcpy(dv, sv, 3u * vb_stride);
+        auto rd_f = [&](size_t v, size_t off) -> float {
+            float val = 0.0f;
+            std::memcpy(&val, sv + v * vb_stride + off, 4u);
+            return val;
+        };
+        auto edge_vec = [&](size_t from, size_t to, double& ex, double& ey, double& ez) {
+            ex = static_cast<double>(rd_f(to, pos_off)) - static_cast<double>(rd_f(from, pos_off));
+            ey = static_cast<double>(rd_f(to, pos_off + 4u)) - static_cast<double>(rd_f(from, pos_off + 4u));
+            ez = (pos_comps >= 3u && pos_off + 12u <= vb_stride)
+                     ? (static_cast<double>(rd_f(to, pos_off + 8u)) - static_cast<double>(rd_f(from, pos_off + 8u)))
+                     : 0.0;
+        };
+        auto corner_cos2 = [&](size_t c, size_t a, size_t b) -> double {
+            double ax = 0.0, ay = 0.0, az = 0.0;
+            double bx = 0.0, by = 0.0, bz = 0.0;
+            edge_vec(c, a, ax, ay, az);
+            edge_vec(c, b, bx, by, bz);
+            const double la2 = ax * ax + ay * ay + az * az;
+            const double lb2 = bx * bx + by * by + bz * bz;
+            if (la2 <= 1e-24 || lb2 <= 1e-24) return 2.0;
+            const double dot = ax * bx + ay * by + az * bz;
+            return (dot * dot) / (la2 * lb2);
+        };
+        const double c0 = corner_cos2(0u, 1u, 2u);
+        const double c1 = corner_cos2(1u, 0u, 2u);
+        const double c2 = corner_cos2(2u, 0u, 1u);
+        size_t ca = 1u, cb = 2u, cc = 0u;
+        size_t v3_dst = 4u;
+        if (c1 <= c0 && c1 <= c2) {
+            ca = 0u; cb = 2u; cc = 1u; v3_dst = 5u;
+            std::memcpy(dv + 3u * vb_stride, sv + 0u * vb_stride, vb_stride);
+            std::memcpy(dv + 4u * vb_stride, sv + 2u * vb_stride, vb_stride);
+            std::memcpy(dv + 5u * vb_stride, sv + 1u * vb_stride, vb_stride);
+        } else if (c2 <= c0 && c2 <= c1) {
+            ca = 0u; cb = 1u; cc = 2u; v3_dst = 4u;
+            std::memcpy(dv + 3u * vb_stride, sv + 0u * vb_stride, vb_stride);
+            std::memcpy(dv + 4u * vb_stride, sv + 2u * vb_stride, vb_stride);
+            std::memcpy(dv + 5u * vb_stride, sv + 1u * vb_stride, vb_stride);
+        } else {
+            ca = 1u; cb = 2u; cc = 0u; v3_dst = 4u;
+            std::memcpy(dv + 3u * vb_stride, sv + 1u * vb_stride, vb_stride);
+            std::memcpy(dv + 4u * vb_stride, sv + 0u * vb_stride, vb_stride);
+            std::memcpy(dv + 5u * vb_stride, sv + 2u * vb_stride, vb_stride);
+        }
+        for (size_t off = 0u; off < vb_stride; off += 4u) {
+            uint32_t u0 = 0u, u1 = 0u, u2 = 0u;
+            std::memcpy(&u0, sv + 0u * vb_stride + off, 4u);
+            std::memcpy(&u1, sv + 1u * vb_stride + off, 4u);
+            std::memcpy(&u2, sv + 2u * vb_stride + off, 4u);
+            if (u0 == u1 && u1 == u2) continue;
+            const uint32_t dw_idx = static_cast<uint32_t>(off >> 2u);
+            const bool is_non_float =
+                (dw_idx < 32u && ((non_float_mask & (1u << dw_idx)) != 0u)) ||
+                ((u0 & 0x7F800000u) == 0x7F800000u) ||
+                ((u1 & 0x7F800000u) == 0x7F800000u) ||
+                ((u2 & 0x7F800000u) == 0x7F800000u);
+            if (is_non_float) {
+                uint8_t b3[4]{};
+                const uint8_t* ba = sv + ca * vb_stride + off;
+                const uint8_t* bb = sv + cb * vb_stride + off;
+                const uint8_t* bc = sv + cc * vb_stride + off;
+                for (size_t bi = 0u; bi < 4u; ++bi) {
+                    const int v = static_cast<int>(ba[bi]) + static_cast<int>(bb[bi]) -
+                                  static_cast<int>(bc[bi]);
+                    b3[bi] = static_cast<uint8_t>(std::clamp(v, 0, 255));
+                }
+                std::memcpy(dv + v3_dst * vb_stride + off, b3, 4u);
+            } else {
+                const float f3 = rd_f(ca, off) + rd_f(cb, off) - rd_f(cc, off);
+                std::memcpy(dv + v3_dst * vb_stride + off, &f3, 4u);
+            }
+        }
+    }
 }
 }  // namespace
 
@@ -987,91 +1203,360 @@ void STDMETHODCALLTYPE CommandListX::DrawInstanced(
         AppendDiagOp(buf);
     }
     if (!skip_host && !last_pso_is_standin_ && !pso_missing) {
-        // Xbox Scarlett RECTLIST (topology 17/19) draws a full rectangle from 3 vertices (V0,V1,V2)
-        // with implicit 4th corner V3 = V1 + V2 - V0. Expand 3 -> 6 vertices (2 matching-winding
-        // triangles) so fullscreen UI/blit quads cover 100% of the 4K screen on desktop D3D12.
-        bool drew_rectlist_quad = false;
-        if (device_x_ && device_x_->IsRetailScarlettAbi() &&
+        const bool want_zero_ia_rectlist =
+            device_x_ && device_x_->IsRetailScarlettAbi() &&
             (last_raw_topology_ == 17u || last_raw_topology_ == 19u) &&
-            VertexCountPerInstance == 3u &&
-            last_vb0_raw_.BufferLocation != 0ull &&
-            last_vb0_raw_.StrideInBytes == 24u &&
-            last_vb0_raw_.SizeInBytes >= (StartVertexLocation + 3u) * 24u) {
-            const uint64_t src_va =
-                last_vb0_raw_.BufferLocation + static_cast<uint64_t>(StartVertexLocation) * 24ull;
-            void* src_cpu = reinterpret_cast<void*>(static_cast<uintptr_t>(src_va));
-            alignas(16) uint8_t quad6[6u * 24u]{};
-            const bool copied = SafeCopyBytes72(quad6, src_cpu);
-            if (copied) {
-                auto rd_f = [&](size_t v, size_t off) -> float {
-                    float val = 0.0f;
-                    std::memcpy(&val, quad6 + v * 24u + off, 4u);
-                    return val;
-                };
-                auto wr_f = [&](size_t v, size_t off, float val) {
-                    std::memcpy(quad6 + v * 24u + off, &val, 4u);
-                };
-                // Identify the right-angle corner (opposite the longest edge / hypotenuse) so
-                // RECTLIST expansion works for any Xbox vertex ordering (e.g. V1 at 90 deg in
-                // RAGE UI/blit quads: V0=TL, V1=BL, V2=BR -> V3 = V0 + V2 - V1 = TR) while
-                // preserving exact front-face winding!
-                auto dist2 = [&](size_t a, size_t b) -> float {
-                    const float dx = rd_f(a, 0u) - rd_f(b, 0u);
-                    const float dy = rd_f(a, 4u) - rd_f(b, 4u);
-                    const float dz = rd_f(a, 8u) - rd_f(b, 8u);
-                    return dx * dx + dy * dy + dz * dz;
-                };
-                const float d01 = dist2(0u, 1u);
-                const float d12 = dist2(1u, 2u);
-                const float d02 = dist2(0u, 2u);
-                size_t ca = 1u, cb = 2u, cc = 0u;  // V3 = Va + Vb - Vc
-                if (d02 >= d12 && d02 >= d01) {
-                    // Hypotenuse (V0, V2), 90 deg at V1 -> Tri 2 = (V0, V2, V3)
-                    ca = 0u; cb = 2u; cc = 1u;
-                    std::memcpy(quad6 + 3u * 24u, quad6 + 0u * 24u, 24u);
-                    std::memcpy(quad6 + 4u * 24u, quad6 + 2u * 24u, 24u);
-                    std::memcpy(quad6 + 5u * 24u, quad6 + 1u * 24u, 24u);
-                    for (size_t off : {size_t(0u), size_t(4u), size_t(8u), size_t(16u), size_t(20u)}) {
-                        wr_f(5u, off, rd_f(ca, off) + rd_f(cb, off) - rd_f(cc, off));
+            VertexCountPerInstance >= 3u && (VertexCountPerInstance % 3u) == 0u &&
+            last_pso_proxy_ != nullptr &&
+            last_pso_proxy_->PendingXdatDesc() != nullptr &&
+            last_pso_proxy_->PendingXdatDesc()->il_elems.empty();
+        if (last_pso_proxy_ != nullptr) {
+            ID3D12PipelineState* target_pso = last_pso_proxy_->GetHostPsoForTargets(
+                last_bound_rtv_count_, last_bound_rtv_formats_, last_bound_dsv_format_,
+                want_zero_ia_rectlist);
+            if (target_pso && target_pso != last_host_pso_) {
+                host_list_->SetPipelineState(target_pso);
+                last_host_pso_ = target_pso;
+            }
+            uint8_t s57_ref = 0u;
+            if (!guest_set_stencil_ref_ && last_pso_proxy_->HasSlot57StencilRef(s57_ref)) {
+                host_list_->OMSetStencilRef(s57_ref);
+            }
+        }
+        // Xbox Scarlett RECTLIST (topology 17/19) draws each rectangle from 3 vertices (V0,V1,V2)
+        // with implicit 4th corner V3 = Va + Vb - Vc; QUADLIST (topology 18) draws 4-vertex quads;
+        // TRIANGLEFAN (topology 6/20) draws N-2 triangles sharing V0.
+        bool drew_rectlist_quad = false;
+        const bool zero_ia_pso = device_x_ && device_x_->PsoUsesZeroIaInputs(last_host_pso_);
+        if (want_zero_ia_rectlist &&
+            !last_pso_proxy_->PendingXdatDesc()->lifted_rectlist_vs_dxil.empty()) {
+            host_list_->DrawInstanced(
+                (VertexCountPerInstance / 3u) * 6u,
+                InstanceCount,
+                (StartVertexLocation / 3u) * 6u,
+                StartInstanceLocation);
+            drew_rectlist_quad = true;
+        }
+        const UINT vb_stride = last_vb0_raw_.StrideInBytes;
+        if (!drew_rectlist_quad && zero_ia_pso && device_x_->IsRetailScarlettAbi() &&
+            (last_raw_topology_ == 17u || last_raw_topology_ == 19u) &&
+            VertexCountPerInstance >= 3u && (VertexCountPerInstance % 3u) == 0u &&
+            VertexCountPerInstance <= 4095u &&
+            last_gfx_root_srv_raw_[0] != 0ull) {
+            // Software-vertex-fetch RECTLIST PSO (e.g. RAGE9 VS_Clear InputLayout=0 reading stream
+            // headers at +0x0 and +0xC from SetGraphicsRootShaderResourceView(0, ...)).
+            const uint64_t srv0_cpu = device_x_->ResolveCpuAliasVa(last_gfx_root_srv_raw_[0]);
+            uint8_t hdr[64]{};
+            if (SafeCopyBytes(hdr, reinterpret_cast<const void*>(static_cast<uintptr_t>(srv0_cpu)), 32u)) {
+                uint32_t d0 = 0u, d3 = 0u;
+                std::memcpy(&d0, hdr + 0u, 4u);
+                std::memcpy(&d3, hdr + 12u, 4u);
+                const uint32_t stride0 = (d0 >> 3u) & 60u;
+                const uint32_t off0 = (d0 >> 7u) & 0x1FFFFFCu;
+                const uint32_t stride1 = (d3 >> 3u) & 60u;
+                const uint32_t off1 = (d3 >> 7u) & 0x1FFFFFCu;
+                if (stride0 >= 8u && stride0 <= 64u && (stride0 & 3u) == 0u &&
+                    off0 >= 16u && off0 <= 65536u) {
+                    const uint32_t num_rects = VertexCountPerInstance / 3u;
+                    const size_t s0_src_bytes = static_cast<size_t>(VertexCountPerInstance) * stride0;
+                    const uint64_t s0_cpu =
+                        srv0_cpu + off0 + static_cast<uint64_t>(StartVertexLocation) * stride0;
+                    std::vector<uint8_t> s0_src(s0_src_bytes);
+                    if (SafeCopyBytes(s0_src.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(s0_cpu)), s0_src_bytes)) {
+                        const bool has_s1 =
+                            stride1 >= 4u && stride1 <= 64u && (stride1 & 3u) == 0u &&
+                            off1 >= 16u && off1 <= 65536u;
+                        std::vector<uint8_t> s1_src;
+                        bool s1_ok = false;
+                        if (has_s1) {
+                            const size_t s1_src_bytes = static_cast<size_t>(VertexCountPerInstance) * stride1;
+                            const uint64_t s1_cpu =
+                                srv0_cpu + off1 + static_cast<uint64_t>(StartVertexLocation) * stride1;
+                            s1_src.resize(s1_src_bytes);
+                            s1_ok = SafeCopyBytes(
+                                s1_src.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(s1_cpu)), s1_src_bytes);
+                        }
+                        const uint32_t hdr_copy = std::min<uint32_t>(std::min<uint32_t>(off0, has_s1 ? off1 : off0), 64u);
+                        (void)SafeCopyBytes(hdr, reinterpret_cast<const void*>(static_cast<uintptr_t>(srv0_cpu)), hdr_copy);
+                        const uint32_t new_off0 = (hdr_copy + 15u) & ~15u;
+                        const uint32_t s0_dst_bytes = num_rects * 6u * stride0;
+                        const uint32_t new_off1 = (new_off0 + s0_dst_bytes + 15u) & ~15u;
+                        const uint32_t s1_dst_bytes = s1_ok ? (num_rects * 6u * stride1) : 0u;
+                        std::vector<uint8_t> exp_pkg(new_off1 + s1_dst_bytes, 0u);
+                        std::memcpy(exp_pkg.data(), hdr, hdr_copy);
+                        const uint32_t new_d0 = (d0 & 0x1FFu) | ((new_off0 & 0x1FFFFFCu) << 7u);
+                        std::memcpy(exp_pkg.data() + 0u, &new_d0, 4u);
+                        if (s1_ok) {
+                            const uint32_t new_d3 = (d3 & 0x1FFu) | ((new_off1 & 0x1FFFFFCu) << 7u);
+                            std::memcpy(exp_pkg.data() + 12u, &new_d3, 4u);
+                        }
+                        std::vector<uint8_t> s0_dst;
+                        ExpandRectListVerticesToTriangles(
+                            s0_src.data(), num_rects, stride0, 0u, (stride0 >= 12u ? 3u : 2u), 0u, s0_dst);
+                        std::memcpy(exp_pkg.data() + new_off0, s0_dst.data(), s0_dst.size());
+                        if (s1_ok) {
+                            // Apply the exact same corner mapping per rectangle from stream 0 to stream 1.
+                            for (uint32_t r = 0u; r < num_rects; ++r) {
+                                const uint8_t* p0 = s0_src.data() + static_cast<size_t>(r) * 3u * stride0;
+                                auto rf0 = [&](size_t v, size_t o) -> double {
+                                    float fv = 0.0f;
+                                    std::memcpy(&fv, p0 + v * stride0 + o, 4u);
+                                    return static_cast<double>(fv);
+                                };
+                                auto c_cos2 = [&](size_t c, size_t a, size_t b) -> double {
+                                    const double ax = rf0(a, 0u) - rf0(c, 0u), ay = rf0(a, 4u) - rf0(c, 4u);
+                                    const double bx = rf0(b, 0u) - rf0(c, 0u), by = rf0(b, 4u) - rf0(c, 4u);
+                                    const double la2 = ax * ax + ay * ay, lb2 = bx * bx + by * by;
+                                    if (la2 <= 1e-24 || lb2 <= 1e-24) return 2.0;
+                                    const double dot = ax * bx + ay * by;
+                                    return (dot * dot) / (la2 * lb2);
+                                };
+                                const double cc0 = c_cos2(0u, 1u, 2u);
+                                const double cc1 = c_cos2(1u, 0u, 2u);
+                                const double cc2 = c_cos2(2u, 0u, 1u);
+                                const uint8_t* sv1 = s1_src.data() + static_cast<size_t>(r) * 3u * stride1;
+                                uint8_t* dv1 = exp_pkg.data() + new_off1 + static_cast<size_t>(r) * 6u * stride1;
+                                std::memcpy(dv1, sv1, 3u * stride1);
+                                size_t ca = 1u, cb = 2u, cc = 0u, v3_dst = 4u;
+                                if (cc1 <= cc0 && cc1 <= cc2) {
+                                    ca = 0u; cb = 2u; cc = 1u; v3_dst = 5u;
+                                    std::memcpy(dv1 + 3u * stride1, sv1 + 0u * stride1, stride1);
+                                    std::memcpy(dv1 + 4u * stride1, sv1 + 2u * stride1, stride1);
+                                } else if (cc2 <= cc0 && cc2 <= cc1) {
+                                    ca = 0u; cb = 1u; cc = 2u; v3_dst = 4u;
+                                    std::memcpy(dv1 + 3u * stride1, sv1 + 0u * stride1, stride1);
+                                    std::memcpy(dv1 + 5u * stride1, sv1 + 1u * stride1, stride1);
+                                } else {
+                                    ca = 1u; cb = 2u; cc = 0u; v3_dst = 4u;
+                                    std::memcpy(dv1 + 3u * stride1, sv1 + 1u * stride1, stride1);
+                                    std::memcpy(dv1 + 5u * stride1, sv1 + 2u * stride1, stride1);
+                                }
+                                for (size_t off = 0u; off < stride1; off += 4u) {
+                                    float fa = 0.0f, fb = 0.0f, fc = 0.0f;
+                                    std::memcpy(&fa, sv1 + ca * stride1 + off, 4u);
+                                    std::memcpy(&fb, sv1 + cb * stride1 + off, 4u);
+                                    std::memcpy(&fc, sv1 + cc * stride1 + off, 4u);
+                                    const float f3 = fa + fb - fc;
+                                    std::memcpy(dv1 + v3_dst * stride1 + off, &f3, 4u);
+                                }
+                            }
+                        }
+                        const D3D12_GPU_VIRTUAL_ADDRESS exp_gpu =
+                            device_x_->UploadTransientGuestBufferForDesktop(
+                                static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(reinterpret_cast<uintptr_t>(exp_pkg.data())),
+                                exp_pkg.size(), 256ull, /*allow_same_frame_cache=*/false);
+                        if (exp_gpu != 0ull) {
+                            host_list_->SetGraphicsRootShaderResourceView(0u, exp_gpu);
+                            host_list_->DrawInstanced(num_rects * 6u, InstanceCount, 0u, StartInstanceLocation);
+                            if (last_gfx_root_srv_host_[0] != 0ull) {
+                                host_list_->SetGraphicsRootShaderResourceView(0u, last_gfx_root_srv_host_[0]);
+                            }
+                            drew_rectlist_quad = true;
+                        }
                     }
-                } else if (d01 >= d12 && d01 >= d02) {
-                    // Hypotenuse (V0, V1), 90 deg at V2 -> Tri 2 = (V0, V3, V1)
-                    ca = 0u; cb = 1u; cc = 2u;
-                    std::memcpy(quad6 + 3u * 24u, quad6 + 0u * 24u, 24u);
-                    std::memcpy(quad6 + 4u * 24u, quad6 + 2u * 24u, 24u);
-                    std::memcpy(quad6 + 5u * 24u, quad6 + 1u * 24u, 24u);
-                    for (size_t off : {size_t(0u), size_t(4u), size_t(8u), size_t(16u), size_t(20u)}) {
-                        wr_f(4u, off, rd_f(ca, off) + rd_f(cb, off) - rd_f(cc, off));
-                    }
-                } else {
-                    // Hypotenuse (V1, V2), 90 deg at V0 -> Tri 2 = (V1, V3, V2)
-                    ca = 1u; cb = 2u; cc = 0u;
-                    std::memcpy(quad6 + 3u * 24u, quad6 + 1u * 24u, 24u);
-                    std::memcpy(quad6 + 4u * 24u, quad6 + 0u * 24u, 24u);
-                    std::memcpy(quad6 + 5u * 24u, quad6 + 2u * 24u, 24u);
-                    for (size_t off : {size_t(0u), size_t(4u), size_t(8u), size_t(16u), size_t(20u)}) {
-                        wr_f(4u, off, rd_f(ca, off) + rd_f(cb, off) - rd_f(cc, off));
-                    }
-                }
-                const D3D12_GPU_VIRTUAL_ADDRESS quad_gpu =
-                    device_x_->UploadTransientGuestBufferForDesktop(
-                        static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(reinterpret_cast<uintptr_t>(quad6)),
-                        sizeof(quad6), 256ull, /*allow_same_frame_cache=*/false);
-                if (quad_gpu != 0ull) {
-                    D3D12_VERTEX_BUFFER_VIEW qv{};
-                    qv.BufferLocation = quad_gpu;
-                    qv.SizeInBytes = static_cast<UINT>(sizeof(quad6));
-                    qv.StrideInBytes = 24u;
-                    host_list_->IASetVertexBuffers(0u, 1u, &qv);
-                    host_list_->DrawInstanced(6u, InstanceCount, 0u, StartInstanceLocation);
-                    host_list_->IASetVertexBuffers(0u, 1u, &last_vb0_host_);
-                    drew_rectlist_quad = true;
                 }
             }
         }
+        if (!zero_ia_pso && device_x_ && device_x_->IsRetailScarlettAbi() &&
+            last_vb0_raw_.BufferLocation != 0ull &&
+            vb_stride >= 8u && vb_stride <= 128u && (vb_stride & 3u) == 0u) {
+            if ((last_raw_topology_ == 17u || last_raw_topology_ == 19u) &&
+                VertexCountPerInstance >= 3u && (VertexCountPerInstance % 3u) == 0u &&
+                VertexCountPerInstance <= 65535u &&
+                last_vb0_raw_.SizeInBytes >= (StartVertexLocation + VertexCountPerInstance) * vb_stride) {
+                const uint32_t num_rects = VertexCountPerInstance / 3u;
+                const size_t src_bytes = static_cast<size_t>(VertexCountPerInstance) * vb_stride;
+                const uint64_t raw_va =
+                    last_vb0_raw_.BufferLocation + static_cast<uint64_t>(StartVertexLocation) * vb_stride;
+                const uint64_t cpu_va = device_x_->ResolveCpuAliasVa(raw_va);
+                std::vector<uint8_t> src_buf(src_bytes);
+                if (SafeCopyBytes(src_buf.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(cpu_va)), src_bytes)) {
+                    uint32_t pos_off = 0u, pos_comps = 2u, non_float_mask = 0u;
+                    ResolveRectListVertexLayout(
+                        device_x_, last_host_pso_, vb_stride, src_buf.data(), src_buf.size(),
+                        pos_off, pos_comps, non_float_mask);
+                    std::vector<uint8_t> dst_buf;
+                    ExpandRectListVerticesToTriangles(
+                        src_buf.data(), num_rects, vb_stride, pos_off, pos_comps, non_float_mask, dst_buf);
+                    const D3D12_GPU_VIRTUAL_ADDRESS quad_gpu =
+                        device_x_->UploadTransientGuestBufferForDesktop(
+                            static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(reinterpret_cast<uintptr_t>(dst_buf.data())),
+                            dst_buf.size(), 256ull, /*allow_same_frame_cache=*/false);
+                    if (quad_gpu != 0ull) {
+                        D3D12_VERTEX_BUFFER_VIEW qv{};
+                        qv.BufferLocation = quad_gpu;
+                        qv.SizeInBytes = static_cast<UINT>(dst_buf.size());
+                        qv.StrideInBytes = vb_stride;
+                        host_list_->IASetVertexBuffers(0u, 1u, &qv);
+                        host_list_->DrawInstanced(num_rects * 6u, InstanceCount, 0u, StartInstanceLocation);
+                        host_list_->IASetVertexBuffers(0u, 1u, &last_vb0_host_);
+                        drew_rectlist_quad = true;
+                    }
+                }
+            } else if (last_raw_topology_ == 18u &&
+                       VertexCountPerInstance >= 4u && (VertexCountPerInstance % 4u) == 0u &&
+                       VertexCountPerInstance <= 65536u &&
+                       last_vb0_raw_.SizeInBytes >= (StartVertexLocation + VertexCountPerInstance) * vb_stride) {
+                const uint32_t num_quads = VertexCountPerInstance / 4u;
+                const size_t src_bytes = static_cast<size_t>(VertexCountPerInstance) * vb_stride;
+                const size_t dst_bytes = static_cast<size_t>(num_quads) * 6u * vb_stride;
+                const uint64_t raw_va =
+                    last_vb0_raw_.BufferLocation + static_cast<uint64_t>(StartVertexLocation) * vb_stride;
+                const uint64_t cpu_va = device_x_->ResolveCpuAliasVa(raw_va);
+                std::vector<uint8_t> src_buf(src_bytes);
+                if (SafeCopyBytes(src_buf.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(cpu_va)), src_bytes)) {
+                    std::vector<uint8_t> dst_buf(dst_bytes);
+                    for (uint32_t q = 0u; q < num_quads; ++q) {
+                        const uint8_t* sv = src_buf.data() + static_cast<size_t>(q) * 4u * vb_stride;
+                        uint8_t* dv = dst_buf.data() + static_cast<size_t>(q) * 6u * vb_stride;
+                        std::memcpy(dv + 0u * vb_stride, sv + 0u * vb_stride, vb_stride);
+                        std::memcpy(dv + 1u * vb_stride, sv + 1u * vb_stride, vb_stride);
+                        std::memcpy(dv + 2u * vb_stride, sv + 2u * vb_stride, vb_stride);
+                        std::memcpy(dv + 3u * vb_stride, sv + 0u * vb_stride, vb_stride);
+                        std::memcpy(dv + 4u * vb_stride, sv + 2u * vb_stride, vb_stride);
+                        std::memcpy(dv + 5u * vb_stride, sv + 3u * vb_stride, vb_stride);
+                    }
+                    const D3D12_GPU_VIRTUAL_ADDRESS quad_gpu =
+                        device_x_->UploadTransientGuestBufferForDesktop(
+                            static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(reinterpret_cast<uintptr_t>(dst_buf.data())),
+                            dst_bytes, 256ull, /*allow_same_frame_cache=*/false);
+                    if (quad_gpu != 0ull) {
+                        D3D12_VERTEX_BUFFER_VIEW qv{};
+                        qv.BufferLocation = quad_gpu;
+                        qv.SizeInBytes = static_cast<UINT>(dst_bytes);
+                        qv.StrideInBytes = vb_stride;
+                        host_list_->IASetVertexBuffers(0u, 1u, &qv);
+                        host_list_->DrawInstanced(num_quads * 6u, InstanceCount, 0u, StartInstanceLocation);
+                        host_list_->IASetVertexBuffers(0u, 1u, &last_vb0_host_);
+                        drew_rectlist_quad = true;
+                    }
+                }
+            } else if ((last_raw_topology_ == 6u || last_raw_topology_ == 20u) &&
+                       VertexCountPerInstance >= 3u && VertexCountPerInstance <= 65535u &&
+                       last_vb0_raw_.SizeInBytes >= (StartVertexLocation + VertexCountPerInstance) * vb_stride) {
+                const uint32_t num_tris = VertexCountPerInstance - 2u;
+                const size_t src_bytes = static_cast<size_t>(VertexCountPerInstance) * vb_stride;
+                const size_t dst_bytes = static_cast<size_t>(num_tris) * 3u * vb_stride;
+                const uint64_t raw_va =
+                    last_vb0_raw_.BufferLocation + static_cast<uint64_t>(StartVertexLocation) * vb_stride;
+                const uint64_t cpu_va = device_x_->ResolveCpuAliasVa(raw_va);
+                std::vector<uint8_t> src_buf(src_bytes);
+                if (SafeCopyBytes(src_buf.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(cpu_va)), src_bytes)) {
+                    std::vector<uint8_t> dst_buf(dst_bytes);
+                    for (uint32_t t = 0u; t < num_tris; ++t) {
+                        uint8_t* dv = dst_buf.data() + static_cast<size_t>(t) * 3u * vb_stride;
+                        std::memcpy(dv + 0u * vb_stride, src_buf.data() + 0u, vb_stride);
+                        std::memcpy(dv + 1u * vb_stride, src_buf.data() + static_cast<size_t>(t + 1u) * vb_stride, vb_stride);
+                        std::memcpy(dv + 2u * vb_stride, src_buf.data() + static_cast<size_t>(t + 2u) * vb_stride, vb_stride);
+                    }
+                    const D3D12_GPU_VIRTUAL_ADDRESS fan_gpu =
+                        device_x_->UploadTransientGuestBufferForDesktop(
+                            static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(reinterpret_cast<uintptr_t>(dst_buf.data())),
+                            dst_bytes, 256ull, /*allow_same_frame_cache=*/false);
+                    if (fan_gpu != 0ull) {
+                        D3D12_VERTEX_BUFFER_VIEW fv{};
+                        fv.BufferLocation = fan_gpu;
+                        fv.SizeInBytes = static_cast<UINT>(dst_bytes);
+                        fv.StrideInBytes = vb_stride;
+                        host_list_->IASetVertexBuffers(0u, 1u, &fv);
+                        host_list_->DrawInstanced(num_tris * 3u, InstanceCount, 0u, StartInstanceLocation);
+                        host_list_->IASetVertexBuffers(0u, 1u, &last_vb0_host_);
+                        drew_rectlist_quad = true;
+                    }
+                }
+            }
+        }
+        static const bool s_diag_bink_di = []() {
+            char b[16]{};
+            return ::GetEnvironmentVariableA("OPENSCARLETT_DIAG_BINK", b, sizeof(b)) > 0 && b[0] == '1';
+        }();
+        const void* bink_pso = g_bink_host_pso.load(std::memory_order_acquire);
+        if (s_diag_bink_di && vb_stride == 24u && bink_pso != nullptr && last_host_pso_ == bink_pso) {
+            static std::atomic<uint32_t> s_bdi_cnt{0u};
+            if (s_bdi_cnt.fetch_add(1u, std::memory_order_relaxed) < 20u) {
+                const D3D12_RESOURCE_DESC rtd = last_bound_rtv0_res_ ? last_bound_rtv0_res_->GetDesc() : D3D12_RESOURCE_DESC{};
+                std::fprintf(stderr,
+                             "[OpenScarlett][BINK-DI] v=%u inst=%u topo=%u rect=%d pso=%p rtv=%p(%llux%u fmt=%d) vb=0x%llX(sz=%u)",
+                             VertexCountPerInstance, InstanceCount, last_raw_topology_,
+                             drew_rectlist_quad ? 1 : 0, static_cast<void*>(last_host_pso_),
+                             static_cast<void*>(last_bound_rtv0_res_),
+                             static_cast<unsigned long long>(rtd.Width), rtd.Height, static_cast<int>(rtd.Format),
+                             static_cast<unsigned long long>(last_vb0_raw_.BufferLocation), last_vb0_raw_.SizeInBytes);
+                if (device_x_ && last_vb0_raw_.BufferLocation != 0ull && last_vb0_raw_.SizeInBytes >= 72u) {
+                    const uint64_t cva = device_x_->ResolveCpuAliasVa(
+                        last_vb0_raw_.BufferLocation + static_cast<uint64_t>(StartVertexLocation) * 24ull);
+                    uint8_t vraw[96]{};
+                    const size_t rlen = std::min<size_t>(sizeof(vraw), static_cast<size_t>(VertexCountPerInstance) * 24u);
+                    if (SafeCopyBytes(vraw, reinterpret_cast<const void*>(static_cast<uintptr_t>(cva)), rlen)) {
+                        const uint32_t nv = std::min<uint32_t>(VertexCountPerInstance, 4u);
+                        for (uint32_t vi = 0u; vi < nv; ++vi) {
+                            float px = 0.f, py = 0.f, pz = 0.f, u = 0.f, v = 0.f;
+                            uint32_t col = 0u;
+                            std::memcpy(&px, vraw + vi * 24u + 0u, 4u);
+                            std::memcpy(&py, vraw + vi * 24u + 4u, 4u);
+                            std::memcpy(&pz, vraw + vi * 24u + 8u, 4u);
+                            std::memcpy(&col, vraw + vi * 24u + 12u, 4u);
+                            std::memcpy(&u, vraw + vi * 24u + 16u, 4u);
+                            std::memcpy(&v, vraw + vi * 24u + 20u, 4u);
+                            std::fprintf(stderr, " v%u(%.2f,%.2f,%.2f c=%08X uv=%.3f,%.3f)", vi, px, py, pz, col, u, v);
+                        }
+                    }
+                }
+                std::fprintf(stderr, "\n");
+                std::fflush(stderr);
+            }
+        }
         if (!drew_rectlist_quad) {
+            UINT eff_start_vert = StartVertexLocation;
+            bool rebound_vb = false;
+            if (!zero_ia_pso && device_x_ && device_x_->IsRetailScarlettAbi()) {
+                const bool only_vb0 = (last_vb_valid_mask_ & ~1u) == 0u;
+                for (uint32_t s = 0u; s < 8u; ++s) {
+                    if (!last_vb_need_upload_[s]) continue;
+                    const auto& raw_vb = last_vb_raw_[s];
+                    if (raw_vb.BufferLocation == 0ull || raw_vb.SizeInBytes == 0u) continue;
+                    const uint32_t st = raw_vb.StrideInBytes;
+                    uint64_t slice_va = raw_vb.BufferLocation;
+                    uint64_t slice_bytes = raw_vb.SizeInBytes;
+                    if (st > 0u) {
+                        if (only_vb0 && s == 0u) {
+                            const uint64_t off_b = static_cast<uint64_t>(StartVertexLocation) * st;
+                            const uint64_t need_b = static_cast<uint64_t>(VertexCountPerInstance) * st;
+                            if (off_b < raw_vb.SizeInBytes && need_b > 0ull) {
+                                slice_va = raw_vb.BufferLocation + off_b;
+                                slice_bytes = std::min<uint64_t>(need_b, raw_vb.SizeInBytes - off_b);
+                                eff_start_vert = 0u;
+                            }
+                        } else {
+                            const uint64_t max_elems = std::max<uint64_t>(
+                                static_cast<uint64_t>(StartVertexLocation) + VertexCountPerInstance,
+                                static_cast<uint64_t>(StartInstanceLocation) + InstanceCount);
+                            slice_bytes = std::min<uint64_t>(raw_vb.SizeInBytes, max_elems * st);
+                        }
+                    }
+                    slice_bytes = std::min<uint64_t>(slice_bytes, 4ull * 1024ull * 1024ull);
+                    const D3D12_GPU_VIRTUAL_ADDRESS up_va =
+                        device_x_->UploadTransientGuestBufferForDesktop(
+                            slice_va, slice_bytes, 16ull, /*allow_same_frame_cache=*/(slice_bytes > 65536ull));
+                    if (up_va != 0ull) {
+                        D3D12_VERTEX_BUFFER_VIEW svb{};
+                        svb.BufferLocation = up_va;
+                        svb.SizeInBytes = static_cast<UINT>(slice_bytes);
+                        svb.StrideInBytes = raw_vb.StrideInBytes;
+                        host_list_->IASetVertexBuffers(s, 1u, &svb);
+                        rebound_vb = true;
+                    }
+                }
+            }
             host_list_->DrawInstanced(
-                VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
+                VertexCountPerInstance, InstanceCount, eff_start_vert, StartInstanceLocation);
+            if (rebound_vb) {
+                for (uint32_t s = 0u; s < 8u; ++s) {
+                    if (last_vb_need_upload_[s] && last_vb_host_[s].BufferLocation != 0ull) {
+                        host_list_->IASetVertexBuffers(s, 1u, &last_vb_host_[s]);
+                    }
+                }
+            }
         }
     } else if (IsDiagTraceEnabled() && (last_pso_is_standin_ || pso_missing)) {
         static std::atomic<uint64_t> s_skip_di{0ull};
@@ -1137,6 +1622,18 @@ void STDMETHODCALLTYPE CommandListX::DrawIndexedInstanced(
         if (device_x_ && last_bound_rtv0_res_) {
             device_x_->SetLastDiiRtv(last_bound_rtv0_res_);
         }
+        if (last_pso_proxy_ != nullptr) {
+            ID3D12PipelineState* target_pso = last_pso_proxy_->GetHostPsoForTargets(
+                last_bound_rtv_count_, last_bound_rtv_formats_, last_bound_dsv_format_);
+            if (target_pso && target_pso != last_host_pso_) {
+                host_list_->SetPipelineState(target_pso);
+                last_host_pso_ = target_pso;
+            }
+            uint8_t s57_ref = 0u;
+            if (!guest_set_stencil_ref_ && last_pso_proxy_->HasSlot57StencilRef(s57_ref)) {
+                host_list_->OMSetStencilRef(s57_ref);
+            }
+        }
         static const bool trace_sf_dii = []() {
             char v[16]{};
             return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_SF_DRAW", v, sizeof(v)) > 0 && v[0] == '1';
@@ -1149,9 +1646,285 @@ void STDMETHODCALLTYPE CommandListX::DrawIndexedInstanced(
                          static_cast<void*>(last_host_pso_), last_gfx_rs_is_empty_ ? 1 : 0);
             std::fflush(stderr);
         }
-        host_list_->DrawIndexedInstanced(
-            IndexCountPerInstance, InstanceCount, StartIndexLocation,
-            BaseVertexLocation, StartInstanceLocation);
+        bool drew_indexed_quad = false;
+        if (device_x_ && device_x_->IsRetailScarlettAbi() &&
+            last_ib_raw_.BufferLocation != 0ull &&
+            (last_ib_raw_.Format == DXGI_FORMAT_R16_UINT || last_ib_raw_.Format == DXGI_FORMAT_R32_UINT)) {
+            const uint32_t idx_bytes = (last_ib_raw_.Format == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
+            const size_t src_ib_bytes = static_cast<size_t>(IndexCountPerInstance) * idx_bytes;
+            if ((last_raw_topology_ == 17u || last_raw_topology_ == 19u) &&
+                IndexCountPerInstance >= 3u && (IndexCountPerInstance % 3u) == 0u &&
+                IndexCountPerInstance <= 65535u &&
+                last_ib_raw_.SizeInBytes >= static_cast<UINT>(StartIndexLocation) * idx_bytes + src_ib_bytes &&
+                last_vb0_raw_.BufferLocation != 0ull &&
+                last_vb0_raw_.StrideInBytes >= 8u && last_vb0_raw_.StrideInBytes <= 128u &&
+                (last_vb0_raw_.StrideInBytes & 3u) == 0u) {
+                const uint32_t vb_stride = last_vb0_raw_.StrideInBytes;
+                const uint32_t num_rects = IndexCountPerInstance / 3u;
+                const uint64_t ib_cpu = device_x_->ResolveCpuAliasVa(
+                    last_ib_raw_.BufferLocation + static_cast<uint64_t>(StartIndexLocation) * idx_bytes);
+                const uint64_t vb_cpu_base = device_x_->ResolveCpuAliasVa(last_vb0_raw_.BufferLocation);
+                std::vector<uint8_t> src_ib(src_ib_bytes);
+                if (SafeCopyBytes(src_ib.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(ib_cpu)), src_ib_bytes)) {
+                    std::vector<uint8_t> deindexed_verts(static_cast<size_t>(IndexCountPerInstance) * vb_stride);
+                    bool all_v_ok = true;
+                    for (uint32_t k = 0u; k < IndexCountPerInstance; ++k) {
+                        uint32_t raw_idx = 0u;
+                        if (idx_bytes == 4u) {
+                            std::memcpy(&raw_idx, src_ib.data() + static_cast<size_t>(k) * 4u, 4u);
+                        } else {
+                            uint16_t i16 = 0u;
+                            std::memcpy(&i16, src_ib.data() + static_cast<size_t>(k) * 2u, 2u);
+                            raw_idx = i16;
+                        }
+                        const int64_t v_idx = static_cast<int64_t>(raw_idx) + static_cast<int64_t>(BaseVertexLocation);
+                        if (v_idx < 0 ||
+                            (static_cast<uint64_t>(v_idx) + 1ull) * vb_stride > last_vb0_raw_.SizeInBytes ||
+                            !SafeCopyBytes(
+                                deindexed_verts.data() + static_cast<size_t>(k) * vb_stride,
+                                reinterpret_cast<const void*>(static_cast<uintptr_t>(
+                                    vb_cpu_base + static_cast<uint64_t>(v_idx) * vb_stride)),
+                                vb_stride)) {
+                            all_v_ok = false;
+                            break;
+                        }
+                    }
+                    if (all_v_ok) {
+                        uint32_t pos_off = 0u, pos_comps = 2u, non_float_mask = 0u;
+                        ResolveRectListVertexLayout(
+                            device_x_, last_host_pso_, vb_stride, deindexed_verts.data(), deindexed_verts.size(),
+                            pos_off, pos_comps, non_float_mask);
+                        std::vector<uint8_t> dst_buf;
+                        ExpandRectListVerticesToTriangles(
+                            deindexed_verts.data(), num_rects, vb_stride, pos_off, pos_comps, non_float_mask, dst_buf);
+                        const D3D12_GPU_VIRTUAL_ADDRESS quad_gpu =
+                            device_x_->UploadTransientGuestBufferForDesktop(
+                                static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(reinterpret_cast<uintptr_t>(dst_buf.data())),
+                                dst_buf.size(), 256ull, /*allow_same_frame_cache=*/false);
+                        if (quad_gpu != 0ull) {
+                            D3D12_VERTEX_BUFFER_VIEW qv{};
+                            qv.BufferLocation = quad_gpu;
+                            qv.SizeInBytes = static_cast<UINT>(dst_buf.size());
+                            qv.StrideInBytes = vb_stride;
+                            host_list_->IASetVertexBuffers(0u, 1u, &qv);
+                            host_list_->DrawInstanced(num_rects * 6u, InstanceCount, 0u, StartInstanceLocation);
+                            host_list_->IASetVertexBuffers(0u, 1u, &last_vb0_host_);
+                            drew_indexed_quad = true;
+                        }
+                    }
+                }
+            } else if (last_raw_topology_ == 18u &&
+                       IndexCountPerInstance >= 4u && (IndexCountPerInstance % 4u) == 0u &&
+                       IndexCountPerInstance <= 65536u &&
+                       last_ib_raw_.SizeInBytes >= static_cast<UINT>(StartIndexLocation) * idx_bytes + src_ib_bytes) {
+                const uint32_t num_quads = IndexCountPerInstance / 4u;
+                const size_t dst_bytes = static_cast<size_t>(num_quads) * 6u * idx_bytes;
+                const uint64_t ib_cpu = device_x_->ResolveCpuAliasVa(
+                    last_ib_raw_.BufferLocation + static_cast<uint64_t>(StartIndexLocation) * idx_bytes);
+                std::vector<uint8_t> src_ib(src_ib_bytes);
+                if (SafeCopyBytes(src_ib.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(ib_cpu)), src_ib_bytes)) {
+                    std::vector<uint8_t> dst_ib(dst_bytes);
+                    for (uint32_t q = 0u; q < num_quads; ++q) {
+                        const uint8_t* si = src_ib.data() + static_cast<size_t>(q) * 4u * idx_bytes;
+                        uint8_t* di = dst_ib.data() + static_cast<size_t>(q) * 6u * idx_bytes;
+                        std::memcpy(di + 0u * idx_bytes, si + 0u * idx_bytes, idx_bytes);
+                        std::memcpy(di + 1u * idx_bytes, si + 1u * idx_bytes, idx_bytes);
+                        std::memcpy(di + 2u * idx_bytes, si + 2u * idx_bytes, idx_bytes);
+                        std::memcpy(di + 3u * idx_bytes, si + 0u * idx_bytes, idx_bytes);
+                        std::memcpy(di + 4u * idx_bytes, si + 2u * idx_bytes, idx_bytes);
+                        std::memcpy(di + 5u * idx_bytes, si + 3u * idx_bytes, idx_bytes);
+                    }
+                    const D3D12_GPU_VIRTUAL_ADDRESS qib_gpu =
+                        device_x_->UploadTransientGuestBufferForDesktop(
+                            static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(reinterpret_cast<uintptr_t>(dst_ib.data())),
+                            dst_bytes, 256ull, /*allow_same_frame_cache=*/false);
+                    if (qib_gpu != 0ull) {
+                        D3D12_INDEX_BUFFER_VIEW qib{};
+                        qib.BufferLocation = qib_gpu;
+                        qib.SizeInBytes = static_cast<UINT>(dst_bytes);
+                        qib.Format = last_ib_raw_.Format;
+                        host_list_->IASetIndexBuffer(&qib);
+                        host_list_->DrawIndexedInstanced(
+                            num_quads * 6u, InstanceCount, 0u, BaseVertexLocation, StartInstanceLocation);
+                        host_list_->IASetIndexBuffer(&last_ib_host_);
+                        drew_indexed_quad = true;
+                    }
+                }
+            } else if ((last_raw_topology_ == 6u || last_raw_topology_ == 20u) &&
+                       IndexCountPerInstance >= 3u && IndexCountPerInstance <= 65535u &&
+                       last_ib_raw_.SizeInBytes >= static_cast<UINT>(StartIndexLocation) * idx_bytes + src_ib_bytes) {
+                const uint32_t num_tris = IndexCountPerInstance - 2u;
+                const size_t dst_bytes = static_cast<size_t>(num_tris) * 3u * idx_bytes;
+                const uint64_t ib_cpu = device_x_->ResolveCpuAliasVa(
+                    last_ib_raw_.BufferLocation + static_cast<uint64_t>(StartIndexLocation) * idx_bytes);
+                std::vector<uint8_t> src_ib(src_ib_bytes);
+                if (SafeCopyBytes(src_ib.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(ib_cpu)), src_ib_bytes)) {
+                    std::vector<uint8_t> dst_ib(dst_bytes);
+                    for (uint32_t t = 0u; t < num_tris; ++t) {
+                        uint8_t* di = dst_ib.data() + static_cast<size_t>(t) * 3u * idx_bytes;
+                        std::memcpy(di + 0u * idx_bytes, src_ib.data() + 0u, idx_bytes);
+                        std::memcpy(di + 1u * idx_bytes, src_ib.data() + static_cast<size_t>(t + 1u) * idx_bytes, idx_bytes);
+                        std::memcpy(di + 2u * idx_bytes, src_ib.data() + static_cast<size_t>(t + 2u) * idx_bytes, idx_bytes);
+                    }
+                    const D3D12_GPU_VIRTUAL_ADDRESS fib_gpu =
+                        device_x_->UploadTransientGuestBufferForDesktop(
+                            static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(reinterpret_cast<uintptr_t>(dst_ib.data())),
+                            dst_bytes, 256ull, /*allow_same_frame_cache=*/false);
+                    if (fib_gpu != 0ull) {
+                        D3D12_INDEX_BUFFER_VIEW fib{};
+                        fib.BufferLocation = fib_gpu;
+                        fib.SizeInBytes = static_cast<UINT>(dst_bytes);
+                        fib.Format = last_ib_raw_.Format;
+                        host_list_->IASetIndexBuffer(&fib);
+                        host_list_->DrawIndexedInstanced(
+                            num_tris * 3u, InstanceCount, 0u, BaseVertexLocation, StartInstanceLocation);
+                        host_list_->IASetIndexBuffer(&last_ib_host_);
+                        drew_indexed_quad = true;
+                    }
+                }
+            }
+        }
+        if (!drew_indexed_quad) {
+            UINT eff_start_index = StartIndexLocation;
+            INT eff_base_vertex = BaseVertexLocation;
+            bool rebound_ib = false;
+            bool rebound_vb = false;
+            if (device_x_ && device_x_->IsRetailScarlettAbi() &&
+                !device_x_->PsoUsesZeroIaInputs(last_host_pso_)) {
+                bool have_idx_bounds = false;
+                uint32_t min_idx = UINT32_MAX;
+                uint32_t max_idx = 0u;
+                const bool any_vb_upload =
+                    last_vb_need_upload_[0] || last_vb_need_upload_[1] ||
+                    last_vb_need_upload_[2] || last_vb_need_upload_[3] ||
+                    last_vb_need_upload_[4] || last_vb_need_upload_[5] ||
+                    last_vb_need_upload_[6] || last_vb_need_upload_[7];
+                if ((last_ib_need_upload_ || any_vb_upload) &&
+                    last_ib_raw_.BufferLocation != 0ull &&
+                    (last_ib_raw_.Format == DXGI_FORMAT_R16_UINT || last_ib_raw_.Format == DXGI_FORMAT_R32_UINT)) {
+                    const uint32_t idx_bytes = (last_ib_raw_.Format == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
+                    const uint64_t ib_off_b = static_cast<uint64_t>(StartIndexLocation) * idx_bytes;
+                    const uint64_t ib_slice_b = static_cast<uint64_t>(IndexCountPerInstance) * idx_bytes;
+                    if (ib_off_b < last_ib_raw_.SizeInBytes && ib_slice_b > 0ull &&
+                        ib_off_b + ib_slice_b <= last_ib_raw_.SizeInBytes &&
+                        ib_slice_b <= 4ull * 1024ull * 1024ull) {
+                        const uint64_t ib_slice_va = last_ib_raw_.BufferLocation + ib_off_b;
+                        const uint64_t ib_cpu = device_x_->ResolveCpuAliasVa(ib_slice_va);
+                        if (any_vb_upload && IndexCountPerInstance <= 262144u) {
+                            std::vector<uint8_t> tmp_ib(static_cast<size_t>(ib_slice_b));
+                            if (SafeCopyBytes(tmp_ib.data(),
+                                              reinterpret_cast<const void*>(static_cast<uintptr_t>(ib_cpu)),
+                                              tmp_ib.size())) {
+                                const uint32_t prim_cut = (idx_bytes == 4u) ? 0xFFFFFFFFu : 0xFFFFu;
+                                for (uint32_t k = 0u; k < IndexCountPerInstance; ++k) {
+                                    uint32_t v = 0u;
+                                    if (idx_bytes == 4u) {
+                                        std::memcpy(&v, tmp_ib.data() + static_cast<size_t>(k) * 4u, 4u);
+                                    } else {
+                                        uint16_t v16 = 0u;
+                                        std::memcpy(&v16, tmp_ib.data() + static_cast<size_t>(k) * 2u, 2u);
+                                        v = v16;
+                                    }
+                                    if (v == prim_cut) continue;
+                                    if (v < min_idx) min_idx = v;
+                                    if (v > max_idx) max_idx = v;
+                                }
+                                have_idx_bounds = (min_idx <= max_idx);
+                                if (last_ib_need_upload_) {
+                                    const D3D12_GPU_VIRTUAL_ADDRESS up_ib =
+                                        device_x_->UploadTransientGuestBufferForDesktop(
+                                            static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(reinterpret_cast<uintptr_t>(tmp_ib.data())),
+                                            tmp_ib.size(), 16ull, /*allow_same_frame_cache=*/false);
+                                    if (up_ib != 0ull) {
+                                        D3D12_INDEX_BUFFER_VIEW sib{};
+                                        sib.BufferLocation = up_ib;
+                                        sib.SizeInBytes = static_cast<UINT>(tmp_ib.size());
+                                        sib.Format = last_ib_raw_.Format;
+                                        host_list_->IASetIndexBuffer(&sib);
+                                        eff_start_index = 0u;
+                                        rebound_ib = true;
+                                    }
+                                }
+                            }
+                        } else if (last_ib_need_upload_) {
+                            const D3D12_GPU_VIRTUAL_ADDRESS up_ib =
+                                device_x_->UploadTransientGuestBufferForDesktop(
+                                    ib_slice_va, ib_slice_b, 16ull,
+                                    /*allow_same_frame_cache=*/(ib_slice_b > 65536ull));
+                            if (up_ib != 0ull) {
+                                D3D12_INDEX_BUFFER_VIEW sib{};
+                                sib.BufferLocation = up_ib;
+                                sib.SizeInBytes = static_cast<UINT>(ib_slice_b);
+                                sib.Format = last_ib_raw_.Format;
+                                host_list_->IASetIndexBuffer(&sib);
+                                eff_start_index = 0u;
+                                rebound_ib = true;
+                            }
+                        }
+                    }
+                }
+                if (any_vb_upload) {
+                    const bool only_vb0 = (last_vb_valid_mask_ & ~1u) == 0u;
+                    for (uint32_t s = 0u; s < 8u; ++s) {
+                        if (!last_vb_need_upload_[s]) continue;
+                        const auto& raw_vb = last_vb_raw_[s];
+                        if (raw_vb.BufferLocation == 0ull || raw_vb.SizeInBytes == 0u) continue;
+                        const uint32_t st = raw_vb.StrideInBytes;
+                        uint64_t slice_va = raw_vb.BufferLocation;
+                        uint64_t slice_bytes = raw_vb.SizeInBytes;
+                        if (st > 0u && have_idx_bounds) {
+                            const int64_t first_v = std::max<int64_t>(
+                                0ll, static_cast<int64_t>(min_idx) + static_cast<int64_t>(BaseVertexLocation));
+                            const int64_t last_v =
+                                static_cast<int64_t>(max_idx) + static_cast<int64_t>(BaseVertexLocation);
+                            if (last_v >= first_v) {
+                                if (only_vb0 && s == 0u) {
+                                    const uint64_t off_b = static_cast<uint64_t>(first_v) * st;
+                                    const uint64_t need_b =
+                                        static_cast<uint64_t>(last_v - first_v + 1ll) * st;
+                                    if (off_b < raw_vb.SizeInBytes && need_b > 0ull) {
+                                        slice_va = raw_vb.BufferLocation + off_b;
+                                        slice_bytes = std::min<uint64_t>(need_b, raw_vb.SizeInBytes - off_b);
+                                        eff_base_vertex = BaseVertexLocation - static_cast<INT>(first_v);
+                                    }
+                                } else {
+                                    const uint64_t max_elems = std::max<uint64_t>(
+                                        static_cast<uint64_t>(last_v + 1ll),
+                                        static_cast<uint64_t>(StartInstanceLocation) + InstanceCount);
+                                    slice_bytes = std::min<uint64_t>(raw_vb.SizeInBytes, max_elems * st);
+                                }
+                            }
+                        }
+                        slice_bytes = std::min<uint64_t>(slice_bytes, 4ull * 1024ull * 1024ull);
+                        const D3D12_GPU_VIRTUAL_ADDRESS up_vb =
+                            device_x_->UploadTransientGuestBufferForDesktop(
+                                slice_va, slice_bytes, 16ull,
+                                /*allow_same_frame_cache=*/(slice_bytes > 65536ull));
+                        if (up_vb != 0ull) {
+                            D3D12_VERTEX_BUFFER_VIEW svb{};
+                            svb.BufferLocation = up_vb;
+                            svb.SizeInBytes = static_cast<UINT>(slice_bytes);
+                            svb.StrideInBytes = raw_vb.StrideInBytes;
+                            host_list_->IASetVertexBuffers(s, 1u, &svb);
+                            rebound_vb = true;
+                        }
+                    }
+                }
+            }
+            host_list_->DrawIndexedInstanced(
+                IndexCountPerInstance, InstanceCount, eff_start_index,
+                eff_base_vertex, StartInstanceLocation);
+            if (rebound_ib && last_ib_host_.BufferLocation != 0ull) {
+                host_list_->IASetIndexBuffer(&last_ib_host_);
+            }
+            if (rebound_vb) {
+                for (uint32_t s = 0u; s < 8u; ++s) {
+                    if (last_vb_need_upload_[s] && last_vb_host_[s].BufferLocation != 0ull) {
+                        host_list_->IASetVertexBuffers(s, 1u, &last_vb_host_[s]);
+                    }
+                }
+            }
+        }
     } else if (IsDiagTraceEnabled() && (last_pso_is_standin_ || pso_missing)) {
         static std::atomic<uint64_t> s_skip_dii{0ull};
         const uint64_t n = s_skip_dii.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
@@ -1268,11 +2041,15 @@ void STDMETHODCALLTYPE CommandListX::CopyBufferRegion(
                 b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
                 host_list_->ResourceBarrier(1u, &b);
                 host_list_->CopyBufferRegion(host_dst, DstOffset, staging, 0ull, NumBytes);
+                device_x_->NotifyGpuWrittenBufferRange(host_dst, DstOffset, NumBytes);
                 TrackAlignTransientResource(staging);
                 RecordList("ID3D12GraphicsCommandListX::CopyBufferRegion", 15, S_OK);
                 return;
             }
         }
+    }
+    if (device_x_) {
+        device_x_->NotifyGpuWrittenBufferRange(host_dst, DstOffset, NumBytes);
     }
     host_list_->CopyBufferRegion(host_dst, DstOffset, host_src, SrcOffset, NumBytes);
     if (IsDiagTraceEnabled()) {
@@ -1573,12 +2350,47 @@ void STDMETHODCALLTYPE CommandListX::CopyTextureRegion(
             TransitionAlignedStagingState(D3D12_RESOURCE_STATE_COPY_SOURCE);
             host_list_->CopyBufferRegion(
                 dst_loc.pResource, dst_loc.PlacedFootprint.Offset, stage_buf, stage_off, copy_bytes);
+            device_x_->NotifyGpuWrittenBufferRange(
+                dst_loc.pResource, dst_loc.PlacedFootprint.Offset, copy_bytes);
             RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion[AlignedFootprintStage]", 16, S_OK);
             RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion", 16, S_OK);
             return;
         }
     }
 
+    if (device_x_ && dst_ptr && dst_ptr->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+        device_x_->NotifyGpuWrittenTexture(dst_ptr->pResource);
+    } else if (device_x_ && dst_ptr && dst_ptr->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT &&
+               dst_ptr->pResource != nullptr) {
+        const uint64_t fp_bytes = ComputePlacedFootprintByteSize(dst_ptr->PlacedFootprint.Footprint);
+        device_x_->NotifyGpuWrittenBufferRange(
+            dst_ptr->pResource, dst_ptr->PlacedFootprint.Offset, fp_bytes);
+    }
+    {
+        static const bool s_diag_bink_cp = []() {
+            char b[16]{};
+            return ::GetEnvironmentVariableA("OPENSCARLETT_DIAG_BINK", b, sizeof(b)) > 0 && b[0] == '1';
+        }();
+        if (s_diag_bink_cp && dst_ptr && src_ptr && dst_ptr->pResource && src_ptr->pResource) {
+            const D3D12_RESOURCE_DESC dd = dst_ptr->pResource->GetDesc();
+            const D3D12_RESOURCE_DESC sd = src_ptr->pResource->GetDesc();
+            if ((dd.Width >= 960u && (dd.Format == DXGI_FORMAT_R8_UNORM || dd.Format == DXGI_FORMAT_R8_TYPELESS)) ||
+                (sd.Width >= 960u && (sd.Format == DXGI_FORMAT_R8_UNORM || sd.Format == DXGI_FORMAT_R8_TYPELESS))) {
+                static std::atomic<uint32_t> s_bcp_cnt{0u};
+                if (s_bcp_cnt.fetch_add(1u, std::memory_order_relaxed) < 24u) {
+                    std::fprintf(stderr,
+                                 "[OpenScarlett][BINK-COPY-TEX] dst=%p(t=%d %llux%u f=%d) src=%p(t=%d %llux%u f=%d off=0x%llX)\n",
+                                 static_cast<void*>(dst_ptr->pResource), static_cast<int>(dst_ptr->Type),
+                                 static_cast<unsigned long long>(dd.Width), dd.Height, static_cast<int>(dd.Format),
+                                 static_cast<void*>(src_ptr->pResource), static_cast<int>(src_ptr->Type),
+                                 static_cast<unsigned long long>(sd.Width), sd.Height, static_cast<int>(sd.Format),
+                                 src_ptr->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT
+                                     ? static_cast<unsigned long long>(src_ptr->PlacedFootprint.Offset) : 0ull);
+                    std::fflush(stderr);
+                }
+            }
+        }
+    }
     host_list_->CopyTextureRegion(dst_ptr, DstX, DstY, DstZ, src_ptr, pSrcBox);
     if (IsDiagTraceEnabled() && dst_ptr && src_ptr) {
         const D3D12_RESOURCE_DESC dd = dst_ptr->pResource ? dst_ptr->pResource->GetDesc() : D3D12_RESOURCE_DESC{};
@@ -1627,6 +2439,10 @@ void STDMETHODCALLTYPE CommandListX::CopyResource(
         RecordList("ID3D12GraphicsCommandListX::CopyResource[PlacedTiled]", 17, S_OK);
         RecordList("ID3D12GraphicsCommandListX::CopyResource", 17, S_OK);
         return;
+    }
+    if (device_x_) {
+        device_x_->NotifyGpuWrittenTexture(host_dst);
+        device_x_->NotifyGpuWrittenBuffer(host_dst);
     }
     host_list_->CopyResource(host_dst, host_src);
     RecordList("ID3D12GraphicsCommandListX::CopyResource", 17, S_OK);
@@ -1775,6 +2591,8 @@ void STDMETHODCALLTYPE CommandListX::OMSetBlendFactor(const FLOAT BlendFactor[4]
 }
 
 void STDMETHODCALLTYPE CommandListX::OMSetStencilRef(UINT StencilRef) {
+    guest_set_stencil_ref_ = true;
+    guest_stencil_ref_ = StencilRef;
     host_list_->OMSetStencilRef(StencilRef);
     RecordList("ID3D12GraphicsCommandListX::OMSetStencilRef", 24, S_OK);
 }
@@ -1790,6 +2608,7 @@ void STDMETHODCALLTYPE CommandListX::SetPipelineState(ID3D12PipelineState* pPipe
     }
     ID3D12PipelineState* host_pso = nullptr;
     last_pso_is_standin_ = false;
+    last_pso_proxy_ = nullptr;
     if (pPipelineState && IsKnownProxyPointer(pPipelineState)) {
         IOpenScarlettProxyInspect* insp = nullptr;
         if (SUCCEEDED(pPipelineState->QueryInterface(IID_IOpenScarlettProxyInspect, reinterpret_cast<void**>(&insp))) && insp) {
@@ -1797,6 +2616,7 @@ void STDMETHODCALLTYPE CommandListX::SetPipelineState(ID3D12PipelineState* pPipe
                 auto* pso_proxy = static_cast<PipelineStateXProxy*>(pPipelineState);
                 pso_proxy->EnsureLiftedOnBind();
                 last_pso_is_standin_ = pso_proxy->IsStandinPso();
+                last_pso_proxy_ = pso_proxy;
                 host_pso = pso_proxy->HostPipelineState();
             }
             insp->Release();
@@ -2684,7 +3504,7 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootDescriptorTable(
         BaseDescriptor = device_x_->TranslateGpuDescriptorHandle(BaseDescriptor);
         if (is_table_param && !is_sampler_param) {
             BaseDescriptor = device_x_->MaterializeGuestDescriptorTable(
-                BaseDescriptor, last_host_compute_rs_, RootParameterIndex);
+                BaseDescriptor, last_host_compute_rs_, RootParameterIndex, nullptr, nullptr, /*is_compute=*/true);
         }
         const uint32_t sgpr_slot = (RootParameterIndex * 2u) % 14u;
         (void)device_x_->GetDescriptorBridge().SetRootSgprTablePtr(sgpr_slot, BaseDescriptor.ptr);
@@ -2714,7 +3534,7 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootDescriptorTable(
                       static_cast<unsigned long long>(BaseDescriptor.ptr));
         AppendDiagOp(buf);
     }
-    if (valid_for_host && !last_cmp_rs_is_empty_ && !last_pso_is_standin_) {
+    if (valid_for_host && !last_cmp_rs_is_empty_) {
         host_list_->SetComputeRootDescriptorTable(RootParameterIndex, BaseDescriptor);
     }
     RecordList("ID3D12GraphicsCommandListX::SetComputeRootDescriptorTable", 31, S_OK);
@@ -2769,7 +3589,7 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRootDescriptorTable(
                       last_gfx_rs_is_empty_ ? 1 : 0);
         AppendDiagOp(extra.empty() ? std::string(buf) : (std::string(buf) + " " + extra));
     }
-    if (valid_for_host && !last_gfx_rs_is_empty_ && !last_pso_is_standin_) {
+    if (valid_for_host && !last_gfx_rs_is_empty_) {
         host_list_->SetGraphicsRootDescriptorTable(RootParameterIndex, BaseDescriptor);
     }
     RecordList("ID3D12GraphicsCommandListX::SetGraphicsRootDescriptorTable", 32, S_OK);
@@ -2791,7 +3611,7 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRoot32BitConstant(
         }
         vk_cmp_root_constants_[DestOffsetIn32BitValues] = SrcData;
     }
-    if (!last_cmp_rs_is_empty_ && !last_pso_is_standin_) {
+    if (!last_cmp_rs_is_empty_) {
         host_list_->SetComputeRoot32BitConstant(RootParameterIndex, SrcData, DestOffsetIn32BitValues);
     }
     RecordList("ID3D12GraphicsCommandListX::SetComputeRoot32BitConstant", 33, S_OK);
@@ -2818,7 +3638,7 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRoot32BitConstant(
         std::snprintf(buf, sizeof(buf), "SetGfxRoot32BitConst(rp=%u off=%u)", RootParameterIndex, DestOffsetIn32BitValues);
         AppendDiagOp(buf);
     }
-    if (!last_gfx_rs_is_empty_ && !last_pso_is_standin_) {
+    if (!last_gfx_rs_is_empty_) {
         host_list_->SetGraphicsRoot32BitConstant(RootParameterIndex, SrcData, DestOffsetIn32BitValues);
     }
     RecordList("ID3D12GraphicsCommandListX::SetGraphicsRoot32BitConstant", 34, S_OK);
@@ -2845,7 +3665,7 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRoot32BitConstants(
         std::memcpy(vk_cmp_root_constants_.data() + DestOffsetIn32BitValues,
                     pSrcData, static_cast<size_t>(Num32BitValuesToSet) * sizeof(uint32_t));
     }
-    if (!last_cmp_rs_is_empty_ && !last_pso_is_standin_) {
+    if (!last_cmp_rs_is_empty_) {
         host_list_->SetComputeRoot32BitConstants(
             RootParameterIndex, Num32BitValuesToSet, pSrcData, DestOffsetIn32BitValues);
     }
@@ -2879,7 +3699,7 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRoot32BitConstants(
                       RootParameterIndex, Num32BitValuesToSet, DestOffsetIn32BitValues);
         AppendDiagOp(buf);
     }
-    if (!last_gfx_rs_is_empty_ && !last_pso_is_standin_) {
+    if (!last_gfx_rs_is_empty_) {
         host_list_->SetGraphicsRoot32BitConstants(
             RootParameterIndex, Num32BitValuesToSet, pSrcData, DestOffsetIn32BitValues);
     }
@@ -2889,10 +3709,7 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRoot32BitConstants(
 void STDMETHODCALLTYPE CommandListX::SetComputeRootConstantBufferView(
     UINT RootParameterIndex, D3D12_GPU_VIRTUAL_ADDRESS BufferLocation) {
     D3D12_GPU_VIRTUAL_ADDRESS translated =
-        device_x_ ? device_x_->TranslateGuestGpuVa(BufferLocation) : BufferLocation;
-    if (device_x_ && (translated & 255ull) != 0ull) {
-        translated = device_x_->AlignRootCbvGpuVaForDesktop(translated);
-    }
+        device_x_ ? device_x_->ResolveOrUploadRootCbvGpuVa(BufferLocation) : BufferLocation;
     if (device_x_) {
         const uint32_t sgpr_slot = (RootParameterIndex * 2u) % 14u;
         (void)device_x_->GetDescriptorBridge().SetRootSgprTablePtr(sgpr_slot, translated);
@@ -2910,7 +3727,7 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootConstantBufferView(
                       static_cast<unsigned long long>(translated));
         AppendDiagOp(buf);
     }
-    if (!last_cmp_rs_is_empty_ && !last_pso_is_standin_) {
+    if (!last_cmp_rs_is_empty_ && translated != 0ull) {
         host_list_->SetComputeRootConstantBufferView(RootParameterIndex, translated);
     }
     RecordList("ID3D12GraphicsCommandListX::SetComputeRootConstantBufferView", 37, S_OK);
@@ -2919,10 +3736,7 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootConstantBufferView(
 void STDMETHODCALLTYPE CommandListX::SetGraphicsRootConstantBufferView(
     UINT RootParameterIndex, D3D12_GPU_VIRTUAL_ADDRESS BufferLocation) {
     D3D12_GPU_VIRTUAL_ADDRESS translated =
-        device_x_ ? device_x_->TranslateGuestGpuVa(BufferLocation) : BufferLocation;
-    if (device_x_ && (translated & 255ull) != 0ull) {
-        translated = device_x_->AlignRootCbvGpuVaForDesktop(translated);
-    }
+        device_x_ ? device_x_->ResolveOrUploadRootCbvGpuVa(BufferLocation) : BufferLocation;
     if (device_x_) {
         const uint32_t sgpr_slot = (RootParameterIndex * 2u) % 14u;
         (void)device_x_->GetDescriptorBridge().SetRootSgprTablePtr(sgpr_slot, translated);
@@ -2941,7 +3755,7 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRootConstantBufferView(
                       static_cast<unsigned long long>(translated));
         AppendDiagOp(buf);
     }
-    if (!last_gfx_rs_is_empty_ && !last_pso_is_standin_) {
+    if (!last_gfx_rs_is_empty_ && translated != 0ull) {
         host_list_->SetGraphicsRootConstantBufferView(RootParameterIndex, translated);
     }
     RecordList("ID3D12GraphicsCommandListX::SetGraphicsRootConstantBufferView", 38, S_OK);
@@ -2950,7 +3764,7 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRootConstantBufferView(
 void STDMETHODCALLTYPE CommandListX::SetComputeRootShaderResourceView(
     UINT RootParameterIndex, D3D12_GPU_VIRTUAL_ADDRESS BufferLocation) {
     const D3D12_GPU_VIRTUAL_ADDRESS translated =
-        device_x_ ? device_x_->TranslateGuestGpuVa(BufferLocation) : BufferLocation;
+        device_x_ ? device_x_->ResolveOrUploadRootSrvGpuVa(BufferLocation) : BufferLocation;
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
         if (vk_cmp_srvs_.size() <= RootParameterIndex) vk_cmp_srvs_.resize(static_cast<size_t>(RootParameterIndex) + 1u, 0ull);
@@ -2963,7 +3777,7 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootShaderResourceView(
                       static_cast<unsigned long long>(translated));
         AppendDiagOp(buf);
     }
-    if (!last_cmp_rs_is_empty_ && !last_pso_is_standin_) {
+    if (!last_cmp_rs_is_empty_ && translated != 0ull) {
         host_list_->SetComputeRootShaderResourceView(RootParameterIndex, translated);
     }
     RecordList("ID3D12GraphicsCommandListX::SetComputeRootShaderResourceView", 39, S_OK);
@@ -2972,7 +3786,11 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootShaderResourceView(
 void STDMETHODCALLTYPE CommandListX::SetGraphicsRootShaderResourceView(
     UINT RootParameterIndex, D3D12_GPU_VIRTUAL_ADDRESS BufferLocation) {
     const D3D12_GPU_VIRTUAL_ADDRESS translated =
-        device_x_ ? device_x_->TranslateGuestGpuVa(BufferLocation) : BufferLocation;
+        device_x_ ? device_x_->ResolveOrUploadRootSrvGpuVa(BufferLocation) : BufferLocation;
+    if (RootParameterIndex < 16u) {
+        last_gfx_root_srv_raw_[RootParameterIndex] = BufferLocation;
+        last_gfx_root_srv_host_[RootParameterIndex] = translated;
+    }
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
         if (vk_gfx_srvs_.size() <= RootParameterIndex) vk_gfx_srvs_.resize(static_cast<size_t>(RootParameterIndex) + 1u, 0ull);
@@ -2986,7 +3804,7 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRootShaderResourceView(
                       static_cast<unsigned long long>(translated));
         AppendDiagOp(buf);
     }
-    if (!last_gfx_rs_is_empty_ && !last_pso_is_standin_) {
+    if (!last_gfx_rs_is_empty_ && translated != 0ull) {
         host_list_->SetGraphicsRootShaderResourceView(RootParameterIndex, translated);
     }
     RecordList("ID3D12GraphicsCommandListX::SetGraphicsRootShaderResourceView", 40, S_OK);
@@ -2995,7 +3813,7 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRootShaderResourceView(
 void STDMETHODCALLTYPE CommandListX::SetComputeRootUnorderedAccessView(
     UINT RootParameterIndex, D3D12_GPU_VIRTUAL_ADDRESS BufferLocation) {
     const D3D12_GPU_VIRTUAL_ADDRESS translated =
-        device_x_ ? device_x_->TranslateGuestGpuVa(BufferLocation) : BufferLocation;
+        device_x_ ? device_x_->ResolveOrDummyRootUavGpuVa(BufferLocation) : BufferLocation;
     if (device_x_) {
         uint64_t off = 0ull;
         if (ID3D12Resource* res = device_x_->ResolveBufferResourceByGpuVa(BufferLocation, &off)) {
@@ -3014,7 +3832,7 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootUnorderedAccessView(
                       static_cast<unsigned long long>(translated));
         AppendDiagOp(buf);
     }
-    if (!last_cmp_rs_is_empty_ && !last_pso_is_standin_) {
+    if (!last_cmp_rs_is_empty_ && translated != 0ull) {
         host_list_->SetComputeRootUnorderedAccessView(RootParameterIndex, translated);
     }
     RecordList("ID3D12GraphicsCommandListX::SetComputeRootUnorderedAccessView", 41, S_OK);
@@ -3023,7 +3841,7 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootUnorderedAccessView(
 void STDMETHODCALLTYPE CommandListX::SetGraphicsRootUnorderedAccessView(
     UINT RootParameterIndex, D3D12_GPU_VIRTUAL_ADDRESS BufferLocation) {
     const D3D12_GPU_VIRTUAL_ADDRESS translated =
-        device_x_ ? device_x_->TranslateGuestGpuVa(BufferLocation) : BufferLocation;
+        device_x_ ? device_x_->ResolveOrDummyRootUavGpuVa(BufferLocation) : BufferLocation;
     if (device_x_) {
         uint64_t off = 0ull;
         if (ID3D12Resource* res = device_x_->ResolveBufferResourceByGpuVa(BufferLocation, &off)) {
@@ -3043,7 +3861,7 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRootUnorderedAccessView(
                       static_cast<unsigned long long>(translated));
         AppendDiagOp(buf);
     }
-    if (!last_gfx_rs_is_empty_ && !last_pso_is_standin_) {
+    if (!last_gfx_rs_is_empty_ && translated != 0ull) {
         host_list_->SetGraphicsRootUnorderedAccessView(RootParameterIndex, translated);
     }
     RecordList("ID3D12GraphicsCommandListX::SetGraphicsRootUnorderedAccessView", 42, S_OK);
@@ -3054,21 +3872,34 @@ void STDMETHODCALLTYPE CommandListX::IASetIndexBuffer(const D3D12_INDEX_BUFFER_V
     const D3D12_INDEX_BUFFER_VIEW* pass_view = pView;
     if (pView) {
         translated_view = *pView;
+        bool defer_ib_upload = false;
         if (device_x_ && translated_view.BufferLocation != 0ull) {
             translated_view.BufferLocation =
                 device_x_->TranslateGuestGpuVa(translated_view.BufferLocation);
-            if (device_x_->IsRetailScarlettAbi() &&
-                translated_view.BufferLocation == pView->BufferLocation &&
-                pView->SizeInBytes > 0u) {
-                const D3D12_GPU_VIRTUAL_ADDRESS uploaded =
-                    device_x_->UploadTransientGuestBufferForDesktop(
-                        pView->BufferLocation, pView->SizeInBytes, 16ull, true);
-                if (uploaded != 0ull) {
-                    translated_view.BufferLocation = uploaded;
+            const bool unmapped_va = (translated_view.BufferLocation == pView->BufferLocation);
+            bool need_guest_upload = unmapped_va;
+            if (!need_guest_upload && device_x_->IsRetailScarlettAbi()) {
+                uint64_t ib_off = 0ull;
+                ID3D12Resource* ib_res = device_x_->ResolveBufferResourceByGpuVa(pView->BufferLocation, &ib_off);
+                if (ib_res && !device_x_->IsGpuWrittenBufferRange(ib_res, ib_off, pView->SizeInBytes)) {
+                    need_guest_upload = true;
                 }
             }
+            defer_ib_upload =
+                device_x_->IsRetailScarlettAbi() && need_guest_upload && pView->SizeInBytes > 0u;
+            if (unmapped_va && defer_ib_upload) {
+                translated_view.BufferLocation = 0ull;
+                translated_view.SizeInBytes = 0u;
+            }
         }
-        pass_view = &translated_view;
+        pass_view = (translated_view.BufferLocation != 0ull) ? &translated_view : nullptr;
+        last_ib_raw_ = *pView;
+        last_ib_host_ = translated_view;
+        last_ib_need_upload_ = defer_ib_upload;
+    } else {
+        last_ib_raw_ = {};
+        last_ib_host_ = {};
+        last_ib_need_upload_ = false;
     }
     if (IsDiagTraceEnabled() && pView) {
         char buf[128];
@@ -3128,18 +3959,36 @@ void STDMETHODCALLTYPE CommandListX::IASetVertexBuffers(
         }
         for (UINT i = 0u; i < NumViews; ++i) {
             translated[i] = pViews[i];
+            bool defer_vb_upload = false;
             if (device_x_ && translated[i].BufferLocation != 0ull) {
                 translated[i].BufferLocation =
                     device_x_->TranslateGuestGpuVa(translated[i].BufferLocation);
-                if (device_x_->IsRetailScarlettAbi() &&
-                    translated[i].BufferLocation == pViews[i].BufferLocation &&
-                    pViews[i].SizeInBytes > 0u) {
-                    const D3D12_GPU_VIRTUAL_ADDRESS uploaded =
-                        device_x_->UploadTransientGuestBufferForDesktop(
-                            pViews[i].BufferLocation, pViews[i].SizeInBytes, 16ull, true);
-                    if (uploaded != 0ull) {
-                        translated[i].BufferLocation = uploaded;
+                const bool unmapped_va = (translated[i].BufferLocation == pViews[i].BufferLocation);
+                bool need_guest_upload = unmapped_va;
+                if (!need_guest_upload && device_x_->IsRetailScarlettAbi()) {
+                    uint64_t vb_off = 0ull;
+                    ID3D12Resource* vb_res =
+                        device_x_->ResolveBufferResourceByGpuVa(pViews[i].BufferLocation, &vb_off);
+                    if (vb_res && !device_x_->IsGpuWrittenBufferRange(vb_res, vb_off, pViews[i].SizeInBytes)) {
+                        need_guest_upload = true;
                     }
+                }
+                defer_vb_upload =
+                    device_x_->IsRetailScarlettAbi() && need_guest_upload && pViews[i].SizeInBytes > 0u;
+                if (unmapped_va && defer_vb_upload) {
+                    translated[i].BufferLocation = 0ull;
+                    translated[i].SizeInBytes = 0u;
+                }
+            }
+            const UINT slot = StartSlot + i;
+            if (slot < 8u) {
+                last_vb_raw_[slot] = pViews[i];
+                last_vb_host_[slot] = translated[i];
+                last_vb_need_upload_[slot] = defer_vb_upload;
+                if (pViews[i].BufferLocation != 0ull && pViews[i].SizeInBytes > 0u) {
+                    last_vb_valid_mask_ |= static_cast<uint8_t>(1u << slot);
+                } else {
+                    last_vb_valid_mask_ &= static_cast<uint8_t>(~(1u << slot));
                 }
             }
         }
@@ -3147,6 +3996,20 @@ void STDMETHODCALLTYPE CommandListX::IASetVertexBuffers(
         if (StartSlot == 0u && NumViews > 0u) {
             last_vb0_raw_ = pViews[0];
             last_vb0_host_ = translated[0];
+        }
+    } else {
+        for (UINT i = 0u; i < NumViews; ++i) {
+            const UINT slot = StartSlot + i;
+            if (slot < 8u) {
+                last_vb_raw_[slot] = {};
+                last_vb_host_[slot] = {};
+                last_vb_need_upload_[slot] = false;
+                last_vb_valid_mask_ &= static_cast<uint8_t>(~(1u << slot));
+            }
+        }
+        if (StartSlot == 0u && NumViews > 0u) {
+            last_vb0_raw_ = {};
+            last_vb0_host_ = {};
         }
     }
     if (IsDiagTraceEnabled() && pViews) {
@@ -3290,6 +4153,11 @@ void STDMETHODCALLTYPE CommandListX::OMSetRenderTargets(
                 }
             }
         }
+        for (UINT k = 0u; k < clean_n; ++k) {
+            if (ID3D12Resource* rk = device_x_->LookupRetailRtvResource(clean_rtvs[k].ptr)) {
+                device_x_->NotifyGpuWrittenTexture(rk);
+            }
+        }
         ID3D12Resource* prev_rtv0 = last_bound_rtv0_res_;
         ID3D12Resource* next_rtv0 =
             (clean_n > 0u) ? device_x_->LookupRetailRtvResource(clean_rtvs[0].ptr) : nullptr;
@@ -3340,6 +4208,13 @@ void STDMETHODCALLTYPE CommandListX::OMSetRenderTargets(
             }
         }
         last_bound_rtv0_res_ = next_rtv0;
+        last_bound_rtv_count_ = clean_n;
+        for (UINT k = 0u; k < 8u; ++k) {
+            last_bound_rtv_formats_[k] =
+                (k < clean_n) ? device_x_->LookupRetailRtvFormat(clean_rtvs[k].ptr) : DXGI_FORMAT_UNKNOWN;
+        }
+        last_bound_dsv_format_ =
+            clean_dsv ? device_x_->LookupRetailDsvFormat(clean_dsv->ptr) : DXGI_FORMAT_UNKNOWN;
         if (IsDiagTraceEnabled()) {
             char buf[220];
             const D3D12_RESOURCE_DESC dd_diag = dsv_res ? dsv_res->GetDesc() : D3D12_RESOURCE_DESC{};
@@ -3444,11 +4319,32 @@ void STDMETHODCALLTYPE CommandListX::ClearRenderTargetView(
         AppendDiagOp(buf);
     }
     if (!invalid_rtv) {
+        static constexpr FLOAT kZeroClear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        const FLOAT* eff_rgba = ColorRGBA ? ColorRGBA : kZeroClear;
         ID3D12Resource* rtv_res =
             (device_x_ && device_x_->IsRetailScarlettAbi())
                 ? device_x_->LookupRetailRtvResource(RenderTargetView.ptr)
                 : nullptr;
         if (rtv_res) {
+            device_x_->NotifyGpuWrittenTexture(rtv_res);
+            static const bool s_log_clears = []() {
+                char b[16]{};
+                return ::GetEnvironmentVariableA("OPENSCARLETT_CAPTURE_DIR", b, sizeof(b)) > 0;
+            }();
+            if (s_log_clears) {
+                static std::atomic<uint32_t> s_clr_cnt{0u};
+                const uint32_t cn = s_clr_cnt.fetch_add(1u, std::memory_order_relaxed);
+                if (cn < 16u) {
+                    const D3D12_RESOURCE_DESC rd = rtv_res->GetDesc();
+                    std::fprintf(stderr,
+                                 "[OpenScarlett][d3d12_xs] CLEAR-RTV #%u res=%p (%llux%u fmt=%d) rgba=(%.3f,%.3f,%.3f,%.3f)\n",
+                                 cn, static_cast<void*>(rtv_res),
+                                 static_cast<unsigned long long>(rd.Width), rd.Height,
+                                 static_cast<int>(rd.Format),
+                                 eff_rgba[0], eff_rgba[1], eff_rgba[2], eff_rgba[3]);
+                    std::fflush(stderr);
+                }
+            }
             const D3D12_RESOURCE_STATES before = device_x_->TransitionRetailResourceState(
                 rtv_res, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
             if (before != D3D12_RESOURCE_STATE_RENDER_TARGET) {
@@ -3461,7 +4357,7 @@ void STDMETHODCALLTYPE CommandListX::ClearRenderTargetView(
                 host_list_->ResourceBarrier(1u, &b);
             }
         }
-        host_list_->ClearRenderTargetView(RenderTargetView, ColorRGBA, NumRects, pRects);
+        host_list_->ClearRenderTargetView(RenderTargetView, eff_rgba, NumRects, pRects);
     }
     RecordList("ID3D12GraphicsCommandListX::ClearRenderTargetView", 48, S_OK);
 }
@@ -4014,9 +4910,54 @@ void STDMETHODCALLTYPE CommandListX::ExecuteIndirect(
             AppendDiagOp(buf);
         }
         if (!handled_via_warp_replay && host_max_count > 0u && !last_pso_is_standin_ && !pso_missing) {
+            // On PC NVIDIA D3D12 drivers, a UAV barrier preceding ExecuteIndirect in the same
+            // command list does not stall CP/PFP indirect-argument fetch. Transitioning a
+            // 256-byte DEFAULT-heap sync buffer COMMON -> INDIRECT_ARGUMENT -> COMMON around
+            // ExecuteIndirect forces the GPU front-end to wait for prior compute UAV writes.
+            const bool need_ei_fe_sync =
+                device_x_ && !device_x_->AdapterInfo().is_warp &&
+                (list_type_ == D3D12_COMMAND_LIST_TYPE_DIRECT ||
+                 list_type_ == D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            if (need_ei_fe_sync && !ei_sync_dummy_buf_ && device_x_->HostDevice()) {
+                D3D12_HEAP_PROPERTIES hp{};
+                hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                hp.CreationNodeMask = 1u;
+                hp.VisibleNodeMask = 1u;
+                D3D12_RESOURCE_DESC rd{};
+                rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                rd.Width = 256ull;
+                rd.Height = 1u;
+                rd.DepthOrArraySize = 1u;
+                rd.MipLevels = 1u;
+                rd.Format = DXGI_FORMAT_UNKNOWN;
+                rd.SampleDesc.Count = 1u;
+                rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                (void)device_x_->HostDevice()->CreateCommittedResource(
+                    &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON,
+                    nullptr, OS_D3D12_IID(ID3D12Resource),
+                    reinterpret_cast<void**>(&ei_sync_dummy_buf_));
+            }
+            if (need_ei_fe_sync && ei_sync_dummy_buf_) {
+                D3D12_RESOURCE_BARRIER pre_b{};
+                pre_b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                pre_b.Transition.pResource = ei_sync_dummy_buf_;
+                pre_b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                pre_b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                pre_b.Transition.StateAfter = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+                host_list_->ResourceBarrier(1u, &pre_b);
+            }
             host_list_->ExecuteIndirect(
                 host_sig, host_max_count,
                 exec_arg_buf, exec_arg_offset, exec_cnt_buf, exec_cnt_offset);
+            if (need_ei_fe_sync && ei_sync_dummy_buf_) {
+                D3D12_RESOURCE_BARRIER post_b{};
+                post_b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                post_b.Transition.pResource = ei_sync_dummy_buf_;
+                post_b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                post_b.Transition.StateBefore = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+                post_b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+                host_list_->ResourceBarrier(1u, &post_b);
+            }
         }
     }
     RecordList("ID3D12GraphicsCommandListX::ExecuteIndirect", 59, S_OK);
@@ -4240,6 +5181,14 @@ void STDMETHODCALLTYPE CommandListX::WriteBufferImmediate(
     }
 
     if (host_list2_ && all_host_vas_valid) {
+        if (device_x_) {
+            for (UINT i = 0u; i < Count; ++i) {
+                uint64_t off = 0ull;
+                if (ID3D12Resource* wb_res = device_x_->ResolveBufferResourceByGpuVa(pParams[i].Dest, &off)) {
+                    device_x_->NotifyGpuWrittenBufferRange(wb_res, off, 4ull);
+                }
+            }
+        }
         host_list2_->WriteBufferImmediate(Count, translated, pModes);
     } else {
         // Safe CPU fallback when host command list lacks ID3D12GraphicsCommandList2.
@@ -5836,6 +6785,10 @@ bool CommandListX::TryBridgePlacedTiledCopyResource(
     }
 
     // Texture <-> Texture where at least one is a placed tiled texture.
+    if (device_x_) {
+        device_x_->NotifyGpuWrittenTexture(host_dst);
+        device_x_->NotifyGpuWrittenBuffer(host_dst);
+    }
     host_list_->CopyResource(host_dst, host_src);
     {
         auto& reg = GetPlacedTiledRegistry();

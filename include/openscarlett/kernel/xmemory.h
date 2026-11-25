@@ -117,6 +117,11 @@ public:
     Status ReserveVirtualPlaceholder(size_t size,
                                      void*& out_base,
                                      MemoryPageSize granule = MemoryPageSize::Page64KB);
+    Status ReserveVirtualPlaceholderAt(void* requested_base,
+                                       size_t size,
+                                       void*& out_base,
+                                       MemoryPageSize granule = MemoryPageSize::Page64KB);
+    Status PromoteReservedRangeToPlaceholder(void* target_addr, size_t min_bytes);
     Status ReleaseVirtualPlaceholder(void* base);
 
     // Explicit placeholder split / coalesce helpers (also performed automatically during

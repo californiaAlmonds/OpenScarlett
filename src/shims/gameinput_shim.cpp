@@ -976,11 +976,18 @@ bool PollPhysicalGamepad(
     }
     struct AutoNavEvent {
         uint64_t time_ms = 0ull;
+        uint64_t dur_ms = 300ull;
         uint32_t mask = 0u;
+        float lx = 0.0f;
+        float ly = 0.0f;
+        float rx = 0.0f;
+        float ry = 0.0f;
+        float lt = 0.0f;
+        float rt = 0.0f;
     };
     static const std::vector<AutoNavEvent> s_autonav = []() {
         std::vector<AutoNavEvent> evs;
-        char buf[512]{};
+        char buf[1024]{};
         const DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_AUTONAV", buf, sizeof(buf));
         if (n == 0u || n >= sizeof(buf)) return evs;
         const char* p = buf;
@@ -991,20 +998,44 @@ bool PollPhysicalGamepad(
             const uint64_t t = std::strtoull(p, &end, 10);
             if (!end || *end != ':') break;
             p = end + 1;
-            uint32_t m = 0u;
-            switch (*p) {
-                case 'A': case 'a': m = GameInputGamepadA; break;
-                case 'B': case 'b': m = GameInputGamepadB; break;
-                case 'X': case 'x': m = GameInputGamepadX; break;
-                case 'Y': case 'y': m = GameInputGamepadY; break;
-                case 'U': case 'u': m = GameInputGamepadDPadUp; break;
-                case 'D': case 'd': m = GameInputGamepadDPadDown; break;
-                case 'L': case 'l': m = GameInputGamepadDPadLeft; break;
-                case 'R': case 'r': m = GameInputGamepadDPadRight; break;
-                case 'S': case 's': m = GameInputGamepadMenu; break;
-                default: break;
+            AutoNavEvent ev{};
+            ev.time_ms = t;
+            ev.dur_ms = 300ull;
+            if (std::strncmp(p, "LSU", 3) == 0) { ev.ly = 1.0f; }
+            else if (std::strncmp(p, "LSD", 3) == 0) { ev.ly = -1.0f; }
+            else if (std::strncmp(p, "LSL", 3) == 0) { ev.lx = -1.0f; }
+            else if (std::strncmp(p, "LSR", 3) == 0) { ev.lx = 1.0f; }
+            else if (std::strncmp(p, "RSU", 3) == 0) { ev.ry = 1.0f; }
+            else if (std::strncmp(p, "RSD", 3) == 0) { ev.ry = -1.0f; }
+            else if (std::strncmp(p, "RSL", 3) == 0) { ev.rx = -1.0f; }
+            else if (std::strncmp(p, "RSR", 3) == 0) { ev.rx = 1.0f; }
+            else if (std::strncmp(p, "RT", 2) == 0) { ev.rt = 1.0f; }
+            else if (std::strncmp(p, "LT", 2) == 0) { ev.lt = 1.0f; }
+            else {
+                switch (*p) {
+                    case 'A': case 'a': ev.mask = GameInputGamepadA; break;
+                    case 'B': case 'b': ev.mask = GameInputGamepadB; break;
+                    case 'X': case 'x': ev.mask = GameInputGamepadX; break;
+                    case 'Y': case 'y': ev.mask = GameInputGamepadY; break;
+                    case 'U': case 'u': ev.mask = GameInputGamepadDPadUp; break;
+                    case 'D': case 'd': ev.mask = GameInputGamepadDPadDown; break;
+                    case 'L': case 'l': ev.mask = GameInputGamepadDPadLeft; break;
+                    case 'R': case 'r': ev.mask = GameInputGamepadDPadRight; break;
+                    case 'S': case 's': ev.mask = GameInputGamepadMenu; break;
+                    case 'V': case 'v': ev.mask = GameInputGamepadView; break;
+                    default: break;
+                }
             }
-            if (m != 0u) evs.push_back({t, m});
+            while (*p && *p != ',' && *p != ':') ++p;
+            if (*p == ':') {
+                ++p;
+                const uint64_t d = std::strtoull(p, nullptr, 10);
+                if (d > 0ull && d <= 30000ull) ev.dur_ms = d;
+            }
+            if (ev.mask != 0u || ev.lx != 0.0f || ev.ly != 0.0f || ev.rx != 0.0f || ev.ry != 0.0f ||
+                ev.lt != 0.0f || ev.rt != 0.0f) {
+                evs.push_back(ev);
+            }
             while (*p && *p != ',') ++p;
         }
         return evs;
@@ -1013,75 +1044,123 @@ bool PollPhysicalGamepad(
         static const uint64_t s_nav_t0_ms = ::GetTickCount64();
         const uint64_t elapsed = ::GetTickCount64() - s_nav_t0_ms;
         for (const auto& ev : s_autonav) {
-            if (elapsed >= ev.time_ms && elapsed < ev.time_ms + 300ull) {
+            if (elapsed >= ev.time_ms && elapsed < ev.time_ms + ev.dur_ms) {
                 found = true;
                 out_gamepad.buttons |= ev.mask;
+                if (ev.lx != 0.0f) out_gamepad.leftThumbstickX = ev.lx;
+                if (ev.ly != 0.0f) out_gamepad.leftThumbstickY = ev.ly;
+                if (ev.rx != 0.0f) out_gamepad.rightThumbstickX = ev.rx;
+                if (ev.ry != 0.0f) out_gamepad.rightThumbstickY = ev.ry;
+                if (ev.lt != 0.0f) out_gamepad.leftTrigger = ev.lt;
+                if (ev.rt != 0.0f) out_gamepad.rightTrigger = ev.rt;
             }
         }
     }
-    // Live interactive input file (OPENSCARLETT_LIVE_INPUT_FILE): format "<seq>:<CMD>[:<dur_ms>]"
-    // where CMD is A/B/X/Y/U/D/L/R/S/RSD/RSU/LSD/LSU. Each new <seq> fires a single clean hold.
+    // Live interactive input file (OPENSCARLETT_LIVE_INPUT_FILE):
+    // Supports either single "<seq>:<CMD>[:<dur_ms>]" or multi-line timed batches
+    // "<seq>:<delay_ms>:<CMD>:<dur_ms>" (one event per line sharing <seq>).
     static const std::string s_live_input_path = []() -> std::string {
         char buf[MAX_PATH]{};
         const DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_LIVE_INPUT_FILE", buf, sizeof(buf));
         return (n > 0u && n < sizeof(buf)) ? std::string(buf, n) : std::string();
     }();
     if (!s_live_input_path.empty()) {
+        struct LiveStep {
+            uint64_t start_ms = 0ull;
+            uint64_t end_ms = 0ull;
+            uint32_t btn = 0u;
+            float lx = 0.0f, ly = 0.0f, rx = 0.0f, ry = 0.0f, lt = 0.0f, rt = 0.0f;
+        };
         static std::mutex s_live_mu;
         static uint64_t s_last_poll_ms = 0ull;
         static uint64_t s_last_seq = 0ull;
-        static uint64_t s_active_until_ms = 0ull;
-        static uint32_t s_active_btn = 0u;
-        static float s_active_rsy = 0.0f;
-        static float s_active_lsy = 0.0f;
+        static std::vector<LiveStep> s_steps;
+        auto parse_cmd = [](const char* cmd, LiveStep& st, uint64_t& out_dur) {
+            out_dur = 250ull;
+            if (std::strncmp(cmd, "RSD", 3) == 0) { st.ry = -1.0f; out_dur = 3000ull; }
+            else if (std::strncmp(cmd, "RSU", 3) == 0) { st.ry = 1.0f; out_dur = 1500ull; }
+            else if (std::strncmp(cmd, "RSL", 3) == 0) { st.rx = -1.0f; out_dur = 600ull; }
+            else if (std::strncmp(cmd, "RSR", 3) == 0) { st.rx = 1.0f; out_dur = 600ull; }
+            else if (std::strncmp(cmd, "LSD", 3) == 0) { st.ly = -1.0f; out_dur = 400ull; }
+            else if (std::strncmp(cmd, "LSU", 3) == 0) { st.ly = 1.0f; out_dur = 400ull; }
+            else if (std::strncmp(cmd, "LSL", 3) == 0) { st.lx = -1.0f; out_dur = 400ull; }
+            else if (std::strncmp(cmd, "LSR", 3) == 0) { st.lx = 1.0f; out_dur = 400ull; }
+            else if (std::strncmp(cmd, "LT", 2) == 0) { st.lt = 1.0f; out_dur = 400ull; }
+            else if (std::strncmp(cmd, "RT", 2) == 0) { st.rt = 1.0f; out_dur = 400ull; }
+            else if (std::strncmp(cmd, "LB", 2) == 0) { st.btn = GameInputGamepadLeftShoulder; }
+            else if (std::strncmp(cmd, "RB", 2) == 0) { st.btn = GameInputGamepadRightShoulder; }
+            else if (cmd[0] == 'A') { st.btn = GameInputGamepadA; }
+            else if (cmd[0] == 'B') { st.btn = GameInputGamepadB; }
+            else if (cmd[0] == 'X') { st.btn = GameInputGamepadX; }
+            else if (cmd[0] == 'Y') { st.btn = GameInputGamepadY; }
+            else if (cmd[0] == 'U') { st.btn = GameInputGamepadDPadUp; }
+            else if (cmd[0] == 'D') { st.btn = GameInputGamepadDPadDown; }
+            else if (cmd[0] == 'L') { st.btn = GameInputGamepadDPadLeft; }
+            else if (cmd[0] == 'R') { st.btn = GameInputGamepadDPadRight; }
+            else if (cmd[0] == 'S') { st.btn = GameInputGamepadMenu; }
+            else if (cmd[0] == 'V') { st.btn = GameInputGamepadView; }
+        };
         const uint64_t now_ms = ::GetTickCount64();
         std::lock_guard<std::mutex> lk(s_live_mu);
         if (now_ms - s_last_poll_ms >= 50ull) {
             s_last_poll_ms = now_ms;
             FILE* f = nullptr;
             if (::fopen_s(&f, s_live_input_path.c_str(), "rb") == 0 && f) {
-                char line[128]{};
-                if (std::fgets(line, static_cast<int>(sizeof(line)), f)) {
-                    char* end = nullptr;
-                    const uint64_t seq = std::strtoull(line, &end, 10);
-                    if (end && *end == ':' && seq > s_last_seq) {
+                char line[160]{};
+                uint64_t batch_seq = 0ull;
+                while (std::fgets(line, static_cast<int>(sizeof(line)), f)) {
+                    if (line[0] == '#' || line[0] == '\r' || line[0] == '\n') continue;
+                    char* end1 = nullptr;
+                    const uint64_t seq = std::strtoull(line, &end1, 10);
+                    if (!end1 || *end1 != ':') continue;
+                    if (batch_seq == 0ull) {
+                        if (seq <= s_last_seq) break;
+                        batch_seq = seq;
                         s_last_seq = seq;
-                        const char* cmd = end + 1;
-                        uint32_t btn = 0u;
-                        float rsy = 0.0f;
-                        float lsy = 0.0f;
-                        uint64_t dur = 250ull;
-                        if (std::strncmp(cmd, "RSD", 3) == 0) { rsy = -1.0f; dur = 3000ull; }
-                        else if (std::strncmp(cmd, "RSU", 3) == 0) { rsy = 1.0f; dur = 1500ull; }
-                        else if (std::strncmp(cmd, "LSD", 3) == 0) { lsy = -1.0f; dur = 400ull; }
-                        else if (std::strncmp(cmd, "LSU", 3) == 0) { lsy = 1.0f; dur = 400ull; }
-                        else if (cmd[0] == 'A') { btn = GameInputGamepadA; }
-                        else if (cmd[0] == 'B') { btn = GameInputGamepadB; }
-                        else if (cmd[0] == 'X') { btn = GameInputGamepadX; }
-                        else if (cmd[0] == 'Y') { btn = GameInputGamepadY; }
-                        else if (cmd[0] == 'U') { btn = GameInputGamepadDPadUp; }
-                        else if (cmd[0] == 'D') { btn = GameInputGamepadDPadDown; }
-                        else if (cmd[0] == 'L') { btn = GameInputGamepadDPadLeft; }
-                        else if (cmd[0] == 'R') { btn = GameInputGamepadDPadRight; }
-                        else if (cmd[0] == 'S') { btn = GameInputGamepadMenu; }
-                        if (const char* col2 = std::strchr(cmd, ':')) {
-                            const uint64_t parsed_dur = std::strtoull(col2 + 1, nullptr, 10);
-                            if (parsed_dur > 0ull && parsed_dur <= 15000ull) dur = parsed_dur;
-                        }
-                        s_active_btn = btn;
-                        s_active_rsy = rsy;
-                        s_active_lsy = lsy;
-                        s_active_until_ms = now_ms + dur;
+                        s_steps.clear();
+                    } else if (seq != batch_seq) {
+                        continue;
                     }
+                    const char* p1 = end1 + 1;
+                    LiveStep st{};
+                    uint64_t delay_ms = 0ull;
+                    uint64_t dur = 250ull;
+                    if (p1[0] >= '0' && p1[0] <= '9') {
+                        char* end2 = nullptr;
+                        delay_ms = std::strtoull(p1, &end2, 10);
+                        if (end2 && *end2 == ':') {
+                            const char* cmd = end2 + 1;
+                            parse_cmd(cmd, st, dur);
+                            if (const char* col3 = std::strchr(cmd, ':')) {
+                                const uint64_t pd = std::strtoull(col3 + 1, nullptr, 10);
+                                if (pd > 0ull && pd <= 30000ull) dur = pd;
+                            }
+                        }
+                    } else {
+                        parse_cmd(p1, st, dur);
+                        if (const char* col2 = std::strchr(p1, ':')) {
+                            const uint64_t pd = std::strtoull(col2 + 1, nullptr, 10);
+                            if (pd > 0ull && pd <= 30000ull) dur = pd;
+                        }
+                    }
+                    st.start_ms = now_ms + delay_ms;
+                    st.end_ms = st.start_ms + dur;
+                    s_steps.push_back(st);
                 }
                 std::fclose(f);
             }
         }
-        if (now_ms < s_active_until_ms) {
-            found = true;
-            out_gamepad.buttons |= s_active_btn;
-            if (s_active_rsy != 0.0f) out_gamepad.rightThumbstickY = s_active_rsy;
-            if (s_active_lsy != 0.0f) out_gamepad.leftThumbstickY = s_active_lsy;
+        for (const auto& st : s_steps) {
+            if (now_ms >= st.start_ms && now_ms < st.end_ms) {
+                found = true;
+                out_gamepad.buttons |= st.btn;
+                if (st.lx != 0.0f) out_gamepad.leftThumbstickX = st.lx;
+                if (st.ly != 0.0f) out_gamepad.leftThumbstickY = st.ly;
+                if (st.rx != 0.0f) out_gamepad.rightThumbstickX = st.rx;
+                if (st.ry != 0.0f) out_gamepad.rightThumbstickY = st.ry;
+                if (st.lt != 0.0f) out_gamepad.leftTrigger = st.lt;
+                if (st.rt != 0.0f) out_gamepad.rightTrigger = st.rt;
+            }
         }
     }
 
@@ -2917,6 +2996,27 @@ private:
 #endif
 
     bool ShouldAllowInput() const noexcept {
+#if defined(_WIN32)
+        static const bool s_force_bg_allow = []() noexcept {
+            char buf[64]{};
+            if (::GetEnvironmentVariableA("OPENSCARLETT_GAMEINPUT_BACKGROUND", buf, sizeof(buf)) > 0 && buf[0] != '0') {
+                return true;
+            }
+            if (::GetEnvironmentVariableA("OPENSCARLETT_AUTONAV", buf, sizeof(buf)) > 0) {
+                return true;
+            }
+            if (::GetEnvironmentVariableA("OPENSCARLETT_LIVE_INPUT_FILE", buf, sizeof(buf)) > 0) {
+                return true;
+            }
+            if (::GetEnvironmentVariableA("OPENSCARLETT_AUTOPRESS_A_MS", buf, sizeof(buf)) > 0) {
+                return true;
+            }
+            return false;
+        }();
+        if (s_force_bg_allow) {
+            return true;
+        }
+#endif
         const uint32_t policy = focus_policy_.load(std::memory_order_acquire);
         if ((policy & (GameInputEnableBackgroundInput | 0x00000040u)) != 0u) {
             return true;

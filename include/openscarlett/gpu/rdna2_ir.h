@@ -311,6 +311,7 @@ struct Psv0HlslBindingOverrides {
     uint32_t rwimg_u32_res_kind = 2u;
     bool cs_fssm_abi = false;
     uint32_t cs_user_sgpr_count = 0u;
+    uint32_t cs_tgid_en_mask = 0x7u;
     uint32_t space2_cbv_slot_mask = 0u;
     std::vector<Psv0HlslResourceEntry> uav_buffers;
     std::vector<Psv0HlslResourceEntry> uav_textures;
@@ -326,6 +327,7 @@ struct StageContractTable {
     Rdna2TextureFormat texture_srv_format = Rdna2TextureFormat::Float4;
     std::vector<VsIaInputBinding> vs_ia_inputs;
     uint32_t min_param_outputs = 0u;
+    bool rectlist_zero_ia_vs = false;
     Psv0HlslBindingOverrides psv0_bindings{};
 };
 
@@ -366,6 +368,9 @@ struct Rdna2IrModule {
     uint32_t used_space2_tex_slots = 0u;
     uint32_t used_space2_cbv_slots = 0u;
     uint32_t used_space2_srv_slots = 0u;
+    uint32_t used_space2_rwtex_slots = 0u;
+    uint8_t space2_tex_res_kind[16]{};
+    uint8_t space2_rwtex_res_kind[16]{};
     bool uses_texture_cube_srv = false;
     bool uses_texture_uav = false;
     bool uses_texture_u32_uav = false;

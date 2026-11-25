@@ -924,7 +924,10 @@ std::vector<ScalarVectorOpcodeEntry> BuildScalarVectorOpcodeTable() {
     add(Enc::VOP3, 0x274, "v_interp_p1ll_f16", 2, true, false, false, false, false, false, false, 16, DK::Float, SC::VectorInterp);
     add(Enc::VOP3, 0x275, "v_interp_p1lv_f16", 3, true, false, false, false, false, false, false, 16, DK::Float, SC::VectorInterp);
     add(Enc::VOP3, 0x276, "v_interp_p2_f16", 3, true, false, false, false, false, false, false, 16, DK::Float, SC::VectorInterp);
-    // VOP3 GFX10.3 16-bit / wave / 3-src ops (0x300..0x37F)
+    // VOP3 GFX10.3 64-bit shift / 16-bit / wave / 3-src ops (0x2FF..0x37F)
+    add(Enc::VOP3, 0x2FF, "v_lshlrev_b64", 2, true, false, true, false, false, false, false, 64, DK::Untyped, SC::VectorLogicShiftBit);
+    add(Enc::VOP3, 0x300, "v_lshrrev_b64", 2, true, false, true, false, false, false, false, 64, DK::Untyped, SC::VectorLogicShiftBit);
+    add(Enc::VOP3, 0x301, "v_ashrrev_i64", 2, true, false, true, false, false, false, false, 64, DK::SignedInt, SC::VectorLogicShiftBit);
     add(Enc::VOP3, 0x303, "v_add_nc_u16", 2, true, false, false, false, false, false, false, 16, DK::UnsignedInt, SC::VectorIntArith);
     add(Enc::VOP3, 0x304, "v_sub_nc_u16", 2, true, false, false, false, false, false, false, 16, DK::UnsignedInt, SC::VectorIntArith);
     add(Enc::VOP3, 0x305, "v_mbcnt_lo_u32_b32", 2, true, false, false, false, false, false, false, 32, DK::UnsignedInt, SC::VectorCrossLane);
@@ -6078,12 +6081,43 @@ public:
                         write64 = true; set_scc_nz = true; break;
                     }
                     case 0x24: r = EmitBfmB32(a, b); break;
+                    case 0x25: {
+                        const uint32_t w64 = BinU32(199u, a, ConstU32(63u));
+                        const uint32_t o64 = BinU32(199u, b, ConstU32(63u));
+                        const uint32_t w_lo = SelU32(BinBool(176u, w64, ConstU32(32u)), w64, ConstU32(32u));
+                        const uint32_t m_lo = SelU32(BinBool(170u, w_lo, ConstU32(32u)), ConstU32(0xFFFFFFFFu),
+                                                     BinU32(130u, BinU32(196u, ConstU32(1u), BinU32(199u, w_lo, ConstU32(31u))), ConstU32(1u)));
+                        const uint32_t w_hi = SelU32(BinBool(172u, w64, ConstU32(32u)), BinU32(130u, w64, ConstU32(32u)), c0);
+                        const uint32_t m_hi = SelU32(BinBool(170u, w_hi, ConstU32(32u)), ConstU32(0xFFFFFFFFu),
+                                                     BinU32(130u, BinU32(196u, ConstU32(1u), BinU32(199u, w_hi, ConstU32(31u))), ConstU32(1u)));
+                        const uint32_t sh0 = BinBool(170u, o64, c0);
+                        const uint32_t lt32 = BinBool(176u, o64, ConstU32(32u));
+                        const uint32_t sh_lo = BinU32(199u, o64, ConstU32(31u));
+                        const uint32_t inv = BinU32(199u, BinU32(130u, ConstU32(32u), sh_lo), ConstU32(31u));
+                        r = SelU32(lt32, BinU32(196u, m_lo, sh_lo), c0);
+                        rh = SelU32(sh0, m_hi, SelU32(lt32, BinU32(197u, BinU32(196u, m_hi, sh_lo), BinU32(194u, m_lo, inv)), BinU32(196u, m_lo, sh_lo)));
+                        write64 = true;
+                        break;
+                    }
                     case 0x26: { uint32_t ge = BinBool(175u /*SGe*/, Bitcast(t_i32_, a), Bitcast(t_i32_, b)); r = SelU32(ge, BinU32(130u, a, b), BinU32(130u, b, a)); set_scc_nz = true; break; }
                     case 0x27: r = EmitSBfeU32(a, b); set_scc_nz = true; break;
                     case 0x28: r = EmitSBfeI32(a, b); set_scc_nz = true; break;
                     case 0x29: EmitSBfe64(a, read_op_hi(inst.src[0]), b, false, r, rh); write64 = true; set_scc_nz = true; break;
                     case 0x2A: EmitSBfe64(a, read_op_hi(inst.src[0]), b, true, r, rh); write64 = true; set_scc_nz = true; break;
                     case 0x2C: r = BinU32(132u, a, b); break;
+                    case 0x2D: {
+                        const uint32_t a_lo = BinU32(199u, a, ConstU32(0xFFFFu));
+                        const uint32_t a_hi = BinU32(194u, a, ConstU32(16u));
+                        const uint32_t b_lo = BinU32(199u, b, ConstU32(0xFFFFu));
+                        const uint32_t b_hi = BinU32(194u, b, ConstU32(16u));
+                        const uint32_t p00 = BinU32(132u, a_lo, b_lo);
+                        const uint32_t p01 = BinU32(132u, a_lo, b_hi);
+                        const uint32_t p10 = BinU32(132u, a_hi, b_lo);
+                        const uint32_t p11 = BinU32(132u, a_hi, b_hi);
+                        const uint32_t mid = BinU32(128u, BinU32(128u, BinU32(194u, p00, ConstU32(16u)), BinU32(199u, p01, ConstU32(0xFFFFu))), BinU32(199u, p10, ConstU32(0xFFFFu)));
+                        r = BinU32(128u, BinU32(128u, p11, BinU32(194u, p01, ConstU32(16u))), BinU32(128u, BinU32(194u, p10, ConstU32(16u)), BinU32(194u, mid, ConstU32(16u))));
+                        break;
+                    }
                     case 0x2E: r = BinU32(128u, BinU32(196u, a, ConstU32(1u)), b); break;
                     case 0x2F: r = BinU32(128u, BinU32(196u, a, ConstU32(2u)), b); break;
                     case 0x30: r = BinU32(128u, BinU32(196u, a, ConstU32(3u)), b); break;

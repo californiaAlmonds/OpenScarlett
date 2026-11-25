@@ -452,7 +452,15 @@ public:
             for (uint32_t m = 0u; m < pLayout->MipLevels; ++m) {
                 const XG_MIPLEVEL_LAYOUT& sm = src_mips[m];
                 XG_MIPLEVEL_LAYOUT_XBOX& dm = dst_p.MipLayout[m];
-                dm.SizeBytes = sm.SizeBytes;
+                if (sm.InMipTail != 0u && m == dst_p.MipTailStartLevel && sm.SlicePitchBytes > 0u) {
+                    // On Xbox Series X|S, MipLayout[MipTailStartLevel].SizeBytes reports the
+                    // full packed mip-tail tile allocation across all slices (e.g. 64 KiB * ArraySize
+                    // for 64KB swizzle modes, or 4 KiB * ArraySize for 4KB swizzle modes), matching
+                    // cooked RPF/BCPack mip-tail chunk sizes.
+                    dm.SizeBytes = sm.SlicePitchBytes * std::max<uint64_t>(layout_.ArraySize, 1ull);
+                } else {
+                    dm.SizeBytes = sm.SizeBytes;
+                }
                 dm.OffsetBytes = sm.OffsetBytes;
                 dm.Slice2DSizeBytes = sm.SlicePitchBytes;
                 dm.PitchPixels = sm.PaddedWidthElements * std::max<uint32_t>(fi.block_width, 1u);

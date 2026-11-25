@@ -357,6 +357,11 @@ private:
 struct PendingXdatGfxDesc {
     bool is_compute = false;
     bool from_slot57 = false;
+    bool has_slot57_stencil_ref = false;
+    bool has_cs_rsrc2 = false;
+    uint8_t slot57_stencil_ref = 0u;
+    uint32_t cs_user_sgpr_count = 0u;
+    uint32_t cs_tgid_en_mask = 0x7u;
     uint32_t vs_cbv_slot_mask = 0u;
     uint32_t ps_cbv_slot_mask = 0u;
     std::vector<uint8_t> vs_blob;
@@ -369,6 +374,14 @@ struct PendingXdatGfxDesc {
     std::vector<std::string> il_names;
     std::vector<D3D12_INPUT_ELEMENT_DESC> il_elems;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC gpso{};
+    bool has_lifted_gfx_dxil = false;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC lifted_gpso{};
+    std::vector<uint8_t> lifted_vs_dxil;
+    std::vector<uint8_t> lifted_rectlist_vs_dxil;
+    std::vector<uint8_t> lifted_ps_dxil;
+    std::vector<uint8_t> lifted_hs_dxil;
+    std::vector<uint8_t> lifted_ds_dxil;
+    std::vector<uint8_t> lifted_gs_dxil;
 
     ~PendingXdatGfxDesc() {
         if (host_rs) host_rs->Release();
@@ -392,6 +405,20 @@ public:
     void EnsureLiftedOnBind();
     void AdoptLiftedHostPso(ID3D12PipelineState* lifted_pso);
     PendingXdatGfxDesc* PendingXdatDesc() noexcept { return pending_xdat_.get(); }
+    ID3D12PipelineState* GetHostPsoForTargets(
+        UINT num_rtvs,
+        const DXGI_FORMAT* rtv_formats,
+        DXGI_FORMAT dsv_format,
+        bool rectlist_zero_ia = false);
+    bool HasSlot57StencilRef(uint8_t& out_ref) const noexcept {
+        if (pending_xdat_ && pending_xdat_->has_slot57_stencil_ref &&
+            pending_xdat_->has_lifted_gfx_dxil &&
+            pending_xdat_->lifted_gpso.DepthStencilState.StencilEnable) {
+            out_ref = pending_xdat_->slot57_stencil_ref;
+            return true;
+        }
+        return false;
+    }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
     ULONG STDMETHODCALLTYPE AddRef() override;
@@ -423,6 +450,7 @@ private:
     std::atomic<bool> lift_attempted_{false};
     std::mutex lift_mutex_;
     std::unique_ptr<PendingXdatGfxDesc> pending_xdat_;
+    std::unordered_map<uint64_t, ID3D12PipelineState*> target_variants_;
 };
 
 // ---------------------------------------------------------------------------
