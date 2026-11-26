@@ -3277,25 +3277,89 @@ public:
         const HRESULT hr = inner_->CreateCommittedResource(
             pHeapProperties, HeapFlags, desc_ptr, state, pOptimizedClearValue, riidResource, ppvResource);
         if (SUCCEEDED(hr) && desc_ptr) {
-            // On Xbox Series X, D3D12X committed resources account their allocation through
-            // XMemAlloc(size, eXALLOCAllocatorId_D3D=0x80 | XALLOC_PAGESIZE_4MB=0x8000), which
-            // dispatches into the title's exported __XMemAllocationHooks__ budget scopes.
-            static auto s_xmem_alloc = []() -> void*(__stdcall*)(size_t, uint64_t) {
+            // On Xbox Series X, D3D12X committed resources notify the title's exported
+            // __XMemAllocationHooks__ = {alloc(size, attrs), free(ptr, attrs)} for allocatorId 0x80
+            // (adapted from MIT R0Y00/Xbox2Windows title_resource_memory). Invoke the title hook
+            // directly without XMemAllocDefault fallback, and release on ID3D12Resource destruction.
+            using PfnTitleAllocHook = void*(__stdcall*)(size_t, uint64_t);
+            using PfnTitleFreeHook = void(__stdcall*)(void*, uint64_t);
+            struct TitleHookPair {
+                PfnTitleAllocHook alloc_fn = nullptr;
+                PfnTitleFreeHook free_fn = nullptr;
+            };
+            static const TitleHookPair s_title_hooks = []() -> TitleHookPair {
+                TitleHookPair out{};
                 HMODULE main_mod = ::GetModuleHandleW(nullptr);
-                if (!main_mod || !::GetProcAddress(main_mod, "__XMemAllocationHooks__")) {
-                    return nullptr;
+                if (!main_mod) return out;
+                const auto* tbl = reinterpret_cast<const uintptr_t*>(
+                    ::GetProcAddress(main_mod, "__XMemAllocationHooks__"));
+                if (tbl && tbl[0] >= 0x10000ull) {
+                    out.alloc_fn = reinterpret_cast<PfnTitleAllocHook>(tbl[0]);
+                    if (tbl[1] >= 0x10000ull) {
+                        out.free_fn = reinterpret_cast<PfnTitleFreeHook>(tbl[1]);
+                    }
                 }
-                HMODULE xm = ::GetModuleHandleW(L"xmem.dll");
-                return xm ? reinterpret_cast<void*(__stdcall*)(size_t, uint64_t)>(
-                                ::GetProcAddress(xm, "XMemAlloc"))
-                          : nullptr;
+                return out;
             }();
-            if (s_xmem_alloc) {
+            if (s_title_hooks.alloc_fn) {
                 const D3D12_RESOURCE_ALLOCATION_INFO ai =
                     inner_->GetResourceAllocationInfo(0u, 1u, desc_ptr);
                 if (ai.SizeInBytes > 0u && ai.SizeInBytes != UINT64_MAX) {
-                    constexpr uint64_t kD3dLargePageAttrs = (0x80ull << 16) | 0x8000ull;
-                    (void)s_xmem_alloc(static_cast<size_t>(ai.SizeInBytes), kD3dLargePageAttrs);
+                    uint32_t log2_align = 0u;
+                    while ((1ull << (log2_align + 1u)) <= ai.Alignment && log2_align < 31u) {
+                        ++log2_align;
+                    }
+                    const uint64_t page_code = (ai.SizeInBytes >= (4ull << 20)) ? 2ull : 1ull;
+                    const uint64_t attrs =
+                        (page_code << 14) | (0x80ull << 16) | (static_cast<uint64_t>(log2_align) << 24);
+                    void* title_mem = s_title_hooks.alloc_fn(static_cast<size_t>(ai.SizeInBytes), attrs);
+                    if (title_mem && s_title_hooks.free_fn && ppvResource && *ppvResource) {
+                        class TitleHookReleaseGuard final : public IUnknown {
+                        public:
+                            TitleHookReleaseGuard(PfnTitleFreeHook fn, void* p, uint64_t a) noexcept
+                                : free_fn_(fn), ptr_(p), attrs_(a) {}
+                            HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+                                if (!out) return E_POINTER;
+                                *out = nullptr;
+                                if (riid == IID_IUnknown) {
+                                    *out = static_cast<IUnknown*>(this);
+                                    AddRef();
+                                    return S_OK;
+                                }
+                                return E_NOINTERFACE;
+                            }
+                            ULONG STDMETHODCALLTYPE AddRef() override {
+                                return static_cast<ULONG>(::InterlockedIncrement(&refs_));
+                            }
+                            ULONG STDMETHODCALLTYPE Release() override {
+                                const ULONG r = static_cast<ULONG>(::InterlockedDecrement(&refs_));
+                                if (r == 0u) delete this;
+                                return r;
+                            }
+                        private:
+                            ~TitleHookReleaseGuard() {
+                                if (free_fn_ && ptr_) free_fn_(ptr_, attrs_);
+                            }
+                            LONG refs_ = 1;
+                            PfnTitleFreeHook free_fn_ = nullptr;
+                            void* ptr_ = nullptr;
+                            uint64_t attrs_ = 0ull;
+                        };
+                        static constexpr GUID kTitleHookGuardGuid = {
+                            0x91D3A741u, 0x5B2Cu, 0x4E8Au, {0x9Au, 0x62u, 0x31u, 0x7Eu, 0x44u, 0x10u, 0x8Bu, 0xC9u}};
+                        ID3D12Object* obj = nullptr;
+                        if (SUCCEEDED(static_cast<IUnknown*>(*ppvResource)->QueryInterface(
+                                __uuidof(ID3D12Object), reinterpret_cast<void**>(&obj))) &&
+                            obj) {
+                            auto* guard = new (std::nothrow)
+                                TitleHookReleaseGuard(s_title_hooks.free_fn, title_mem, attrs);
+                            if (guard) {
+                                (void)obj->SetPrivateDataInterface(kTitleHookGuardGuid, guard);
+                                guard->Release();
+                            }
+                            obj->Release();
+                        }
+                    }
                 }
             }
         }

@@ -164,7 +164,13 @@ bool ShouldForceSparseSection(size_t aligned_size) noexcept {
     const DWORD flen = GetEnvironmentVariableA(
         "OPENSCARLETT_FORCE_SPARSE_COMMIT", force_buf, static_cast<DWORD>(sizeof(force_buf)));
     if (flen > 0u && force_buf[0] != '0') {
-        return true;
+        if (force_buf[0] == 'l' || force_buf[0] == 'L') {
+            if (aligned_size >= (4ull * 1024ull * 1024ull)) {
+                return true;
+            }
+        } else {
+            return true;
+        }
     }
     if (aligned_size >= (32ull * 1024ull * 1024ull)) {
         MEMORYSTATUSEX ms{};

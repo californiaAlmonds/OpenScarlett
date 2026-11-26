@@ -483,7 +483,13 @@ bool ShouldPreferSparseCommitKx(size_t byte_size, bool prefer_write_watch_first)
     const DWORD flen = ::GetEnvironmentVariableA(
         "OPENSCARLETT_FORCE_SPARSE_COMMIT", force_buf, static_cast<DWORD>(sizeof(force_buf)));
     if (flen > 0u && force_buf[0] != '0') {
-        return true;
+        if (force_buf[0] == 'l' || force_buf[0] == 'L') {
+            if (byte_size >= (4ull * 1024ull * 1024ull)) {
+                return true;
+            }
+        } else {
+            return true;
+        }
     }
     const size_t min_size = prefer_write_watch_first ? (128ull * 1024ull * 1024ull)
                                                      : (32ull * 1024ull * 1024ull);
