@@ -32,6 +32,7 @@
 #include <string>
 #include <vector>
 
+#include "openscarlett/gpu/descriptor_sgpr_bridge.h"
 #include "openscarlett/gpu/rdna2_disasm.h"
 #include "openscarlett/gpu/rdna2_interpreter.h"
 #include "openscarlett/gpu/rdna2_ir.h"
@@ -2167,6 +2168,523 @@ void Test12_ZeroHitchAsyncPsoAndPersistentDiskCache(const TestEnv& env) {
     std::printf("[PASS] Test12: Zero-hitch multi-threaded async PSO + persistent disk ShaderCache (pool/prewarm/hot-swap/CRC32/prune)\n");
 }
 
+// ---------------------------------------------------------------------------
+// 13. 3D-World RDNA2 ISA Completeness: DPP16, v_writelane_b32 Wave64 Spills,
+//     v_bfm_b32 / s_bfm_b64 / s_quadmask_b32_b64 / SAD+MSAD / SGPR104..107 /
+//     SALU Null SCC / MIMG Atomics / V# Unified 7-bit UFMT + DST_SEL
+// ---------------------------------------------------------------------------
+uint32_t MakeDpp16Word(uint8_t vsrc0,
+                       uint16_t dpp_ctrl,
+                       bool bound_ctrl = false,
+                       uint8_t bank_mask = 0xFu,
+                       uint8_t row_mask = 0xFu,
+                       bool s0_neg = false,
+                       bool s0_abs = false,
+                       bool s1_neg = false,
+                       bool s1_abs = false) noexcept {
+    return static_cast<uint32_t>(vsrc0) |
+           (static_cast<uint32_t>(dpp_ctrl & 0x1FFu) << 8u) |
+           (bound_ctrl ? (1u << 19u) : 0u) |
+           (s0_neg ? (1u << 20u) : 0u) |
+           (s0_abs ? (1u << 21u) : 0u) |
+           (s1_neg ? (1u << 22u) : 0u) |
+           (s1_abs ? (1u << 23u) : 0u) |
+           (static_cast<uint32_t>(bank_mask & 0xFu) << 24u) |
+           (static_cast<uint32_t>(row_mask & 0xFu) << 28u);
+}
+
+void Test13_Rdna2_3dWorldIsaCompleteness(TestEnv& env) {
+    Rdna2LiftOptions opts{};
+    opts.emit_hlsl = true;
+    opts.emit_spirv = true;
+    opts.compile_dxil_with_dxc = false;
+
+    // 13A. DPP16 (0xFA) Full Decoding & Lowering (CS Wave64 all modes + PS QuadReadLaneAt)
+    {
+        Rdna2Assembler a;
+        // v1 = lane + 100 (100..163)
+        a.EmitVop2(Rdna2Opcode::V_ADD_NC_U32, 1u, Rdna2Operand::LiteralU32(100u), 0u);
+        // v2: quad_perm:[1,0,3,2] (0xB1)
+        const uint32_t dpp_qp = MakeDpp16Word(1u, 0xB1u);
+        a.EmitVop1Dpp16(Rdna2Opcode::V_MOV_B32, 2u, dpp_qp);
+        // v3: row_shl:1 (0x101) with bound_ctrl=1 (OOB lane 15/31/47/63 -> 0)
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 3u, Rdna2Operand::LiteralU32(0xDEADu));
+        a.EmitVop1Dpp16(Rdna2Opcode::V_MOV_B32, 3u, MakeDpp16Word(1u, 0x101u, /*bound_ctrl=*/true));
+        // v4: row_shr:2 (0x112) with bound_ctrl=0 (OOB lanes 0,1 in each row keep 0x7777!)
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 4u, Rdna2Operand::LiteralU32(0x7777u));
+        a.EmitVop1Dpp16(Rdna2Opcode::V_MOV_B32, 4u, MakeDpp16Word(1u, 0x112u, /*bound_ctrl=*/false));
+        // v5: row_ror:3 (0x123)
+        a.EmitVop1Dpp16(Rdna2Opcode::V_MOV_B32, 5u, MakeDpp16Word(1u, 0x123u));
+        // v6: row_mirror (0x140)
+        a.EmitVop1Dpp16(Rdna2Opcode::V_MOV_B32, 6u, MakeDpp16Word(1u, 0x140u));
+        // v7: row_half_mirror (0x141)
+        a.EmitVop1Dpp16(Rdna2Opcode::V_MOV_B32, 7u, MakeDpp16Word(1u, 0x141u));
+        // v8: row_bcast15 (0x142) with row_mask=0xA (rows 1 & 3 active, rows 0 & 2 keep 0x5555)
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 8u, Rdna2Operand::LiteralU32(0x5555u));
+        a.EmitVop1Dpp16(Rdna2Opcode::V_MOV_B32, 8u, MakeDpp16Word(1u, 0x142u, false, 0xFu, 0xAu));
+        // v9: row_bcast31 (0x143) with row_mask=0xC (rows 2 & 3 read lane 31, rows 0 & 1 keep 0x6666)
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 9u, Rdna2Operand::LiteralU32(0x6666u));
+        a.EmitVop1Dpp16(Rdna2Opcode::V_MOV_B32, 9u, MakeDpp16Word(1u, 0x143u, false, 0xFu, 0xCu));
+        // v10: row_share:5 (0x155) with bank_mask=0x5 (banks 0,2 active; banks 1,3 keep 0x8888)
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 10u, Rdna2Operand::LiteralU32(0x8888u));
+        a.EmitVop1Dpp16(Rdna2Opcode::V_MOV_B32, 10u, MakeDpp16Word(1u, 0x155u, false, 0x5u, 0xFu));
+        // v11: row_xmask:3 (0x163)
+        a.EmitVop1Dpp16(Rdna2Opcode::V_MOV_B32, 11u, MakeDpp16Word(1u, 0x163u));
+        // v12: VOP2 DPP16 with src0_abs=1, src1_neg=1: |-3.0f| + -(-1.0f) = 4.0f (0x40800000)
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 13u, Rdna2Operand::LiteralF32(-3.0f));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 14u, Rdna2Operand::InlineFloat(-1.0f));
+        a.EmitVop2Dpp16(Rdna2Opcode::V_ADD_F32, 12u, 14u,
+                        MakeDpp16Word(13u, 0x00u, false, 0xFu, 0xFu, false, true, true, false));
+
+        // Store 11 dwords per lane (lanes 0..63 -> 704 dwords)
+        a.EmitVop3(Rdna2Opcode::V_MUL_LO_U32, 15u, Rdna2Operand::Vgpr(0), Rdna2Operand::InlineInt(44));
+        for (uint8_t r = 2u; r <= 12u; ++r) {
+            a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, r, 15u, 4u, static_cast<uint16_t>((r - 2u) * 4u));
+        }
+        a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        Rdna2LiftResult lifted{};
+        OS_REQUIRE(LiftRdna2Xs2Shader(a.BuildXs2(ShaderStage::Compute, 64u, 1u, 1u, 24u, 20u, 64u), lifted, opts).ok());
+        // Verify disassembler populated has_dpp16 and dpp16_word
+        OS_REQUIRE(lifted.instructions.size() >= 3u);
+        OS_REQUIRE(lifted.instructions[1].has_dpp16 && lifted.instructions[1].dpp16_word == dpp_qp);
+
+        std::vector<uint32_t> expected(64u * 11u, 0u);
+        for (uint32_t l = 0u; l < 64u; ++l) {
+            const uint32_t in_r = l & 15u;
+            const uint32_t rb = l & ~15u;
+            const uint32_t bk = (l >> 2u) & 3u;
+            const uint32_t rw = (l >> 4u) & 3u;
+            const size_t base = static_cast<size_t>(l) * 11u;
+            const uint32_t qp_idx = (0xB1u >> ((l & 3u) * 2u)) & 3u;
+            expected[base + 0u] = ((l & ~3u) | qp_idx) + 100u;
+            expected[base + 1u] = (in_r + 1u < 16u) ? (rb + in_r + 1u + 100u) : 0u;
+            expected[base + 2u] = (in_r >= 2u) ? (rb + in_r - 2u + 100u) : 0x7777u;
+            expected[base + 3u] = (rb | ((in_r + 13u) & 15u)) + 100u;
+            expected[base + 4u] = (rb | (15u - in_r)) + 100u;
+            expected[base + 5u] = ((l & ~7u) | (7u - (l & 7u))) + 100u;
+            expected[base + 6u] = (((0xAu >> rw) & 1u) != 0u) ? (((l & ~31u) | 15u) + 100u) : 0x5555u;
+            expected[base + 7u] = (((0xCu >> rw) & 1u) != 0u) ? (31u + 100u) : 0x6666u;
+            expected[base + 8u] = (((0x5u >> bk) & 1u) != 0u) ? ((rb | 5u) + 100u) : 0x8888u;
+            expected[base + 9u] = (l ^ 3u) + 100u;
+            expected[base + 10u] = F2U(4.0f);
+        }
+        RunAndVerifyComputeBothGpus(env, lifted, std::vector<uint32_t>(8u, 0u),
+                                    std::vector<uint32_t>(expected.size(), 0u), expected, "dpp16_wave64_all_modes");
+
+        // Pixel-stage quad_perm lowering via QuadReadLaneAt when row_mask==0xF && bank_mask==0xF
+        Rdna2Assembler ps;
+        ps.EmitVop1(Rdna2Opcode::V_MOV_B32, 2u, Rdna2Operand::LiteralF32(0.25f));
+        ps.EmitVop1(Rdna2Opcode::V_MOV_B32, 3u, Rdna2Operand::InlineFloat(0.5f));
+        ps.EmitVop1Dpp16(Rdna2Opcode::V_MOV_B32, 4u, MakeDpp16Word(2u, 0x00u));  // quad_perm:[0,0,0,0] -> QuadReadLaneAt(v,0)
+        ps.EmitVop2Dpp16(Rdna2Opcode::V_ADD_F32, 5u, 3u, MakeDpp16Word(2u, 0xB1u));  // quad_perm:[1,0,3,2] + 0.5f = 0.75f
+        ps.EmitVop1(Rdna2Opcode::V_MOV_B32, 6u, Rdna2Operand::InlineFloat(1.0f));
+        ps.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Mrt0), 4u, 5u, 3u, 6u, 0xFu, true, false, true);
+        ps.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        Rdna2LiftResult ps_lift{};
+        OS_REQUIRE(LiftRdna2Xs2Shader(ps.BuildXs2(ShaderStage::Pixel, 1u, 1u, 1u, 16u, 12u, 32u), ps_lift, opts).ok());
+        OS_REQUIRE(CountSubstr(ps_lift.hlsl_source, "QuadReadLaneAt") >= 5u);
+        ValidateSpirvIfAvailable(env, ps_lift.spirv_words, "ps_dpp16_quad_perm");
+#if defined(_WIN32)
+        if (!env.dxc_path.empty() && (env.has_hw || env.has_warp)) {
+            Rdna2Assembler vs;
+            vs.EmitVop2(Rdna2Opcode::V_AND_B32, 1u, Rdna2Operand::InlineInt(1), 0u);
+            vs.EmitVop2(Rdna2Opcode::V_LSHRREV_B32, 2u, Rdna2Operand::InlineInt(1), 0u);
+            vs.EmitVop1(Rdna2Opcode::V_CVT_F32_U32, 3u, Rdna2Operand::Vgpr(1));
+            vs.EmitVop1(Rdna2Opcode::V_CVT_F32_U32, 4u, Rdna2Operand::Vgpr(2));
+            vs.EmitVop3(Rdna2Opcode::V_FMA_F32, 5u, Rdna2Operand::Vgpr(3), Rdna2Operand::LiteralF32(4.0f), Rdna2Operand::InlineFloat(-1.0f));
+            vs.EmitVop3(Rdna2Opcode::V_FMA_F32, 6u, Rdna2Operand::Vgpr(4), Rdna2Operand::LiteralF32(4.0f), Rdna2Operand::InlineFloat(-1.0f));
+            vs.EmitVop1(Rdna2Opcode::V_MOV_B32, 7u, Rdna2Operand::InlineFloat(0.0f));
+            vs.EmitVop1(Rdna2Opcode::V_MOV_B32, 8u, Rdna2Operand::InlineFloat(1.0f));
+            vs.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Pos0), 5u, 6u, 7u, 8u, 0xFu, true);
+            vs.EmitSopp(Rdna2Opcode::S_ENDPGM);
+            Rdna2LiftResult vs_lift{};
+            OS_REQUIRE(LiftRdna2Xs2Shader(vs.BuildXs2(ShaderStage::Vertex, 1u, 1u, 1u, 16u, 16u, 32u), vs_lift, opts).ok());
+            auto run_ps = [&](S16D3D12Runner& gpu) {
+                std::vector<uint8_t> vs_dxil, ps_dxil;
+                std::string diag;
+                OS_REQUIRE(CompileHlslWithDxc(vs_lift.hlsl_source, gpu.TargetProfile("vs"), "main", vs_dxil, diag, env.dxc_path).ok());
+                OS_REQUIRE(CompileHlslWithDxc(ps_lift.hlsl_source, gpu.TargetProfile("ps"), "main", ps_dxil, diag, env.dxc_path).ok());
+                OS_REQUIRE(ResignDxilContainer(vs_dxil).ok() && ResignDxilContainer(ps_dxil).ok());
+                std::vector<float> fb;
+                OS_REQUIRE(gpu.RunGraphicsDraw(vs_dxil, ps_dxil, fb));
+                OS_REQUIRE(std::fabs(fb[0] - 0.25f) < 1e-4f && std::fabs(fb[1] - 0.75f) < 1e-4f);
+            };
+            if (env.has_hw) run_ps(env.hw);
+            if (env.has_warp) run_ps(env.warp);
+        }
+#endif
+    }
+
+    // 13B. v_writelane_b32 (VOP3 0x361) + Wave64 SGPR Constant-Lane Spills (K in 0..63 on Wave32 Host!)
+    {
+        Rdna2Assembler a;
+        // Spill 5 SGPR constants into v4 at K = 0, 15, 32, 47, 63 (note tg_x=16 < 32 so lanes 32..63
+        // do not even exist as physical GPU threads — only exact (vN, K) spill tracking can recover them!)
+        const std::array<uint32_t, 5> spill_lanes = {0u, 15u, 32u, 47u, 63u};
+        const std::array<uint32_t, 5> spill_vals = {
+            0xA0000000u, 0xA000000Fu, 0xA0000020u, 0xA000002Fu, 0xA000003Fu};
+        for (size_t i = 0u; i < 5u; ++i) {
+            a.EmitSop1(Rdna2Opcode::S_MOV_B32, static_cast<uint8_t>(10u + i), Rdna2Operand::LiteralU32(spill_vals[i]));
+            a.EmitVop3(Rdna2Opcode::V_WRITELANE_B32, 4u,
+                       Rdna2Operand::Sgpr(static_cast<uint8_t>(10u + i)),
+                       Rdna2Operand::InlineInt(static_cast<int32_t>(spill_lanes[i])));
+        }
+        for (size_t i = 0u; i < 5u; ++i) {
+            a.EmitVop3(Rdna2Opcode::V_READLANE_B32, static_cast<uint8_t>(20u + i),
+                       Rdna2Operand::Vgpr(4u),
+                       Rdna2Operand::InlineInt(static_cast<int32_t>(spill_lanes[i])));
+        }
+        // Normal VGPR write to v5 MUST invalidate stale spill slot (v5, 5)!
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 15u, Rdna2Operand::LiteralU32(0xCAFEBABEu));
+        a.EmitVop3(Rdna2Opcode::V_WRITELANE_B32, 5u, Rdna2Operand::Sgpr(15u), Rdna2Operand::InlineInt(5));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 5u, Rdna2Operand::LiteralU32(0x12345678u));
+        a.EmitVop3(Rdna2Opcode::V_READLANE_B32, 25u, Rdna2Operand::Vgpr(5u), Rdna2Operand::InlineInt(5));
+
+        // Dynamic-lane v_writelane_b32 MUST update vdst on (lane == ssrc1) IGNORING EXEC!
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 6u, Rdna2Operand::LiteralU32(0x11111111u));
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 2u, Rdna2Operand::InlineInt(0));
+        a.EmitSmem(Rdna2Opcode::S_BUFFER_LOAD_DWORD, 26u, 0u, 0, 2u);  // uav0[0] == 7 (runtime dynamic!)
+        a.EmitSopp(Rdna2Opcode::S_WAITCNT, 0);
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 126u /*EXEC_LO*/, Rdna2Operand::InlineInt(1));  // lane 7 is INACTIVE in EXEC!
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 127u /*EXEC_HI*/, Rdna2Operand::InlineInt(0));
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 27u, Rdna2Operand::LiteralU32(0x99999999u));
+        a.EmitVop3(Rdna2Opcode::V_WRITELANE_B32, 6u, Rdna2Operand::Sgpr(27u), Rdna2Operand::Sgpr(26u));
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 126u /*EXEC_LO*/, Rdna2Operand::InlineInt(-1));
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 127u /*EXEC_HI*/, Rdna2Operand::InlineInt(-1));
+
+        // Lane 0 writes recovered scalars [0..5]; all 16 lanes write v6 to [6 + lane]
+        a.EmitVopc(Rdna2Opcode::V_CMP_EQ_U32, Rdna2Operand::InlineInt(0), 0u);
+        const uint32_t br_skip = a.EmitSopp(Rdna2Opcode::S_CBRANCH_VCCZ);
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 7u, Rdna2Operand::InlineInt(0));
+        for (uint8_t k = 0u; k < 6u; ++k) {
+            a.EmitVop1(Rdna2Opcode::V_MOV_B32, 8u, Rdna2Operand::Sgpr(static_cast<uint8_t>(20u + k)));
+            a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 8u, 7u, 4u, static_cast<uint16_t>(k * 4u));
+        }
+        a.PatchBranch(br_skip, a.CurrentWordOffset());
+        a.EmitVop2(Rdna2Opcode::V_LSHLREV_B32, 9u, Rdna2Operand::InlineInt(2), 0u);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 6u, 9u, 4u, 24u);
+        a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        Rdna2LiftResult lifted{};
+        OS_REQUIRE(LiftRdna2Xs2Shader(a.BuildXs2(ShaderStage::Compute, 16u, 1u, 1u, 40u, 12u, 64u), lifted, opts).ok());
+        std::vector<uint32_t> expected(22u, 0x11111111u);
+        for (size_t i = 0u; i < 5u; ++i) expected[i] = spill_vals[i];
+        expected[5] = 0x12345678u;
+        expected[6u + 7u] = 0x99999999u;  // Lane 7 updated even though EXEC was 0x1!
+        RunAndVerifyComputeBothGpus(env, lifted, std::vector<uint32_t>{7u, 0u, 0u, 0u},
+                                    std::vector<uint32_t>(expected.size(), 0u), expected, "writelane_wave64_spill");
+    }
+
+    // 13C. V_BFM_B32 (0x363) vs V_BCNT_U32_B32 (0x178), S_BFM_B64 (0x25),
+    //      S_QUADMASK_B32/B64 (0x2C/0x2D), V_SAD_*/V_MSAD_U8, SGPR 104..107, SALU Null SCC
+    {
+        Rdna2Assembler a;
+        // 1) V_BFM_B32 (0x363) & V_BCNT_U32_B32 (0x178)
+        a.EmitVop3(Rdna2Opcode::V_BFM_B32, 2u, Rdna2Operand::InlineInt(8), Rdna2Operand::InlineInt(4));   // 0x00000FF0
+        a.EmitVop3(Rdna2Opcode::V_BFM_B32, 3u, Rdna2Operand::InlineInt(0), Rdna2Operand::InlineInt(12));  // 0
+        a.EmitVop3(Rdna2Opcode::V_BCNT_U32_B32, 4u, Rdna2Operand::LiteralU32(0xF0F00F0Fu), Rdna2Operand::InlineInt(3));  // 19
+
+        // 2) S_BFM_B64 (0x25): width=40, offset=12 -> 0x000FFFFF_FFFFF000, leaving SCC=1 unchanged!
+        a.EmitSopc(Rdna2Opcode::S_CMP_EQ_U32, Rdna2Operand::InlineInt(1), Rdna2Operand::InlineInt(1));  // SCC = 1
+        a.EmitSop2(Rdna2Opcode::S_BFM_B64, 30u, Rdna2Operand::InlineInt(40), Rdna2Operand::InlineInt(12));
+        a.EmitSop2(Rdna2Opcode::S_CSELECT_B32, 32u, Rdna2Operand::LiteralU32(0xAA55AA55u), Rdna2Operand::InlineInt(0));
+
+        // 3) S_QUADMASK_B32 (0x2C) & S_QUADMASK_B64 (0x2D) + SCC update
+        a.EmitSop1(Rdna2Opcode::S_QUADMASK_B32, 33u, Rdna2Operand::LiteralU32(0x80040300u));  // nibs 2,4,7 -> 0x94, SCC=1
+        a.EmitSop2(Rdna2Opcode::S_CSELECT_B32, 34u, Rdna2Operand::InlineInt(1), Rdna2Operand::InlineInt(0));
+        a.EmitSop1(Rdna2Opcode::S_QUADMASK_B32, 35u, Rdna2Operand::InlineInt(0));  // 0, SCC=0
+        a.EmitSop2(Rdna2Opcode::S_CSELECT_B32, 36u, Rdna2Operand::InlineInt(1), Rdna2Operand::InlineInt(0));
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 38u, Rdna2Operand::LiteralU32(0x00010000u));  // nib 4
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 39u, Rdna2Operand::LiteralU32(0xF0000002u));  // nibs 8, 15
+        a.EmitSop1(Rdna2Opcode::S_QUADMASK_B64, 40u, Rdna2Operand::Sgpr(38u));           // s40=0x8110, s41=0, SCC=1
+
+        // 4) V_SAD_U8 / V_SAD_HI_U8 / V_SAD_U16 / V_SAD_U32 / V_MSAD_U8
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 10u, Rdna2Operand::LiteralU32(0x10203040u));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 11u, Rdna2Operand::LiteralU32(0x15183050u));
+        a.EmitVop3(Rdna2Opcode::V_SAD_U8, 5u, Rdna2Operand::Vgpr(10u), Rdna2Operand::Vgpr(11u), Rdna2Operand::LiteralU32(100u));  // 29 + 100 = 129
+        a.EmitVop3(Rdna2Opcode::V_SAD_HI_U8, 6u, Rdna2Operand::Vgpr(10u), Rdna2Operand::Vgpr(11u), Rdna2Operand::LiteralU32(0x00050007u));  // (29<<16)+0x50007 = 0x00220007
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 12u, Rdna2Operand::LiteralU32(0x01000050u));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 13u, Rdna2Operand::LiteralU32(0x00800070u));
+        a.EmitVop3(Rdna2Opcode::V_SAD_U16, 7u, Rdna2Operand::Vgpr(12u), Rdna2Operand::Vgpr(13u), Rdna2Operand::InlineInt(10));  // 32 + 128 + 10 = 170
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 14u, Rdna2Operand::LiteralU32(1000u));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 15u, Rdna2Operand::LiteralU32(2500u));
+        a.EmitVop3(Rdna2Opcode::V_SAD_U32, 8u, Rdna2Operand::Vgpr(14u), Rdna2Operand::Vgpr(15u), Rdna2Operand::InlineInt(7));  // 1507
+        // V_MSAD_U8: src=0xAA203040, ref=0x00180050 -> bytes 1 & 3 skipped (ref==0)! |0x40-0x50|+|0x20-0x18|+5 = 16+8+5 = 29
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 16u, Rdna2Operand::LiteralU32(0xAA203040u));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 17u, Rdna2Operand::LiteralU32(0x00180050u));
+        a.EmitVop3(Rdna2Opcode::V_MSAD_U8, 9u, Rdna2Operand::Vgpr(16u), Rdna2Operand::Vgpr(17u), Rdna2Operand::InlineInt(5));
+
+        // 5) SALU writes to Null (125) still compute & update SCC!
+        a.EmitSop2(Rdna2Opcode::S_AND_B32, 125u /*null*/, Rdna2Operand::LiteralU32(0xF0u), Rdna2Operand::InlineInt(15));  // 0 -> SCC = 0
+        a.EmitSop2(Rdna2Opcode::S_CSELECT_B32, 42u, Rdna2Operand::InlineInt(9), Rdna2Operand::InlineInt(7));              // -> 7
+        a.EmitSop2(Rdna2Opcode::S_ADD_I32, 125u /*null*/, Rdna2Operand::LiteralU32(0x7FFFFFFFu), Rdna2Operand::InlineInt(1));  // signed overflow -> SCC = 1
+        a.EmitSop2(Rdna2Opcode::S_CSELECT_B32, 43u, Rdna2Operand::InlineInt(9), Rdna2Operand::InlineInt(7));              // -> 9
+
+        // 6) SGPR 104..107 descriptor tracking (V# in s[104:107] -> s107/vcc_hi holds V# word3 UFMT=60 R8G8B8A8_UINT + DST_SEL_X=Z(6)!)
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 104u, Rdna2Operand::InlineInt(0));
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 105u, Rdna2Operand::InlineInt(0));
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 106u, Rdna2Operand::InlineInt(64));
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 107u,
+                   Rdna2Operand::LiteralU32(6u /*Z*/ | (5u << 3u) | (6u << 6u) | (7u << 9u) |
+                                            (static_cast<uint32_t>(Rdna2Gfx103Ufmt::R8G8B8A8_UINT) << 12u) |
+                                            (1u << 24u) | (2u << 30u)));
+
+        // Store all 20 results from lane 0 (slot 20 holds 0xDEADC0DE in uav1 -> byte 2 (Z) == 0xAD!)
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 18u, Rdna2Operand::InlineInt(0));
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_FORMAT_X, 20u, 18u, 104u, 20u * 4u, true, false);
+        const std::array<uint8_t, 8> v_out = {2, 3, 4, 5, 6, 7, 8, 9};
+        for (size_t i = 0u; i < v_out.size(); ++i) {
+            a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, v_out[i], 18u, 4u, static_cast<uint16_t>(i * 4u));
+        }
+        const std::array<uint8_t, 11> s_out = {30, 31, 32, 33, 34, 35, 36, 40, 41, 42, 43};
+        for (size_t i = 0u; i < s_out.size(); ++i) {
+            a.EmitVop1(Rdna2Opcode::V_MOV_B32, 19u, Rdna2Operand::Sgpr(s_out[i]));
+            a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 19u, 18u, 4u, static_cast<uint16_t>((8u + i) * 4u));
+        }
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 20u, 18u, 4u, 19u * 4u);
+        a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        Rdna2LiftResult lifted{};
+        OS_REQUIRE(LiftRdna2Xs2Shader(a.BuildXs2(ShaderStage::Compute, 1u, 1u, 1u, 108u, 24u, 32u), lifted, opts).ok());
+        // Verify disassembler opcode IDs (no silent misdecode!)
+        auto has_op = [&](Rdna2Opcode op) {
+            for (const auto& ins : lifted.instructions) {
+                if (ins.opcode == op) return true;
+            }
+            return false;
+        };
+        OS_REQUIRE(has_op(Rdna2Opcode::V_BFM_B32));
+        OS_REQUIRE(has_op(Rdna2Opcode::V_BCNT_U32_B32));
+        OS_REQUIRE(has_op(Rdna2Opcode::S_BFM_B64));
+        OS_REQUIRE(has_op(Rdna2Opcode::S_QUADMASK_B32));
+        OS_REQUIRE(has_op(Rdna2Opcode::S_QUADMASK_B64));
+        OS_REQUIRE(has_op(Rdna2Opcode::V_MSAD_U8));
+
+        const std::vector<uint32_t> expected = {
+            0x00000FF0u,  // v_bfm_b32(8, 4)
+            0u,           // v_bfm_b32(0, 12)
+            19u,          // v_bcnt_u32_b32(0xF0F00F0F, 3)
+            129u,         // v_sad_u8
+            0x00220007u,  // v_sad_hi_u8
+            170u,         // v_sad_u16
+            1507u,        // v_sad_u32
+            29u,          // v_msad_u8 (skipped zero ref bytes!)
+            0xFFFFF000u,  // s_bfm_b64 lo
+            0x000FFFFFu,  // s_bfm_b64 hi
+            0xAA55AA55u,  // SCC preserved as 1 across s_bfm_b64!
+            0x94u,        // s_quadmask_b32(0x80040300)
+            1u,           // SCC == 1
+            0u,           // s_quadmask_b32(0)
+            0u,           // SCC == 0
+            0x8110u,      // s_quadmask_b64 lo
+            0u,           // s_quadmask_b64 hi
+            7u,           // s_and_b32 null, 0xF0, 15 -> SCC == 0
+            9u,           // s_add_i32 null, 0x7FFFFFFF, 1 -> SCC == 1
+            0xADu,        // loaded byte 2 (DST_SEL_X=Z) of 0xDEADC0DE via V# in s[104:107]!
+            0xDEADC0DEu,  // untouched source word at uav1[20]
+        };
+        std::vector<uint32_t> init1(expected.size(), 0u);
+        init1[20] = 0xDEADC0DEu;
+        RunAndVerifyComputeBothGpus(env, lifted, std::vector<uint32_t>(4u, 0u),
+                                    init1, expected, "bfm_quadmask_sad_null_sgpr104");
+    }
+
+    // 13D. MIMG IMAGE_ATOMIC_* (0x10..0x1E) Disassembly + IR + SPIR-V + DXC SM 6.5 Validation
+    {
+        Rdna2Assembler a;
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 2u, Rdna2Operand::InlineInt(1));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 3u, Rdna2Operand::InlineInt(2));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 4u, Rdna2Operand::InlineInt(9));
+        a.EmitMimg(Rdna2Opcode::IMAGE_ATOMIC_SWAP, 4u, 2u, 8u, 0u, 0x1u, 1u, false, true);
+        a.EmitMimg(Rdna2Opcode::IMAGE_ATOMIC_ADD,  4u, 2u, 8u, 0u, 0x1u, 1u, false, true);
+        a.EmitMimg(Rdna2Opcode::IMAGE_ATOMIC_SUB,  4u, 2u, 8u, 0u, 0x1u, 1u, false, false);
+        a.EmitMimg(Rdna2Opcode::IMAGE_ATOMIC_UMIN, 4u, 2u, 8u, 0u, 0x1u, 1u, false, true);
+        a.EmitMimg(Rdna2Opcode::IMAGE_ATOMIC_UMAX, 4u, 2u, 8u, 0u, 0x1u, 1u, false, true);
+        a.EmitMimg(Rdna2Opcode::IMAGE_ATOMIC_AND,  4u, 2u, 8u, 0u, 0x1u, 1u, false, false);
+        a.EmitMimg(Rdna2Opcode::IMAGE_ATOMIC_OR,   4u, 2u, 8u, 0u, 0x1u, 1u, false, false);
+        a.EmitMimg(Rdna2Opcode::IMAGE_ATOMIC_XOR,  4u, 2u, 8u, 0u, 0x1u, 1u, false, true);
+        a.EmitMimg(Rdna2Opcode::IMAGE_ATOMIC_INC,  4u, 2u, 8u, 0u, 0x1u, 1u, false, true);
+        a.EmitMimg(Rdna2Opcode::IMAGE_ATOMIC_DEC,  4u, 2u, 8u, 0u, 0x1u, 1u, false, true);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 4u, 2u, 4u, 0u);
+        a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        Rdna2LiftResult lifted{};
+        OS_REQUIRE(LiftRdna2Xs2Shader(a.BuildXs2(ShaderStage::Compute, 1u, 1u, 1u, 24u, 12u, 32u), lifted, opts).ok());
+        ValidateSpirvIfAvailable(env, lifted.spirv_words, "mimg_image_atomics_all");
+#if defined(_WIN32)
+        if (!env.dxc_path.empty()) {
+            std::vector<uint8_t> dxil;
+            std::string diag;
+            OS_REQUIRE(CompileHlslWithDxc(lifted.hlsl_source, "cs_6_5", "main", dxil, diag, env.dxc_path).ok());
+            OS_REQUIRE(ResignDxilContainer(dxil).ok());
+        }
+#endif
+    }
+
+    // 13E. GFX10.3 Buffer V# Word 3 [18:12] Unified 7-Bit FORMAT + DST_SEL (0,1,4,5,6,7)
+    {
+        // DescriptorSgprBridge check on real hardware GFX10.3 V# (resource_level=true, type=2)
+#if defined(_WIN32)
+        {
+            Rdna2BufferDescriptor vsharp{};
+            vsharp.base_address = 0x100000ull;
+            vsharp.num_records = 64u;
+            vsharp.resource_level = true;
+            vsharp.type = 2u;
+            vsharp.dst_sel_x = Rdna2DstSel::B;
+            vsharp.dst_sel_y = Rdna2DstSel::G;
+            vsharp.dst_sel_z = Rdna2DstSel::R;
+            vsharp.dst_sel_w = Rdna2DstSel::One;
+            vsharp.format = static_cast<uint8_t>(Rdna2Gfx103Ufmt::R8G8B8A8_UNORM);  // 56
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            OS_REQUIRE(DescriptorSgprBridge::SynthesizeD3D12BufferSrv(vsharp, 0u, srv));
+            OS_REQUIRE(srv.Format == DXGI_FORMAT_R8G8B8A8_UNORM);
+
+            vsharp.format = static_cast<uint8_t>(Rdna2Gfx103Ufmt::R16G16_FLOAT);  // 29
+            OS_REQUIRE(DescriptorSgprBridge::SynthesizeD3D12BufferSrv(vsharp, 0u, srv));
+            OS_REQUIRE(srv.Format == DXGI_FORMAT_R16G16_FLOAT);
+
+            vsharp.format = static_cast<uint8_t>(Rdna2Gfx103Ufmt::R32G32B32_FLOAT);  // 74
+            OS_REQUIRE(DescriptorSgprBridge::SynthesizeD3D12BufferSrv(vsharp, 0u, srv));
+            OS_REQUIRE(srv.Format == DXGI_FORMAT_R32G32B32_FLOAT);
+        }
+#endif
+
+        auto pack_vsharp_w3 = [](Rdna2Gfx103Ufmt ufmt,
+                                 uint32_t sx = 4u, uint32_t sy = 5u,
+                                 uint32_t sz = 6u, uint32_t sw = 7u) -> uint32_t {
+            return (sx & 7u) | ((sy & 7u) << 3u) | ((sz & 7u) << 6u) | ((sw & 7u) << 9u) |
+                   (static_cast<uint32_t>(ufmt) << 12u) | (1u << 24u) | (2u << 30u);
+        };
+
+        // Buffer layout in uav0:
+        // [0]  = 0x4080C0FF (bytes: FF, C0, 80, 40)
+        // [1]  = 0x000080FF (bytes: FF, 80)
+        // [2]  = F2U(2.5f)
+        // [3]  = 0xFFFF0000 (u16: 0x0000, 0xFFFF)
+        // [4]  = 0x80017FFF (s16: +32767, -32767)
+        // [5]  = 0x12345678 (u16: 0x5678, 0x1234)
+        // [6]  = (F32ToF16(-2.0f) << 16) | F32ToF16(1.0f)
+        // [7]  = F2U(3.25f), [8] = F2U(-4.5f)
+        // [9]  = (F32ToF16(2.0f) << 16) | F32ToF16(1.0f), [10] = (F32ToF16(-0.5f) << 16) | F32ToF16(4.0f)
+        // [11..13] = 1.5f, 2.5f, 3.5f
+        // [14..17] = 10.0f, 20.0f, 30.0f, 40.0f
+        std::vector<uint32_t> uav0 = {
+            0x4080C0FFu,
+            0x000080FFu,
+            F2U(2.5f),
+            0xFFFF0000u,
+            0x80017FFFu,
+            0x12345678u,
+            (static_cast<uint32_t>(F32ToF16(-2.0f)) << 16u) | static_cast<uint32_t>(F32ToF16(1.0f)),
+            F2U(3.25f), F2U(-4.5f),
+            (static_cast<uint32_t>(F32ToF16(2.0f)) << 16u) | static_cast<uint32_t>(F32ToF16(1.0f)),
+            (static_cast<uint32_t>(F32ToF16(-0.5f)) << 16u) | static_cast<uint32_t>(F32ToF16(4.0f)),
+            F2U(1.5f), F2U(2.5f), F2U(3.5f),
+            F2U(10.0f), F2U(20.0f), F2U(30.0f), F2U(40.0f),
+            0u, 0u,
+        };
+
+        Rdna2Assembler a;
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 1u, Rdna2Operand::InlineInt(0));  // vaddr = 0
+        uint16_t out_off = 0u;
+        auto emit_vsharp_load4 = [&](uint32_t w3, uint16_t byte_off, bool use_tbuf, uint8_t tbuf_ufmt = 0u) {
+            a.EmitSop1(Rdna2Opcode::S_MOV_B32, 3u, Rdna2Operand::LiteralU32(w3));
+            if (use_tbuf) {
+                a.EmitMtbufUfmt(Rdna2Opcode::TBUFFER_LOAD_FORMAT_XYZW, 4u, 1u, 0u, tbuf_ufmt, byte_off, true, false);
+            } else {
+                a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_FORMAT_XYZW, 4u, 1u, 0u, byte_off, true, false);
+            }
+            for (uint8_t c = 0u; c < 4u; ++c) {
+                a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, static_cast<uint8_t>(4u + c), 1u, 4u, out_off);
+                out_off = static_cast<uint16_t>(out_off + 4u);
+            }
+        };
+
+        // 1: R8_UNORM (ufmt=1) -> (1.0f, 0.0f, 0.0f, 1.0f)
+        emit_vsharp_load4(pack_vsharp_w3(Rdna2Gfx103Ufmt::R8_UNORM), 0u, false);
+        // 5: R8_UINT (ufmt=5) -> (255u, 0u, 0u, 1u)
+        emit_vsharp_load4(pack_vsharp_w3(Rdna2Gfx103Ufmt::R8_UINT), 0u, false);
+        // 14: R8G8_UNORM (ufmt=14) via tbuffer_load_format_xyzw -> (1.0f, 128/255.f, 0.0f, 1.0f)
+        emit_vsharp_load4(pack_vsharp_w3(Rdna2Gfx103Ufmt::Invalid), 4u, true,
+                          static_cast<uint8_t>(Rdna2Gfx103Ufmt::R8G8_UNORM));
+        // 22: R32_FLOAT (ufmt=22) -> (2.5f, 0.0f, 0.0f, 1.0f)
+        emit_vsharp_load4(pack_vsharp_w3(Rdna2Gfx103Ufmt::R32_FLOAT), 8u, false);
+        // 23: R16G16_UNORM (ufmt=23) -> (0.0f, 1.0f, 0.0f, 1.0f)
+        emit_vsharp_load4(pack_vsharp_w3(Rdna2Gfx103Ufmt::R16G16_UNORM), 12u, false);
+        // 24: R16G16_SNORM (ufmt=24) -> (+1.0f, -1.0f, 0.0f, 1.0f)
+        emit_vsharp_load4(pack_vsharp_w3(Rdna2Gfx103Ufmt::R16G16_SNORM), 16u, false);
+        // 27: R16G16_UINT (ufmt=27) -> (0x5678u, 0x1234u, 0u, 1u)
+        emit_vsharp_load4(pack_vsharp_w3(Rdna2Gfx103Ufmt::R16G16_UINT), 20u, false);
+        // 29: R16G16_FLOAT (ufmt=29) -> (1.0f, -2.0f, 0.0f, 1.0f)
+        emit_vsharp_load4(pack_vsharp_w3(Rdna2Gfx103Ufmt::R16G16_FLOAT), 24u, false);
+        // 56: R8G8B8A8_UNORM + DST_SEL = (W=7, Z=6, Zero=0, One=1) -> (0x40/255.f, 0x80/255.f, 0.0f, 1.0f)
+        emit_vsharp_load4(pack_vsharp_w3(Rdna2Gfx103Ufmt::R8G8B8A8_UNORM, 7u, 6u, 0u, 1u), 0u, false);
+        // 60: R8G8B8A8_UINT + DST_SEL = (Z=6, Y=5, X=4, One=1) -> (0x80u, 0xC0u, 0xFFu, 1u)
+        emit_vsharp_load4(pack_vsharp_w3(Rdna2Gfx103Ufmt::R8G8B8A8_UINT, 6u, 5u, 4u, 1u), 0u, false);
+        // 64: R32G32_FLOAT (ufmt=64) -> (3.25f, -4.5f, 0.0f, 1.0f)
+        emit_vsharp_load4(pack_vsharp_w3(Rdna2Gfx103Ufmt::R32G32_FLOAT), 28u, false);
+        // 71: R16G16B16A16_FLOAT (ufmt=71) -> (1.0f, 2.0f, 4.0f, -0.5f)
+        emit_vsharp_load4(pack_vsharp_w3(Rdna2Gfx103Ufmt::R16G16B16A16_FLOAT), 36u, false);
+        // 74: R32G32B32_FLOAT (ufmt=74) -> (1.5f, 2.5f, 3.5f, 1.0f)
+        emit_vsharp_load4(pack_vsharp_w3(Rdna2Gfx103Ufmt::R32G32B32_FLOAT), 44u, false);
+        // 77: R32G32B32A32_FLOAT (ufmt=77) -> (10.0f, 20.0f, 30.0f, 40.0f)
+        emit_vsharp_load4(pack_vsharp_w3(Rdna2Gfx103Ufmt::R32G32B32A32_FLOAT), 56u, false);
+        a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        Rdna2LiftResult lifted{};
+        OS_REQUIRE(LiftRdna2Xs2Shader(a.BuildXs2(ShaderStage::Compute, 1u, 1u, 1u, 16u, 12u, 32u), lifted, opts).ok());
+        ValidateSpirvIfAvailable(env, lifted.spirv_words, "vsharp_ufmt7_dst_sel");
+
+        const std::vector<uint32_t> expected = {
+            F2U(1.0f), F2U(0.0f), F2U(0.0f), F2U(1.0f),
+            255u, 0u, 0u, 1u,
+            F2U(1.0f), F2U(128.0f / 255.0f), F2U(0.0f), F2U(1.0f),
+            F2U(2.5f), F2U(0.0f), F2U(0.0f), F2U(1.0f),
+            F2U(0.0f), F2U(1.0f), F2U(0.0f), F2U(1.0f),
+            F2U(1.0f), F2U(-1.0f), F2U(0.0f), F2U(1.0f),
+            0x5678u, 0x1234u, 0u, 1u,
+            F2U(1.0f), F2U(-2.0f), F2U(0.0f), F2U(1.0f),
+            F2U(64.0f / 255.0f), F2U(128.0f / 255.0f), 0u, F2U(1.0f),
+            0x80u, 0xC0u, 0xFFu, 1u,
+            F2U(3.25f), F2U(-4.5f), F2U(0.0f), F2U(1.0f),
+            F2U(1.0f), F2U(2.0f), F2U(4.0f), F2U(-0.5f),
+            F2U(1.5f), F2U(2.5f), F2U(3.5f), F2U(1.0f),
+            F2U(10.0f), F2U(20.0f), F2U(30.0f), F2U(40.0f),
+        };
+#if defined(_WIN32)
+        if (!env.dxc_path.empty()) {
+            auto run_ufmt = [&](S16D3D12Runner& gpu, const char* tag) {
+                std::vector<uint8_t> dxil;
+                std::string diag;
+                OS_REQUIRE(CompileHlslWithDxc(lifted.hlsl_source, gpu.TargetProfile("cs"), "main", dxil, diag, env.dxc_path).ok());
+                OS_REQUIRE(ResignDxilContainer(dxil).ok());
+                std::vector<uint32_t> out;
+                OS_REQUIRE(gpu.RunComputeDualUavTable(dxil, uav0, std::vector<uint32_t>(expected.size(), 0u), out));
+                OS_REQUIRE(out.size() == expected.size());
+                for (size_t i = 0u; i < expected.size(); ++i) {
+                    if (out[i] != expected[i]) {
+                        // Allow 1-ULP float tolerance on 128/255f & 64/255f division
+                        const bool approx_ok = (std::fabs(U2F(out[i]) - U2F(expected[i])) < 1e-6f);
+                        if (!approx_ok) {
+                            std::fprintf(stderr, "[FAIL] vsharp_ufmt7 (%s) [%zu]: got=0x%08X exp=0x%08X\n",
+                                         tag, i, out[i], expected[i]);
+                        }
+                        OS_REQUIRE(approx_ok);
+                    }
+                }
+            };
+            if (env.has_hw) run_ufmt(env.hw, "D3D12-HW");
+            if (env.has_warp) run_ufmt(env.warp, "D3D12-WARP");
+        }
+#endif
+    }
+
+    std::printf("[PASS] Test13: 3D-world RDNA2 ISA completeness (DPP16, writelane Wave64 spills, BFM/QUADMASK/SAD/MSAD, SGPR104..107, Null SCC, MIMG atomics, V# UFMT+DST_SEL)\n");
+}
+
 }  // namespace
 
 int main() {
@@ -2196,7 +2714,8 @@ int main() {
     Test10_Dpp8AndVop3I16AndPsCmp64(env);
     Test11_All7StagesLiveGpuAndBenchJson();
     Test12_ZeroHitchAsyncPsoAndPersistentDiskCache(env);
+    Test13_Rdna2_3dWorldIsaCompleteness(env);
 
-    std::printf("=== ALL 12 SPRINT 16 SHADER COMPLETENESS TESTS PASSED ===\n");
+    std::printf("=== ALL 13 SPRINT 16 SHADER COMPLETENESS TESTS PASSED ===\n");
     return 0;
 }
