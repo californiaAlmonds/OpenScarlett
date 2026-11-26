@@ -2626,6 +2626,36 @@ Status ExecuteRdna2Cpu(
                                         wv.vgpr[l][inst.dst.reg_index] = (m & ins) | (~m & base);
                                     }
                                     break;
+                                case Rdna2Opcode::V_LSHL_ADD_U32:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        const uint32_t s0 = read_op_u32(inst.src[0], l);
+                                        const uint32_t s1 = read_op_u32(inst.src[1], l);
+                                        const uint32_t s2 = read_op_u32(inst.src[2], l);
+                                        if (inst.raw_opcode == 0x345u) {
+                                            wv.vgpr[l][inst.dst.reg_index] = (s0 ^ s1) + s2;
+                                        } else if (inst.raw_opcode == 0x347u || inst.raw_opcode == 0x374u) {
+                                            wv.vgpr[l][inst.dst.reg_index] = (s0 + s1) << (s2 & 31u);
+                                        } else {
+                                            wv.vgpr[l][inst.dst.reg_index] = (s0 << (s1 & 31u)) + s2;
+                                        }
+                                    }
+                                    break;
+                                case Rdna2Opcode::V_LSHL_OR_B32:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        const uint32_t s0 = read_op_u32(inst.src[0], l);
+                                        const uint32_t s1 = read_op_u32(inst.src[1], l);
+                                        const uint32_t s2 = read_op_u32(inst.src[2], l);
+                                        if (inst.raw_opcode == 0x36Eu || inst.raw_opcode == 0x371u) {
+                                            wv.vgpr[l][inst.dst.reg_index] = (s0 & s1) | s2;
+                                        } else if (inst.raw_opcode == 0x370u) {
+                                            wv.vgpr[l][inst.dst.reg_index] = s0 | s1 | s2;
+                                        } else {
+                                            wv.vgpr[l][inst.dst.reg_index] = (s0 << (s1 & 31u)) | s2;
+                                        }
+                                    }
+                                    break;
                                 case Rdna2Opcode::V_ALIGNBYTE_B32:
                                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
                                         if (!lane_active(l)) continue;

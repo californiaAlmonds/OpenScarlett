@@ -4958,8 +4958,13 @@ Status BuildRdna2Ir(
                     IrValueId x0 = eval_operand(inst.src[0], false);
                     IrValueId x1 = eval_operand(inst.src[1], false);
                     IrValueId x2 = eval_operand(inst.src[2], false);
-                    if (inst.encoding == Rdna2Encoding::VOP3 && inst.raw_opcode == 0x374u) {
-                        // GFX10.3 v_add_lshl_u32: (s0 + s1) << s2
+                    if (inst.encoding == Rdna2Encoding::VOP3 && inst.raw_opcode == 0x345u) {
+                        // GFX10.3 v_xad_u32: (s0 ^ s1) + s2
+                        IrValueId xr = emit_in_bb(IrOp::BitXor, IrType::U32, {x0, x1});
+                        write_dst(inst.dst, emit_in_bb(IrOp::IAdd, IrType::U32, {xr, x2}));
+                    } else if (inst.encoding == Rdna2Encoding::VOP3 &&
+                               (inst.raw_opcode == 0x347u || inst.raw_opcode == 0x374u)) {
+                        // GFX10.3 v_add_lshl_u32 (0x347 / legacy 0x374): (s0 + s1) << (s2 & 31)
                         IrValueId sum = emit_in_bb(IrOp::IAdd, IrType::U32, {x0, x1});
                         write_dst(inst.dst, emit_in_bb(IrOp::Shl, IrType::U32, {sum, x2}));
                     } else {
@@ -4972,8 +4977,9 @@ Status BuildRdna2Ir(
                     IrValueId x0 = eval_operand(inst.src[0], false);
                     IrValueId x1 = eval_operand(inst.src[1], false);
                     IrValueId x2 = eval_operand(inst.src[2], false);
-                    if (inst.encoding == Rdna2Encoding::VOP3 && inst.raw_opcode == 0x36Eu) {
-                        // GFX10.3 v_and_or_b32: (s0 & s1) | s2
+                    if (inst.encoding == Rdna2Encoding::VOP3 &&
+                        (inst.raw_opcode == 0x36Eu || inst.raw_opcode == 0x371u)) {
+                        // GFX10.3 v_and_or_b32 (0x371 / legacy 0x36E): (s0 & s1) | s2
                         IrValueId a = emit_in_bb(IrOp::BitAnd, IrType::U32, {x0, x1});
                         write_dst(inst.dst, emit_in_bb(IrOp::BitOr, IrType::U32, {a, x2}));
                     } else if (inst.encoding == Rdna2Encoding::VOP3 && inst.raw_opcode == 0x370u) {

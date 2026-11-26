@@ -933,7 +933,7 @@ public:
             (ir_.wave_size == 64u) &&
             (ir_.stage == ShaderStage::Mesh || ir_.stage == ShaderStage::Amplification ||
              ir_.stage == ShaderStage::Geometry);
-        hoisted_mesh_counts_ = false;
+        mesh_stage_slots_ = 1u;
 
         const uint32_t orig_tg = std::max(1u, ir_.threadgroup_x * ir_.threadgroup_y * ir_.threadgroup_z);
         // Wave32 split execution for >128-thread console mesh shaders (e.g. 256-thread Xbox mesh shaders
@@ -1234,6 +1234,9 @@ public:
             const uint32_t max_waves = ComputeMaxGuestWaves(ir_);
             hdr << "groupshared uint _w64_ballot[" << (max_waves * 2u) << "];\n";
             hdr << "groupshared uint _w64_lanes[" << w_cap << "];\n";
+        }
+        if (ir_.stage == ShaderStage::Mesh) {
+            hdr << "groupshared uint _gs_mesh_counts[2];\n";
         }
         if (uses_alignbyte) {
             hdr << "// UB-free v_alignbyte_b32 helper (all shift amounts strictly < 32)\n";
@@ -2052,6 +2055,39 @@ public:
                 }
                 hdr << "    uint _mesh_vcnt = " << max_v << "u;\n";
                 hdr << "    uint _mesh_pcnt = " << max_p << "u;\n";
+                bool has_explicit_mesh_counts = false;
+                for (const auto& mbb : ir_.blocks) {
+                    for (const auto& minst : mbb.instructions) {
+                        if (minst.op == IrOp::SetMeshOutputCounts) {
+                            has_explicit_mesh_counts = true;
+                            break;
+                        }
+                    }
+                    if (has_explicit_mesh_counts) break;
+                }
+                mesh_stage_slots_ = mesh_wave32_split_ ? std::max(1u, mesh_split_passes_)
+                                                       : (bounded_wave64_dispatcher_ ? 2u : 1u);
+                const uint32_t init_vcnt = has_explicit_mesh_counts ? 0u : max_v;
+                const uint32_t init_pcnt = has_explicit_mesh_counts ? 0u : max_p;
+                hdr << "    if (_gtid == 0u) { _gs_mesh_counts[0] = " << init_vcnt
+                    << "u; _gs_mesh_counts[1] = " << init_pcnt << "u; }\n";
+                hdr << "    GroupMemoryBarrierWithGroupSync();\n";
+                hdr << "    MeshVert _ms_st_v[" << mesh_stage_slots_ << "];\n";
+                hdr << "    uint3 _ms_st_p[" << mesh_stage_slots_ << "];\n";
+                if (ir_.uses_mesh_cull) {
+                    hdr << "    bool _ms_st_cull[" << mesh_stage_slots_ << "];\n";
+                }
+                hdr << "    [unroll] for (uint _msi = 0u; _msi < " << mesh_stage_slots_ << "u; ++_msi) {\n";
+                hdr << "        _ms_st_v[_msi] = (MeshVert)0;\n";
+                hdr << "        _ms_st_v[_msi].pos = float4(0.0, 0.0, 0.0, 1.0);\n";
+                hdr << "        _ms_st_p[_msi] = uint3(0u, 0u, 0u);\n";
+                if (ir_.uses_mesh_cull) {
+                    hdr << "        _ms_st_cull[_msi] = false;\n";
+                }
+                hdr << "    }\n";
+                if (!mesh_wave32_split_ && !bounded_wave64_dispatcher_) {
+                    hdr << "    const uint _ms_slot = 0u;\n";
+                }
                 if (ir_.uses_wave64_emulation && !bounded_wave64_dispatcher_) {
                     const uint32_t lane_mask = (ir_.wave_size == 64u) ? 63u : 31u;
                     const uint32_t wave_shift = (ir_.wave_size == 64u) ? 6u : 5u;
@@ -2154,37 +2190,23 @@ public:
                 hdr << "    if (_gtid == 0u) { _w64_ballot[0] = 0u; _w64_ballot[1] = 0u; }\n";
                 hdr << "    GroupMemoryBarrierWithGroupSync();\n";
             }
-            if (ir_.stage == ShaderStage::Mesh) {
-                // Hoist uniform SetMeshOutputCounts before the split loop so DXC validates single call
-                for (const auto& inst : ir_.blocks[0].instructions) {
-                    if (inst.op == IrOp::SetMeshOutputCounts) {
-                        auto resolve_uniform_u32 = [&](IrValueId id, uint32_t fallback) -> std::string {
-                            auto it = defs_.find(id);
-                            if (it != defs_.end()) {
-                                if (it->second->op == IrOp::ConstU32) return HexU32(it->second->imm_u32);
-                                if (it->second->op == IrOp::LoadRootConst) return "_rc" + std::to_string(it->second->imm_u32);
-                            }
-                            return std::to_string(fallback) + "u";
-                        };
-                        hdr << "    _mesh_vcnt = " << resolve_uniform_u32(inst.operands[0], 3u) << ";\n";
-                        hdr << "    _mesh_pcnt = " << resolve_uniform_u32(inst.operands[1], 1u) << ";\n";
-                        hdr << "    SetMeshOutputCounts(_mesh_vcnt, _mesh_pcnt);\n";
-                        hoisted_mesh_counts_ = true;
-                        break;
-                    }
-                }
-            }
             if (mesh_wave32_split_) {
                 hdr << "    // Wave32 split execution for " << orig_tg << "-thread console mesh shader ("
                     << mesh_split_passes_ << " passes x 128 hw threads; xcl #39 / xbox-emulator #172)\n";
                 hdr << "    [unroll]\n";
                 hdr << "    for (uint _ms_pass = 0u; _ms_pass < " << mesh_split_passes_ << "u; ++_ms_pass) {\n";
+                if (ir_.stage == ShaderStage::Mesh) {
+                    hdr << "        uint _ms_slot = _ms_pass;\n";
+                }
                 hdr << "        uint _w64_gtid = (_ms_pass * 128u) + _gtid;\n";
                 hdr << "        if (_w64_gtid >= " << orig_tg << "u) { continue; }\n";
             } else {
                 hdr << "    // Bounded wave64-on-wave32 two-half execution dispatcher (half = 0..1)\n";
                 hdr << "    [unroll]\n";
                 hdr << "    for (uint _w64_half = 0u; _w64_half < 2u; ++_w64_half) {\n";
+                if (ir_.stage == ShaderStage::Mesh) {
+                    hdr << "        uint _ms_slot = _w64_half;\n";
+                }
                 if (is_group_stage) {
                     hdr << "        uint _hw_lane = (WaveGetLaneCount() >= 32u) ? (WaveGetLaneIndex() & 31u) : (_gtid & 31u);\n";
                     hdr << "        uint _w64_lane = (_w64_half * 32u) + _hw_lane;\n";
@@ -2200,12 +2222,13 @@ public:
 
         const bool wrap_split_loop = bounded_wave64_dispatcher_ || mesh_wave32_split_;
         const bool wrap_as_single_dispatch =
-            (!wrap_split_loop && ir_.stage == ShaderStage::Amplification);
+            (!wrap_split_loop && (ir_.stage == ShaderStage::Amplification || ir_.stage == ShaderStage::Mesh));
         const int base_depth = (wrap_split_loop || wrap_as_single_dispatch) ? 2 : 1;
         Rdna2CfgAnalysis cfg_info{};
         AnalyzeRdna2Cfg(ir_, cfg_info);
         std::ostringstream body;
         std::unordered_set<uint32_t> visited;
+        std::vector<uint32_t> topo_order;
         if (!cfg_info.has_cycles && !cfg_info.is_irreducible &&
             EmitStructured(body, 0u, UINT32_MAX, base_depth, visited)) {
             if (wrap_as_single_dispatch) {
@@ -2214,6 +2237,15 @@ public:
                 hdr << "    } while (false);\n";
             } else {
                 hdr << body.str();
+            }
+        } else if (!cfg_info.has_cycles && ComputeTopologicalOrder(topo_order)) {
+            EmitTopologicalDag(hdr, topo_order, wrap_split_loop ? 2 : 1);
+            if (!wrap_split_loop) {
+                if (ir_.stage == ShaderStage::Vertex) {
+                    hdr << "    return _out;\n";
+                } else if (ir_.stage == ShaderStage::Pixel) {
+                    hdr << (mrt_out_count_ > 1u ? "    return _ps_out;\n" : "    return _mrt0;\n");
+                }
             }
         } else {
             EmitStateMachine(hdr, wrap_split_loop ? 2 : 1);
@@ -2226,6 +2258,33 @@ public:
             }
         }
         if (wrap_split_loop) {
+            hdr << "    }\n";
+        }
+        if (ir_.stage == ShaderStage::Mesh) {
+            const uint32_t max_v = ir_.mesh_max_vertices ? ir_.mesh_max_vertices : 64u;
+            const uint32_t max_p = ir_.mesh_max_primitives ? ir_.mesh_max_primitives : 64u;
+            hdr << "    GroupMemoryBarrierWithGroupSync();\n";
+            hdr << "    uint _final_vcnt = min(_gs_mesh_counts[0], " << max_v << "u);\n";
+            hdr << "    uint _final_pcnt = min(_gs_mesh_counts[1], " << max_p << "u);\n";
+            hdr << "    uint _vmax_idx = (_final_vcnt > 0u) ? (_final_vcnt - 1u) : 0u;\n";
+            hdr << "    SetMeshOutputCounts(_final_vcnt, _final_pcnt);\n";
+            hdr << "    [unroll] for (uint _msi = 0u; _msi < " << mesh_stage_slots_ << "u; ++_msi) {\n";
+            if (mesh_wave32_split_) {
+                hdr << "        uint _out_idx = (_msi * 128u) + _gtid;\n";
+            } else if (bounded_wave64_dispatcher_) {
+                hdr << "        uint _hw_l = (WaveGetLaneCount() >= 32u) ? (WaveGetLaneIndex() & 31u) : (_gtid & 31u);\n";
+                hdr << "        uint _out_idx = ((_gtid & ~31u) * 2u) + (_msi * 32u) + _hw_l;\n";
+            } else {
+                hdr << "        uint _out_idx = _gtid;\n";
+            }
+            hdr << "        if (_out_idx < _final_vcnt) { _verts[_out_idx] = _ms_st_v[_msi]; }\n";
+            hdr << "        if (_out_idx < _final_pcnt) {\n";
+            hdr << "            _prims[_out_idx] = uint3(min(_ms_st_p[_msi].x, _vmax_idx), "
+                   "min(_ms_st_p[_msi].y, _vmax_idx), min(_ms_st_p[_msi].z, _vmax_idx));\n";
+            if (ir_.uses_mesh_cull) {
+                hdr << "            _prim_attrs[_out_idx].cull = _ms_st_cull[_msi];\n";
+            }
+            hdr << "        }\n";
             hdr << "    }\n";
         }
         if (ir_.stage == ShaderStage::Amplification) {
@@ -2446,7 +2505,7 @@ private:
         if (bounded_wave64_dispatcher_ || mesh_wave32_split_) return "continue;";
         if (ir_.stage == ShaderStage::Vertex) return "return _out;";
         if (ir_.stage == ShaderStage::Pixel) return (mrt_out_count_ > 1u) ? "return _ps_out;" : "return _mrt0;";
-        if (ir_.stage == ShaderStage::Amplification) return "break;";
+        if (ir_.stage == ShaderStage::Amplification || ir_.stage == ShaderStage::Mesh) return "break;";
         return "return;";
     }
 
@@ -3836,30 +3895,28 @@ private:
                         os << ind << "_dm_x = " << AsU32(inst.operands[0]) << ";\n";
                         os << ind << "_dm_y = " << AsU32(inst.operands[1]) << ";\n";
                         os << ind << "_dm_z = 1u;\n";
-                    } else if (!hoisted_mesh_counts_) {
-                        os << ind << "_mesh_vcnt = " << AsU32(inst.operands[0]) << ";\n";
-                        os << ind << "_mesh_pcnt = " << AsU32(inst.operands[1]) << ";\n";
-                        os << ind << "SetMeshOutputCounts(_mesh_vcnt, _mesh_pcnt);\n";
+                    } else if (ir_.stage == ShaderStage::Mesh) {
+                        const uint32_t max_v = ir_.mesh_max_vertices ? ir_.mesh_max_vertices : 64u;
+                        const uint32_t max_p = ir_.mesh_max_primitives ? ir_.mesh_max_primitives : 64u;
+                        os << ind << "{ uint _mv = min(" << AsU32(inst.operands[0]) << ", " << max_v << "u); "
+                           << "uint _mp = min(" << AsU32(inst.operands[1]) << ", " << max_p << "u); "
+                           << "_mesh_vcnt = _mv; _mesh_pcnt = _mp; "
+                           << "InterlockedMax(_gs_mesh_counts[0], _mv); InterlockedMax(_gs_mesh_counts[1], _mp); }\n";
                     }
                     break;
                 case IrOp::ExportMeshPrim: {
-                    const char* idx_var = (bounded_wave64_dispatcher_ || mesh_wave32_split_) ? "_w64_gtid" : "_gtid";
                     if (inst.imm_u32 == 1u) {
                         const std::string p = AsU32(inst.operands[0]);
-                        os << ind << "if (" << idx_var << " < _mesh_pcnt) { _prims[" << idx_var
-                           << "] = uint3((" << p << ") & 0x3FFu, ((" << p
-                           << ") >> 10u) & 0x3FFu, ((" << p << ") >> 20u) & 0x3FFu); }\n";
+                        os << ind << "_ms_st_p[_ms_slot] = uint3((" << p << ") & 0x3FFu, ((" << p
+                           << ") >> 10u) & 0x3FFu, ((" << p << ") >> 20u) & 0x3FFu);\n";
                     } else {
-                        os << ind << "if (" << idx_var << " < _mesh_pcnt) { _prims[" << idx_var
-                           << "] = uint3(" << AsU32(inst.operands[0]) << ", "
-                           << AsU32(inst.operands[1]) << ", " << AsU32(inst.operands[2]) << "); }\n";
+                        os << ind << "_ms_st_p[_ms_slot] = uint3(" << AsU32(inst.operands[0]) << ", "
+                           << AsU32(inst.operands[1]) << ", " << AsU32(inst.operands[2]) << ");\n";
                     }
                     break;
                 }
                 case IrOp::ExportMeshCull: {
-                    const char* idx_var = (bounded_wave64_dispatcher_ || mesh_wave32_split_) ? "_w64_gtid" : "_gtid";
-                    os << ind << "if (" << idx_var << " < _mesh_pcnt) { _prim_attrs[" << idx_var
-                       << "].cull = " << AsBool(inst.operands[0]) << "; }\n";
+                    os << ind << "_ms_st_cull[_ms_slot] = " << AsBool(inst.operands[0]) << ";\n";
                     break;
                 }
                 case IrOp::DispatchMeshGroups:
@@ -4382,13 +4439,11 @@ private:
                     }
                     const std::string vec = "float4(" + AsF32(inst.operands[0]) + ", " + AsF32(inst.operands[1]) +
                                             ", " + AsF32(inst.operands[2]) + ", " + AsF32(inst.operands[3]) + ")";
-                    const char* mesh_idx = (bounded_wave64_dispatcher_ || mesh_wave32_split_) ? "_w64_gtid" : "_gtid";
                     if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos0)) {
                         if (ir_.stage == ShaderStage::Vertex) {
                             os << ind << "_out.pos = " << vec << ";\n";
                         } else if (ir_.stage == ShaderStage::Mesh) {
-                            os << ind << "if (" << mesh_idx << " < _mesh_vcnt) { _verts["
-                               << mesh_idx << "].pos = " << vec << "; }\n";
+                            os << ind << "_ms_st_v[_ms_slot].pos = " << vec << ";\n";
                         } else if (ir_.stage == ShaderStage::Geometry) {
                             os << ind << "_gs_out.pos = " << vec << ";\n";
                             os << ind << "_gs_stream.Append(_gs_out);\n";
@@ -4401,8 +4456,7 @@ private:
                             if (ir_.stage == ShaderStage::Vertex) {
                                 os << ind << "_out.viewport_index = " << vp_expr << ";\n";
                             } else if (ir_.stage == ShaderStage::Mesh) {
-                                os << ind << "if (" << mesh_idx << " < _mesh_vcnt) { _verts["
-                                   << mesh_idx << "].viewport_index = " << vp_expr << "; }\n";
+                                os << ind << "_ms_st_v[_ms_slot].viewport_index = " << vp_expr << ";\n";
                             } else if (ir_.stage == ShaderStage::Geometry) {
                                 os << ind << "_gs_out.viewport_index = " << vp_expr << ";\n";
                             }
@@ -4415,8 +4469,7 @@ private:
                             if (ir_.stage == ShaderStage::Vertex) {
                                 os << ind << "_out.param" << pslot << " = " << vec << ";\n";
                             } else if (ir_.stage == ShaderStage::Mesh) {
-                                os << ind << "if (" << mesh_idx << " < _mesh_vcnt) { _verts["
-                                   << mesh_idx << "].param" << pslot << " = " << vec << "; }\n";
+                                os << ind << "_ms_st_v[_ms_slot].param" << pslot << " = " << vec << ";\n";
                             } else if (ir_.stage == ShaderStage::Geometry) {
                                 os << ind << "_gs_out.param" << pslot << " = " << vec << ";\n";
                             }
@@ -4431,8 +4484,7 @@ private:
                         if (ir_.stage == ShaderStage::Vertex) {
                             os << ind << "_out." << field << " = " << vec << ";\n";
                         } else if (ir_.stage == ShaderStage::Mesh) {
-                            os << ind << "if (" << mesh_idx << " < _mesh_vcnt) { _verts[" << mesh_idx
-                               << "]." << field << " = " << vec << "; }\n";
+                            os << ind << "_ms_st_v[_ms_slot]." << field << " = " << vec << ";\n";
                         } else if (ir_.stage == ShaderStage::Geometry) {
                             os << ind << "_gs_out." << field << " = " << vec << ";\n";
                         }
@@ -4584,6 +4636,116 @@ private:
         return true;
     }
 
+    bool ComputeTopologicalOrder(std::vector<uint32_t>& out_order) const {
+        out_order.clear();
+        const size_t n = ir_.blocks.size();
+        if (n == 0u) return false;
+
+        std::vector<std::vector<uint32_t>> succs(n);
+        for (size_t b = 0u; b < n; ++b) {
+            const auto& ins = ir_.blocks[b].instructions;
+            if (ins.empty()) continue;
+            const auto& term = ins.back();
+            if (term.op == IrOp::Branch && term.true_block < n) {
+                succs[b].push_back(term.true_block);
+            } else if (term.op == IrOp::CondBranch) {
+                if (term.true_block < n) succs[b].push_back(term.true_block);
+                if (term.false_block < n && term.false_block != term.true_block) {
+                    succs[b].push_back(term.false_block);
+                }
+            }
+        }
+
+        // Restrict to blocks reachable from entry block 0.
+        std::vector<uint8_t> reachable(n, 0u);
+        std::vector<uint32_t> stack = {0u};
+        reachable[0] = 1u;
+        size_t reachable_count = 0u;
+        while (!stack.empty()) {
+            const uint32_t u = stack.back();
+            stack.pop_back();
+            ++reachable_count;
+            for (uint32_t v : succs[u]) {
+                if (!reachable[v]) {
+                    reachable[v] = 1u;
+                    stack.push_back(v);
+                }
+            }
+        }
+
+        std::vector<uint32_t> indeg(n, 0u);
+        for (size_t u = 0u; u < n; ++u) {
+            if (!reachable[u]) continue;
+            for (uint32_t v : succs[u]) {
+                if (reachable[v]) ++indeg[v];
+            }
+        }
+
+        std::vector<uint32_t> ready;
+        ready.reserve(reachable_count);
+        for (size_t u = 0u; u < n; ++u) {
+            if (reachable[u] && indeg[u] == 0u) {
+                ready.push_back(static_cast<uint32_t>(u));
+            }
+        }
+
+        out_order.reserve(reachable_count);
+        while (!ready.empty()) {
+            auto min_it = std::min_element(ready.begin(), ready.end());
+            const uint32_t u = *min_it;
+            ready.erase(min_it);
+            out_order.push_back(u);
+            for (uint32_t v : succs[u]) {
+                if (!reachable[v]) continue;
+                if (--indeg[v] == 0u) {
+                    ready.push_back(v);
+                }
+            }
+        }
+        return out_order.size() == reachable_count && !out_order.empty() && out_order[0] == 0u;
+    }
+
+    void EmitTopologicalDag(
+        std::ostringstream& os,
+        const std::vector<uint32_t>& topo_order,
+        int base_depth = 1) const {
+        const std::string i0 = Indent(base_depth);
+        const std::string i1 = Indent(base_depth + 1);
+        const std::string i2 = Indent(base_depth + 2);
+        os << i0 << "uint _cfg_state = 0u;\n";
+        for (uint32_t bb_idx : topo_order) {
+            const auto& bb = ir_.blocks[bb_idx];
+            if (bb_idx == 0u) {
+                os << i0 << "{\n";
+            } else {
+                os << i0 << "if (_cfg_state == " << bb.id << "u) {\n";
+            }
+            EmitNonTerminators(os, bb, base_depth + 1);
+            if (!bb.instructions.empty()) {
+                const auto& term = bb.instructions.back();
+                if (term.op == IrOp::Return) {
+                    os << i1 << "_cfg_state = 0xFFFFFFFFu;\n";
+                } else if (term.op == IrOp::Branch) {
+                    EmitPhiCopies(os, bb.id, term.true_block, base_depth + 1);
+                    os << i1 << "_cfg_state = " << term.true_block << "u;\n";
+                } else if (term.op == IrOp::CondBranch) {
+                    os << i1 << "if (" << AsBool(term.operands[0]) << ") {\n";
+                    EmitPhiCopies(os, bb.id, term.true_block, base_depth + 2);
+                    os << i2 << "_cfg_state = " << term.true_block << "u;\n";
+                    os << i1 << "} else {\n";
+                    EmitPhiCopies(os, bb.id, term.false_block, base_depth + 2);
+                    os << i2 << "_cfg_state = " << term.false_block << "u;\n";
+                    os << i1 << "}\n";
+                } else {
+                    os << i1 << "_cfg_state = 0xFFFFFFFFu;\n";
+                }
+            } else {
+                os << i1 << "_cfg_state = 0xFFFFFFFFu;\n";
+            }
+            os << i0 << "}\n";
+        }
+    }
+
     void EmitStateMachine(std::ostringstream& os, int base_depth = 1) const {
         const std::string i0 = Indent(base_depth);
         const std::string i1 = Indent(base_depth + 1);
@@ -4591,7 +4753,7 @@ private:
         const std::string i3 = Indent(base_depth + 3);
         const std::string i4 = Indent(base_depth + 4);
         os << i0 << "uint _cfg_state = 0u;\n";
-        os << i0 << "[loop] while (true) {\n";
+        os << i0 << "[loop] for (uint _cfg_iter = 0u; _cfg_iter < 4096u; ++_cfg_iter) {\n";
         os << i1 << "if (_cfg_state == 0xFFFFFFFFu) { break; }\n";
         os << i1 << "switch (_cfg_state) {\n";
         for (size_t i = 0; i < ir_.blocks.size(); ++i) {
@@ -4636,8 +4798,8 @@ private:
     bool bounded_wave64_dispatcher_ = false;
     bool mesh_wave32_split_ = false;
     uint32_t mesh_split_passes_ = 1u;
+    uint32_t mesh_stage_slots_ = 1u;
     uint32_t orig_tg_total_ = 1u;
-    bool hoisted_mesh_counts_ = false;
     bool uses_viewport_idx_ = false;
     uint32_t param_out_count_ = 0u;
     uint32_t param_in_count_ = 0u;

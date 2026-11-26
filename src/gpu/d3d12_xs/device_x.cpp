@@ -10184,7 +10184,7 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
         }
         if (!out_ps_param_in_count && !s_disk_cache_dir.empty()) {
             char cpath[320]{};
-            std::snprintf(cpath, sizeof(cpath), "%s\\v25_%016llx.dxil",
+            std::snprintf(cpath, sizeof(cpath), "%s\\v26_%016llx.dxil",
                           s_disk_cache_dir.c_str(), static_cast<unsigned long long>(h));
             FILE* cf = nullptr;
             if (::fopen_s(&cf, cpath, "rb") == 0 && cf) {
@@ -10374,7 +10374,7 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
             out_err = st.message;
         } else if (!s_disk_cache_dir.empty()) {
             char cpath[320]{};
-            std::snprintf(cpath, sizeof(cpath), "%s\\v25_%016llx.dxil",
+            std::snprintf(cpath, sizeof(cpath), "%s\\v26_%016llx.dxil",
                           s_disk_cache_dir.c_str(), static_cast<unsigned long long>(h));
             FILE* cf = nullptr;
             if (::fopen_s(&cf, cpath, "wb") == 0 && cf) {

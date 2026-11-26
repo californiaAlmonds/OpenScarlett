@@ -1705,7 +1705,18 @@ public:
         inner_->CopyTextureRegion(pDst, DstX, DstY, DstZ, pSrc, pSrcBox);
     }
     virtual void STDMETHODCALLTYPE Slot84() { RecordClUnimpl(84); }
-    virtual void STDMETHODCALLTYPE Slot85() { RecordClUnimpl(85); }
+    // Slot 85 (+0x2A8): CopyTextureRegionX(pDst, DstX, DstY, DstZ, pSrc, pSrcBox, Flags)
+    // (retail GRDK 2504+ shifted +2 slots from GDK Slot 83, verified at +0x4F4574 / +0x4F4819)
+    virtual void STDMETHODCALLTYPE Slot85(
+        const D3D12_TEXTURE_COPY_LOCATION* pDst,
+        UINT DstX, UINT DstY, UINT DstZ,
+        const D3D12_TEXTURE_COPY_LOCATION* pSrc,
+        const D3D12_BOX* pSrcBox,
+        UINT /*Flags*/) {
+        if (inner_) {
+            inner_->CopyTextureRegion(pDst, DstX, DstY, DstZ, pSrc, pSrcBox);
+        }
+    }
     virtual void STDMETHODCALLTYPE Slot86() { RecordClUnimpl(86); }
     virtual void STDMETHODCALLTYPE Slot87() { RecordClUnimpl(87); }
     virtual void STDMETHODCALLTYPE Slot88() { RecordClUnimpl(88); }

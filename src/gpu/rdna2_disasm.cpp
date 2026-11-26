@@ -843,7 +843,9 @@ Rdna2Opcode DecodeVop3Opcode(uint16_t raw, uint8_t& out_src_count) {
         case 0x314: out_src_count = 2; return Rdna2Opcode::V_LSHLREV_B16;
         case 0x315: out_src_count = 2; return Rdna2Opcode::V_LSHRREV_B16;
         case 0x340: out_src_count = 3; return Rdna2Opcode::V_MAD_U16;
-        case 0x346: out_src_count = 3; return Rdna2Opcode::V_LSHL_ADD_U32;
+        case 0x345: out_src_count = 3; return Rdna2Opcode::V_LSHL_ADD_U32;  // GFX10.3 v_xad_u32
+        case 0x346: out_src_count = 3; return Rdna2Opcode::V_LSHL_ADD_U32;  // GFX10.3 v_lshl_add_u32
+        case 0x347: out_src_count = 3; return Rdna2Opcode::V_LSHL_ADD_U32;  // GFX10.3 v_add_lshl_u32
         case 0x34B: out_src_count = 3; return Rdna2Opcode::V_FMA_F16;
         case 0x360: out_src_count = 2; return Rdna2Opcode::V_READLANE_B32;
         case 0x361: out_src_count = 2; return Rdna2Opcode::V_WRITELANE_B32;
@@ -855,13 +857,13 @@ Rdna2Opcode DecodeVop3Opcode(uint16_t raw, uint8_t& out_src_count) {
         case 0x368: out_src_count = 2; return Rdna2Opcode::V_CVT_PKNORM_I16_F32;
         case 0x369: out_src_count = 2; return Rdna2Opcode::V_CVT_PKNORM_U16_F32;
         case 0x36D: out_src_count = 3; return Rdna2Opcode::V_ADD3_U32;
-        case 0x36E: out_src_count = 3; return Rdna2Opcode::V_LSHL_OR_B32;   // GFX10.3 v_and_or_b32
-        case 0x36F: out_src_count = 3; return Rdna2Opcode::V_LSHL_OR_B32;
-        case 0x370: out_src_count = 3; return Rdna2Opcode::V_LSHL_OR_B32;   // GFX10.3 v_or3_b32
-        case 0x371: out_src_count = 3; return Rdna2Opcode::V_ADD3_U32;      // GFX10.3 v_and_or_b32
-        case 0x372: out_src_count = 3; return Rdna2Opcode::V_LSHL_ADD_U32;  // GFX10.3 v_lshl_add_u32
+        case 0x36E: out_src_count = 3; return Rdna2Opcode::V_LSHL_OR_B32;   // GFX10.3 v_and_or_b32 (legacy)
+        case 0x36F: out_src_count = 3; return Rdna2Opcode::V_LSHL_OR_B32;   // GFX10.3 v_lshl_or_b32
+        case 0x370: out_src_count = 3; return Rdna2Opcode::V_LSHL_OR_B32;   // GFX10.3 v_or3_b32 (legacy)
+        case 0x371: out_src_count = 3; return Rdna2Opcode::V_LSHL_OR_B32;   // GFX10.3 v_and_or_b32
+        case 0x372: out_src_count = 3; return Rdna2Opcode::V_LSHL_ADD_U32;  // GFX10.1 v_lshl_add_u32
         case 0x373: out_src_count = 3; return Rdna2Opcode::V_DOT2_F32_F16;
-        case 0x374: out_src_count = 3; return Rdna2Opcode::V_LSHL_ADD_U32;  // GFX10.3 v_add_lshl_u32
+        case 0x374: out_src_count = 3; return Rdna2Opcode::V_LSHL_ADD_U32;  // GFX10.1 v_add_lshl_u32
         case 0x377: out_src_count = 3; return Rdna2Opcode::V_PERMLANE16_B32;
         case 0x378: out_src_count = 3; return Rdna2Opcode::V_PERMLANEX16_B32;
         default: break;

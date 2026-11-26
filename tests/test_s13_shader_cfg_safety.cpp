@@ -717,6 +717,158 @@ void TestRealGpu700Opcodes() {
     Check(secs < 120.0, "Live GPU opcode verification completes within 120s sanity budget");
 }
 
+// ---------------------------------------------------------------------------
+// Test 7: GFX10.3 VOP3 v_add_lshl_u32 (0x347) / v_and_or_b32 (0x371) & Topological Acyclic DAG HLSL
+// ---------------------------------------------------------------------------
+void TestVop3AddLshlAndTopologicalDag() {
+    std::printf("\n--- Test 7: GFX10.3 VOP3 0x347/0x371 & Multi-Block Acyclic DAG HLSL ---\n");
+    const std::string dxc_path = ResolvePortableDxcPath();
+    std::error_code ec;
+    const bool has_dxc = !dxc_path.empty() && std::filesystem::exists(dxc_path, ec);
+
+    // Build a multi-block forward-branching acyclic DAG (spanning >1 blocks so EmitStructured
+    // yields to EmitTopologicalDag) that exercises raw VOP3 0x347 (v_add_lshl_u32), 0x345 (v_xad_u32),
+    // and 0x371 (v_and_or_b32).
+    std::vector<uint32_t> words;
+    // v1 = tid << 2
+    words.push_back(0x00020282u | (1u << 17) | (0u << 9));  // v_lshlrev_b32 v1, 2, v0 (via assembler below)
+    words.clear();
+
+    Rdna2Assembler a;
+    a.EmitVop2(Rdna2Opcode::V_LSHLREV_B32, 1, Rdna2Operand::InlineInt(2), 0);
+    // Emit raw GFX10.3 VOP3 v_add_lshl_u32 v2, v0, 5, 2 -> (tid + 5) << 2
+    // w0: [31:26]=0x35 (0xD4000000), op=0x347 -> 0xD7470002; w1: src0=v0(256), src1=5(133), src2=2(130)
+    std::vector<uint32_t> raw = a.Words();
+    raw.push_back(0xD7470002u);
+    raw.push_back(256u | (133u << 9) | (130u << 18));
+    // Emit raw GFX10.3 VOP3 v_and_or_b32 (0x371) v3, v2, 0xFF(lit->inline 15=143), 1(129) -> (v2 & 15) | 1
+    raw.push_back(0xD7710003u);
+    raw.push_back(258u | (143u << 9) | (129u << 18));
+    // Emit raw GFX10.3 VOP3 v_xad_u32 (0x345) v4, v2, v3, 7(135) -> (v2 ^ v3) + 7
+    raw.push_back(0xD7450004u);
+    raw.push_back(258u | (259u << 9) | (135u << 18));
+    // Multi-block forward-branching acyclic DAG (non-single-block diamond -> triggers EmitTopologicalDag)
+    // s_cmp_lt_u32 s4, 1; s_cbranch_scc1 +4; s_mov_b32 s5, 10; s_cmp_eq_u32 s4, 2; s_cbranch_scc1 +2; s_mov_b32 s5, 20
+    raw.push_back(0xBF0A0104u);  // s_cmp_lt_u32 s4, 1 (ssrc0=4, ssrc1=129)
+    raw[raw.size() - 1] = (0x17Eu << 23) | (0x08u << 16) | (129u << 8) | 4u;
+    raw.push_back((0x17Fu << 23) | (0x05u << 16) | 4u);   // s_cbranch_scc1 +4 (jumps over 2 blocks!)
+    raw.push_back((0x17Du << 23) | (5u << 16) | (0x03u << 8) | 138u);  // s_mov_b32 s5, 10
+    raw.push_back((0x17Eu << 23) | (0x00u << 16) | (130u << 8) | 4u);  // s_cmp_eq_i32 s4, 2
+    raw.push_back((0x17Fu << 23) | (0x05u << 16) | 1u);   // s_cbranch_scc1 +1
+    raw.push_back((0x17Du << 23) | (5u << 16) | (0x03u << 8) | 148u);  // s_mov_b32 s5, 20
+    // buffer_store_dword v4, v1, s[4:7], 0 offen + s_endpgm
+    Rdna2Assembler tail;
+    tail.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 4, 1, 4, 0);
+    tail.EmitSopp(Rdna2Opcode::S_ENDPGM);
+    raw.insert(raw.end(), tail.Words().begin(), tail.Words().end());
+
+    Xs2ShaderContainer xs2{};
+    xs2.stage = ShaderStage::Compute;
+    xs2.threadgroup_x = 32u;
+    xs2.threadgroup_y = 1u;
+    xs2.threadgroup_z = 1u;
+    xs2.wave_size = 32u;
+    xs2.code_words = raw;
+
+    std::vector<Rdna2Instruction> insts;
+    Check(DisassembleRdna2Extended(xs2.code_words, insts).ok(),
+          "DisassembleRdna2Extended decodes VOP3 0x347 (v_add_lshl_u32), 0x345 (v_xad_u32), 0x371 (v_and_or_b32)");
+
+    Rdna2IrModule ir{};
+    Check(BuildRdna2Ir(xs2, insts, ir, nullptr).ok() && OptimizeRdna2Ir(ir).ok(),
+          "BuildRdna2Ir + OptimizeRdna2Ir succeeds for VOP3 0x347/0x345/0x371 DAG");
+
+    std::string hlsl, target;
+    Check(EmitHlsl(ir, hlsl, target, true).ok(), "EmitHlsl succeeds for multi-block acyclic DAG");
+    Check(!Contains(hlsl, "while (true)") && !Contains(hlsl, "_cfg_iter"),
+          "Acyclic multi-block DAG emits loop-free EmitTopologicalDag HLSL (no state-machine loop)");
+
+    if (has_dxc) {
+        std::vector<uint8_t> dxil;
+        std::string diag;
+        Check(CompileHlslWithDxc(hlsl, target, "main", dxil, diag, dxc_path).ok() && !dxil.empty(),
+              "Loop-free topological DAG HLSL compiles cleanly with dxc.exe");
+    }
+
+    // Verify CPU interpreter parity on VOP3 0x347 / 0x371 / 0x345
+    Rdna2CpuExecState cpu{};
+    cpu.uav0.assign(32u, 0u);
+    cpu.uav1.assign(32u, 0u);
+    Check(ExecuteRdna2Cpu(xs2, insts, cpu).ok(), "CPU interpreter executes VOP3 0x347/0x371/0x345 cleanly");
+    bool parity_ok = (cpu.uav1.size() >= 32u);
+    for (uint32_t tid = 0u; tid < 32u && parity_ok; ++tid) {
+        const uint32_t v2 = (tid + 5u) << 2u;
+        const uint32_t v3 = (v2 & 15u) | 1u;
+        const uint32_t v4 = (v2 ^ v3) + 7u;
+        if (cpu.uav1[tid] != v4) parity_ok = false;
+    }
+    Check(parity_ok, "VOP3 0x347/0x371/0x345 outputs match exact bit-level formula across all 32 lanes");
+
+    // Optional live-captured 3D shader corpus check when saved_3d_psos_v18 is present locally.
+    const std::filesystem::path saved_dir(R"(E:\OpenScarlett\.tmp\saved_3d_psos_v18)");
+    if (has_dxc && std::filesystem::exists(saved_dir / "bound_11_ms.bin", ec)) {
+        auto lift_saved = [&](const char* fname, bool is_cs, bool is_ms, uint32_t max_ms_params) {
+            std::vector<uint8_t> blob;
+            FILE* fp = nullptr;
+            const std::string p = (saved_dir / fname).string();
+            if (::fopen_s(&fp, p.c_str(), "rb") == 0 && fp) {
+                std::fseek(fp, 0, SEEK_END);
+                const long sz = std::ftell(fp);
+                std::fseek(fp, 0, SEEK_SET);
+                if (sz > 0) {
+                    blob.resize(static_cast<size_t>(sz));
+                    (void)std::fread(blob.data(), 1u, blob.size(), fp);
+                }
+                std::fclose(fp);
+            }
+            XboxContainerLiftResult lr{};
+            XboxContainerLiftOptions lo{};
+            lo.lift_options.use_sm65 = true;
+            lo.lift_options.emit_spirv = false;
+            lo.lift_options.compile_dxil_with_dxc = true;
+            lo.lift_options.dxc_path = dxc_path;
+            if (is_ms) {
+                lo.lift_options.mesh_has_payload = false;
+                lo.lift_options.stage_contract.max_param_outputs = max_ms_params;
+            }
+            auto& pb = lo.lift_options.stage_contract.psv0_bindings;
+            pb.enabled = true;
+            pb.in0_is_srv = true;
+            pb.in0_is_cbv = false;
+            pb.in0_reg = 0u;
+            pb.in0_space = 2u;
+            pb.has_tex0 = true;
+            pb.tex0_reg = 0u;
+            pb.tex0_space = 2u;
+            pb.has_rwtex0 = true;
+            pb.rwtex0_reg = 0u;
+            pb.rwtex0_space = 2u;
+            pb.has_rwimg_u32 = true;
+            pb.rwimg_u32_reg = 1u;
+            pb.rwimg_u32_space = 2u;
+            pb.cs_fssm_abi = is_cs;
+            const auto t0 = std::chrono::steady_clock::now();
+            const Status st = LiftXboxShaderContainer(blob.data(), blob.size(), lr, lo);
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0).count();
+            std::printf("  [SAVED-3D] %-16s raw=%5zuB -> hlsl=%6zuB -> dxil=%6zuB in %7.1fms (%s)\n",
+                        fname, blob.size(), lr.lift.hlsl_source.size(), lr.lift.pc_dxil.size(), ms,
+                        st.ok() ? "OK" : st.message.c_str());
+            Check(st.ok() && !lr.lift.pc_dxil.empty(), fname);
+            if (std::strcmp(fname, "bound_14_cs.bin") == 0) {
+                Check(!Contains(lr.lift.hlsl_source, "while (true)") &&
+                          !Contains(lr.lift.hlsl_source, "_cfg_iter") &&
+                          lr.lift.pc_dxil.size() < 250000u,
+                      "bound_14_cs.bin compiles as loop-free topological DAG (<250 KB DXIL, no 616 KB state-machine bloat)");
+            }
+        };
+        lift_saved("bound_11_ms.bin", false, true, 0u);
+        lift_saved("bound_12_ms.bin", false, true, 4u);
+        lift_saved("bound_14_cs.bin", true, false, 0u);
+        lift_saved("bound_17_cs.bin", true, false, 0u);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -728,6 +880,7 @@ int main() {
     TestMixedHeapAndVertexTableDiagnostics();
     TestMeshShaderLdsBarrierReads();
     TestRealGpu700Opcodes();
+    TestVop3AddLshlAndTopologicalDag();
 
     if (g_failures > 0) {
         std::fprintf(stderr, "\nFAILED: %d check(s) failed.\n", g_failures);
