@@ -935,7 +935,7 @@ public:
             return true;
         }
 
-        // 2. Cached constant-shift fast path (e.g. lighting.ttpf +0xE0000).
+        // 2. Cached constant-shift fast path (e.g. lighting.ttpf / ttdb_maps / ttdb_props +0xE0000).
         const uint64_t cached_shift = last_rds5_shift_.load(std::memory_order_relaxed);
         if (cached_shift > 0ull && req_off >= cached_shift) {
             const uint64_t cand_off = req_off - cached_shift;
@@ -945,15 +945,15 @@ public:
                 sit->comp_off == cand_off &&
                 sit->comp_sz == req_src_sz &&
                 sit->flags == want_flags &&
-                sit->uncomp_sz == dst_sz) {
+                sit->uncomp_sz >= dst_sz) {
                 out_true_off = cand_off;
-                out_full_uncomp_sz = dst_sz;
+                out_full_uncomp_sz = sit->uncomp_sz;
                 out_slice_off = 0u;
                 return true;
             }
         }
 
-        // 3. Backward scan within 16 MiB for sub-chunk slice or shifted whole chunk.
+        // 3. Backward scan within 16 MiB for sub-chunk slice or shifted chunk.
         constexpr uint64_t kMaxRds5ShiftWindow = 16ull * 1024ull * 1024ull;
         auto cur = std::upper_bound(
             rds5_chunks_.begin(),
@@ -961,7 +961,8 @@ public:
             req_off,
             [](uint64_t off, const Rds5ChunkEntry& e) { return off < e.comp_off; });
 
-        const Rds5ChunkEntry* whole_match = nullptr;
+        const Rds5ChunkEntry* fallback_match = nullptr;
+        uint64_t fallback_shift = 0ull;
         while (cur != rds5_chunks_.begin()) {
             --cur;
             if (cur->comp_off >= req_off) continue;
@@ -969,7 +970,7 @@ public:
             if (shift > kMaxRds5ShiftWindow) {
                 break;
             }
-            if (cur->comp_sz != req_src_sz || cur->flags != want_flags) {
+            if (cur->comp_sz != req_src_sz || cur->flags != want_flags || cur->uncomp_sz < dst_sz) {
                 continue;
             }
             if (cur->uncomp_sz > dst_sz && shift + dst_sz <= cur->uncomp_sz) {
@@ -978,15 +979,27 @@ public:
                 out_slice_off = static_cast<size_t>(shift);
                 return true;
             }
-            if (!whole_match && cur->uncomp_sz == dst_sz) {
-                whole_match = &(*cur);
+            if (cur->uncomp_sz == dst_sz) {
+                last_rds5_shift_.store(shift, std::memory_order_relaxed);
+                out_true_off = cur->comp_off;
+                out_full_uncomp_sz = dst_sz;
+                out_slice_off = 0u;
+                return true;
+            }
+            if (!fallback_match) {
+                fallback_match = &(*cur);
+                fallback_shift = shift;
             }
         }
-        if (whole_match) {
-            last_rds5_shift_.store(req_off - whole_match->comp_off, std::memory_order_relaxed);
-            out_true_off = whole_match->comp_off;
-            out_full_uncomp_sz = dst_sz;
-            out_slice_off = 0u;
+        if (fallback_match) {
+            out_true_off = fallback_match->comp_off;
+            out_full_uncomp_sz = fallback_match->uncomp_sz;
+            if (fallback_shift < fallback_match->uncomp_sz) {
+                out_slice_off = fallback_match->uncomp_sz - dst_sz;
+            } else {
+                last_rds5_shift_.store(fallback_shift, std::memory_order_relaxed);
+                out_slice_off = 0u;
+            }
             return true;
         }
         return false;

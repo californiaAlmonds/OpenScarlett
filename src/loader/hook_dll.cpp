@@ -6155,41 +6155,35 @@ LONG CALLBACK Zen2IllegalInstructionVeh(PEXCEPTION_POINTERS ep) {
             MEMORY_BASIC_INFORMATION mbi{};
             if (::VirtualQuery(p, &mbi, sizeof(mbi)) != 0u && mbi.State == MEM_COMMIT && *p == 0xCCu) {
                 bool allow_continue = (continue_int3_mode > 0);
-                // Always run structured cold-assert epilogue recoveries BEFORE generic Rip += 1u
-                // so OPENSCARLETT_CONTINUE_INT3=1 never falls into out-of-bounds chunk-table sentinels.
-                HMODULE hit_mod = nullptr;
-                const HMODULE main_exe = ::GetModuleHandleW(nullptr);
-                if (main_exe != nullptr &&
-                    ::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                         reinterpret_cast<LPCSTR>(p), &hit_mod) &&
-                    hit_mod == main_exe) {
-                    const uintptr_t reg_end =
-                        reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-                    if (reinterpret_cast<uintptr_t>(p) + 1u < reg_end && p[1] != 0xCCu) {
-                        // Detect leaf chunk-counter end-of-table cold assert (`je +0x38 -> CC EB C5`
-                        // with `C3` ret at `p - 16` when `rdx == r9`): return valid chunk count in `eax`
-                        // instead of jumping backward into out-of-bounds sentinel `[rdx + 8]`!
-                        if (reinterpret_cast<uintptr_t>(p) >=
-                                reinterpret_cast<uintptr_t>(mbi.BaseAddress) + 16u &&
-                            reinterpret_cast<uintptr_t>(p) + 2u < reg_end &&
-                            p[1] == 0xEBu && p[2] == 0xC5u && p[-16] == 0xC3u &&
-                            ctx->Rdx == ctx->R9) {
-                            ctx->Rip = reinterpret_cast<uintptr_t>(p - 16);
-                            return EXCEPTION_CONTINUE_EXECUTION;
+                if (!allow_continue) {
+                    HMODULE hit_mod = nullptr;
+                    const HMODULE main_exe = ::GetModuleHandleW(nullptr);
+                    if (main_exe != nullptr &&
+                        ::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                             reinterpret_cast<LPCSTR>(p), &hit_mod) &&
+                        hit_mod == main_exe) {
+                        const uintptr_t reg_end =
+                            reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+                        if (reinterpret_cast<uintptr_t>(p) + 1u < reg_end && p[1] != 0xCCu) {
+                            if (reinterpret_cast<uintptr_t>(p) >=
+                                    reinterpret_cast<uintptr_t>(mbi.BaseAddress) + 16u &&
+                                reinterpret_cast<uintptr_t>(p) + 2u < reg_end &&
+                                p[1] == 0xEBu && p[2] == 0xC5u && p[-16] == 0xC3u &&
+                                ctx->Rdx == ctx->R9) {
+                                ctx->Rip = reinterpret_cast<uintptr_t>(p - 16);
+                                return EXCEPTION_CONTINUE_EXECUTION;
+                            }
+                            if (reinterpret_cast<uintptr_t>(p) >=
+                                    reinterpret_cast<uintptr_t>(mbi.BaseAddress) + 8u &&
+                                reinterpret_cast<uintptr_t>(p) + 5u < reg_end &&
+                                p[1] == 0xE9u && p[-7] == 0x31u && p[-6] == 0xC0u &&
+                                p[-5] == 0xE9u && ctx->Rdi == ctx->Rdx) {
+                                ctx->Rip = reinterpret_cast<uintptr_t>(p - 5);
+                                return EXCEPTION_CONTINUE_EXECUTION;
+                            }
+                            allow_continue = true;
                         }
-                        // Detect EnqueueChunksForRead end-of-table cold assert (`CC E9 A5 FD FF FF`
-                        // preceded by `31 C0 E9 3E FF FF FF` epilogue jump when `rdi == rdx`):
-                        // return valid chunk count in `eax` via epilogue instead of looping into OOB `[rdi]`.
-                        if (reinterpret_cast<uintptr_t>(p) >=
-                                reinterpret_cast<uintptr_t>(mbi.BaseAddress) + 8u &&
-                            reinterpret_cast<uintptr_t>(p) + 5u < reg_end &&
-                            p[1] == 0xE9u && p[-7] == 0x31u && p[-6] == 0xC0u &&
-                            p[-5] == 0xE9u && ctx->Rdi == ctx->Rdx) {
-                            ctx->Rip = reinterpret_cast<uintptr_t>(p - 5);
-                            return EXCEPTION_CONTINUE_EXECUTION;
-                        }
-                        allow_continue = true;
                     }
                 }
                 if (allow_continue) {
