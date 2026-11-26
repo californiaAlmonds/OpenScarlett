@@ -361,6 +361,33 @@ OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL OpenScarlettTransferT
     uint32_t isWrite,
     void* hostBuffer);
 
+// Xbox Scarlett D3D12X CommandQueue::Slot31 GPU tile page-mapping batch descriptors
+// (layout verified against retail Scarlett callers and MIT-licensed R0Y00/Xbox2Windows).
+typedef struct OPENSCARLETT_TILE_PAGE_RANGE {
+    uint32_t kind;   // 0: consecutive pool[start + i], 1: repeat pool[start], 2: unmap, 3: keep
+    uint32_t start;  // 64 KiB page index from poolBaseVa
+    uint32_t count;  // number of 64 KiB destination pages
+} OPENSCARLETT_TILE_PAGE_RANGE;
+
+typedef struct OPENSCARLETT_TILE_PAGE_BATCH {
+    uint64_t destination;
+    uint32_t count;
+    uint32_t reserved;
+    const OPENSCARLETT_TILE_PAGE_RANGE* ranges;
+} OPENSCARLETT_TILE_PAGE_BATCH;
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL OpenScarlettMapPhysicalPagesScatter(
+    void* const* addresses,
+    uint64_t count,
+    const uint64_t* tokens);
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL OpenScarlettMapTilePageBatch(
+    uint32_t batchCount,
+    const OPENSCARLETT_TILE_PAGE_BATCH* batches,
+    uint64_t poolBaseVa,
+    uint32_t poolPages,
+    uint32_t flags);
+
 // Note: kernelx.dll also exports unprefixed VirtualAllocFromApp, VirtualProtectFromApp,
 // CreateWaitableTimerExW, and QueryUnbiasedInterruptTime in its PE export directory.
 // The KernelX-prefixed declarations below prevent clashes when <windows.h> is included.

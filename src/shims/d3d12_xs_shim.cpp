@@ -1219,19 +1219,50 @@ public:
         }
         return hr;
     }
-    // Slot 31 (+0xF8): UpdatePageMappingsBatchX(BatchCount, pBatches, BaseVa, PageSizeOrFlags, Reserved)
-    // Title has already updated CPU/unified physical page mappings via XMemMapPhysicalPagesScatter;
-    // record telemetry cleanly and return S_OK so TileHeap streaming completes without error.
+    // Slot 31 (+0xF8): UpdatePageMappingsBatchX(BatchCount, pBatches, PoolBaseVa, PoolPages, Flags)
+    // Applies GPU tile-window page-mapping batches directly onto the GPU placeholder window
+    // (adapted with attribution from MIT-licensed R0Y00/Xbox2Windows queue_page_mappings / X2WMapPageBatch)
+    // so GPU-only tiles (Case 2) and CPU-unmapped / GPU-resident tiles (Case 0 -> Case 4) remain
+    // backed by committed physical section views for DeviceX, DirectStorage, BVH, and shaders.
     virtual HRESULT STDMETHODCALLTYPE Slot31(
-        UINT /*BatchCount*/,
-        const void* /*pBatches*/,
-        D3D12_GPU_VIRTUAL_ADDRESS /*BaseVa*/,
-        UINT /*PageSizeOrFlags*/,
-        UINT /*Reserved*/) {
+        UINT BatchCount,
+        const void* pBatches,
+        D3D12_GPU_VIRTUAL_ADDRESS BaseVa,
+        UINT PageSizeOrFlags,
+        UINT Reserved) {
+        HRESULT hr = S_OK;
+        if (BatchCount > 0u && pBatches != nullptr && BaseVa != 0ull) {
+            using PfnMapTilePageBatch = int32_t(__stdcall*)(
+                uint32_t, const void*, uint64_t, uint32_t, uint32_t);
+            static PfnMapTilePageBatch s_map_batch = []() -> PfnMapTilePageBatch {
+                HMODULE hkx = ::GetModuleHandleW(L"kernelx.dll");
+                if (!hkx) hkx = ::LoadLibraryW(L"kernelx.dll");
+                return hkx ? reinterpret_cast<PfnMapTilePageBatch>(
+                                 ::GetProcAddress(hkx, "OpenScarlettMapTilePageBatch"))
+                           : nullptr;
+            }();
+            if (s_map_batch) {
+                hr = s_map_batch(BatchCount, pBatches, BaseVa, PageSizeOrFlags, Reserved);
+                static std::atomic<uint32_t> s_slot31_logs{0u};
+                const uint32_t log_idx = s_slot31_logs.fetch_add(1u, std::memory_order_relaxed);
+                if (log_idx < 4u || FAILED(hr)) {
+                    std::fprintf(
+                        stderr,
+                        "[OpenScarlett][d3d12_xs] Queue::UpdatePageMappingsBatchX_Slot31(#%u: batches=%u pool=0x%llX pages=%u flags=0x%X) -> hr=0x%08lX\n",
+                        log_idx,
+                        BatchCount,
+                        static_cast<unsigned long long>(BaseVa),
+                        PageSizeOrFlags,
+                        Reserved,
+                        static_cast<unsigned long>(hr));
+                    std::fflush(stderr);
+                }
+            }
+        }
         openscarlett::CallTelemetry::Global().Record(
             "d3d12_xs.dll", "ScarlettRetailCommandQueue::UpdatePageMappingsBatchX_Slot31",
-            openscarlett::CallOutcome::Ok, S_OK, 31);
-        return S_OK;
+            SUCCEEDED(hr) ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr, 31);
+        return hr;
     }
     // Slot 32 (+0x100): PresentX on Scarlett GRDK Version >= 0x20004 (kept stubbed on < 0x20004)
     virtual HRESULT STDMETHODCALLTYPE PresentX_Slot32(
@@ -2864,9 +2895,40 @@ public:
         void* pBaseAddress,
         UINT numPages,
         uint64_t* pOutHandle) {
-        (void)numPages;
         if (pOutHandle) {
             *pOutHandle = reinterpret_cast<uint64_t>(pBaseAddress);
+        }
+        // When a retail Scarlett title allocates a full-budget physical tile pool (e.g. 99,776 pages =
+        // 6,236 MiB on Anaconda) and decrements its soft eviction counter before async DirectStorage /
+        // GPU-fenced unmap batches drain, reserve 10,240 physical pages (640 MiB) of transient unmap
+        // slack in the soft eviction watermark so the physical free-list never hits 0x1FFFFF.
+        if (pOutHandle && numPages >= 65536u) {
+            const HMODULE main_exe = ::GetModuleHandleW(nullptr);
+            if (main_exe) {
+                const uintptr_t base = reinterpret_cast<uintptr_t>(main_exe);
+                if (reinterpret_cast<uintptr_t>(pOutHandle) == base + 0x71BFCC8u &&
+                    IsReadableRetailRange(base + 0x9C3E060u, sizeof(uint64_t)) &&
+                    IsReadableRetailRange(base + 0x98D26D8u, sizeof(uint64_t))) {
+                    auto* p_budget_cap = reinterpret_cast<uint64_t*>(base + 0x9C3E060u);
+                    const auto* p_budget_used = reinterpret_cast<const uint64_t*>(base + 0x98D26D8u);
+                    const uint64_t pool_bytes = static_cast<uint64_t>(numPages) << 16u;
+                    if (*p_budget_cap == pool_bytes && *p_budget_used == 0ull) {
+                        constexpr uint64_t kAsyncUnmapSlackPages = 10240ull;  // 640 MiB
+                        const uint64_t safe_cap =
+                            static_cast<uint64_t>(numPages - kAsyncUnmapSlackPages) << 16u;
+                        *p_budget_cap = safe_cap;
+                        std::fprintf(
+                            stderr,
+                            "[OpenScarlett][d3d12_xs] CreateTilePoolX_Slot74: pool=%p pages=%u (%.1f MiB), reserved %llu slack pages -> soft cap=%.1f MiB\n",
+                            pBaseAddress,
+                            numPages,
+                            static_cast<double>(pool_bytes) / (1024.0 * 1024.0),
+                            static_cast<unsigned long long>(kAsyncUnmapSlackPages),
+                            static_cast<double>(safe_cap) / (1024.0 * 1024.0));
+                        std::fflush(stderr);
+                    }
+                }
+            }
         }
         openscarlett::CallTelemetry::Global().Record(
             "d3d12_xs.dll", "ScarlettRetailDevice::CreateTilePoolX_Slot74",

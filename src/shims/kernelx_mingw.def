@@ -91,3 +91,6 @@ EXPORTS
     UmsThreadYield
     OpenScarlettUmsBindWorkerProc
     OpenScarlettUmsEnqueueCompletionItem
+    OpenScarlettTransferTitlePhysicalPages
+    OpenScarlettMapPhysicalPagesScatter
+    OpenScarlettMapTilePageBatch

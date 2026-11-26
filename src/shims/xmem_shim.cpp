@@ -484,69 +484,9 @@ int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemMapPhysicalPagesScatter(
         return 0;
     }
 
-    bool all_ok = true;
-    for (uint64_t i = 0u; i < count; ++i) {
-        void* va = addresses[i];
-        if (reinterpret_cast<uintptr_t>(va) < 0x10000ull) {
-            if (tokens != nullptr) {
-                for (uint64_t j = 0u; j < i; ++j) {
-                    (void)::XMemUnmapPhysicalPages(addresses[j], 1u);
-                }
-            }
-#if defined(_WIN32)
-            SetLastError(87u);
-#endif
-            all_ok = false;
-            break;
-        }
-        if (tokens != nullptr) {
-            if (tokens[i] == 0ull || tokens[i] == ~0ull || tokens[i] == 0xFFFFFFFFull) {
-                (void)::XMemUnmapPhysicalPages(va, 1u);
-                continue;
-            }
-            void* mapped = ::XMemMapPhysicalPages(
-                va,
-                1u,
-                0x10000000u /*MEM_GRAPHICS*/,
-                0x04u /*PAGE_READWRITE*/,
-                &tokens[i]);
-            if (!mapped) {
-                // On Xbox Scarlett, scatter mapping onto an already-mapped tile VA replaces it.
-                (void)::XMemUnmapPhysicalPages(va, 1u);
-                mapped = ::XMemMapPhysicalPages(
-                    va,
-                    1u,
-                    0x10000000u /*MEM_GRAPHICS*/,
-                    0x04u /*PAGE_READWRITE*/,
-                    &tokens[i]);
-            }
-            if (!mapped) {
-#if defined(_WIN32)
-                const DWORD err = ::GetLastError();
-                std::fprintf(stderr,
-                             "[OpenScarlett][xmem] XMemMapPhysicalPagesScatter FAIL i=%llu/%llu va=%p tok=0x%llX err=%lu\n",
-                             static_cast<unsigned long long>(i),
-                             static_cast<unsigned long long>(count),
-                             va,
-                             static_cast<unsigned long long>(tokens[i]),
-                             static_cast<unsigned long>(err));
-                std::fflush(stderr);
-#endif
-                for (uint64_t j = 0u; j < i; ++j) {
-                    (void)::XMemUnmapPhysicalPages(addresses[j], 1u);
-                }
-                all_ok = false;
-                break;
-            }
-        } else {
-            if (::XMemUnmapPhysicalPages(va, 1u) == 0) {
-                all_ok = false;
-            }
-        }
-    }
-
-    RecordOutcome("XMemMapPhysicalPagesScatter", all_ok);
-    return all_ok ? 1 : 0;
+    const int32_t ok = ::OpenScarlettMapPhysicalPagesScatter(addresses, count, tokens);
+    RecordOutcome("XMemMapPhysicalPagesScatter", ok != 0);
+    return ok;
 }
 
 int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemIsToolsMemAvailable(void) {
@@ -626,13 +566,34 @@ void RecordPotentialAliasWindow(void* ptr, size_t dwSize, uint32_t flProtect) no
 extern "C" __declspec(dllexport) uint64_t OPENSCARLETT_KERNELX_CALL
 OpenScarlett_XMemResolveCpuAliasVa(uint64_t va) {
     if (va == 0ull) return 0ull;
-    std::lock_guard<std::mutex> lk(AliasWindowMutex());
-    for (const auto& w : PairedAliasWindows()) {
-        if (va >= w.gpu_base && (va - w.gpu_base) < w.size) {
-            return w.cpu_base + (va - w.gpu_base);
+    uint64_t cpu_va = va;
+    bool in_gpu_window = false;
+    {
+        std::lock_guard<std::mutex> lk(AliasWindowMutex());
+        for (const auto& w : PairedAliasWindows()) {
+            if (va >= w.gpu_base && (va - w.gpu_base) < w.size) {
+                cpu_va = w.cpu_base + (va - w.gpu_base);
+                in_gpu_window = true;
+                break;
+            }
         }
     }
-    return va;
+#if defined(_WIN32)
+    if (in_gpu_window) {
+        // If CommandQueue::Slot31 mapped physical tile pages directly into the GPU window
+        // (e.g. GPU-only Case 2 tiles, or Case 0->4 tiles whose CPU view was later unmapped),
+        // prefer the live committed GPU-window view; otherwise fall back to the paired CPU view.
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (::VirtualQuery(reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(va)), &mbi, sizeof(mbi)) != 0u &&
+            mbi.State == MEM_COMMIT &&
+            (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0u &&
+            (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                            PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0u) {
+            return va;
+        }
+    }
+#endif
+    return cpu_va;
 }
 
 void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemVirtualAlloc(

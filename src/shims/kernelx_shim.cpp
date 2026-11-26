@@ -47,8 +47,10 @@
 #include <cstring>
 #include <cwchar>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -1371,6 +1373,7 @@ public:
                 if (pfn == 0ull) {
                     for (uint64_t j = 0; j < i; ++j) {
                         pfn_table_.erase(pPageArray[j]);
+                        free_pfns_.insert(pPageArray[j]);
                         pPageArray[j] = 0ull;
                     }
                     pools_.erase(phys.physical_id);
@@ -1433,6 +1436,7 @@ public:
                 auto it = pfn_table_.find(pfn);
                 const uint64_t phys_id = it->second.physical_id;
                 pfn_table_.erase(it);
+                free_pfns_.insert(pfn);
 
                 auto pit = pools_.find(phys_id);
                 if (pit != pools_.end()) {
@@ -1838,6 +1842,374 @@ public:
 
         SetHostLastError(87u);
         return 0;
+    }
+
+    int32_t MapPhysicalPagesScatter(void* const* addresses,
+                                    uint64_t count,
+                                    const uint64_t* tokens) {
+        if (!addresses || count == 0u || !UnifiedMemoryManager::SupportsOsPlaceholders()) {
+            SetHostLastError(87u);
+            return 0;
+        }
+        if (count > (GetTitleBudgetBytes() / kPage64KB) * 4ull) {
+            SetHostLastError(87u);
+            return 0;
+        }
+
+        // Deduplicate by 64 KiB page address (last write in batch wins, matching Scarlett &
+        // MIT-licensed R0Y00/Xbox2Windows local_apply_locked semantics).
+        std::map<uintptr_t, uint64_t> desired;
+        for (uint64_t i = 0u; i < count; ++i) {
+            const uintptr_t va = reinterpret_cast<uintptr_t>(addresses[i]);
+            if (va < 0x10000ull || (va & (kPage64KB - 1u)) != 0u) {
+                SetHostLastError(87u);
+                return 0;
+            }
+            const uint64_t tok =
+                (tokens != nullptr)
+                    ? ((tokens[i] == ~0ull || tokens[i] == 0xFFFFFFFFull) ? 0ull : tokens[i])
+                    : 0ull;
+            desired[va] = tok;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto unmap_slot_locked = [&](uintptr_t slot_va) -> bool {
+            auto ex_it = mappings_.find(slot_va);
+            if (ex_it == mappings_.end() || ex_it->second.owns_placeholder) {
+                return false;
+            }
+            if (ex_it->second.size_bytes != kPage64KB) {
+                return false;
+            }
+            for (void* ap : ex_it->second.alias_ptrs) {
+                (void)memory_.UnmapPhysicalAlias(ap);
+            }
+            for (uint64_t pfn : ex_it->second.pfns) {
+                auto pit = pfn_table_.find(pfn);
+                if (pit != pfn_table_.end() && pit->second.map_refcount > 0) {
+                    --pit->second.map_refcount;
+                }
+            }
+            mappings_.erase(ex_it);
+            return true;
+        };
+
+        auto map_slot_locked = [&](uintptr_t slot_va,
+                                   const PageFrameRecord& frame,
+                                   uint64_t pfn) -> bool {
+            void* slot = reinterpret_cast<void*>(slot_va);
+            const MemoryProtection prot = MemoryProtection::ReadWrite;
+            const uint32_t mem_flags = ToUnifiedFlags(MEM_GRAPHICS | frame.alloc_flags, PAGE_READWRITE);
+            const size_t phys_off = static_cast<size_t>(frame.page_index) * kPage64KB;
+            UnifiedMemoryAlias out_alias{};
+            Status st = memory_.MapPhysicalAlias(
+                frame.physical_id, phys_off, kPage64KB, prot, mem_flags, slot, out_alias);
+#if defined(_WIN32)
+            if (!st.ok()) {
+                (void)memory_.PromoteReservedRangeToPlaceholder(slot, kPage64KB);
+                st = memory_.MapPhysicalAlias(
+                    frame.physical_id, phys_off, kPage64KB, prot, mem_flags, slot, out_alias);
+            }
+            if (!st.ok()) {
+                void* sp_base = nullptr;
+                size_t sp_size = 0u;
+                size_t sp_granule = 0u;
+                bool sp_mapped = false;
+                if (memory_.LookupPlaceholderByHostPtr(slot, sp_base, sp_size, sp_granule, sp_mapped) &&
+                    sp_base != nullptr && !sp_mapped && sp_size > 0u) {
+                    (void)sp_granule;
+                    constexpr DWORD kMemCoalescePlaceholders = 0x00000001u;
+                    (void)VirtualFree(sp_base, sp_size, MEM_RELEASE | kMemCoalescePlaceholders);
+                    st = memory_.MapPhysicalAlias(
+                        frame.physical_id, phys_off, kPage64KB, prot, mem_flags, slot, out_alias);
+                }
+            }
+#endif
+            if (!st.ok()) {
+                return false;
+            }
+            ActiveTitleMapping page_map{};
+            page_map.base_va = slot_va;
+            page_map.size_bytes = kPage64KB;
+            page_map.page_size_bytes = kPage64KB;
+            page_map.primary_physical_id = frame.physical_id;
+            page_map.alloc_flags = MEM_GRAPHICS | frame.alloc_flags;
+            page_map.win32_protect = PAGE_READWRITE;
+            page_map.owns_placeholder = false;
+            page_map.pfns.push_back(pfn);
+            page_map.alias_ptrs.push_back(out_alias.host_ptr);
+            ++pfn_table_[pfn].map_refcount;
+            mappings_[slot_va] = std::move(page_map);
+            return true;
+        };
+
+        for (const auto& [slot_va, tok] : desired) {
+            if (tok == 0ull) {
+                (void)unmap_slot_locked(slot_va);
+                continue;
+            }
+            auto ex_it = mappings_.find(slot_va);
+            if (ex_it != mappings_.end() &&
+                ex_it->second.size_bytes == kPage64KB &&
+                ex_it->second.pfns.size() == 1u &&
+                ex_it->second.pfns[0] == tok) {
+                continue;  // Already mapped to the exact requested PFN!
+            }
+            auto pit = pfn_table_.find(tok);
+            if (pit == pfn_table_.end() || pit->second.page_size_bytes != kPage64KB) {
+                if (count == 1u) {
+                    SetHostLastError(87u);
+                    return 0;
+                }
+                static std::atomic<uint32_t> s_scatter_warn{0u};
+                const uint32_t wn = s_scatter_warn.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (wn <= 16u) {
+                    std::fprintf(
+                        stderr,
+                        "[OpenScarlett][kernelx] MapPhysicalPagesScatter skipped unowned tok=0x%llX at va=%p (batch=%llu)\n",
+                        static_cast<unsigned long long>(tok),
+                        reinterpret_cast<void*>(slot_va),
+                        static_cast<unsigned long long>(count));
+                    std::fflush(stderr);
+                }
+                (void)unmap_slot_locked(slot_va);
+                continue;
+            }
+            const PageFrameRecord frame = pit->second;
+            (void)unmap_slot_locked(slot_va);
+            if (!map_slot_locked(slot_va, frame, tok)) {
+                if (count == 1u) {
+                    SetHostLastError(487u);
+                    return 0;
+                }
+                static std::atomic<uint32_t> s_scatter_map_err{0u};
+                const uint32_t mn = s_scatter_map_err.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (mn <= 16u) {
+                    std::fprintf(
+                        stderr,
+                        "[OpenScarlett][kernelx] MapPhysicalPagesScatter alias FAIL tok=0x%llX at va=%p (batch=%llu)\n",
+                        static_cast<unsigned long long>(tok),
+                        reinterpret_cast<void*>(slot_va),
+                        static_cast<unsigned long long>(count));
+                    std::fflush(stderr);
+                }
+            }
+        }
+        SetHostLastError(0u);
+        return 1;
+    }
+
+    // Applies Scarlett D3D12X CommandQueue::Slot31 GPU tile page-mapping batches onto the GPU
+    // placeholder window (adapted with attribution from MIT-licensed R0Y00/Xbox2Windows X2WMapPageBatch).
+    int32_t MapTilePageBatch(uint32_t batchCount,
+                             const OPENSCARLETT_TILE_PAGE_BATCH* batches,
+                             uint64_t poolBaseVa,
+                             uint32_t poolPages,
+                             uint32_t flags) {
+        constexpr int32_t kHrBatchOk = 0;
+        constexpr int32_t kHrBatchInvalidArg = static_cast<int32_t>(0x80070057u);
+        constexpr int32_t kHrBatchPointer = static_cast<int32_t>(0x80004003u);
+        if (flags != 0u || (batchCount > 0u && !batches) ||
+            (poolPages > 0u && poolBaseVa == 0ull) ||
+            (poolBaseVa & (kPage64KB - 1u)) != 0ull) {
+            return kHrBatchInvalidArg;
+        }
+        if (batchCount == 0u || !UnifiedMemoryManager::SupportsOsPlaceholders()) {
+            return kHrBatchOk;
+        }
+#if defined(_WIN32)
+        auto is_readable = [](const void* p, size_t len) -> bool {
+            if (!p || len == 0u) return false;
+            uintptr_t cur = reinterpret_cast<uintptr_t>(p);
+            if (cur + len < cur) return false;
+            size_t rem = len;
+            while (rem > 0u) {
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi)) == 0u ||
+                    mbi.State != MEM_COMMIT ||
+                    (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0u) {
+                    return false;
+                }
+                const uintptr_t end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+                if (end <= cur) return false;
+                const size_t step = std::min(rem, static_cast<size_t>(end - cur));
+                cur += step;
+                rem -= step;
+            }
+            return true;
+        };
+        if (!is_readable(batches, static_cast<size_t>(batchCount) * sizeof(OPENSCARLETT_TILE_PAGE_BATCH))) {
+            return kHrBatchPointer;
+        }
+#endif
+        struct CapturedTileRange {
+            uintptr_t base_va = 0u;
+            OPENSCARLETT_TILE_PAGE_RANGE range{};
+        };
+        std::vector<CapturedTileRange> captured;
+        captured.reserve(static_cast<size_t>(batchCount) * 2u);
+        constexpr uint32_t kMaxTotalTilePages = 524288u;
+        uint32_t total_pages = 0u;
+        for (uint32_t b = 0u; b < batchCount; ++b) {
+            const OPENSCARLETT_TILE_PAGE_BATCH batch = batches[b];
+            if (batch.destination < 0x10000ull ||
+                (batch.destination & (kPage64KB - 1u)) != 0ull ||
+                batch.count == 0u || !batch.ranges ||
+                batch.count > kMaxTotalTilePages - total_pages) {
+                return kHrBatchInvalidArg;
+            }
+#if defined(_WIN32)
+            if (!is_readable(batch.ranges, static_cast<size_t>(batch.count) * sizeof(OPENSCARLETT_TILE_PAGE_RANGE))) {
+                return kHrBatchPointer;
+            }
+#endif
+            uintptr_t cur_va = static_cast<uintptr_t>(batch.destination);
+            for (uint32_t r = 0u; r < batch.count; ++r) {
+                const OPENSCARLETT_TILE_PAGE_RANGE rng = batch.ranges[r];
+                if (rng.count == 0u || rng.count > kMaxTotalTilePages - total_pages || rng.kind > 3u) {
+                    return kHrBatchInvalidArg;
+                }
+                if (rng.kind <= 1u && poolPages > 0u) {
+                    if (rng.start >= poolPages || (rng.kind == 0u && rng.count > poolPages - rng.start)) {
+                        return kHrBatchInvalidArg;
+                    }
+                }
+                const size_t bytes = static_cast<size_t>(rng.count) * kPage64KB;
+                if (cur_va + bytes < cur_va) {
+                    return kHrBatchInvalidArg;
+                }
+                captured.push_back({cur_va, rng});
+                total_pages += rng.count;
+                cur_va += bytes;
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        const uintptr_t pool_base = static_cast<uintptr_t>(poolBaseVa);
+        const auto pool_root_it = mappings_.find(pool_base);
+
+        auto lookup_pool_pfn_locked = [&](uint32_t page_idx) -> uint64_t {
+            if (pool_root_it != mappings_.end() &&
+                page_idx < pool_root_it->second.pfns.size()) {
+                return pool_root_it->second.pfns[page_idx];
+            }
+            const uintptr_t pva = pool_base + static_cast<size_t>(page_idx) * kPage64KB;
+            const auto pit = mappings_.find(pva);
+            if (pit != mappings_.end() && !pit->second.pfns.empty()) {
+                return pit->second.pfns[0];
+            }
+            return 0ull;
+        };
+
+        constexpr uint64_t kKeepTileSentinel = ~0ull;
+        std::map<uintptr_t, uint64_t> edits;
+        for (const auto& item : captured) {
+            for (uint32_t p = 0u; p < item.range.count; ++p) {
+                const uintptr_t dst_va = item.base_va + static_cast<size_t>(p) * kPage64KB;
+                if (item.range.kind == 3u) {
+                    edits.try_emplace(dst_va, kKeepTileSentinel);
+                } else if (item.range.kind == 2u) {
+                    edits[dst_va] = 0ull;
+                } else {
+                    const uint32_t pool_idx = item.range.start + ((item.range.kind == 0u) ? p : 0u);
+                    const uint64_t pfn = lookup_pool_pfn_locked(pool_idx);
+                    if (pfn != 0ull) {
+                        edits[dst_va] = pfn;
+                    }
+                }
+            }
+        }
+
+        for (const auto& [slot_va, want_pfn] : edits) {
+            if (want_pfn == kKeepTileSentinel) {
+                continue;
+            }
+            auto ex_it = mappings_.find(slot_va);
+            if (want_pfn == 0ull) {
+                if (ex_it != mappings_.end() && !ex_it->second.owns_placeholder &&
+                    ex_it->second.size_bytes == kPage64KB) {
+                    for (void* ap : ex_it->second.alias_ptrs) {
+                        (void)memory_.UnmapPhysicalAlias(ap);
+                    }
+                    for (uint64_t pfn : ex_it->second.pfns) {
+                        auto pit = pfn_table_.find(pfn);
+                        if (pit != pfn_table_.end() && pit->second.map_refcount > 0) {
+                            --pit->second.map_refcount;
+                        }
+                    }
+                    mappings_.erase(ex_it);
+                }
+                continue;
+            }
+            if (ex_it != mappings_.end() &&
+                ex_it->second.size_bytes == kPage64KB &&
+                ex_it->second.pfns.size() == 1u &&
+                ex_it->second.pfns[0] == want_pfn) {
+                continue;
+            }
+            auto pit = pfn_table_.find(want_pfn);
+            if (pit == pfn_table_.end() || pit->second.page_size_bytes != kPage64KB) {
+                continue;
+            }
+            const PageFrameRecord frame = pit->second;
+            if (ex_it != mappings_.end() && !ex_it->second.owns_placeholder &&
+                ex_it->second.size_bytes == kPage64KB) {
+                for (void* ap : ex_it->second.alias_ptrs) {
+                    (void)memory_.UnmapPhysicalAlias(ap);
+                }
+                for (uint64_t old_pfn : ex_it->second.pfns) {
+                    auto opit = pfn_table_.find(old_pfn);
+                    if (opit != pfn_table_.end() && opit->second.map_refcount > 0) {
+                        --opit->second.map_refcount;
+                    }
+                }
+                mappings_.erase(ex_it);
+            }
+            void* slot = reinterpret_cast<void*>(slot_va);
+            const MemoryProtection prot = MemoryProtection::ReadWrite;
+            const uint32_t mem_flags = ToUnifiedFlags(MEM_GRAPHICS | frame.alloc_flags, PAGE_READWRITE);
+            const size_t phys_off = static_cast<size_t>(frame.page_index) * kPage64KB;
+            UnifiedMemoryAlias out_alias{};
+            Status st = memory_.MapPhysicalAlias(
+                frame.physical_id, phys_off, kPage64KB, prot, mem_flags, slot, out_alias);
+#if defined(_WIN32)
+            if (!st.ok()) {
+                (void)memory_.PromoteReservedRangeToPlaceholder(slot, kPage64KB);
+                st = memory_.MapPhysicalAlias(
+                    frame.physical_id, phys_off, kPage64KB, prot, mem_flags, slot, out_alias);
+            }
+            if (!st.ok()) {
+                void* sp_base = nullptr;
+                size_t sp_size = 0u;
+                size_t sp_granule = 0u;
+                bool sp_mapped = false;
+                if (memory_.LookupPlaceholderByHostPtr(slot, sp_base, sp_size, sp_granule, sp_mapped) &&
+                    sp_base != nullptr && !sp_mapped && sp_size > 0u) {
+                    (void)sp_granule;
+                    constexpr DWORD kMemCoalescePlaceholders = 0x00000001u;
+                    (void)VirtualFree(sp_base, sp_size, MEM_RELEASE | kMemCoalescePlaceholders);
+                    st = memory_.MapPhysicalAlias(
+                        frame.physical_id, phys_off, kPage64KB, prot, mem_flags, slot, out_alias);
+                }
+            }
+#endif
+            if (st.ok()) {
+                ActiveTitleMapping page_map{};
+                page_map.base_va = slot_va;
+                page_map.size_bytes = kPage64KB;
+                page_map.page_size_bytes = kPage64KB;
+                page_map.primary_physical_id = frame.physical_id;
+                page_map.alloc_flags = MEM_GRAPHICS | frame.alloc_flags;
+                page_map.win32_protect = PAGE_READWRITE;
+                page_map.owns_placeholder = false;
+                page_map.pfns.push_back(want_pfn);
+                page_map.alias_ptrs.push_back(out_alias.host_ptr);
+                ++pfn_table_[want_pfn].map_refcount;
+                mappings_[slot_va] = std::move(page_map);
+            }
+        }
+        return kHrBatchOk;
     }
 
     int32_t QueryPhysicalPages(const void* virtualAddress,
@@ -3165,6 +3537,8 @@ public:
         aux_file_mapped_.clear();
 
         pfn_table_.clear();
+        free_pfns_.clear();
+        next_pfn_ = 0x10ull;
         pools_.clear();
     }
 
@@ -3175,6 +3549,15 @@ private:
         constexpr uint64_t kMinPfn = 0x10ull;
         constexpr uint64_t kPfnStep = 0x10ull;
         constexpr uint64_t kPfnLimit = 0x2000000ull;
+        while (!free_pfns_.empty()) {
+            const auto first_it = free_pfns_.begin();
+            const uint64_t reused = *first_it;
+            free_pfns_.erase(first_it);
+            if (reused >= kMinPfn && reused < kPfnLimit && (reused & 0xFull) == 0ull &&
+                pfn_table_.find(reused) == pfn_table_.end()) {
+                return reused;
+            }
+        }
         constexpr uint64_t kMaxSlots = (kPfnLimit - kMinPfn) / kPfnStep + 1ull;
         for (uint64_t attempt = 0; attempt < kMaxSlots; ++attempt) {
             if (next_pfn_ < kMinPfn || next_pfn_ >= kPfnLimit || (next_pfn_ & 0xFull) != 0ull) {
@@ -3196,6 +3579,7 @@ private:
     GpuTilePool tile_pool_;
     mutable std::mutex mutex_;
     uint64_t next_pfn_ = 0x10ull;
+    std::set<uint64_t> free_pfns_;
     std::atomic<uint64_t> app_committed_bytes_{0};
     std::atomic<uint64_t> xmem_allocated_bytes_{0};
     std::atomic<uint64_t> aux_allocated_bytes_{0};
@@ -3907,6 +4291,22 @@ int32_t OPENSCARLETT_KERNELX_CALL OpenScarlettTransferTitlePhysicalPages(const u
                                                                          void* hostBuffer) {
     return KernelXState::Instance().TransferPhysicalPagesDirect(
         pPageArray, numberOfPages, pageOffset, byteSize, isWrite, hostBuffer);
+}
+
+int32_t OPENSCARLETT_KERNELX_CALL OpenScarlettMapPhysicalPagesScatter(void* const* addresses,
+                                                                      uint64_t count,
+                                                                      const uint64_t* tokens) {
+    return KernelXState::Instance().MapPhysicalPagesScatter(addresses, count, tokens);
+}
+
+int32_t OPENSCARLETT_KERNELX_CALL OpenScarlettMapTilePageBatch(
+    uint32_t batchCount,
+    const OPENSCARLETT_TILE_PAGE_BATCH* batches,
+    uint64_t poolBaseVa,
+    uint32_t poolPages,
+    uint32_t flags) {
+    return KernelXState::Instance().MapTilePageBatch(
+        batchCount, batches, poolBaseVa, poolPages, flags);
 }
 
 void* OPENSCARLETT_KERNELX_CALL KernelXVirtualAllocFromApp(void* baseAddress,

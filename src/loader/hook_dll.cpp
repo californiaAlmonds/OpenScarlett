@@ -6036,8 +6036,28 @@ LONG CALLBACK Zen2IllegalInstructionVeh(PEXCEPTION_POINTERS ep) {
         }();
         {
             static std::atomic<uint32_t> s_int3_diag_cnt{0u};
+            static SRWLOCK s_seen_int3_lock = SRWLOCK_INIT;
+            static uintptr_t s_seen_int3_rips[32]{};
+            static uint32_t s_seen_int3_count = 0u;
             const uint32_t diag_n = s_int3_diag_cnt.fetch_add(1u, std::memory_order_relaxed);
-            if (diag_n < 16u) {
+            bool first_at_rip = false;
+            if (diag_n >= 16u) {
+                const uintptr_t cur_rip = static_cast<uintptr_t>(ctx->Rip);
+                ::AcquireSRWLockExclusive(&s_seen_int3_lock);
+                bool already_seen = false;
+                for (uint32_t si = 0u; si < s_seen_int3_count; ++si) {
+                    if (s_seen_int3_rips[si] == cur_rip) {
+                        already_seen = true;
+                        break;
+                    }
+                }
+                if (!already_seen && s_seen_int3_count < 32u) {
+                    s_seen_int3_rips[s_seen_int3_count++] = cur_rip;
+                    first_at_rip = true;
+                }
+                ::ReleaseSRWLockExclusive(&s_seen_int3_lock);
+            }
+            if (diag_n < 16u || first_at_rip) {
                 auto resolve_addr = [](uintptr_t addr, char* out_buf, size_t out_cap) {
                     HMODULE m = nullptr;
                     char mpath[MAX_PATH]{};
