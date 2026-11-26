@@ -9,6 +9,7 @@
 #  include <d3d12.h>
 #endif
 
+#include "openscarlett/gpu/d3d12_xs_abi.h"
 #include "os_check.h"
 
 namespace fs = std::filesystem;
@@ -283,6 +284,247 @@ void TestXMemTransferMemory() {
 
     OS_REQUIRE(FreeLibrary(mod) != FALSE);
 }
+
+#pragma section(".text")
+// Exact byte-pattern replicas of RAGE9 `LookupResourceVar` (+0x5429D30) and
+// `ResolveShaderTextureView` (+0x94E6F0) placed in `.text` of the main executable
+// so `d3d12_xs` retail VEH module-origin validation exercises the real code path:
+//
+// Lookup stub (offset 0x00, 58 bytes):
+//   0x00: 48 89 C8              mov rax, rcx
+//   0x03: 0F B7 09              movzx ecx, word ptr [rcx]   <-- Case D fault when rcx == 0
+//   0x06: 48 85 C9              test rcx, rcx
+//   0x09: 74 2B                 je +0x2B (0x36)
+//   0x0B..0x34: NOP padding
+//   0x35: C3                    ret
+//   0x36: 31 C0                 xor eax, eax                <-- Case D recovery target (rip + 0x33)
+//   0x38: EB FB                 jmp -5 (0x35)
+//
+// Resolve stub (offset 0x40, 44 bytes):
+//   0x40: 57                    push rdi
+//   0x41: 48 83 EC 40           sub rsp, 40h
+//   0x45: 48 8B 7A 28           mov rdi, qword ptr [rdx+28h]
+//   0x49: E8 B2 FF FF FF        call Lookup (0x00) with rcx = arg1 ([effect+0xC90], here nullptr -> rax=0)
+//   0x4E: 48 85 C0              test rax, rax
+//   0x51: 74 13                 je +0x13 (0x66 -> jumps back to 0x53!)
+//   0x53: F6 00 40              test byte ptr [rax], 40h    <-- Case C fault when rax == 0
+//   0x56: 75 21                 jne +0x21 (0x79)
+//   0x58: 48 89 F8              mov rax, rdi                <-- Case C recovery target (rip + 5)
+//   0x5B: 48 83 C4 40           add rsp, 40h
+//   0x5F: 5F                    pop rdi
+//   0x60: C3                    ret
+//   0x61..0x65: CC padding
+//   0x66: EB EB                 jmp 0x53 (replicates `+0x94E749: jmp +0x94E725` unchecked fallback!)
+//   0x68..0x79: C3 padding
+__declspec(allocate(".text")) alignas(16) const uint8_t kRetailShaderVarStub[128] = {
+    // 0x00: Lookup_5429D30 replica
+    0x48u, 0x89u, 0xC8u, 0x0Fu, 0xB7u, 0x09u, 0x48u, 0x85u,
+    0xC9u, 0x74u, 0x2Bu, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u,
+    0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u,
+    0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u,
+    0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u,
+    0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u,
+    0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0xC3u, 0x31u, 0xC0u,
+    0xEBu, 0xFBu, 0xCCu, 0xCCu, 0xCCu, 0xCCu, 0xCCu, 0xCCu,
+    // 0x40: Resolve_94E6F0 replica
+    0x57u, 0x48u, 0x83u, 0xECu, 0x40u, 0x48u, 0x8Bu, 0x7Au,
+    0x28u, 0xE8u, 0xB2u, 0xFFu, 0xFFu, 0xFFu, 0x48u, 0x85u,
+    0xC0u, 0x74u, 0x13u, 0xF6u, 0x00u, 0x40u, 0x75u, 0x21u,
+    0x48u, 0x89u, 0xF8u, 0x48u, 0x83u, 0xC4u, 0x40u, 0x5Fu,
+    0xC3u, 0xCCu, 0xCCu, 0xCCu, 0xCCu, 0xCCu, 0xEBu, 0xEBu,
+    0x31u, 0xC0u, 0x48u, 0x83u, 0xC4u, 0x40u, 0x5Fu, 0xC3u,
+    0xCCu, 0xCCu, 0xCCu, 0xCCu, 0xCCu, 0xCCu, 0xCCu, 0xCCu,
+    0xCCu, 0x31u, 0xC0u, 0x48u, 0x83u, 0xC4u, 0x40u, 0x5Fu
+};
+
+void TestRetailShaderVarNullBindingGuard() {
+    std::printf("[3/3] Retail Scarlett +0x94E725 / +0x5429D33 unbound shader texture var VEH guard...\n");
+
+    const fs::path dll_path = GetExeDir() / L"d3d12_xs.dll";
+    HMODULE mod = LoadLibraryW(dll_path.c_str());
+    OS_REQUIRE(mod != nullptr);
+
+    using PfnXboxCreateDevice = HRESULT(WINAPI*)(
+        IUnknown*, const D3D12XBOX_CREATE_DEVICE_PARAMETERS*, REFIID, void**);
+    auto create_fn = reinterpret_cast<PfnXboxCreateDevice>(GetProcAddress(mod, "D3D12XboxCreateDevice"));
+    OS_REQUIRE(create_fn != nullptr);
+
+    D3D12XBOX_CREATE_DEVICE_PARAMETERS params{};
+    params.Version = 0x00020000u;  // Activates retail Scarlett proxy & VEH recovery guards
+    params.GraphicsCommandQueueRingSizeBytes = 256u * 1024u;
+    params.GraphicsScratchMemorySizeBytes = 64u * 1024u;
+    params.ComputeScratchMemorySizeBytes = 64u * 1024u;
+
+    // Test across both default hardware adapter and WARP fallback
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass == 1) {
+            SetEnvironmentVariableA("OPENSCARLETT_D3D12_WARP", "1");
+        }
+        IUnknown* dev = nullptr;
+        const HRESULT hr = create_fn(nullptr, &params, __uuidof(ID3D12Device), reinterpret_cast<void**>(&dev));
+        if (pass == 1) {
+            SetEnvironmentVariableA("OPENSCARLETT_D3D12_WARP", nullptr);
+        }
+        OS_REQUIRE(SUCCEEDED(hr) && dev != nullptr);
+
+        struct FakeGrcTexture {
+            uint64_t pad[5]{};
+            uint64_t default_srv = 0xCAFEBABE12345678ull;  // +0x28
+        } fake_tex{};
+
+        using PfnLookupStub = const uint8_t*(__fastcall*)(const void* table, uint32_t var_hash);
+        using PfnResolveStub = uint64_t(__fastcall*)(const void* table, const FakeGrcTexture* tex, uint32_t var_hash);
+
+        auto lookup_fn = reinterpret_cast<PfnLookupStub>(&kRetailShaderVarStub[0x00]);
+        auto resolve_fn = reinterpret_cast<PfnResolveStub>(&kRetailShaderVarStub[0x40]);
+
+        // 1) Direct null-table call (+0x5429D33 Case D) returns nullptr cleanly
+        OS_REQUIRE(lookup_fn(nullptr, 0x84C69350u) == nullptr);
+
+        // 2) Full fallback miss (+0x94E725 Case C) returns `fake_tex.default_srv` (`rdi`) cleanly
+        const uint64_t resolved_srv = resolve_fn(nullptr, &fake_tex, 0x84C69350u);
+        OS_REQUIRE(resolved_srv == 0xCAFEBABE12345678ull);
+
+        // 3) Empty non-null table (`count == 0`) also misses and recovers via Case C cleanly
+        const uint64_t empty_table[2] = {0ull, 0ull};
+        OS_REQUIRE(resolve_fn(empty_table, &fake_tex, 0x84C69350u) == 0xCAFEBABE12345678ull);
+
+        dev->Release();
+    }
+
+    OS_REQUIRE(FreeLibrary(mod) != FALSE);
+}
+// Replica of RAGE9 lock-free descriptor pool pop (`+0x55AC251..+0x55AC2A7`):
+//   0x00: 56 57 53              push rsi; push rdi; push rbx
+//   0x03: 45 31 C0              xor r8d, r8d
+//   0x06: 41 BB FF FF FF FF     mov r11d, 0FFFFFFFFh
+//   0x0C: 48 BE 00..FF          mov rsi, 0FFFFFFFF00000000h
+//   0x16: 49 89 D2              mov r10, rdx  (stride)
+//   0x19: 4D 89 C1              mov r9, r8_in -> passed via r9 (pool_base)
+//   0x19: 48 8B 15 30 00 00 00  mov rdx, qword ptr [rip+0x30] -> g_test_desc_pool_head at +0x50
+//   0x20: 89 D7                 mov edi, edx
+//   0x22: 4C 39 DF              cmp rdi, r11
+//   0x25: 74 2B                 je +0x2B (0x52)
+//   0x27: 49 0F AF FA           imul rdi, r10
+//   0x2B: 48 89 D3              mov rbx, rdx
+//   0x2E: 48 21 F3              and rbx, rsi
+//   0x31: 42 8B 04 0F           mov eax, dword ptr [rdi+r9]   <-- faulting rip
+//   0x35: 48 09 C3              or rbx, rax
+//   0x38: 48 89 D0              mov rax, rdx
+//   0x3B: F0 48 0F B1 1D 19 00 00 00  lock cmpxchg qword ptr [rip+0x19], rbx -> +0x5D? Let's place RW head via page!
+// Note: `.text` is RX, whereas `head_va` must be RW! So we allocate a 64 KiB RW+RX two-page block via VirtualAlloc
+// in `TestRetailDescPoolVehGuard` so `rip+disp32` points directly to a writable `uint64_t` global just like `.data`.
+void TestRetailDescPoolVehGuard() {
+    std::printf("[4/4] Retail Scarlett +0x55AC280 descriptor pool corrupted free-list VEH guard...\n");
+
+    const fs::path dll_path = GetExeDir() / L"d3d12_xs.dll";
+    HMODULE mod = LoadLibraryW(dll_path.c_str());
+    OS_REQUIRE(mod != nullptr);
+
+    using PfnXboxCreateDevice = HRESULT(WINAPI*)(
+        IUnknown*, const D3D12XBOX_CREATE_DEVICE_PARAMETERS*, REFIID, void**);
+    auto create_fn = reinterpret_cast<PfnXboxCreateDevice>(GetProcAddress(mod, "D3D12XboxCreateDevice"));
+    OS_REQUIRE(create_fn != nullptr);
+
+    D3D12XBOX_CREATE_DEVICE_PARAMETERS params{};
+    params.Version = 0x00020000u;
+    params.GraphicsCommandQueueRingSizeBytes = 256u * 1024u;
+    params.GraphicsScratchMemorySizeBytes = 64u * 1024u;
+    params.ComputeScratchMemorySizeBytes = 64u * 1024u;
+
+    uint8_t* region = static_cast<uint8_t*>(
+        VirtualAlloc(nullptr, 0x2000u, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    OS_REQUIRE(region != nullptr);
+
+    // Page 0 (0x0000..0x0FFF): executable Pop stub
+    // Page 1 (0x1000..0x1FFF): writable `.data` globals:
+    //   +0x1000: uint64_t stride = 32
+    //   +0x1008: uint64_t pool_base = reinterpret_cast<uint64_t>(region + 0x1100)
+    //   +0x1010: uint64_t free_head
+    static constexpr uint8_t kPopTemplate[] = {
+        0x56u, 0x57u, 0x53u,                                            // 0x00: push rsi; push rdi; push rbx
+        0x4Cu, 0x8Bu, 0x15u, 0xF3u, 0x0Fu, 0x00u, 0x00u,                // 0x03: mov r10, [rip+0xFF3] -> +0x1000 (stride)
+        0x4Cu, 0x8Bu, 0x0Du, 0xF4u, 0x0Fu, 0x00u, 0x00u,                // 0x0A: mov r9,  [rip+0xFF4] -> +0x1008 (pool_base)
+        0x45u, 0x31u, 0xC0u,                                            // 0x11: xor r8d, r8d
+        0x41u, 0xBBu, 0xFFu, 0xFFu, 0xFFu, 0xFFu,                      // 0x14: mov r11d, 0FFFFFFFFh
+        0x48u, 0xBEu, 0x00u, 0x00u, 0x00u, 0x00u, 0xFFu, 0xFFu, 0xFFu, 0xFFu, // 0x1A: mov rsi, 0xFFFFFFFF00000000
+        0x48u, 0x8Bu, 0x15u, 0xDFu, 0x0Fu, 0x00u, 0x00u,                // 0x24: mov rdx, [rip+0xFDF] -> +0x100A? Fix disp below!
+        0x89u, 0xD7u,                                                   // 0x2B: mov edi, edx
+        0x4Cu, 0x39u, 0xDFu,                                            // 0x2D: cmp rdi, r11
+        0x74u, 0x2Bu,                                                   // 0x30: je +0x2B (0x5D)
+        0x49u, 0x0Fu, 0xAFu, 0xFAu,                                     // 0x32: imul rdi, r10
+        0x48u, 0x89u, 0xD3u,                                            // 0x36: mov rbx, rdx
+        0x48u, 0x21u, 0xF3u,                                            // 0x39: and rbx, rsi
+        0x42u, 0x8Bu, 0x04u, 0x0Fu,                                     // 0x3C: mov eax, [rdi+r9]  <-- faulting rip
+        0x48u, 0x09u, 0xC3u,                                            // 0x40: or rbx, rax
+        0x48u, 0x89u, 0xD0u,                                            // 0x43: mov rax, rdx
+        0xF0u, 0x48u, 0x0Fu, 0xB1u, 0x1Du, 0xBFu, 0x0Fu, 0x00u, 0x00u, // 0x46: lock cmpxchg [rip+disp], rbx
+        0x48u, 0x39u, 0xC2u,                                            // 0x4F: cmp rdx, rax
+        0x48u, 0x89u, 0xC2u,                                            // 0x52: mov rdx, rax
+        0x75u, 0xD4u,                                                   // 0x55: jne 0x2B
+        0x4Cu, 0x01u, 0xCFu,                                            // 0x57: add rdi, r9
+        0x49u, 0x89u, 0xF8u,                                            // 0x5A: mov r8, rdi
+        0x4Cu, 0x89u, 0x01u,                                            // 0x5D: mov [rcx], r8  (0x3C + 0x21 = 0x5D!)
+        0x5Bu, 0x5Fu, 0x5Eu, 0xC3u                                      // 0x60: pop rbx; pop rdi; pop rsi; ret
+    };
+    std::memcpy(region, kPopTemplate, sizeof(kPopTemplate));
+    // Patch exact RIP-relative displacements to +0x1000, +0x1008, +0x1010:
+    const int32_t d_stride = 0x1000 - 0x0A;
+    const int32_t d_base   = 0x1008 - 0x11;
+    const int32_t d_head1  = 0x1010 - 0x2B;
+    const int32_t d_head2  = 0x1010 - 0x4F;
+    std::memcpy(region + 0x06, &d_stride, 4);
+    std::memcpy(region + 0x0D, &d_base,   4);
+    std::memcpy(region + 0x27, &d_head1,  4);
+    std::memcpy(region + 0x4B, &d_head2,  4);
+
+    DWORD old_prot = 0;
+    OS_REQUIRE(VirtualProtect(region, 0x1000u, PAGE_EXECUTE_READ, &old_prot) != FALSE);
+    FlushInstructionCache(GetCurrentProcess(), region, 0x1000u);
+
+    auto* p_stride = reinterpret_cast<uint64_t*>(region + 0x1000);
+    auto* p_base   = reinterpret_cast<uint64_t*>(region + 0x1008);
+    auto* p_head   = reinterpret_cast<volatile uint64_t*>(region + 0x1010);
+    uint8_t* slots = region + 0x1100;
+    *p_stride = 32ull;
+    *p_base   = reinterpret_cast<uint64_t>(slots);
+
+    using PfnPop = void(__fastcall*)(uint64_t* out_va);
+    auto pop_fn = reinterpret_cast<PfnPop>(region);
+
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass == 1) {
+            SetEnvironmentVariableA("OPENSCARLETT_D3D12_WARP", "1");
+        }
+        IUnknown* dev = nullptr;
+        const HRESULT hr = create_fn(nullptr, &params, __uuidof(ID3D12Device), reinterpret_cast<void**>(&dev));
+        if (pass == 1) {
+            SetEnvironmentVariableA("OPENSCARLETT_D3D12_WARP", nullptr);
+        }
+        OS_REQUIRE(SUCCEEDED(hr) && dev != nullptr);
+
+        // 1) Valid slot 0 -> 0xFFFFFFFF pops cleanly
+        *reinterpret_cast<uint32_t*>(slots) = 0xFFFFFFFFu;
+        *p_head = 0x0000000500000000ull;
+        uint64_t out_va = 0ull;
+        pop_fn(&out_va);
+        OS_REQUIRE(out_va == reinterpret_cast<uint64_t>(slots));
+        OS_REQUIRE(*p_head == 0x00000005FFFFFFFFull);
+
+        // 2) Corrupted head (0x2E576014920F -> +48 GiB unmapped VA) recovers cleanly via VEH,
+        //    seals *p_head to 0x2E58FFFFFFFF, and writes out_va = 0!
+        *p_head = 0x00002E576014920Full;
+        out_va = 0xDEADDEADDEADDEADull;
+        pop_fn(&out_va);
+        OS_REQUIRE(out_va == 0ull);
+        OS_REQUIRE(*p_head == 0x00002E58FFFFFFFFull);
+
+        dev->Release();
+    }
+
+    OS_REQUIRE(VirtualFree(region, 0, MEM_RELEASE) != FALSE);
+    OS_REQUIRE(FreeLibrary(mod) != FALSE);
+}
 #endif
 
 }  // namespace
@@ -291,6 +533,8 @@ int main() {
 #if defined(_WIN32)
     TestD3D12XsGuidExports();
     TestXMemTransferMemory();
+    TestRetailShaderVarNullBindingGuard();
+    TestRetailDescPoolVehGuard();
     std::printf("ALL test_mine_d3d12_xmem checks PASSED.\n");
     return 0;
 #else

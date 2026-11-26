@@ -6205,6 +6205,25 @@ LONG CALLBACK Zen2IllegalInstructionVeh(PEXCEPTION_POINTERS ep) {
                             ctx->Rip = reinterpret_cast<uintptr_t>(p - 7);
                             return EXCEPTION_CONTINUE_EXECUTION;
                         }
+                        // Lock-free PRT / streamed mipmap slot allocator empty-head trap (+0x55CC218:
+                        // `CC EB 84` inside `AllocPrtSlot`, where `rax == 0` means free-list head index == 0).
+                        // Stepping +1 (`jmp +0x55CC19F`) with `rax == 0` corrupts sentinel slot 0; instead,
+                        // yield briefly and rewind to `+0x55CC180` (`p - 0x98`) so concurrent eviction can free
+                        // a valid non-zero slot.
+                        if (reinterpret_cast<uintptr_t>(p) >=
+                                reinterpret_cast<uintptr_t>(mbi.BaseAddress) + 0x98u &&
+                            reinterpret_cast<uintptr_t>(p) + 3u < reg_end &&
+                            p[1] == 0xEBu && p[2] == 0x84u && p[-19] == 0xC3u &&
+                            p[-0x98] == 0x48u && p[-0x97] == 0x8Bu && p[-0x96] == 0x05u &&
+                            ctx->Rax == 0ull && ctx->R9 == 0xFFFFFFFFull) {
+                            thread_local uint32_t s_prt_spin = 0u;
+                            if (++s_prt_spin <= 512u) {
+                                ::SwitchToThread();
+                                ctx->Rip = reinterpret_cast<uintptr_t>(p) - 0x98u;
+                                return EXCEPTION_CONTINUE_EXECUTION;
+                            }
+                            s_prt_spin = 0u;
+                        }
                         allow_continue = true;
                     }
                 }
@@ -7368,6 +7387,254 @@ void PatchAllLoadedNonSystemModules() {
     }
 }
 
+struct RetailDescPoolConfig {
+    const char* name;
+    uint32_t pop_rva;
+    uint32_t push_rva;
+    uint32_t heap_rva;
+    uint32_t base_rva;
+    uint32_t head_rva;
+    uint8_t expected_pop[24];
+    uint8_t expected_push[24];
+};
+
+static constexpr RetailDescPoolConfig kRetailDescPools[3] = {
+    {
+        "CBV_SRV_UAV",
+        0x55AC240u,
+        0x4FB0580u,
+        0x75E74E0u,
+        0x75E74E8u,
+        0x75E74F0u,
+        {0x56u, 0x57u, 0x53u, 0x48u, 0x8Bu, 0x05u, 0x96u, 0xB2u, 0x03u, 0x02u, 0x4Cu, 0x8Bu,
+         0x0Du, 0x97u, 0xB2u, 0x03u, 0x02u, 0x45u, 0x31u, 0xC0u, 0x41u, 0xBBu, 0xFFu, 0xFFu},
+        {0x48u, 0x89u, 0xC8u, 0x48u, 0x2Bu, 0x05u, 0x5Eu, 0x6Fu, 0x63u, 0x02u, 0x4Cu, 0x8Bu,
+         0x05u, 0x4Fu, 0x6Fu, 0x63u, 0x02u, 0x31u, 0xD2u, 0x49u, 0xB9u, 0x00u, 0x00u, 0x00u},
+    },
+    {
+        "RTV",
+        0x2474350u,
+        0x047C960u,
+        0x75E7510u,
+        0x75E7518u,
+        0x75E7520u,
+        {0x56u, 0x57u, 0x53u, 0x48u, 0x8Bu, 0x05u, 0xB6u, 0x31u, 0x17u, 0x05u, 0x4Cu, 0x8Bu,
+         0x0Du, 0xB7u, 0x31u, 0x17u, 0x05u, 0x45u, 0x31u, 0xC0u, 0x41u, 0xBBu, 0xFFu, 0xFFu},
+        {0x48u, 0x89u, 0xC8u, 0x48u, 0x2Bu, 0x05u, 0xAEu, 0xABu, 0x16u, 0x07u, 0x4Cu, 0x8Bu,
+         0x05u, 0x9Fu, 0xABu, 0x16u, 0x07u, 0x31u, 0xD2u, 0x49u, 0xB9u, 0x00u, 0x00u, 0x00u},
+    },
+    {
+        "DSV",
+        0x24743C0u,
+        0x56C2F20u,
+        0x75E7528u,
+        0x75E7530u,
+        0x75E7538u,
+        {0x56u, 0x57u, 0x53u, 0x48u, 0x8Bu, 0x05u, 0x5Eu, 0x31u, 0x17u, 0x05u, 0x4Cu, 0x8Bu,
+         0x0Du, 0x5Fu, 0x31u, 0x17u, 0x05u, 0x45u, 0x31u, 0xC0u, 0x41u, 0xBBu, 0xFFu, 0xFFu},
+        {0x48u, 0x89u, 0xC8u, 0x48u, 0x2Bu, 0x05u, 0x06u, 0x46u, 0xF2u, 0x01u, 0x4Cu, 0x8Bu,
+         0x05u, 0xF7u, 0x45u, 0xF2u, 0x01u, 0x31u, 0xD2u, 0x49u, 0xB9u, 0x00u, 0x00u, 0x00u},
+    },
+};
+
+struct SafeDescPoolState {
+    SRWLOCK lock = SRWLOCK_INIT;
+    uintptr_t pool_base = 0u;
+    uint64_t stride = 0u;
+    uint32_t capacity = 0u;
+    uint32_t ring_head = 0u;
+    uint32_t ring_tail = 0u;
+    uint32_t ring_count = 0u;
+    uint64_t aba_seq = 1ull;
+    uint32_t double_frees = 0u;
+    uint32_t oob_frees = 0u;
+    std::vector<uint8_t> allocated;
+    std::vector<uint32_t> free_ring;
+};
+
+static uintptr_t g_safe_desc_exe_base = 0u;
+static SafeDescPoolState g_safe_desc_pools[3]{};
+
+bool EnsureSafeDescPoolInitLocked(size_t idx) noexcept {
+    SafeDescPoolState& st = g_safe_desc_pools[idx];
+    const RetailDescPoolConfig& cfg = kRetailDescPools[idx];
+    const uintptr_t exe_base = g_safe_desc_exe_base;
+    if (exe_base == 0u) {
+        return false;
+    }
+    const uintptr_t heap_obj = *reinterpret_cast<const volatile uintptr_t*>(exe_base + cfg.heap_rva);
+    const uintptr_t cur_base = *reinterpret_cast<const volatile uintptr_t*>(exe_base + cfg.base_rva);
+    if (heap_obj < 0x10000u || cur_base < 0x10000u) {
+        return false;
+    }
+    if (st.pool_base == cur_base && st.capacity > 0u) {
+        return true;
+    }
+    const uint64_t stride = *reinterpret_cast<const uint64_t*>(heap_obj + 0x30u);
+    if (stride < 4ull || stride > 4096ull) {
+        return false;
+    }
+    uint32_t cap = 0u;
+    constexpr uint32_t kMaxCap = 4u * 1024u * 1024u;
+    while (cap < kMaxCap) {
+        const uintptr_t slot_va = cur_base + static_cast<size_t>(cap) * static_cast<size_t>(stride);
+        const uint32_t link = *reinterpret_cast<const uint32_t*>(slot_va);
+        ++cap;
+        if (link == 0xFFFFFFFFu || link != cap) {
+            break;
+        }
+    }
+    if (cap == 0u) {
+        return false;
+    }
+    st.pool_base = cur_base;
+    st.stride = stride;
+    st.capacity = cap;
+    st.ring_head = 0u;
+    st.ring_tail = 0u;
+    st.ring_count = cap;
+    st.allocated.assign(cap, 0u);
+    st.free_ring.resize(cap);
+    for (uint32_t i = 0u; i < cap; ++i) {
+        st.free_ring[i] = i;
+    }
+    std::fprintf(
+        stderr,
+        "[OpenScarlett][loader] Initialized out-of-band D3D12 descriptor pool '%s' (base=0x%llX stride=%llu cap=%u)\n",
+        cfg.name,
+        static_cast<unsigned long long>(cur_base),
+        static_cast<unsigned long long>(stride),
+        cap);
+    std::fflush(stderr);
+    return true;
+}
+
+template <size_t Idx>
+uint64_t SafeDescPoolPop(uint64_t* out_va) noexcept {
+    SafeDescPoolState& st = g_safe_desc_pools[Idx];
+    const RetailDescPoolConfig& cfg = kRetailDescPools[Idx];
+    uint64_t result_va = 0ull;
+    ::AcquireSRWLockExclusive(&st.lock);
+    if (EnsureSafeDescPoolInitLocked(Idx) && st.ring_count > 0u) {
+        const uint32_t slot = st.free_ring[st.ring_head];
+        st.ring_head = (st.ring_head + 1u == st.capacity) ? 0u : (st.ring_head + 1u);
+        --st.ring_count;
+        st.allocated[slot] = 1u;
+        result_va = static_cast<uint64_t>(st.pool_base) + static_cast<uint64_t>(slot) * st.stride;
+        const uint32_t next_head = (st.ring_count > 0u) ? st.free_ring[st.ring_head] : 0xFFFFFFFFu;
+        *reinterpret_cast<volatile uint64_t*>(g_safe_desc_exe_base + cfg.head_rva) =
+            (st.aba_seq << 32u) | static_cast<uint64_t>(next_head);
+    }
+    ::ReleaseSRWLockExclusive(&st.lock);
+    if (out_va != nullptr) {
+        *out_va = result_va;
+    }
+    return result_va;
+}
+
+template <size_t Idx>
+void SafeDescPoolPush(uint64_t desc_va) noexcept {
+    if (desc_va == 0ull) {
+        return;
+    }
+    SafeDescPoolState& st = g_safe_desc_pools[Idx];
+    const RetailDescPoolConfig& cfg = kRetailDescPools[Idx];
+    ::AcquireSRWLockExclusive(&st.lock);
+    if (EnsureSafeDescPoolInitLocked(Idx) && st.capacity > 0u && st.stride > 0u) {
+        const uint64_t base = static_cast<uint64_t>(st.pool_base);
+        const uint64_t pool_bytes = static_cast<uint64_t>(st.capacity) * st.stride;
+        if (desc_va < base || (desc_va - base) >= pool_bytes || ((desc_va - base) % st.stride) != 0ull) {
+            const uint32_t n = ++st.oob_frees;
+            if (n <= 8u) {
+                std::fprintf(
+                    stderr,
+                    "[OpenScarlett][DESC-POOL] Guarded out-of-range free on '%s' #%u (va=0x%llX base=0x%llX bytes=0x%llX)\n",
+                    cfg.name,
+                    n,
+                    static_cast<unsigned long long>(desc_va),
+                    static_cast<unsigned long long>(base),
+                    static_cast<unsigned long long>(pool_bytes));
+                std::fflush(stderr);
+            }
+        } else {
+            const uint32_t slot = static_cast<uint32_t>((desc_va - base) / st.stride);
+            if (st.allocated[slot] == 0u) {
+                const uint32_t n = ++st.double_frees;
+                if (n <= 8u) {
+                    std::fprintf(
+                        stderr,
+                        "[OpenScarlett][DESC-POOL] Guarded double-free on '%s' #%u (va=0x%llX slot=%u)\n",
+                        cfg.name,
+                        n,
+                        static_cast<unsigned long long>(desc_va),
+                        slot);
+                    std::fflush(stderr);
+                }
+            } else {
+                st.allocated[slot] = 0u;
+                st.free_ring[st.ring_tail] = slot;
+                st.ring_tail = (st.ring_tail + 1u == st.capacity) ? 0u : (st.ring_tail + 1u);
+                ++st.ring_count;
+                ++st.aba_seq;
+                *reinterpret_cast<volatile uint64_t*>(g_safe_desc_exe_base + cfg.head_rva) =
+                    (st.aba_seq << 32u) | static_cast<uint64_t>(st.free_ring[st.ring_head]);
+            }
+        }
+    }
+    ::ReleaseSRWLockExclusive(&st.lock);
+}
+
+void InstallRetailSafeDescPools(HMODULE main_exe) noexcept {
+    if (!main_exe) {
+        return;
+    }
+    const uintptr_t exe_base = reinterpret_cast<uintptr_t>(main_exe);
+    auto verify_site = [&](uint32_t rva, const uint8_t (&expected)[24]) noexcept -> bool {
+        const uintptr_t site = exe_base + rva;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (::VirtualQuery(reinterpret_cast<const void*>(site), &mbi, sizeof(mbi)) == 0u ||
+            mbi.State != MEM_COMMIT ||
+            !IsReadableCodePageProtect(mbi.Protect) ||
+            site + sizeof(expected) > reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize) {
+            return false;
+        }
+        return std::memcmp(reinterpret_cast<const void*>(site), expected, sizeof(expected)) == 0;
+    };
+    for (const auto& cfg : kRetailDescPools) {
+        if (!verify_site(cfg.pop_rva, cfg.expected_pop) || !verify_site(cfg.push_rva, cfg.expected_push)) {
+            return;
+        }
+    }
+    g_safe_desc_exe_base = exe_base;
+    auto write_jmp14 = [&](uint32_t rva, const void* detour_target) noexcept -> bool {
+        uint8_t patch[14] = {0xFFu, 0x25u, 0x00u, 0x00u, 0x00u, 0x00u};
+        const uint64_t addr = reinterpret_cast<uint64_t>(detour_target);
+        std::memcpy(patch + 6, &addr, sizeof(addr));
+        auto* dst = reinterpret_cast<uint8_t*>(exe_base + rva);
+        DWORD old_prot = 0u;
+        if (!::VirtualProtect(dst, sizeof(patch), PAGE_EXECUTE_READWRITE, &old_prot)) {
+            return false;
+        }
+        std::memcpy(dst, patch, sizeof(patch));
+        DWORD dummy = 0u;
+        ::VirtualProtect(dst, sizeof(patch), old_prot, &dummy);
+        ::FlushInstructionCache(::GetCurrentProcess(), dst, sizeof(patch));
+        return true;
+    };
+    const bool ok0 = write_jmp14(kRetailDescPools[0].pop_rva, reinterpret_cast<const void*>(&SafeDescPoolPop<0>)) &&
+                     write_jmp14(kRetailDescPools[0].push_rva, reinterpret_cast<const void*>(&SafeDescPoolPush<0>));
+    const bool ok1 = write_jmp14(kRetailDescPools[1].pop_rva, reinterpret_cast<const void*>(&SafeDescPoolPop<1>)) &&
+                     write_jmp14(kRetailDescPools[1].push_rva, reinterpret_cast<const void*>(&SafeDescPoolPush<1>));
+    const bool ok2 = write_jmp14(kRetailDescPools[2].pop_rva, reinterpret_cast<const void*>(&SafeDescPoolPop<2>)) &&
+                     write_jmp14(kRetailDescPools[2].push_rva, reinterpret_cast<const void*>(&SafeDescPoolPush<2>));
+    if (ok0 && ok1 && ok2) {
+        std::fprintf(
+            stderr,
+            "[OpenScarlett][loader] Installed out-of-band FIFO D3D12 descriptor pools (CBV_SRV_UAV/RTV/DSV)\n");
+        std::fflush(stderr);
+    }
+}
+
 bool InitializeHookRuntime(HMODULE self_mod) {
     g_self_module = self_mod;
 
@@ -7661,6 +7928,45 @@ bool InitializeHookRuntime(HMODULE self_mod) {
     }
 
     PatchAllLoadedNonSystemModules();
+
+    // Expand RAGE9 Scarlett PRT / streamed mipmap `uint16_t` slot pool (`+0x1D4B850 -> +0x3BDDCA0`)
+    // from `0x1000 + strIndexCap` to `0xFFF0` (65,520 slots = 1.00 MiB, the maximum 16-wide AVX2
+    // `uint16_t` capacity) before the guest entry point runs, preventing PRT free-list exhaustion
+    // (`+0x55CC218` INT3 / slot-0 aliasing) during 7+ GiB open-world texture streaming on 4 GB GPUs.
+    if (HMODULE main_exe = g_real_GetModuleHandleW ? g_real_GetModuleHandleW(nullptr) : ::GetModuleHandleW(nullptr)) {
+        const uintptr_t prt_site = reinterpret_cast<uintptr_t>(main_exe) + 0x1D4B849u;
+        MEMORY_BASIC_INFORMATION pmbi{};
+        if (::VirtualQuery(reinterpret_cast<const void*>(prt_site), &pmbi, sizeof(pmbi)) != 0u &&
+            pmbi.State == MEM_COMMIT &&
+            IsReadableCodePageProtect(pmbi.Protect) &&
+            prt_site + 24u <= reinterpret_cast<uintptr_t>(pmbi.BaseAddress) + pmbi.RegionSize) {
+            static constexpr uint8_t kExpectedPrtInit[24] = {
+                0x48u, 0x8Bu, 0x05u, 0x50u, 0x6Eu, 0xB8u, 0x07u,  // mov rax, [rip+0x7B86E50]
+                0xB9u, 0x00u, 0x10u, 0x00u, 0x00u,                // mov ecx, 0x1000
+                0x03u, 0x48u, 0x0Cu,                              // add ecx, [rax+0Ch]
+                0x48u, 0x83u, 0xC4u, 0x28u,                      // add rsp, 28h
+                0xE9u, 0x3Fu, 0x24u, 0xE9u, 0x01u                 // jmp +0x3BDDCA0
+            };
+            static constexpr uint8_t kExpandedPrtImm[8] = {
+                0xB9u, 0xF0u, 0xFFu, 0x00u, 0x00u,                // mov ecx, 0xFFF0 (65,520 slots)
+                0x90u, 0x90u, 0x90u                               // nop x3
+            };
+            auto* patch_ptr = reinterpret_cast<uint8_t*>(prt_site + 7u);
+            if (std::memcmp(reinterpret_cast<const void*>(prt_site), kExpectedPrtInit, sizeof(kExpectedPrtInit)) == 0) {
+                DWORD old_prot = 0u;
+                if (::VirtualProtect(patch_ptr, sizeof(kExpandedPrtImm), PAGE_EXECUTE_READWRITE, &old_prot)) {
+                    std::memcpy(patch_ptr, kExpandedPrtImm, sizeof(kExpandedPrtImm));
+                    DWORD dummy = 0u;
+                    ::VirtualProtect(patch_ptr, sizeof(kExpandedPrtImm), old_prot, &dummy);
+                    ::FlushInstructionCache(::GetCurrentProcess(), patch_ptr, sizeof(kExpandedPrtImm));
+                    std::fprintf(stderr, "[OpenScarlett][loader] Expanded Scarlett PRT texture slot pool capacity to 65520 (+0x1D4B850)\n");
+                    std::fflush(stderr);
+                }
+            }
+        }
+        InstallRetailSafeDescPools(main_exe);
+    }
+
     g_initialized.store(true, std::memory_order_release);
     FlushTelemetryInternal(false);
     return true;

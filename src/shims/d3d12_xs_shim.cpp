@@ -4499,6 +4499,65 @@ HRESULT CreateWrappedDeviceInternal(
                         }
                     }
                 }
+                // Defense-in-depth recovery for RAGE9 global D3D12 descriptor pool pop (`+0x55AC280`,
+                // `+0x2474390`, `+0x2474400`: `mov eax, [rdi+r9]` followed by `or rbx, rax; mov rax, rdx;
+                // lock cmpxchg [rip+disp32], rbx`) if an unhooked variant ever encounters a corrupted
+                // in-band free-list index (e.g. `0x2E576014920F`): seal `[head_va]` to `(aba+1)<<32 | -1`
+                // and jump to `rip + 0x21` (`mov [rcx], r8; pop rbx; pop rdi; pop rsi; ret`) with `r8 = 0`.
+                if (code == EXCEPTION_ACCESS_VIOLATION &&
+                    ep->ExceptionRecord->NumberParameters >= 2u &&
+                    ep->ExceptionRecord->ExceptionInformation[0] == 0u &&
+                    reinterpret_cast<uintptr_t>(rip) > 24u &&
+                    IsReadableRetailRange(reinterpret_cast<uintptr_t>(rip) - 17u, 17u + 0x28u) &&
+                    rip[0] == 0x42u && rip[1] == 0x8Bu && rip[2] == 0x04u && rip[3] == 0x0Fu &&
+                    rip[4] == 0x48u && rip[5] == 0x09u && rip[6] == 0xC3u &&
+                    rip[7] == 0x48u && rip[8] == 0x89u && rip[9] == 0xD0u &&
+                    rip[10] == 0xF0u && rip[11] == 0x48u && rip[12] == 0x0Fu &&
+                    rip[13] == 0xB1u && rip[14] == 0x1Du &&
+                    rip[0x21] == 0x4Cu && rip[0x22] == 0x89u && rip[0x23] == 0x01u &&
+                    rip[0x24] == 0x5Bu && rip[0x25] == 0x5Fu && rip[0x26] == 0x5Eu && rip[0x27] == 0xC3u) {
+                    int32_t rel_disp = 0;
+                    std::memcpy(&rel_disp, rip + 15, sizeof(rel_disp));
+                    const uintptr_t head_va = static_cast<uintptr_t>(
+                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(rip + 19)) +
+                        static_cast<intptr_t>(rel_disp));
+                    MEMORY_BASIC_INFORMATION hmbi{};
+                    if (::VirtualQuery(reinterpret_cast<LPCVOID>(head_va), &hmbi, sizeof(hmbi)) != 0u &&
+                        hmbi.State == MEM_COMMIT &&
+                        (hmbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0u &&
+                        (hmbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0u &&
+                        head_va + 8u <= reinterpret_cast<uintptr_t>(hmbi.BaseAddress) + hmbi.RegionSize) {
+                        const uint64_t cur_head = *reinterpret_cast<const volatile uint64_t*>(head_va);
+                        const uint64_t next_aba =
+                            std::max<uint64_t>(cur_head >> 32u, ep->ContextRecord->Rdx >> 32u) + 1ull;
+                        const uint64_t sealed_head = (next_aba << 32u) | 0xFFFFFFFFull;
+                        _InterlockedExchange64(
+                            reinterpret_cast<volatile LONG64*>(head_va),
+                            static_cast<LONG64>(sealed_head));
+                        static std::atomic<uint32_t> s_descpool_seals{0u};
+                        const uint32_t sn = s_descpool_seals.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                        if (sn <= 8u) {
+                            const HMODULE main_exe = ::GetModuleHandleW(nullptr);
+                            const uintptr_t rva = main_exe
+                                ? (reinterpret_cast<uintptr_t>(rip) - reinterpret_cast<uintptr_t>(main_exe))
+                                : reinterpret_cast<uintptr_t>(rip);
+                            std::fprintf(
+                                stderr,
+                                "[OpenScarlett][VEH-GUARD] Sealed corrupted descriptor pool head at +0x%llX #%u "
+                                "(bad_rdx=0x%llX base=0x%llX -> 0x%llX)\n",
+                                static_cast<unsigned long long>(rva),
+                                sn,
+                                static_cast<unsigned long long>(ep->ContextRecord->Rdx),
+                                static_cast<unsigned long long>(ep->ContextRecord->R9),
+                                static_cast<unsigned long long>(sealed_head));
+                            std::fflush(stderr);
+                        }
+                        ep->ContextRecord->R8 = 0ull;
+                        ep->ContextRecord->Rip = reinterpret_cast<uintptr_t>(rip) + 0x21u;
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                }
                 // Guard transient null streamed archetype (`[entity+0x20] == NULL`) during async world
                 // entity instantiation (+0x52912B4 `mov rax, [rbx+50h]` and +0x4E8F49A `mov eax, [rcx+rax*4+8]`):
                 // return cleanly via each function's own epilogue rather than faulting worker threads.
@@ -4544,6 +4603,54 @@ HRESULT CreateWrappedDeviceInternal(
                             rip[0] == 0x8Bu && rip[1] == 0x44u && rip[2] == 0x81u && rip[3] == 0x08u &&
                             rip[11] == 0x31u && rip[12] == 0xC0u && rip[13] == 0xC3u) {
                             ep->ContextRecord->Rip = reinterpret_cast<uintptr_t>(rip) + 11u;
+                            return EXCEPTION_CONTINUE_EXECUTION;
+                        }
+                        // Case C (+0x94E725 `grcEffect::ResolveShaderTextureView`): when a material texture
+                        // parameter (e.g. hash 0x84C69350) is dead-code-stripped from a Lockhart / non-RT
+                        // shader variant's reflection tables (`[r14+0xC88]` and `[r14+0xC90]`), the fallback
+                        // lookup (`call +0x5429D30; jmp +0x94E725`) skips `test rax, rax` and faults on
+                        // `test byte ptr [rax], 40h` (`F6 00 40`) with `rax == 0`. Advance +5 bytes to
+                        // `+0x94E72A` (`mov rax, rdi; add rsp, 40h; ...; ret`) to return `tex->m_DefaultSRV`.
+                        if (av_addr == 0ull &&
+                            ep->ContextRecord->Rax == 0ull &&
+                            reinterpret_cast<uintptr_t>(rip) > 5u &&
+                            IsReadableRetailRange(reinterpret_cast<uintptr_t>(rip) - 5u, 17u) &&
+                            rip[-5] == 0x48u && rip[-4] == 0x85u && rip[-3] == 0xC0u &&
+                            rip[-2] == 0x74u && rip[-1] == 0x13u &&
+                            rip[0] == 0xF6u && rip[1] == 0x00u && rip[2] == 0x40u &&
+                            rip[3] == 0x75u && rip[4] == 0x21u &&
+                            rip[5] == 0x48u && rip[6] == 0x89u && rip[7] == 0xF8u &&
+                            rip[8] == 0x48u && rip[9] == 0x83u && rip[10] == 0xC4u && rip[11] == 0x40u) {
+                            static std::atomic<uint32_t> s_unbound_tex_var{0u};
+                            const uint32_t un = s_unbound_tex_var.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                            if (un <= 8u) {
+                                std::fprintf(
+                                    stderr,
+                                    "[OpenScarlett][VEH-GUARD] Unbound shader texture var 0x%llX at +0x%llX #%u -> default SRV 0x%llX\n",
+                                    static_cast<unsigned long long>(ep->ContextRecord->Rdx),
+                                    static_cast<unsigned long long>(
+                                        reinterpret_cast<uintptr_t>(rip) - reinterpret_cast<uintptr_t>(main_exe)),
+                                    un,
+                                    static_cast<unsigned long long>(ep->ContextRecord->Rdi));
+                                std::fflush(stderr);
+                            }
+                            ep->ContextRecord->Rip = reinterpret_cast<uintptr_t>(rip) + 5u;
+                            return EXCEPTION_CONTINUE_EXECUTION;
+                        }
+                        // Case D (+0x5429D33 `grcEffect::LookupResourceVar`): when `[r14+0xC90]` itself is NULL
+                        // and passed unchecked (`mov rax, rcx; movzx ecx, word ptr [rcx]; test rcx, rcx; je +2Bh`),
+                        // jump cleanly to `rip + 0x33` (`xor eax, eax; jmp -5 -> ret`) to return nullptr.
+                        if (av_addr == 0ull &&
+                            ep->ContextRecord->Rcx == 0ull &&
+                            reinterpret_cast<uintptr_t>(rip) > 3u &&
+                            IsReadableRetailRange(reinterpret_cast<uintptr_t>(rip) - 3u, 0x38u) &&
+                            rip[-3] == 0x48u && rip[-2] == 0x89u && rip[-1] == 0xC8u &&
+                            rip[0] == 0x0Fu && rip[1] == 0xB7u && rip[2] == 0x09u &&
+                            rip[3] == 0x48u && rip[4] == 0x85u && rip[5] == 0xC9u &&
+                            rip[6] == 0x74u && rip[7] == 0x2Bu &&
+                            rip[0x32] == 0xC3u && rip[0x33] == 0x31u && rip[0x34] == 0xC0u &&
+                            rip[0x35] == 0xEBu && rip[0x36] == 0xFBu) {
+                            ep->ContextRecord->Rip = reinterpret_cast<uintptr_t>(rip) + 0x33u;
                             return EXCEPTION_CONTINUE_EXECUTION;
                         }
                     }
