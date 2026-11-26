@@ -1889,6 +1889,71 @@ public:
         return 0;
     }
 
+    // Zero-syscall DirectStorage physical page scatter transfer:
+    // Resolves every PFN under a single brief mutex hold into persistent section R/W views
+    // (no VirtualAlloc2 / MapViewOfFile3 / UnmapViewOfFile2 / TLB shootdowns), then copies
+    // outside the lock in parallel across DirectStorage worker threads.
+    // Returns: 1 = success, 0 = invalid PFN/arg (reject immediately), -1 = fallback to MapTitleVirtualMemory.
+    int32_t TransferPhysicalPagesDirect(const uint64_t* pageArray,
+                                        uint64_t numberOfPages,
+                                        uint16_t pageOffset,
+                                        uint32_t byteSize,
+                                        uint32_t isWrite,
+                                        void* hostBuffer) {
+        if (!pageArray || !hostBuffer || numberOfPages == 0ull || numberOfPages > 65536ull || byteSize == 0u) {
+            return 0;
+        }
+        const uint64_t total_span = static_cast<uint64_t>(pageOffset) + static_cast<uint64_t>(byteSize);
+        if (total_span > numberOfPages * kPage64KB) {
+            return 0;
+        }
+
+        thread_local std::vector<uint8_t*> tl_page_ptrs;
+        tl_page_ptrs.resize(static_cast<size_t>(numberOfPages));
+        size_t page_bytes = kPage64KB;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (uint64_t i = 0ull; i < numberOfPages; ++i) {
+                auto it = pfn_table_.find(pageArray[i]);
+                if (it == pfn_table_.end()) {
+                    return 0;
+                }
+                if (i == 0ull) {
+                    page_bytes = it->second.page_size_bytes;
+                    if (page_bytes != kPage64KB) {
+                        return -1;
+                    }
+                } else if (it->second.page_size_bytes != page_bytes) {
+                    return 0;
+                }
+                uint8_t* ptr = nullptr;
+                const size_t phys_off = static_cast<size_t>(it->second.page_index) * page_bytes;
+                if (!memory_.ResolvePhysicalViewPtr(it->second.physical_id, phys_off, page_bytes, ptr).ok() ||
+                    !ptr) {
+                    return -1;
+                }
+                tl_page_ptrs[static_cast<size_t>(i)] = ptr;
+            }
+        }
+
+        auto* host_bytes = static_cast<uint8_t*>(hostBuffer);
+        size_t copied = 0u;
+        size_t cur_off = static_cast<size_t>(pageOffset);
+        for (size_t i = 0u; i < tl_page_ptrs.size() && copied < byteSize; ++i) {
+            const size_t avail = kPage64KB - cur_off;
+            const size_t step = std::min<size_t>(static_cast<size_t>(byteSize) - copied, avail);
+            if (isWrite != 0u) {
+                std::memcpy(tl_page_ptrs[i] + cur_off, host_bytes + copied, step);
+            } else {
+                std::memcpy(host_bytes + copied, tl_page_ptrs[i] + cur_off, step);
+            }
+            copied += step;
+            cur_off = 0u;
+        }
+        return 1;
+    }
+
     void* VirtualAllocApp(void* baseAddress,
                           size_t size,
                           uint32_t allocationType,
@@ -3832,6 +3897,16 @@ int32_t OPENSCARLETT_KERNELX_CALL QueryTitlePhysicalPages(const void* virtualAdd
         virtualAddress, outPhysicalId, outSizeBytes, outFlags);
     RecordTelemetry(__func__, ok ? CallOutcome::Ok : CallOutcome::Error, ok ? kHrOk : kHrInvalidArg);
     return ok;
+}
+
+int32_t OPENSCARLETT_KERNELX_CALL OpenScarlettTransferTitlePhysicalPages(const uint64_t* pPageArray,
+                                                                         uint64_t numberOfPages,
+                                                                         uint16_t pageOffset,
+                                                                         uint32_t byteSize,
+                                                                         uint32_t isWrite,
+                                                                         void* hostBuffer) {
+    return KernelXState::Instance().TransferPhysicalPagesDirect(
+        pPageArray, numberOfPages, pageOffset, byteSize, isWrite, hostBuffer);
 }
 
 void* OPENSCARLETT_KERNELX_CALL KernelXVirtualAllocFromApp(void* baseAddress,

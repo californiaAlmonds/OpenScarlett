@@ -3767,6 +3767,52 @@ HRESULT CreateWrappedDeviceInternal(
                         }
                     }
                 }
+                // Guard empty task-graph predicate closure invoke (`call qword ptr [rax+0x50]` = `FF 50 50`,
+                // e.g. RVA +0x4E53906 -> return RVA +0x4E53909) when a heap-allocated functor wrapper has
+                // non-null storage (`rax != 0`) but null invoke pointer (`[rax+0x50] == 0`):
+                // pop return address, set `al = 1` (matching the no-predicate `je +0x4E5392D` path), and resume.
+                if (code == EXCEPTION_ACCESS_VIOLATION &&
+                    ep->ExceptionRecord->NumberParameters >= 2u &&
+                    ep->ExceptionRecord->ExceptionInformation[0] == 8u &&
+                    ep->ContextRecord->Rip == 0ull) {
+                    const uintptr_t rsp = static_cast<uintptr_t>(ep->ContextRecord->Rsp);
+                    if (IsReadableRetailRange(rsp, sizeof(uint64_t))) {
+                        uint64_t ret_ip = 0ull;
+                        std::memcpy(&ret_ip, reinterpret_cast<const void*>(rsp), sizeof(ret_ip));
+                        HMODULE hit_mod = nullptr;
+                        const HMODULE main_exe = ::GetModuleHandleW(nullptr);
+                        if (main_exe && ret_ip > 16ull &&
+                            ::GetModuleHandleExA(
+                                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                reinterpret_cast<LPCSTR>(static_cast<uintptr_t>(ret_ip)),
+                                &hit_mod) &&
+                            hit_mod == main_exe &&
+                            IsReadableRetailRange(static_cast<uintptr_t>(ret_ip) - 3u, 6u)) {
+                            const auto* call_site =
+                                reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(ret_ip) - 3u);
+                            if (call_site[0] == 0xFFu && call_site[1] == 0x50u && call_site[2] == 0x50u) {
+                                static std::atomic<uint32_t> s_empty_fn_guard{0u};
+                                const uint32_t fn_n = s_empty_fn_guard.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                                if (fn_n <= 16u) {
+                                    const uintptr_t call_rva =
+                                        (static_cast<uintptr_t>(ret_ip) - 3u) - reinterpret_cast<uintptr_t>(main_exe);
+                                    std::fprintf(
+                                        stderr,
+                                        "[OpenScarlett][VEH-GUARD] Empty functor [rax+0x50]==0 at +0x%llX #%u (rax=0x%llX rdx=0x%llX) -> 1\n",
+                                        static_cast<unsigned long long>(call_rva),
+                                        fn_n,
+                                        static_cast<unsigned long long>(ep->ContextRecord->Rax),
+                                        static_cast<unsigned long long>(ep->ContextRecord->Rdx));
+                                    std::fflush(stderr);
+                                }
+                                ep->ContextRecord->Rsp = rsp + sizeof(uint64_t);
+                                ep->ContextRecord->Rax = 1ull;
+                                ep->ContextRecord->Rip = ret_ip;
+                                return EXCEPTION_CONTINUE_EXECUTION;
+                            }
+                        }
+                    }
+                }
                 return EXCEPTION_CONTINUE_SEARCH;
             });
             ::SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {

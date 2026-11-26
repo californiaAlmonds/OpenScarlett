@@ -56,6 +56,8 @@ using PfnXMemSize = size_t(__stdcall*)(void*, uint64_t);
 using PfnMapTitleVirtualMemory = void*(__stdcall*)(
     void*, uint64_t, uint32_t, uint32_t, const uint64_t*);
 using PfnUnmapTitleVirtualMemory = int32_t(__stdcall*)(void*, uint64_t);
+using PfnTransferTitlePhysicalPages = int32_t(__stdcall*)(
+    const uint64_t*, uint64_t, uint16_t, uint32_t, uint32_t, void*);
 using PfnKxVirtualAllocFromApp = void*(__stdcall*)(void*, size_t, uint32_t, uint32_t);
 using PfnXMemResolveCpuAliasVa = uint64_t(__stdcall*)(uint64_t);
 
@@ -107,6 +109,7 @@ struct CachedKernelxExports {
     PfnXMemSize xmem_size = nullptr;
     PfnMapTitleVirtualMemory map_title_vm = nullptr;
     PfnUnmapTitleVirtualMemory unmap_title_vm = nullptr;
+    PfnTransferTitlePhysicalPages transfer_phys = nullptr;
     PfnKxVirtualAllocFromApp virtual_alloc_app = nullptr;
 };
 
@@ -116,6 +119,7 @@ CachedKernelxExports GetKernelxExports() noexcept {
     static std::atomic<PfnXMemSize> s_xmem_size{nullptr};
     static std::atomic<PfnMapTitleVirtualMemory> s_map{nullptr};
     static std::atomic<PfnUnmapTitleVirtualMemory> s_unmap{nullptr};
+    static std::atomic<PfnTransferTitlePhysicalPages> s_transfer{nullptr};
     static std::atomic<PfnKxVirtualAllocFromApp> s_valloc{nullptr};
     static std::atomic<uint64_t> s_next_probe_ms{0u};
 
@@ -124,6 +128,7 @@ CachedKernelxExports GetKernelxExports() noexcept {
     out.xmem_size = s_xmem_size.load(std::memory_order_acquire);
     out.map_title_vm = s_map.load(std::memory_order_acquire);
     out.unmap_title_vm = s_unmap.load(std::memory_order_acquire);
+    out.transfer_phys = s_transfer.load(std::memory_order_acquire);
     out.virtual_alloc_app = s_valloc.load(std::memory_order_acquire);
     if (s_mod.load(std::memory_order_acquire) != nullptr) {
         return out;
@@ -145,12 +150,15 @@ CachedKernelxExports GetKernelxExports() noexcept {
             reinterpret_cast<void*>(::GetProcAddress(h_kx, "MapTitleVirtualMemory")));
         out.unmap_title_vm = reinterpret_cast<PfnUnmapTitleVirtualMemory>(
             reinterpret_cast<void*>(::GetProcAddress(h_kx, "UnmapTitleVirtualMemory")));
+        out.transfer_phys = reinterpret_cast<PfnTransferTitlePhysicalPages>(
+            reinterpret_cast<void*>(::GetProcAddress(h_kx, "OpenScarlettTransferTitlePhysicalPages")));
         out.virtual_alloc_app = reinterpret_cast<PfnKxVirtualAllocFromApp>(
             reinterpret_cast<void*>(::GetProcAddress(h_kx, "VirtualAllocFromApp")));
         if (out.query_phys) s_query.store(out.query_phys, std::memory_order_release);
         if (out.xmem_size) s_xmem_size.store(out.xmem_size, std::memory_order_release);
         if (out.map_title_vm) s_map.store(out.map_title_vm, std::memory_order_release);
         if (out.unmap_title_vm) s_unmap.store(out.unmap_title_vm, std::memory_order_release);
+        if (out.transfer_phys) s_transfer.store(out.transfer_phys, std::memory_order_release);
         if (out.virtual_alloc_app) s_valloc.store(out.virtual_alloc_app, std::memory_order_release);
         s_mod.store(h_kx, std::memory_order_release);
     }
@@ -646,8 +654,19 @@ int32_t TransferPhysicalPageArray(
         }
     }
 
-    // Path 2: Resolve through kernelx.dll MapTitleVirtualMemory / UnmapTitleVirtualMemory.
+    // Path 2: Zero-syscall persistent section view scatter transfer via kernelx.dll,
+    // with automatic fallback to MapTitleVirtualMemory / UnmapTitleVirtualMemory.
     const CachedKernelxExports kx = GetKernelxExports();
+    if (kx.transfer_phys) {
+        const int32_t trc = kx.transfer_phys(
+            pfns.data(), page_count, page_offset, byte_size, is_write ? 1u : 0u, host_buf);
+        if (trc > 0) {
+            return OS_DSTORAGE_S_OK;
+        }
+        if (trc == 0) {
+            return OS_DSTORAGE_E_INVALIDARG;
+        }
+    }
     if (kx.map_title_vm && kx.unmap_title_vm) {
         const uint32_t prot = is_write ? PAGE_READWRITE : PAGE_READONLY;
         constexpr uint64_t kMaxWindowPages = 256ull;  // 16 MiB VA window per chunk

@@ -139,6 +139,10 @@ public:
                             UnifiedMemoryAlias& out_alias);
     Status UnmapPhysicalAlias(void* host_ptr);
     Status ProtectAlias(void* host_ptr, size_t size, MemoryProtection new_protection);
+    Status ResolvePhysicalViewPtr(uint64_t physical_id,
+                                  size_t physical_offset,
+                                  size_t size,
+                                  uint8_t*& out_ptr);
     bool LookupAliasByHostPtr(const void* host_ptr, UnifiedMemoryAlias& out_alias) const;
     bool LookupBlockByHostPtr(const void* host_ptr, UnifiedMemoryBlock& out_block) const;
     bool LookupPlaceholderByHostPtr(const void* host_ptr,
@@ -154,7 +158,8 @@ public:
 private:
     struct PhysicalPoolEntry {
         PhysicalAllocation info{};
-        void* os_handle = nullptr;  // Win32 HANDLE from CreateFileMappingW
+        void* os_handle = nullptr;     // Win32 HANDLE from CreateFileMappingW
+        void* host_rw_view = nullptr;  // Lazily-mapped persistent host R/W section view (zero extra commit)
         std::vector<uint8_t> fallback_storage;
     };
 

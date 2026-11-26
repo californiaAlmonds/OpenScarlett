@@ -343,6 +343,10 @@ UnifiedMemoryManager::~UnifiedMemoryManager() {
     for (auto& [id, pool] : physical_pools_) {
 #if defined(_WIN32)
         (void)id;
+        if (pool.host_rw_view) {
+            UnmapViewOfFile(pool.host_rw_view);
+            pool.host_rw_view = nullptr;
+        }
         if (pool.os_handle) {
             CloseHandle(static_cast<HANDLE>(pool.os_handle));
             pool.os_handle = nullptr;
@@ -503,6 +507,10 @@ Status UnifiedMemoryManager::FreePhysicalPages(uint64_t physical_id) {
         }
     }
 #if defined(_WIN32)
+    if (it->second.host_rw_view) {
+        UnmapViewOfFile(it->second.host_rw_view);
+        it->second.host_rw_view = nullptr;
+    }
     if (it->second.os_handle) {
         CloseHandle(static_cast<HANDLE>(it->second.os_handle));
         it->second.os_handle = nullptr;
@@ -512,6 +520,45 @@ Status UnifiedMemoryManager::FreePhysicalPages(uint64_t physical_id) {
         total_allocated_bytes_ >= it->second.info.size ? (total_allocated_bytes_ - it->second.info.size) : 0;
     physical_pools_.erase(it);
     return Status::Ok();
+}
+
+Status UnifiedMemoryManager::ResolvePhysicalViewPtr(uint64_t physical_id,
+                                                    size_t physical_offset,
+                                                    size_t size,
+                                                    uint8_t*& out_ptr) {
+    out_ptr = nullptr;
+    if (size == 0u) {
+        return Status::Error(StatusCode::InvalidArgument, "Physical view resolve size must be > 0");
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto pit = physical_pools_.find(physical_id);
+    if (pit == physical_pools_.end()) {
+        return Status::Error(StatusCode::NotFound, "Unknown physical pool id");
+    }
+    auto& pool = pit->second;
+    if (physical_offset > pool.info.size || size > pool.info.size - physical_offset) {
+        return Status::Error(StatusCode::InvalidArgument, "Physical view range exceeds pool size");
+    }
+#if defined(_WIN32)
+    if (!pool.host_rw_view) {
+        if (!pool.os_handle) {
+            return Status::Error(StatusCode::DeviceError, "Physical pool missing OS section handle");
+        }
+        pool.host_rw_view = ::MapViewOfFile(
+            static_cast<HANDLE>(pool.os_handle), FILE_MAP_READ | FILE_MAP_WRITE, 0u, 0u, 0u);
+        if (!pool.host_rw_view) {
+            return Status::Error(StatusCode::OutOfMemory, "MapViewOfFile failed for persistent physical pool view");
+        }
+    }
+    out_ptr = static_cast<uint8_t*>(pool.host_rw_view) + physical_offset;
+    return Status::Ok();
+#else
+    if (pool.fallback_storage.size() < pool.info.size) {
+        return Status::Error(StatusCode::DeviceError, "Fallback physical storage uninitialized");
+    }
+    out_ptr = pool.fallback_storage.data() + physical_offset;
+    return Status::Ok();
+#endif
 }
 
 Status UnifiedMemoryManager::ReserveVirtualPlaceholder(size_t size,

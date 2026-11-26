@@ -353,6 +353,14 @@ OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL QueryTitlePhysicalPag
     uint64_t* outSizeBytes,
     uint32_t* outFlags);
 
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL OpenScarlettTransferTitlePhysicalPages(
+    const uint64_t* pPageArray,
+    uint64_t numberOfPages,
+    uint16_t pageOffset,
+    uint32_t byteSize,
+    uint32_t isWrite,
+    void* hostBuffer);
+
 // Note: kernelx.dll also exports unprefixed VirtualAllocFromApp, VirtualProtectFromApp,
 // CreateWaitableTimerExW, and QueryUnbiasedInterruptTime in its PE export directory.
 // The KernelX-prefixed declarations below prevent clashes when <windows.h> is included.

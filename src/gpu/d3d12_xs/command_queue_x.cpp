@@ -774,6 +774,34 @@ bool IsWritableCpuVa(uint64_t va, size_t byte_size) noexcept {
     return (va + byte_size) <= region_end;
 }
 
+bool IsWritableCpuVaCached(
+    uint64_t va,
+    size_t byte_size,
+    uint64_t& cached_lo,
+    uint64_t& cached_hi) noexcept {
+    if (va == 0ull || byte_size == 0u || va > UINT64_MAX - byte_size) return false;
+    if (va >= cached_lo && (va + byte_size) <= cached_hi) {
+        return true;
+    }
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(va)), &mbi, sizeof(mbi)) == 0) {
+        return false;
+    }
+    if (mbi.State != MEM_COMMIT) return false;
+    constexpr DWORD kWritable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if ((mbi.Protect & kWritable) == 0u || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) {
+        return false;
+    }
+    const uint64_t region_lo = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mbi.BaseAddress));
+    const uint64_t region_hi = region_lo + static_cast<uint64_t>(mbi.RegionSize);
+    if ((va + byte_size) > region_hi) {
+        return false;
+    }
+    cached_lo = region_lo;
+    cached_hi = region_hi;
+    return true;
+}
+
 bool TryParseEnvFcapFps(uint32_t& out_fps) noexcept {
     out_fps = 0u;
     char buf[64]{};
@@ -2143,9 +2171,11 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
         static const bool s_sync_dw = EnvFlagTrueA("OPENSCARLETT_SYNC_DEFERRED_WRITES");
         const int64_t qpc_freq = qpc_freq_;
         auto commit_writes = [qpc_freq](const std::vector<DeferredCpuWrite32>& writes) {
+            uint64_t cached_lo = 0ull;
+            uint64_t cached_hi = 0ull;
             for (const auto& wr : writes) {
                 if (wr.is_64bit) {
-                    if (IsWritableCpuVa(wr.address, sizeof(uint64_t))) {
+                    if (IsWritableCpuVaCached(wr.address, sizeof(uint64_t), cached_lo, cached_hi)) {
                         uint64_t v = wr.value;
                         if (wr.is_timestamp) {
                             const int64_t now = QueryQpcNow();
@@ -2158,7 +2188,7 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
                             reinterpret_cast<volatile LONG64*>(static_cast<uintptr_t>(wr.address)),
                             static_cast<LONG64>(v));
                     }
-                } else if (IsWritableCpuVa(wr.address, sizeof(uint32_t))) {
+                } else if (IsWritableCpuVaCached(wr.address, sizeof(uint32_t), cached_lo, cached_hi)) {
                     ::InterlockedExchange(
                         reinterpret_cast<volatile LONG*>(static_cast<uintptr_t>(wr.address)),
                         static_cast<LONG>(static_cast<uint32_t>(wr.value)));
@@ -2198,9 +2228,11 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
                         [](ID3D12Fence*, UINT64, HRESULT, void* user_ctx) {
                             std::unique_ptr<AsyncWriteBatch> owned(static_cast<AsyncWriteBatch*>(user_ctx));
                             if (!owned) return;
+                            uint64_t cached_lo = 0ull;
+                            uint64_t cached_hi = 0ull;
                             for (const auto& wr : owned->writes) {
                                 if (wr.is_64bit) {
-                                    if (IsWritableCpuVa(wr.address, sizeof(uint64_t))) {
+                                    if (IsWritableCpuVaCached(wr.address, sizeof(uint64_t), cached_lo, cached_hi)) {
                                         uint64_t v = wr.value;
                                         if (wr.is_timestamp) {
                                             const int64_t now = QueryQpcNow();
@@ -2213,7 +2245,7 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
                                             reinterpret_cast<volatile LONG64*>(static_cast<uintptr_t>(wr.address)),
                                             static_cast<LONG64>(v));
                                     }
-                                } else if (IsWritableCpuVa(wr.address, sizeof(uint32_t))) {
+                                } else if (IsWritableCpuVaCached(wr.address, sizeof(uint32_t), cached_lo, cached_hi)) {
                                     ::InterlockedExchange(
                                         reinterpret_cast<volatile LONG*>(static_cast<uintptr_t>(wr.address)),
                                         static_cast<LONG>(static_cast<uint32_t>(wr.value)));
