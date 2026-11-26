@@ -3669,25 +3669,19 @@ HRESULT CreateWrappedDeviceInternal(
                 }
                 // Retail console hang-watchdog patterns:
                 // 1) mov dword ptr [0], 0; int 3 (C7 04 25 00 00 00 00 00 00 00 00 CC, 12 bytes)
-                // 2) mov dword ptr [0], 0x4D8BD421 (C7 04 25 00 00 00 00 21 D4 8B 4D, 11 bytes)
+                // 2) mov dword ptr [0], <imm32> (C7 04 25 00 00 00 00 xx xx xx xx, 11 bytes, e.g. 0x4D8BD421 / 0x2EF1E94B)
                 // Console titles set a strict ~30s QPC budget calibrated for Xbox NVMe + precompiled shaders;
                 // on PC cold storage / on-demand DXC shader lifting, log and step cleanly to recovery.
                 if (code == EXCEPTION_ACCESS_VIOLATION &&
                     ep->ExceptionRecord->NumberParameters >= 2u &&
                     ep->ExceptionRecord->ExceptionInformation[0] == 1u &&
                     ep->ExceptionRecord->ExceptionInformation[1] == 0u &&
-                    IsReadableRetailRange(reinterpret_cast<uintptr_t>(rip), 12u)) {
+                    IsReadableRetailRange(reinterpret_cast<uintptr_t>(rip), 13u)) {
                     static constexpr uint8_t kWatchdogPrefix[7] = {
                         0xC7u, 0x04u, 0x25u, 0x00u, 0x00u, 0x00u, 0x00u};
-                    static constexpr uint8_t kWatchdogZero[5] = {0x00u, 0x00u, 0x00u, 0x00u, 0xCCu};
-                    static constexpr uint8_t kWatchdogMagic[4] = {0x21u, 0xD4u, 0x8Bu, 0x4Du};
                     size_t skip_len = 0u;
                     if (std::memcmp(rip, kWatchdogPrefix, sizeof(kWatchdogPrefix)) == 0) {
-                        if (std::memcmp(rip + 7, kWatchdogZero, sizeof(kWatchdogZero)) == 0) {
-                            skip_len = 12u;
-                        } else if (std::memcmp(rip + 7, kWatchdogMagic, sizeof(kWatchdogMagic)) == 0) {
-                            skip_len = 11u;
-                        }
+                        skip_len = (rip[11] == 0xCCu && rip[12] != 0xCCu) ? 12u : 11u;
                     }
                     if (skip_len > 0u) {
                         static std::atomic<uint32_t> s_wd_hits{0u};

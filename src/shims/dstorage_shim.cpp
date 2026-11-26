@@ -901,46 +901,6 @@ public:
         uint8_t flags = 0u;
     };
 
-    struct Rds5SliceTracker {
-        uint64_t comp_off = 0ull;
-        uint32_t comp_sz = 0u;
-        uint32_t uncomp_sz = 0u;
-        uint64_t base_req_off = 0ull;
-    };
-
-    size_t ComputeOrRecordRds5SliceOffset(
-        const Rds5ChunkEntry& entry,
-        uint64_t req_off,
-        size_t dst_sz) {
-        if (entry.uncomp_sz <= dst_sz || req_off == entry.comp_off) {
-            if (entry.uncomp_sz > dst_sz) {
-                std::lock_guard<std::mutex> lk(rds5_slice_mutex_);
-                rds5_slice_ring_[rds5_slice_cursor_ % rds5_slice_ring_.size()] =
-                    Rds5SliceTracker{entry.comp_off, entry.comp_sz, entry.uncomp_sz, req_off};
-                ++rds5_slice_cursor_;
-            }
-            return 0u;
-        }
-        std::lock_guard<std::mutex> lk(rds5_slice_mutex_);
-        for (const auto& tr : rds5_slice_ring_) {
-            if (tr.comp_off == entry.comp_off &&
-                tr.comp_sz == entry.comp_sz &&
-                tr.uncomp_sz == entry.uncomp_sz &&
-                req_off >= tr.base_req_off) {
-                const uint64_t rel = req_off - tr.base_req_off;
-                if (rel < entry.uncomp_sz && rel + dst_sz <= entry.uncomp_sz) {
-                    return static_cast<size_t>(rel);
-                }
-            }
-        }
-        // First piece of a shifted multi-piece chunk read (e.g. 4 x 0x20000 for an 0x80000 chunk):
-        // record req_off as piece-0 base and serve slice 0.
-        rds5_slice_ring_[rds5_slice_cursor_ % rds5_slice_ring_.size()] =
-            Rds5SliceTracker{entry.comp_off, entry.comp_sz, entry.uncomp_sz, req_off};
-        ++rds5_slice_cursor_;
-        return 0u;
-    }
-
     bool TryCopyCachedRds5Chunk(
         uint64_t comp_off,
         uint32_t comp_sz,
@@ -973,6 +933,92 @@ public:
         rds5_cached_uncomp_.assign(data, data + data_sz);
     }
 
+    bool DecodeSingleRds5Chunk(
+        const Rds5ChunkEntry& c,
+        const std::atomic<bool>* cancel_flag,
+        std::vector<uint8_t>& out_uncomp) {
+        {
+            std::lock_guard<std::mutex> lk(rds5_slice_mutex_);
+            if (rds5_cached_comp_off_ == c.comp_off &&
+                rds5_cached_comp_sz_ == c.comp_sz &&
+                rds5_cached_uncomp_.size() == c.uncomp_sz) {
+                out_uncomp = rds5_cached_uncomp_;
+                return true;
+            }
+        }
+        if (c.flags == 0u) {
+            if (ReadAt(c.comp_off, c.uncomp_sz, out_uncomp, cancel_flag) < 0 ||
+                out_uncomp.size() != c.uncomp_sz) {
+                return false;
+            }
+            StoreCachedRds5Chunk(c.comp_off, c.comp_sz, out_uncomp.data(), out_uncomp.size());
+            return true;
+        }
+        std::vector<uint8_t> raw;
+        if (ReadAt(c.comp_off, c.comp_sz, raw, cancel_flag) < 0 || raw.size() != c.comp_sz) {
+            return false;
+        }
+        if (c.flags == 8u) {
+            if (!zlib_rfc1950::DecompressXboxStream(
+                    raw.data(), raw.size(), c.uncomp_sz, out_uncomp, false) ||
+                out_uncomp.size() != c.uncomp_sz) {
+                return false;
+            }
+            StoreCachedRds5Chunk(c.comp_off, c.comp_sz, out_uncomp.data(), out_uncomp.size());
+            return true;
+        }
+        if (c.flags >= 1u && c.flags <= 7u) {
+            const auto fmt = static_cast<openscarlett::BcFormat>(c.flags);
+            out_uncomp.resize(c.uncomp_sz);
+            size_t written = 0u;
+            if (!openscarlett::BcPackHwDecodeBitstream(
+                    fmt, raw.data(), raw.size(), out_uncomp.data(), out_uncomp.size(), &written)
+                     .ok() ||
+                written != c.uncomp_sz) {
+                return false;
+            }
+            StoreCachedRds5Chunk(c.comp_off, c.comp_sz, out_uncomp.data(), out_uncomp.size());
+            return true;
+        }
+        return false;
+    }
+
+    bool AssembleCrossChunkRds5Span(
+        size_t start_idx,
+        size_t first_slice_off,
+        size_t dst_sz,
+        const std::atomic<bool>* cancel_flag,
+        std::vector<uint8_t>& out_span) {
+        out_span.clear();
+        out_span.reserve(dst_sz);
+        size_t idx = start_idx;
+        size_t in_off = first_slice_off;
+        std::vector<uint8_t> chunk_buf;
+        while (out_span.size() < dst_sz && idx < rds5_chunks_.size()) {
+            const Rds5ChunkEntry& c = rds5_chunks_[idx];
+            if (in_off >= c.uncomp_sz) {
+                in_off -= c.uncomp_sz;
+                ++idx;
+                continue;
+            }
+            if (!DecodeSingleRds5Chunk(c, cancel_flag, chunk_buf)) {
+                return false;
+            }
+            const size_t avail = c.uncomp_sz - in_off;
+            const size_t take = std::min<size_t>(dst_sz - out_span.size(), avail);
+            out_span.insert(
+                out_span.end(),
+                chunk_buf.data() + in_off,
+                chunk_buf.data() + in_off + take);
+            in_off = 0u;
+            ++idx;
+        }
+        if (out_span.size() < dst_sz) {
+            out_span.resize(dst_sz, 0u);
+        }
+        return true;
+    }
+
     bool ResolveRds5Request(
         uint64_t req_off,
         uint32_t req_src_sz,
@@ -981,7 +1027,11 @@ public:
         uint64_t bcpack_mode,
         uint64_t& out_true_off,
         size_t& out_full_uncomp_sz,
-        size_t& out_slice_off) {
+        size_t& out_slice_off,
+        size_t* out_cross_chunk_idx = nullptr) {
+        if (out_cross_chunk_idx) {
+            *out_cross_chunk_idx = SIZE_MAX;
+        }
         EnsureRds5IndexLoaded();
         if (!rds5_valid_ || rds5_chunks_.empty() || req_src_sz == 0u || dst_sz == 0u) {
             return false;
@@ -1003,7 +1053,7 @@ public:
             it->uncomp_sz >= dst_sz) {
             out_true_off = req_off;
             out_full_uncomp_sz = it->uncomp_sz;
-            out_slice_off = ComputeOrRecordRds5SliceOffset(*it, req_off, dst_sz);
+            out_slice_off = 0u;
             return true;
         }
 
@@ -1020,12 +1070,12 @@ public:
                 sit->uncomp_sz >= dst_sz) {
                 out_true_off = cand_off;
                 out_full_uncomp_sz = sit->uncomp_sz;
-                out_slice_off = ComputeOrRecordRds5SliceOffset(*sit, req_off, dst_sz);
+                out_slice_off = 0u;
                 return true;
             }
         }
 
-        // 3. Backward scan within 16 MiB for multi-piece continuation or shifted chunk.
+        // 3. Backward scan within 16 MiB for intra-chunk sub-slice, cross-chunk span, or constant-shifted chunk.
         constexpr uint64_t kMaxRds5ShiftWindow = 16ull * 1024ull * 1024ull;
         auto cur = std::upper_bound(
             rds5_chunks_.begin(),
@@ -1033,8 +1083,9 @@ public:
             req_off,
             [](uint64_t off, const Rds5ChunkEntry& e) { return off < e.comp_off; });
 
-        const Rds5ChunkEntry* first_match = nullptr;
-        uint64_t first_shift = 0ull;
+        const Rds5ChunkEntry* fallback_match = nullptr;
+        size_t fallback_idx = SIZE_MAX;
+        uint64_t fallback_shift = 0ull;
         while (cur != rds5_chunks_.begin()) {
             --cur;
             if (cur->comp_off >= req_off) continue;
@@ -1045,6 +1096,12 @@ public:
             if (cur->comp_sz != req_src_sz || cur->flags != want_flags || cur->uncomp_sz < dst_sz) {
                 continue;
             }
+            if (cur->uncomp_sz > dst_sz && shift + dst_sz <= cur->uncomp_sz) {
+                out_true_off = cur->comp_off;
+                out_full_uncomp_sz = cur->uncomp_sz;
+                out_slice_off = static_cast<size_t>(shift);
+                return true;
+            }
             if (cur->uncomp_sz == dst_sz) {
                 last_rds5_shift_.store(shift, std::memory_order_relaxed);
                 out_true_off = cur->comp_off;
@@ -1052,17 +1109,24 @@ public:
                 out_slice_off = 0u;
                 return true;
             }
-            if (!first_match) {
-                first_match = &(*cur);
-                first_shift = shift;
+            if (!fallback_match) {
+                fallback_match = &(*cur);
+                fallback_idx = static_cast<size_t>(cur - rds5_chunks_.begin());
+                fallback_shift = shift;
             }
         }
-        if (first_match) {
-            out_true_off = first_match->comp_off;
-            out_full_uncomp_sz = first_match->uncomp_sz;
-            out_slice_off = ComputeOrRecordRds5SliceOffset(*first_match, req_off, dst_sz);
-            if (out_slice_off == 0u && first_shift > 0ull) {
-                last_rds5_shift_.store(first_shift, std::memory_order_relaxed);
+        if (fallback_match) {
+            out_true_off = fallback_match->comp_off;
+            out_full_uncomp_sz = fallback_match->uncomp_sz;
+            if (fallback_shift < fallback_match->uncomp_sz) {
+                // Request starts inside fallback_match at offset fallback_shift and crosses into next chunk(s).
+                out_slice_off = static_cast<size_t>(fallback_shift);
+                if (out_cross_chunk_idx) {
+                    *out_cross_chunk_idx = fallback_idx;
+                }
+            } else {
+                last_rds5_shift_.store(fallback_shift, std::memory_order_relaxed);
+                out_slice_off = 0u;
             }
             return true;
         }
@@ -1361,8 +1425,6 @@ private:
     std::vector<Rds5ChunkEntry> rds5_chunks_;
     mutable std::atomic<uint64_t> last_rds5_shift_{0ull};
     std::mutex rds5_slice_mutex_;
-    std::array<Rds5SliceTracker, 16u> rds5_slice_ring_{};
-    size_t rds5_slice_cursor_ = 0u;
     uint64_t rds5_cached_comp_off_ = UINT64_MAX;
     uint32_t rds5_cached_comp_sz_ = 0u;
     std::vector<uint8_t> rds5_cached_uncomp_;
@@ -2650,6 +2712,7 @@ private:
                 req.Source.File.Source != nullptr && req.Source.File.Size > 0u) {
                 auto* file_impl = static_cast<DStorageFileImpl*>(req.Source.File.Source);
                 uint64_t rds5_true_off = 0ull;
+                size_t rds5_cross_idx = SIZE_MAX;
                 if (file_impl->ResolveRds5Request(
                         req.Source.File.Offset,
                         req.Source.File.Size,
@@ -2658,14 +2721,15 @@ private:
                         bcpack_mode,
                         rds5_true_off,
                         rds5_full_uncomp_sz,
-                        rds5_slice_off)) {
+                        rds5_slice_off,
+                        &rds5_cross_idx)) {
                     if (rds5_true_off != req.Source.File.Offset) {
                         static std::atomic<uint32_t> s_rds5_log{0u};
                         const uint32_t rn = s_rds5_log.fetch_add(1u, std::memory_order_relaxed);
                         if (rn < 8u) {
                             std::fprintf(
                                 stderr,
-                                "[OpenScarlett][dstorage] RDS5-REMAP #%u reqOff=0x%llX -> trueOff=0x%llX srcSz=0x%X dstSz=0x%zX fullSz=0x%zX slice=0x%zX z=%d bc=%llu\n",
+                                "[OpenScarlett][dstorage] RDS5-REMAP #%u reqOff=0x%llX -> trueOff=0x%llX srcSz=0x%X dstSz=0x%zX fullSz=0x%zX slice=0x%zX cross=%d z=%d bc=%llu\n",
                                 rn,
                                 static_cast<unsigned long long>(req.Source.File.Offset),
                                 static_cast<unsigned long long>(rds5_true_off),
@@ -2673,6 +2737,7 @@ private:
                                 dst_size,
                                 rds5_full_uncomp_sz,
                                 rds5_slice_off,
+                                (rds5_cross_idx != SIZE_MAX) ? 1 : 0,
                                 use_zlib ? 1 : 0,
                                 static_cast<unsigned long long>(bcpack_mode));
                             std::fflush(stderr);
@@ -2680,9 +2745,16 @@ private:
                     }
                     rds5_resolved_off = rds5_true_off;
                     rds5_resolved_src_sz = req.Source.File.Size;
-                    if (rds5_full_uncomp_sz > dst_size &&
-                        file_impl->TryCopyCachedRds5Chunk(
-                            rds5_true_off, req.Source.File.Size, rds5_slice_off, dst_size, buf_b)) {
+                    if (rds5_cross_idx != SIZE_MAX &&
+                        file_impl->AssembleCrossChunkRds5Span(
+                            rds5_cross_idx, rds5_slice_off, dst_size, cancel_flag, buf_b)) {
+                        src_ptr = buf_b.data();
+                        src_size = buf_b.size();
+                        has_rds5_remap = true;
+                        rds5_served_from_cache = true;
+                    } else if (rds5_full_uncomp_sz > dst_size &&
+                               file_impl->TryCopyCachedRds5Chunk(
+                                   rds5_true_off, req.Source.File.Size, rds5_slice_off, dst_size, buf_b)) {
                         src_ptr = buf_b.data();
                         src_size = buf_b.size();
                         has_rds5_remap = true;
