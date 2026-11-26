@@ -220,6 +220,7 @@ struct UnifiedTextureMapping {
     bool has_pending_hash = false;
     bool is_lazy_placed = false;
     uint64_t gpu_alias_va = 0ull;
+    uint64_t born_present_epoch = 0ull;
     uint64_t unmapped_present_epoch = 0ull;
     uint64_t last_uploaded_hash = 0ull;
     uint64_t pending_hash = 0ull;
@@ -340,6 +341,7 @@ public:
     bool IsSamplerRootTableParam(void* host_rs, UINT root_param_index) const noexcept;
     bool IsValidRootDescriptorTableParam(
         void* host_rs, UINT root_param_index, bool* out_is_sampler = nullptr) const noexcept;
+    void GetAutoSpace2RootParams(void* host_rs, std::vector<uint32_t>& out_params) const;
     ~DeviceX();
 
     DeviceX(const DeviceX&) = delete;
@@ -1266,6 +1268,12 @@ private:
     };
     void MarkLazyPlacedTexture(ID3D12Resource* host_res, uint64_t gpu_va, bool owned_by_unified);
     void ReclaimCompletedGpuResources(ID3D12CommandQueue* host_queue) noexcept;
+    bool IsLocalVramNearBudget() noexcept;
+    HRESULT AllocateBoundedLazyTexture(
+        const D3D12_RESOURCE_DESC& desc,
+        D3D12_RESOURCE_STATES init_state,
+        uint64_t gpu_va,
+        ID3D12Resource** out_tex);
 
     std::mutex transient_res_mutex_;
     std::vector<TransientGpuResourceEntry> transient_gpu_resources_;
@@ -1331,6 +1339,9 @@ private:
     ID3D12CommandQueue* unified_sync_direct_queue_ = nullptr;
     std::atomic<uint64_t> committed_non_rt_vram_bytes_{0ull};
     std::atomic<uint64_t> committed_rt_ds_vram_bytes_{0ull};
+    std::atomic<uint64_t> lazy_placed_committed_bytes_{0ull};
+    std::atomic<uint32_t> vram_probe_counter_{0u};
+    std::atomic<bool> cached_local_vram_tight_{false};
 
     // Direct d3d12_xs -> Vulkan 1.4 routing state (active when OPENSCARLETT_BACKEND=vulkan)
     bool vulkan_routing_active_ = false;
@@ -1687,6 +1698,7 @@ private:
     std::unordered_map<uint64_t, ID3D12Resource*> shadow_to_tex_res_;
     std::unordered_map<void*, std::vector<uint32_t>> rs_table_slot_counts_;
     std::unordered_map<void*, std::vector<RsS2MirrorInfo>> rs_s2_mirrors_;
+    std::unordered_map<void*, std::vector<uint32_t>> rs_auto_s2_params_;
 
     // Diagnostic-only (OPENSCARLETT_TRACE_D3D12_LOG) descriptor & root signature inspector.
     mutable std::mutex diag_meta_mutex_;

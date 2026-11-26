@@ -5521,9 +5521,12 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateRootSignature(
                     OS_D3D12_IID(ID3D12VersionedRootSignatureDeserializer),
                     reinterpret_cast<void**>(&deser))) && deser) {
                 const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* orig = deser->GetUnconvertedRootSignatureDesc();
-                if (orig && (orig->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 ||
-                             orig->Version == D3D_ROOT_SIGNATURE_VERSION_1_1)) {
-                    D3D12_VERSIONED_ROOT_SIGNATURE_DESC aug = *orig;
+                const uint32_t orig_ver = orig ? static_cast<uint32_t>(orig->Version) : 0u;
+                if (orig && (orig_ver == static_cast<uint32_t>(D3D_ROOT_SIGNATURE_VERSION_1_0) ||
+                             orig_ver == static_cast<uint32_t>(D3D_ROOT_SIGNATURE_VERSION_1_1) ||
+                             orig_ver == 3u)) {
+                    D3D12_VERSIONED_ROOT_SIGNATURE_DESC aug{};
+                    aug.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
                     D3D12_STATIC_SAMPLER_DESC fallback_samp{};
                     fallback_samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
                     fallback_samp.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -5539,7 +5542,87 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateRootSignature(
                     fallback_samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
                     std::vector<D3D12_STATIC_SAMPLER_DESC> samps;
                     std::vector<D3D12_ROOT_PARAMETER1> params_1_1;
-                    std::vector<D3D12_DESCRIPTOR_RANGE1> expanded_ranges_1_1;
+                    std::vector<std::vector<D3D12_DESCRIPTOR_RANGE1>> range_storage_1_1;
+                    std::vector<uint32_t> auto_s2_params;
+                    if (orig_ver == static_cast<uint32_t>(D3D_ROOT_SIGNATURE_VERSION_1_0)) {
+                        aug.Desc_1_1.Flags = orig->Desc_1_0.Flags;
+                        params_1_1.resize(orig->Desc_1_0.NumParameters);
+                        range_storage_1_1.reserve(orig->Desc_1_0.NumParameters + 8u);
+                        for (UINT pi = 0u; pi < orig->Desc_1_0.NumParameters; ++pi) {
+                            const auto& p0 = orig->Desc_1_0.pParameters[pi];
+                            D3D12_ROOT_PARAMETER1 p1{};
+                            p1.ParameterType = p0.ParameterType;
+                            p1.ShaderVisibility = p0.ShaderVisibility;
+                            if (p0.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+                                range_storage_1_1.emplace_back();
+                                auto& rvec = range_storage_1_1.back();
+                                rvec.resize(p0.DescriptorTable.NumDescriptorRanges);
+                                for (UINT ri = 0u; ri < p0.DescriptorTable.NumDescriptorRanges; ++ri) {
+                                    const auto& rg0 = p0.DescriptorTable.pDescriptorRanges[ri];
+                                    rvec[ri].RangeType = rg0.RangeType;
+                                    rvec[ri].NumDescriptors = rg0.NumDescriptors;
+                                    rvec[ri].BaseShaderRegister = rg0.BaseShaderRegister;
+                                    rvec[ri].RegisterSpace = rg0.RegisterSpace;
+                                    rvec[ri].Flags = (rg0.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER)
+                                                         ? D3D12_DESCRIPTOR_RANGE_FLAG_NONE
+                                                         : D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+                                    rvec[ri].OffsetInDescriptorsFromTableStart = rg0.OffsetInDescriptorsFromTableStart;
+                                }
+                                p1.DescriptorTable.NumDescriptorRanges = static_cast<UINT>(rvec.size());
+                                p1.DescriptorTable.pDescriptorRanges = rvec.empty() ? nullptr : rvec.data();
+                            } else if (p0.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+                                p1.Constants = p0.Constants;
+                            } else {
+                                p1.Descriptor.ShaderRegister = p0.Descriptor.ShaderRegister;
+                                p1.Descriptor.RegisterSpace = p0.Descriptor.RegisterSpace;
+                                p1.Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
+                            }
+                            params_1_1[pi] = p1;
+                        }
+                        aug.Desc_1_1.NumParameters = static_cast<UINT>(params_1_1.size());
+                        aug.Desc_1_1.pParameters = params_1_1.empty() ? nullptr : params_1_1.data();
+                        if (orig->Desc_1_0.pStaticSamplers && orig->Desc_1_0.NumStaticSamplers > 0u) {
+                            samps.assign(orig->Desc_1_0.pStaticSamplers,
+                                         orig->Desc_1_0.pStaticSamplers + orig->Desc_1_0.NumStaticSamplers);
+                        }
+                    } else if (orig_ver == 3u) {
+                        // D3D_ROOT_SIGNATURE_VERSION_1_2: pParameters uses D3D12_ROOT_PARAMETER1;
+                        // static samplers have 56B stride (52B D3D12_STATIC_SAMPLER_DESC + 4B Flags).
+                        struct RawDesc12Layout {
+                            UINT NumParameters;
+                            const D3D12_ROOT_PARAMETER1* pParameters;
+                            UINT NumStaticSamplers;
+                            const uint8_t* pStaticSamplers1;
+                            D3D12_ROOT_SIGNATURE_FLAGS Flags;
+                        };
+                        const auto& d12 = *reinterpret_cast<const RawDesc12Layout*>(&orig->Desc_1_1);
+                        aug.Desc_1_1.Flags = d12.Flags;
+                        if (d12.pParameters && d12.NumParameters > 0u && d12.NumParameters <= 64u) {
+                            params_1_1.assign(d12.pParameters, d12.pParameters + d12.NumParameters);
+                        }
+                        aug.Desc_1_1.NumParameters = static_cast<UINT>(params_1_1.size());
+                        aug.Desc_1_1.pParameters = params_1_1.empty() ? nullptr : params_1_1.data();
+                        if (d12.pStaticSamplers1 && d12.NumStaticSamplers > 0u && d12.NumStaticSamplers <= 64u) {
+                            samps.resize(d12.NumStaticSamplers);
+                            constexpr size_t kSampler1Stride = sizeof(D3D12_STATIC_SAMPLER_DESC) + sizeof(UINT);
+                            for (UINT si = 0u; si < d12.NumStaticSamplers; ++si) {
+                                std::memcpy(&samps[si], d12.pStaticSamplers1 + si * kSampler1Stride,
+                                            sizeof(D3D12_STATIC_SAMPLER_DESC));
+                            }
+                        }
+                    } else {
+                        aug = *orig;
+                        if (orig->Desc_1_1.pParameters && orig->Desc_1_1.NumParameters > 0u) {
+                            params_1_1.assign(orig->Desc_1_1.pParameters,
+                                              orig->Desc_1_1.pParameters + orig->Desc_1_1.NumParameters);
+                        }
+                        aug.Desc_1_1.NumParameters = static_cast<UINT>(params_1_1.size());
+                        aug.Desc_1_1.pParameters = params_1_1.empty() ? nullptr : params_1_1.data();
+                        if (orig->Desc_1_1.pStaticSamplers && orig->Desc_1_1.NumStaticSamplers > 0u) {
+                            samps.assign(orig->Desc_1_1.pStaticSamplers,
+                                         orig->Desc_1_1.pStaticSamplers + orig->Desc_1_1.NumStaticSamplers);
+                        }
+                    }
                     auto sanitize_flags = [&](D3D12_ROOT_SIGNATURE_FLAGS& f) {
                         UINT bits = static_cast<UINT>(f) & 0x0FFFu;
                         if (adapter_info_.raytracing_tier == 0u) {
@@ -5550,109 +5633,95 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateRootSignature(
                         }
                         if ((bits & static_cast<UINT>(D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE)) == 0u) {
                             bits |= static_cast<UINT>(D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+                            // Ensure lifted VS/PS/MS/AS stages can always access space2 and s0,space99.
+                            bits &= ~static_cast<UINT>(D3D12_ROOT_SIGNATURE_FLAG_DENY_VERTEX_SHADER_ROOT_ACCESS |
+                                                       D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS);
+                            bits &= ~(0x100u | 0x200u);  // DENY_AMPLIFICATION / DENY_MESH_SHADER_ROOT_ACCESS
                         }
                         f = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(bits);
                     };
-                    if (aug.Version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
-                        sanitize_flags(aug.Desc_1_1.Flags);
-                        // Retail Scarlett engines share 1-table template root signatures (e.g. single
-                        // b27 space1 range) across multiple PSOs whose shaders read descriptors at
-                        // explicit offsets 0/1/2 from the same table. Alias the PSV0-verified slots
-                        // at their exact hardware table offsets so PC D3D12 PSO validation passes.
-                        if (aug.Desc_1_1.NumParameters == 1u && aug.Desc_1_1.pParameters &&
-                            aug.Desc_1_1.pParameters[0].ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
-                            aug.Desc_1_1.pParameters[0].DescriptorTable.NumDescriptorRanges == 1u &&
-                            aug.Desc_1_1.pParameters[0].DescriptorTable.pDescriptorRanges &&
-                            aug.Desc_1_1.pParameters[0].DescriptorTable.pDescriptorRanges[0].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV &&
-                            aug.Desc_1_1.pParameters[0].DescriptorTable.pDescriptorRanges[0].BaseShaderRegister == 27u &&
-                            aug.Desc_1_1.pParameters[0].DescriptorTable.pDescriptorRanges[0].RegisterSpace == 1u) {
-                            params_1_1.assign(aug.Desc_1_1.pParameters, aug.Desc_1_1.pParameters + 1u);
-                            D3D12_DESCRIPTOR_RANGE1 r0 = aug.Desc_1_1.pParameters[0].DescriptorTable.pDescriptorRanges[0];
-                            r0.OffsetInDescriptorsFromTableStart = 0u;
-                            auto make_rng = [](D3D12_DESCRIPTOR_RANGE_TYPE rt, UINT reg, UINT off) {
-                                D3D12_DESCRIPTOR_RANGE1 r{};
-                                r.RangeType = rt;
-                                r.NumDescriptors = 1u;
-                                r.BaseShaderRegister = reg;
-                                r.RegisterSpace = 1u;
-                                r.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
-                                r.OffsetInDescriptorsFromTableStart = off;
-                                return r;
-                            };
-                            auto make_s2_rng = [](D3D12_DESCRIPTOR_RANGE_TYPE rt, UINT count) {
-                                D3D12_DESCRIPTOR_RANGE1 r{};
-                                r.RangeType = rt;
-                                r.NumDescriptors = count;
-                                r.BaseShaderRegister = 0u;
-                                r.RegisterSpace = 2u;
-                                r.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
-                                r.OffsetInDescriptorsFromTableStart = 0u;
-                                return r;
-                            };
-                            // Slot @0..@15 space2 SRV, @16..@31 space2 CBV, @32..@47 space2 UAV
-                            // maps every hardware s[8:9]+slot*32 SRV/CBV/UAV cleanly without collisions.
-                            D3D12_DESCRIPTOR_RANGE1 s2_cbv =
-                                make_s2_rng(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 16u);
-                            s2_cbv.OffsetInDescriptorsFromTableStart = 16u;
-                            D3D12_DESCRIPTOR_RANGE1 s98_srv =
-                                make_s2_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 16u);
-                            s98_srv.RegisterSpace = 98u;
-                            expanded_ranges_1_1 = {
-                                r0,
-                                make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2u, 0u),
-                                make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3u, 0u),
-                                make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 7u, 0u),
-                                make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5u, 1u),
-                                make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 72u, 1u),
-                                make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 277u, 1u),
-                                make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 3u, 3u),
-                                make_s2_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 16u),
-                                s98_srv,
-                                s2_cbv,
-                            };
-                            if (params_1_1[0].ShaderVisibility == D3D12_SHADER_VISIBILITY_ALL) {
-                                D3D12_DESCRIPTOR_RANGE1 s2_uav =
-                                    make_s2_rng(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 16u);
-                                s2_uav.OffsetInDescriptorsFromTableStart = 32u;
-                                D3D12_DESCRIPTOR_RANGE1 s98_uav = s2_uav;
-                                s98_uav.RegisterSpace = 98u;
-                                expanded_ranges_1_1.push_back(s2_uav);
-                                expanded_ranges_1_1.push_back(s98_uav);
+                    sanitize_flags(aug.Desc_1_1.Flags);
+                    range_storage_1_1.reserve(range_storage_1_1.size() + 16u);
+                    if (params_1_1.size() == 1u &&
+                        params_1_1[0].ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
+                        params_1_1[0].DescriptorTable.NumDescriptorRanges == 1u &&
+                        params_1_1[0].DescriptorTable.pDescriptorRanges &&
+                        params_1_1[0].DescriptorTable.pDescriptorRanges[0].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV &&
+                        params_1_1[0].DescriptorTable.pDescriptorRanges[0].BaseShaderRegister == 27u &&
+                        params_1_1[0].DescriptorTable.pDescriptorRanges[0].RegisterSpace == 1u) {
+                        D3D12_DESCRIPTOR_RANGE1 r0 = params_1_1[0].DescriptorTable.pDescriptorRanges[0];
+                        r0.OffsetInDescriptorsFromTableStart = 0u;
+                        auto make_rng = [](D3D12_DESCRIPTOR_RANGE_TYPE rt, UINT reg, UINT off) {
+                            D3D12_DESCRIPTOR_RANGE1 r{};
+                            r.RangeType = rt;
+                            r.NumDescriptors = 1u;
+                            r.BaseShaderRegister = reg;
+                            r.RegisterSpace = 1u;
+                            r.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+                            r.OffsetInDescriptorsFromTableStart = off;
+                            return r;
+                        };
+                        auto make_s2_rng = [](D3D12_DESCRIPTOR_RANGE_TYPE rt, UINT count) {
+                            D3D12_DESCRIPTOR_RANGE1 r{};
+                            r.RangeType = rt;
+                            r.NumDescriptors = count;
+                            r.BaseShaderRegister = 0u;
+                            r.RegisterSpace = 2u;
+                            r.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+                            r.OffsetInDescriptorsFromTableStart = 0u;
+                            return r;
+                        };
+                        D3D12_DESCRIPTOR_RANGE1 s2_cbv =
+                            make_s2_rng(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 16u);
+                        s2_cbv.OffsetInDescriptorsFromTableStart = 16u;
+                        D3D12_DESCRIPTOR_RANGE1 s98_srv =
+                            make_s2_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 16u);
+                        s98_srv.RegisterSpace = 98u;
+                        range_storage_1_1.push_back({
+                            r0,
+                            make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2u, 0u),
+                            make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3u, 0u),
+                            make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 7u, 0u),
+                            make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5u, 1u),
+                            make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 72u, 1u),
+                            make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 277u, 1u),
+                            make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 3u, 3u),
+                            make_s2_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 16u),
+                            s98_srv,
+                            s2_cbv,
+                        });
+                        auto& exp_vec = range_storage_1_1.back();
+                        if (params_1_1[0].ShaderVisibility == D3D12_SHADER_VISIBILITY_ALL) {
+                            D3D12_DESCRIPTOR_RANGE1 s2_uav =
+                                make_s2_rng(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 16u);
+                            s2_uav.OffsetInDescriptorsFromTableStart = 32u;
+                            D3D12_DESCRIPTOR_RANGE1 s98_uav = s2_uav;
+                            s98_uav.RegisterSpace = 98u;
+                            exp_vec.push_back(s2_uav);
+                            exp_vec.push_back(s98_uav);
+                        }
+                        params_1_1[0].DescriptorTable.NumDescriptorRanges = static_cast<UINT>(exp_vec.size());
+                        params_1_1[0].DescriptorTable.pDescriptorRanges = exp_vec.data();
+                        if (samps.empty()) {
+                            for (UINT sreg = 0u; sreg < 22u; ++sreg) {
+                                D3D12_STATIC_SAMPLER_DESC ss = fallback_samp;
+                                ss.ShaderRegister = sreg;
+                                ss.RegisterSpace = 1u;
+                                samps.push_back(ss);
                             }
-                            params_1_1[0].DescriptorTable.NumDescriptorRanges = static_cast<UINT>(expanded_ranges_1_1.size());
-                            params_1_1[0].DescriptorTable.pDescriptorRanges = expanded_ranges_1_1.data();
-                            aug.Desc_1_1.pParameters = params_1_1.data();
-                            if (aug.Desc_1_1.NumStaticSamplers == 0u) {
-                                for (UINT sreg = 0u; sreg < 22u; ++sreg) {
-                                    D3D12_STATIC_SAMPLER_DESC ss = fallback_samp;
-                                    ss.ShaderRegister = sreg;
-                                    ss.RegisterSpace = 1u;
-                                    samps.push_back(ss);
-                                }
-                            }
-                        } else if (aug.Desc_1_1.NumParameters >= 1u && aug.Desc_1_1.pParameters) {
-                            // Retail Scarlett Scaleform/UI pipelines share a root signature declaring
-                            // CBV b0 space1 across both instanced (b0 space1) and non-instanced
-                            // (b7 space1) shaders reading the exact same descriptor slot. Alias b7
-                            // space1 at b0 space1's table offset when b7 space1 is not already present,
-                            // and overlay space2 SRV/CBV slots @0..@15 on all retail descriptor tables
-                            // so any lifted XDAT shader can bind its exact hardware descriptor slots.
-                            int target_pi = -1;
-                            int fallback_s2_space1_pi = -1;
-                            int fallback_s2_any_pi = -1;
-                            bool add_b7_alias = false;
-                            UINT b0_table_off = 0u;
-                            for (UINT pi = 0u; pi < aug.Desc_1_1.NumParameters && target_pi < 0; ++pi) {
-                                const auto& rp = aug.Desc_1_1.pParameters[pi];
-                                if (rp.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ||
-                                    !rp.DescriptorTable.pDescriptorRanges ||
-                                    rp.DescriptorTable.NumDescriptorRanges == 0u) {
-                                    continue;
-                                }
+                        }
+                    } else {
+                        bool rs_already_has_s2 = false;
+                        int b7_target_pi = -1;
+                        UINT b0_table_off = 0u;
+                        int vis_all_table_pi = -1;
+                        for (UINT pi = 0u; pi < params_1_1.size(); ++pi) {
+                            const auto& rp = params_1_1[pi];
+                            if (rp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
+                                rp.DescriptorTable.pDescriptorRanges &&
+                                rp.DescriptorTable.NumDescriptorRanges > 0u) {
                                 bool has_b0_s1 = false;
                                 bool has_b7_s1 = false;
-                                bool has_any_s1 = false;
-                                bool has_s2 = false;
                                 bool is_sampler_table = false;
                                 UINT cur_off = 0u;
                                 for (UINT ri = 0u; ri < rp.DescriptorTable.NumDescriptorRanges; ++ri) {
@@ -5664,19 +5733,15 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateRootSignature(
                                     if (rg.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) {
                                         is_sampler_table = true;
                                     }
-                                    if (rg.RegisterSpace == 1u) {
-                                        has_any_s1 = true;
-                                    }
                                     if (rg.RegisterSpace == 2u) {
-                                        has_s2 = true;
+                                        rs_already_has_s2 = true;
                                     }
-                                    if (rg.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV &&
-                                        rg.RegisterSpace == 1u) {
+                                    if (rg.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV && rg.RegisterSpace == 1u) {
                                         if (rg.BaseShaderRegister <= 0u &&
                                             (rg.NumDescriptors == UINT_MAX ||
                                              rg.BaseShaderRegister + rg.NumDescriptors > 0u)) {
                                             has_b0_s1 = true;
-                                            b0_table_off = off;
+                                            if (b7_target_pi < 0) b0_table_off = off;
                                         }
                                         if (rg.BaseShaderRegister <= 7u &&
                                             (rg.NumDescriptors == UINT_MAX ||
@@ -5686,243 +5751,278 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateRootSignature(
                                     }
                                     cur_off = off + ((rg.NumDescriptors == UINT_MAX) ? 64u : rg.NumDescriptors);
                                 }
-                                if (has_b0_s1 && !has_b7_s1) {
-                                    target_pi = static_cast<int>(pi);
-                                    add_b7_alias = true;
-                                } else if (!is_sampler_table && !has_s2) {
-                                    if (has_any_s1 && fallback_s2_space1_pi < 0) {
-                                        fallback_s2_space1_pi = static_cast<int>(pi);
-                                    }
-                                    if (fallback_s2_any_pi < 0) {
-                                        fallback_s2_any_pi = static_cast<int>(pi);
-                                    }
+                                if (has_b0_s1 && !has_b7_s1 && b7_target_pi < 0) {
+                                    b7_target_pi = static_cast<int>(pi);
                                 }
+                                if (!is_sampler_table &&
+                                    rp.ShaderVisibility == D3D12_SHADER_VISIBILITY_ALL &&
+                                    vis_all_table_pi < 0) {
+                                    vis_all_table_pi = static_cast<int>(pi);
+                                }
+                            } else if ((rp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV ||
+                                        rp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV ||
+                                        rp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV) &&
+                                       rp.Descriptor.RegisterSpace == 2u) {
+                                rs_already_has_s2 = true;
                             }
-                            if (target_pi < 0) {
-                                target_pi = (fallback_s2_space1_pi >= 0) ? fallback_s2_space1_pi : fallback_s2_any_pi;
-                                add_b7_alias = false;
+                        }
+
+                        auto append_s2_to_ranges = [](std::vector<D3D12_DESCRIPTOR_RANGE1>& rvec,
+                                                      UINT cur_off,
+                                                      D3D12_SHADER_VISIBILITY vis) {
+                            const UINT s2_cbv_off = std::max<UINT>(16u, (cur_off + 15u) & ~15u);
+                            D3D12_DESCRIPTOR_RANGE1 s2_srv{};
+                            s2_srv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+                            s2_srv.NumDescriptors = 16u;
+                            s2_srv.BaseShaderRegister = 0u;
+                            s2_srv.RegisterSpace = 2u;
+                            s2_srv.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+                            s2_srv.OffsetInDescriptorsFromTableStart = 0u;
+                            D3D12_DESCRIPTOR_RANGE1 s98_srv = s2_srv;
+                            s98_srv.RegisterSpace = 98u;
+                            D3D12_DESCRIPTOR_RANGE1 s2_cbv = s2_srv;
+                            s2_cbv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+                            s2_cbv.OffsetInDescriptorsFromTableStart = s2_cbv_off;
+                            rvec.push_back(s2_srv);
+                            rvec.push_back(s98_srv);
+                            rvec.push_back(s2_cbv);
+                            if (vis == D3D12_SHADER_VISIBILITY_ALL) {
+                                D3D12_DESCRIPTOR_RANGE1 s2_uav = s2_srv;
+                                s2_uav.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+                                s2_uav.OffsetInDescriptorsFromTableStart = s2_cbv_off + 16u;
+                                D3D12_DESCRIPTOR_RANGE1 s98_uav = s2_uav;
+                                s98_uav.RegisterSpace = 98u;
+                                rvec.push_back(s2_uav);
+                                rvec.push_back(s98_uav);
                             }
-                            if (target_pi >= 0) {
-                                params_1_1.assign(aug.Desc_1_1.pParameters,
-                                                  aug.Desc_1_1.pParameters + aug.Desc_1_1.NumParameters);
-                                const auto& dt = params_1_1[static_cast<size_t>(target_pi)].DescriptorTable;
-                                expanded_ranges_1_1.reserve(dt.NumDescriptorRanges + 3u);
-                                UINT cur_off = 0u;
-                                bool has_s2 = false;
-                                const bool scaleform_t2_b0_pair =
-                                    add_b7_alias &&
-                                    (dt.NumDescriptorRanges == 2u &&
-                                     dt.pDescriptorRanges[0].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV &&
-                                     dt.pDescriptorRanges[0].BaseShaderRegister == 2u &&
-                                     dt.pDescriptorRanges[0].NumDescriptors == 1u &&
-                                     dt.pDescriptorRanges[0].RegisterSpace == 1u &&
-                                     dt.pDescriptorRanges[1].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV &&
-                                     dt.pDescriptorRanges[1].BaseShaderRegister == 0u &&
-                                     dt.pDescriptorRanges[1].NumDescriptors == 1u &&
-                                     dt.pDescriptorRanges[1].RegisterSpace == 1u);
-                                bool other_param_uses_s1_ext = false;
-                                if (scaleform_t2_b0_pair) {
-                                    const D3D12_SHADER_VISIBILITY target_vis =
-                                        params_1_1[static_cast<size_t>(target_pi)].ShaderVisibility;
-                                    for (UINT oi = 0u; oi < aug.Desc_1_1.NumParameters && !other_param_uses_s1_ext; ++oi) {
-                                        if (static_cast<int>(oi) == target_pi) continue;
-                                        const auto& orp = aug.Desc_1_1.pParameters[oi];
-                                        const bool vis_overlap =
-                                            (target_vis == D3D12_SHADER_VISIBILITY_ALL) ||
-                                            (orp.ShaderVisibility == D3D12_SHADER_VISIBILITY_ALL) ||
-                                            (target_vis == orp.ShaderVisibility);
-                                        if (!vis_overlap) continue;
-                                        if (orp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
-                                            orp.DescriptorTable.pDescriptorRanges) {
-                                            for (UINT ori = 0u; ori < orp.DescriptorTable.NumDescriptorRanges; ++ori) {
-                                                const auto& org = orp.DescriptorTable.pDescriptorRanges[ori];
-                                                if (org.RegisterSpace != 1u || org.NumDescriptors == 0u) continue;
-                                                const uint64_t rlo = org.BaseShaderRegister;
-                                                const uint64_t rhi = (org.NumDescriptors == UINT_MAX)
-                                                                         ? UINT64_MAX
-                                                                         : (rlo + org.NumDescriptors - 1ull);
-                                                if ((org.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV &&
-                                                     rhi >= 1ull && rlo <= 31ull) ||
-                                                    (org.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV &&
-                                                     rhi >= 3ull && rlo <= 15ull)) {
-                                                    other_param_uses_s1_ext = true;
-                                                    break;
-                                                }
+                        };
+
+                        if (b7_target_pi >= 0) {
+                            const auto& dt = params_1_1[static_cast<size_t>(b7_target_pi)].DescriptorTable;
+                            const bool scaleform_t2_b0_pair =
+                                (dt.NumDescriptorRanges == 2u &&
+                                 dt.pDescriptorRanges[0].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV &&
+                                 dt.pDescriptorRanges[0].BaseShaderRegister == 2u &&
+                                 dt.pDescriptorRanges[0].NumDescriptors == 1u &&
+                                 dt.pDescriptorRanges[0].RegisterSpace == 1u &&
+                                 dt.pDescriptorRanges[1].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV &&
+                                 dt.pDescriptorRanges[1].BaseShaderRegister == 0u &&
+                                 dt.pDescriptorRanges[1].NumDescriptors == 1u &&
+                                 dt.pDescriptorRanges[1].RegisterSpace == 1u);
+                            bool other_param_uses_s1_ext = false;
+                            if (scaleform_t2_b0_pair) {
+                                const D3D12_SHADER_VISIBILITY target_vis =
+                                    params_1_1[static_cast<size_t>(b7_target_pi)].ShaderVisibility;
+                                for (UINT oi = 0u; oi < params_1_1.size() && !other_param_uses_s1_ext; ++oi) {
+                                    if (static_cast<int>(oi) == b7_target_pi) continue;
+                                    const auto& orp = params_1_1[oi];
+                                    const bool vis_overlap =
+                                        (target_vis == D3D12_SHADER_VISIBILITY_ALL) ||
+                                        (orp.ShaderVisibility == D3D12_SHADER_VISIBILITY_ALL) ||
+                                        (target_vis == orp.ShaderVisibility);
+                                    if (!vis_overlap) continue;
+                                    if (orp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
+                                        orp.DescriptorTable.pDescriptorRanges) {
+                                        for (UINT ori = 0u; ori < orp.DescriptorTable.NumDescriptorRanges; ++ori) {
+                                            const auto& org = orp.DescriptorTable.pDescriptorRanges[ori];
+                                            if (org.RegisterSpace != 1u || org.NumDescriptors == 0u) continue;
+                                            const uint64_t rlo = org.BaseShaderRegister;
+                                            const uint64_t rhi = (org.NumDescriptors == UINT_MAX)
+                                                                     ? UINT64_MAX
+                                                                     : (rlo + org.NumDescriptors - 1ull);
+                                            if ((org.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV &&
+                                                 rhi >= 1ull && rlo <= 31ull) ||
+                                                (org.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV &&
+                                                 rhi >= 3ull && rlo <= 15ull)) {
+                                                other_param_uses_s1_ext = true;
+                                                break;
                                             }
-                                        } else if (orp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV ||
-                                                   orp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV) {
-                                            if (orp.Descriptor.RegisterSpace == 1u) {
-                                                if ((orp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV &&
-                                                     orp.Descriptor.ShaderRegister >= 1u &&
-                                                     orp.Descriptor.ShaderRegister <= 31u) ||
-                                                    (orp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV &&
-                                                     orp.Descriptor.ShaderRegister >= 3u &&
-                                                     orp.Descriptor.ShaderRegister <= 15u)) {
-                                                    other_param_uses_s1_ext = true;
-                                                }
-                                            }
+                                        }
+                                    } else if ((orp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV ||
+                                                orp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV) &&
+                                               orp.Descriptor.RegisterSpace == 1u) {
+                                        if ((orp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV &&
+                                             orp.Descriptor.ShaderRegister >= 1u &&
+                                             orp.Descriptor.ShaderRegister <= 31u) ||
+                                            (orp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV &&
+                                             orp.Descriptor.ShaderRegister >= 3u &&
+                                             orp.Descriptor.ShaderRegister <= 15u)) {
+                                            other_param_uses_s1_ext = true;
                                         }
                                     }
                                 }
-                                for (UINT ri = 0u; ri < dt.NumDescriptorRanges; ++ri) {
-                                    D3D12_DESCRIPTOR_RANGE1 rg = dt.pDescriptorRanges[ri];
+                            }
+                            range_storage_1_1.emplace_back();
+                            auto& exp_r = range_storage_1_1.back();
+                            exp_r.reserve(dt.NumDescriptorRanges + 36u);
+                            UINT cur_off = 0u;
+                            for (UINT ri = 0u; ri < dt.NumDescriptorRanges; ++ri) {
+                                D3D12_DESCRIPTOR_RANGE1 rg = dt.pDescriptorRanges[ri];
+                                const UINT off =
+                                    (rg.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND)
+                                        ? cur_off
+                                        : rg.OffsetInDescriptorsFromTableStart;
+                                rg.OffsetInDescriptorsFromTableStart =
+                                    (scaleform_t2_b0_pair && ri == 1u) ? 0u : off;
+                                exp_r.push_back(rg);
+                                cur_off = off + ((rg.NumDescriptors == UINT_MAX) ? 64u : rg.NumDescriptors);
+                            }
+                            D3D12_DESCRIPTOR_RANGE1 b7_alias{};
+                            b7_alias.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+                            b7_alias.NumDescriptors = 1u;
+                            b7_alias.BaseShaderRegister = 7u;
+                            b7_alias.RegisterSpace = 1u;
+                            b7_alias.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+                            b7_alias.OffsetInDescriptorsFromTableStart =
+                                scaleform_t2_b0_pair ? 0u : b0_table_off;
+                            exp_r.push_back(b7_alias);
+                            if (scaleform_t2_b0_pair && !other_param_uses_s1_ext) {
+                                for (UINT cb_reg = 1u; cb_reg <= 15u; ++cb_reg) {
+                                    if (cb_reg == 7u) continue;
+                                    D3D12_DESCRIPTOR_RANGE1 cb_r = b7_alias;
+                                    cb_r.BaseShaderRegister = cb_reg;
+                                    cb_r.NumDescriptors = 1u;
+                                    cb_r.OffsetInDescriptorsFromTableStart = 0u;
+                                    exp_r.push_back(cb_r);
+                                }
+                                for (UINT srv_reg = 3u; srv_reg <= 15u; ++srv_reg) {
+                                    D3D12_DESCRIPTOR_RANGE1 srv_r{};
+                                    srv_r.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+                                    srv_r.NumDescriptors = 1u;
+                                    srv_r.BaseShaderRegister = srv_reg;
+                                    srv_r.RegisterSpace = 1u;
+                                    srv_r.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+                                    srv_r.OffsetInDescriptorsFromTableStart = 1u;
+                                    exp_r.push_back(srv_r);
+                                }
+                            }
+                            params_1_1[static_cast<size_t>(b7_target_pi)].DescriptorTable.NumDescriptorRanges =
+                                static_cast<UINT>(exp_r.size());
+                            params_1_1[static_cast<size_t>(b7_target_pi)].DescriptorTable.pDescriptorRanges =
+                                exp_r.data();
+                        }
+
+                        if (!rs_already_has_s2 &&
+                            (static_cast<UINT>(aug.Desc_1_1.Flags) &
+                             static_cast<UINT>(D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE)) == 0u) {
+                            auto expand_table_with_s2 = [&](size_t pi) {
+                                auto& rp = params_1_1[pi];
+                                range_storage_1_1.emplace_back();
+                                auto& exp_r = range_storage_1_1.back();
+                                exp_r.reserve(rp.DescriptorTable.NumDescriptorRanges + 5u);
+                                UINT cur_off = 0u;
+                                for (UINT ri = 0u; ri < rp.DescriptorTable.NumDescriptorRanges; ++ri) {
+                                    D3D12_DESCRIPTOR_RANGE1 rg = rp.DescriptorTable.pDescriptorRanges[ri];
                                     const UINT off =
                                         (rg.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND)
                                             ? cur_off
                                             : rg.OffsetInDescriptorsFromTableStart;
-                                    if (rg.RegisterSpace == 2u) has_s2 = true;
-                                    rg.OffsetInDescriptorsFromTableStart =
-                                        (scaleform_t2_b0_pair && ri == 1u) ? 0u : off;
-                                    expanded_ranges_1_1.push_back(rg);
+                                    rg.OffsetInDescriptorsFromTableStart = off;
+                                    exp_r.push_back(rg);
                                     cur_off = off + ((rg.NumDescriptors == UINT_MAX) ? 64u : rg.NumDescriptors);
                                 }
-                                if (add_b7_alias) {
-                                    D3D12_DESCRIPTOR_RANGE1 b7_alias{};
-                                    b7_alias.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
-                                    b7_alias.NumDescriptors = 1u;
-                                    b7_alias.BaseShaderRegister = 7u;
-                                    b7_alias.RegisterSpace = 1u;
-                                    b7_alias.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
-                                    b7_alias.OffsetInDescriptorsFromTableStart =
-                                        scaleform_t2_b0_pair ? 0u : b0_table_off;
-                                    expanded_ranges_1_1.push_back(b7_alias);
-                                    if (scaleform_t2_b0_pair && !other_param_uses_s1_ext) {
-                                        // Retail UI/font pipelines sharing the {t2, b0} space1 root
-                                        // signature all place their active CBV at table offset @0
-                                        // under PSV0 registers b1..b15 (e.g. b1, b3, b10, b11).
-                                        // Emit each register individually at @0 so b3/b10/b11 read
-                                        // slot @0 rather than empty slots @2/@3, and alias t3..t15
-                                        // individually at @1 without inflating table size past 16.
-                                        for (UINT cb_reg = 1u; cb_reg <= 15u; ++cb_reg) {
-                                            if (cb_reg == 7u) continue;
-                                            D3D12_DESCRIPTOR_RANGE1 cb_r = b7_alias;
-                                            cb_r.BaseShaderRegister = cb_reg;
-                                            cb_r.NumDescriptors = 1u;
-                                            cb_r.OffsetInDescriptorsFromTableStart = 0u;
-                                            expanded_ranges_1_1.push_back(cb_r);
-                                        }
-                                        for (UINT srv_reg = 3u; srv_reg <= 15u; ++srv_reg) {
-                                            D3D12_DESCRIPTOR_RANGE1 srv_r{};
-                                            srv_r.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-                                            srv_r.NumDescriptors = 1u;
-                                            srv_r.BaseShaderRegister = srv_reg;
-                                            srv_r.RegisterSpace = 1u;
-                                            srv_r.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
-                                            srv_r.OffsetInDescriptorsFromTableStart = 1u;
-                                            expanded_ranges_1_1.push_back(srv_r);
-                                        }
+                                append_s2_to_ranges(exp_r, cur_off, rp.ShaderVisibility);
+                                rp.DescriptorTable.NumDescriptorRanges = static_cast<UINT>(exp_r.size());
+                                rp.DescriptorTable.pDescriptorRanges = exp_r.data();
+                            };
+
+                            if (vis_all_table_pi >= 0) {
+                                // A single VISIBILITY_ALL descriptor table covers VS, PS, MS, AS, and CS.
+                                expand_table_with_s2(static_cast<size_t>(vis_all_table_pi));
+                            } else {
+                                // Overlay space2 onto the first non-sampler table of each distinct ShaderVisibility,
+                                // then append auto-mirrored space2 table(s) for any uncovered stage (e.g. MESH / PIXEL).
+                                uint32_t covered_vis_mask = 0u;
+                                for (size_t pi = 0u; pi < params_1_1.size(); ++pi) {
+                                    const auto& rp = params_1_1[pi];
+                                    if (rp.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ||
+                                        !rp.DescriptorTable.pDescriptorRanges ||
+                                        rp.DescriptorTable.NumDescriptorRanges == 0u) {
+                                        continue;
                                     }
-                                }
-                                if (!has_s2) {
-                                    for (UINT cpi = 0u; cpi < aug.Desc_1_1.NumParameters && !has_s2; ++cpi) {
-                                        const auto& crp = aug.Desc_1_1.pParameters[cpi];
-                                        if (crp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
-                                            crp.DescriptorTable.pDescriptorRanges) {
-                                            for (UINT cri = 0u; cri < crp.DescriptorTable.NumDescriptorRanges; ++cri) {
-                                                if (crp.DescriptorTable.pDescriptorRanges[cri].RegisterSpace == 2u) {
-                                                    has_s2 = true;
-                                                    break;
-                                                }
-                                            }
-                                        } else if ((crp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV ||
-                                                    crp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV ||
-                                                    crp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV) &&
-                                                   crp.Descriptor.RegisterSpace == 2u) {
-                                            has_s2 = true;
-                                        }
-                                    }
-                                }
-                                if (!has_s2) {
-                                    const UINT s2_cbv_off = std::max<UINT>(16u, (cur_off + 15u) & ~15u);
-                                    D3D12_DESCRIPTOR_RANGE1 s2_srv{};
-                                    s2_srv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-                                    s2_srv.NumDescriptors = 16u;
-                                    s2_srv.BaseShaderRegister = 0u;
-                                    s2_srv.RegisterSpace = 2u;
-                                    s2_srv.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
-                                    s2_srv.OffsetInDescriptorsFromTableStart = 0u;
-                                    D3D12_DESCRIPTOR_RANGE1 s98_srv = s2_srv;
-                                    s98_srv.RegisterSpace = 98u;
-                                    D3D12_DESCRIPTOR_RANGE1 s2_cbv = s2_srv;
-                                    s2_cbv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
-                                    s2_cbv.OffsetInDescriptorsFromTableStart = s2_cbv_off;
-                                    expanded_ranges_1_1.push_back(s2_srv);
-                                    expanded_ranges_1_1.push_back(s98_srv);
-                                    expanded_ranges_1_1.push_back(s2_cbv);
-                                    if (params_1_1[static_cast<size_t>(target_pi)].ShaderVisibility ==
-                                        D3D12_SHADER_VISIBILITY_ALL) {
-                                        D3D12_DESCRIPTOR_RANGE1 s2_uav = s2_srv;
-                                        s2_uav.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-                                        s2_uav.OffsetInDescriptorsFromTableStart = s2_cbv_off + 16u;
-                                        D3D12_DESCRIPTOR_RANGE1 s98_uav = s2_uav;
-                                        s98_uav.RegisterSpace = 98u;
-                                        expanded_ranges_1_1.push_back(s2_uav);
-                                        expanded_ranges_1_1.push_back(s98_uav);
-                                    }
-                                }
-                                params_1_1[static_cast<size_t>(target_pi)].DescriptorTable.NumDescriptorRanges =
-                                    static_cast<UINT>(expanded_ranges_1_1.size());
-                                params_1_1[static_cast<size_t>(target_pi)].DescriptorTable.pDescriptorRanges =
-                                    expanded_ranges_1_1.data();
-                                aug.Desc_1_1.pParameters = params_1_1.data();
-                                static const bool trace_sf_rs = []() {
-                                    char v[16]{};
-                                    return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_SF_DRAW", v, sizeof(v)) > 0 && v[0] == '1';
-                                }();
-                                if (trace_sf_rs) {
-                                    std::fprintf(stderr,
-                                                 "[OpenScarlett][SF-RS] aliased b7->b0 space1 at param=%d off=%u (nRanges=%u nParams=%u nSamps=%u)\n",
-                                                 target_pi, b0_table_off,
-                                                 static_cast<unsigned>(expanded_ranges_1_1.size()),
-                                                 aug.Desc_1_1.NumParameters,
-                                                 aug.Desc_1_1.NumStaticSamplers);
-                                    std::fflush(stderr);
-                                }
-                            }
-                        }
-                        if (aug.Desc_1_1.pStaticSamplers && aug.Desc_1_1.NumStaticSamplers > 0u) {
-                            samps.insert(samps.begin(), aug.Desc_1_1.pStaticSamplers,
-                                         aug.Desc_1_1.pStaticSamplers + aug.Desc_1_1.NumStaticSamplers);
-                        } else if (samps.empty() && aug.Desc_1_1.pParameters) {
-                            bool has_sampler_table = false;
-                            bool has_space1 = false;
-                            for (UINT pi = 0u; pi < aug.Desc_1_1.NumParameters; ++pi) {
-                                const auto& rp = aug.Desc_1_1.pParameters[pi];
-                                if (rp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
-                                    rp.DescriptorTable.pDescriptorRanges) {
+                                    bool is_samp = false;
                                     for (UINT ri = 0u; ri < rp.DescriptorTable.NumDescriptorRanges; ++ri) {
-                                        const auto& rg = rp.DescriptorTable.pDescriptorRanges[ri];
-                                        if (rg.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) {
-                                            has_sampler_table = true;
+                                        if (rp.DescriptorTable.pDescriptorRanges[ri].RangeType ==
+                                            D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) {
+                                            is_samp = true;
+                                            break;
                                         }
-                                        if (rg.RegisterSpace == 1u) {
-                                            has_space1 = true;
+                                    }
+                                    if (is_samp) continue;
+                                    const uint32_t v = static_cast<uint32_t>(rp.ShaderVisibility);
+                                    if (v < 16u && (covered_vis_mask & (1u << v)) == 0u) {
+                                        covered_vis_mask |= (1u << v);
+                                        expand_table_with_s2(pi);
+                                    }
+                                }
+                                auto append_auto_s2_param = [&](D3D12_SHADER_VISIBILITY vis) {
+                                    if (params_1_1.size() >= 56u) return;
+                                    range_storage_1_1.emplace_back();
+                                    auto& rvec = range_storage_1_1.back();
+                                    append_s2_to_ranges(rvec, 0u, vis);
+                                    D3D12_ROOT_PARAMETER1 p{};
+                                    p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                                    p.ShaderVisibility = vis;
+                                    p.DescriptorTable.NumDescriptorRanges = static_cast<UINT>(rvec.size());
+                                    p.DescriptorTable.pDescriptorRanges = rvec.data();
+                                    auto_s2_params.push_back(static_cast<uint32_t>(params_1_1.size()));
+                                    params_1_1.push_back(p);
+                                };
+                                if (covered_vis_mask == 0u) {
+                                    append_auto_s2_param(D3D12_SHADER_VISIBILITY_ALL);
+                                } else {
+                                    const D3D12_SHADER_VISIBILITY kNeedVis[] = {
+                                        D3D12_SHADER_VISIBILITY_VERTEX,
+                                        D3D12_SHADER_VISIBILITY_PIXEL,
+                                        D3D12_SHADER_VISIBILITY_AMPLIFICATION,
+                                        D3D12_SHADER_VISIBILITY_MESH,
+                                    };
+                                    for (D3D12_SHADER_VISIBILITY nv : kNeedVis) {
+                                        const uint32_t bit = 1u << static_cast<uint32_t>(nv);
+                                        if (nv == D3D12_SHADER_VISIBILITY_AMPLIFICATION ||
+                                            nv == D3D12_SHADER_VISIBILITY_MESH) {
+                                            if (adapter_info_.mesh_shader_tier == 0u) continue;
+                                        }
+                                        if ((covered_vis_mask & bit) == 0u) {
+                                            append_auto_s2_param(nv);
                                         }
                                     }
                                 }
                             }
-                            if (has_space1 && !has_sampler_table) {
-                                for (UINT sreg = 0u; sreg < 22u; ++sreg) {
-                                    D3D12_STATIC_SAMPLER_DESC ss = fallback_samp;
-                                    ss.ShaderRegister = sreg;
-                                    ss.RegisterSpace = 1u;
-                                    samps.push_back(ss);
+                        }
+                    }
+                    aug.Desc_1_1.NumParameters = static_cast<UINT>(params_1_1.size());
+                    aug.Desc_1_1.pParameters = params_1_1.empty() ? nullptr : params_1_1.data();
+                    if (samps.empty() && aug.Desc_1_1.pParameters) {
+                        bool has_sampler_table = false;
+                        bool has_space1 = false;
+                        for (UINT pi = 0u; pi < aug.Desc_1_1.NumParameters; ++pi) {
+                            const auto& rp = aug.Desc_1_1.pParameters[pi];
+                            if (rp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
+                                rp.DescriptorTable.pDescriptorRanges) {
+                                for (UINT ri = 0u; ri < rp.DescriptorTable.NumDescriptorRanges; ++ri) {
+                                    const auto& rg = rp.DescriptorTable.pDescriptorRanges[ri];
+                                    if (rg.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) {
+                                        has_sampler_table = true;
+                                    }
+                                    if (rg.RegisterSpace == 1u) {
+                                        has_space1 = true;
+                                    }
                                 }
                             }
                         }
-                        samps.push_back(fallback_samp);
-                        aug.Desc_1_1.NumStaticSamplers = static_cast<UINT>(samps.size());
-                        aug.Desc_1_1.pStaticSamplers = samps.data();
-                    } else {
-                        sanitize_flags(aug.Desc_1_0.Flags);
-                        if (aug.Desc_1_0.pStaticSamplers && aug.Desc_1_0.NumStaticSamplers > 0u) {
-                            samps.assign(aug.Desc_1_0.pStaticSamplers,
-                                         aug.Desc_1_0.pStaticSamplers + aug.Desc_1_0.NumStaticSamplers);
+                        if (has_space1 && !has_sampler_table) {
+                            for (UINT sreg = 0u; sreg < 22u; ++sreg) {
+                                D3D12_STATIC_SAMPLER_DESC ss = fallback_samp;
+                                ss.ShaderRegister = sreg;
+                                ss.RegisterSpace = 1u;
+                                samps.push_back(ss);
+                            }
                         }
-                        samps.push_back(fallback_samp);
-                        aug.Desc_1_0.NumStaticSamplers = static_cast<UINT>(samps.size());
-                        aug.Desc_1_0.pStaticSamplers = samps.data();
                     }
+                    samps.push_back(fallback_samp);
+                    aug.Desc_1_1.NumStaticSamplers = static_cast<UINT>(samps.size());
+                    aug.Desc_1_1.pStaticSamplers = samps.data();
                     ID3DBlob* aug_blob = nullptr;
                     ID3DBlob* err_blob = nullptr;
                     if (SUCCEEDED(fn_ser(&aug, &aug_blob, &err_blob)) && aug_blob) {
@@ -5931,6 +6031,10 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateRootSignature(
                             OS_D3D12_IID(ID3D12RootSignature), reinterpret_cast<void**>(&host_rs));
                         if (SUCCEEDED(hr) && host_rs) {
                             RecordRootSigTableSizes(host_rs, aug);
+                            if (!auto_s2_params.empty()) {
+                                std::lock_guard<std::mutex> lk(guest_dh_mutex_);
+                                rs_auto_s2_params_[host_rs] = std::move(auto_s2_params);
+                            }
                         }
                         if (SUCCEEDED(hr) && host_rs &&
                             aug.Version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
@@ -6052,24 +6156,65 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateRootSignature(
                 deser->Release();
             }
         }
-        // Final fallback for retail Scarlett on non-DXR/SM6.5 desktop GPUs (e.g. DXR local root
-        // signatures or Xbox-only root signature blobs): create a valid empty root signature so
-        // non-fatal subsystem init (like InitRayTracing on GTX 1650 Ti) can proceed cleanly.
+        // Final fallback for retail Scarlett when host deserializer rejects an Xbox-proprietary
+        // root signature blob (e.g. NGG Mesh Shader or DXR root signature): synthesize a universal
+        // 1-table VISIBILITY_ALL Scarlett space2 + space98 + space99 root signature so lifted
+        // VS/PS/MS/AS/CS shaders validate cleanly and bind live descriptor tables at slot 0.
         bool used_empty_fallback = false;
         if ((FAILED(hr) || !host_rs) && retail_scarlett_abi_ && fn_ser) {
-            D3D12_VERSIONED_ROOT_SIGNATURE_DESC empty_desc{};
-            empty_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
-            empty_desc.Desc_1_0.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-            ID3DBlob* empty_blob = nullptr;
+            D3D12_DESCRIPTOR_RANGE1 fb_ranges[5]{};
+            fb_ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 16u, 0u, 2u, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, 0u};
+            fb_ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 16u, 0u, 98u, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, 0u};
+            fb_ranges[2] = {D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 16u, 0u, 2u, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, 16u};
+            fb_ranges[3] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 16u, 0u, 2u, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, 32u};
+            fb_ranges[4] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 16u, 0u, 98u, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, 32u};
+            D3D12_ROOT_PARAMETER1 fb_param{};
+            fb_param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            fb_param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            fb_param.DescriptorTable = {5u, fb_ranges};
+            std::vector<D3D12_STATIC_SAMPLER_DESC> fb_samps;
+            fb_samps.reserve(23u);
+            D3D12_STATIC_SAMPLER_DESC fs{};
+            fs.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            fs.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            fs.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            fs.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            fs.MaxAnisotropy = 1u;
+            fs.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+            fs.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+            fs.MinLOD = 0.0f;
+            fs.MaxLOD = D3D12_FLOAT32_MAX;
+            fs.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            for (UINT sr = 0u; sr < 22u; ++sr) {
+                fs.ShaderRegister = sr;
+                fs.RegisterSpace = 1u;
+                fb_samps.push_back(fs);
+            }
+            fs.ShaderRegister = 0u;
+            fs.RegisterSpace = 99u;
+            fb_samps.push_back(fs);
+
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC univ_desc{};
+            univ_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+            univ_desc.Desc_1_1.NumParameters = 1u;
+            univ_desc.Desc_1_1.pParameters = &fb_param;
+            univ_desc.Desc_1_1.NumStaticSamplers = static_cast<UINT>(fb_samps.size());
+            univ_desc.Desc_1_1.pStaticSamplers = fb_samps.data();
+            univ_desc.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+            ID3DBlob* univ_blob = nullptr;
             ID3DBlob* err_blob = nullptr;
-            if (SUCCEEDED(fn_ser(&empty_desc, &empty_blob, &err_blob)) && empty_blob) {
+            if (SUCCEEDED(fn_ser(&univ_desc, &univ_blob, &err_blob)) && univ_blob) {
                 hr = host_dev_->CreateRootSignature(
-                    0u, empty_blob->GetBufferPointer(), empty_blob->GetBufferSize(),
+                    0u, univ_blob->GetBufferPointer(), univ_blob->GetBufferSize(),
                     OS_D3D12_IID(ID3D12RootSignature), reinterpret_cast<void**>(&host_rs));
                 if (SUCCEEDED(hr) && host_rs) {
-                    used_empty_fallback = true;
+                    RecordRootSigTableSizes(host_rs, univ_desc);
+                    {
+                        std::lock_guard<std::mutex> lk(guest_dh_mutex_);
+                        rs_auto_s2_params_[host_rs] = {0u};
+                    }
                 }
-                empty_blob->Release();
+                univ_blob->Release();
             }
             if (err_blob) err_blob->Release();
         }
@@ -6606,33 +6751,15 @@ void DeviceX::CreatePlacedShaderResourceViewX(
                     if (!FormatForbidsDesktopUav(uav_chk_fmt) && HostFormatSupportsTypedUav(uav_chk_fmt)) {
                         lazy_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
                     }
-                    D3D12_HEAP_PROPERTIES def_hp{};
-                    def_hp.Type = D3D12_HEAP_TYPE_DEFAULT;
                     ID3D12Resource* lazy_tex = nullptr;
-                    HRESULT lazy_hr = host_dev_->CreateCommittedResource(
-                        &def_hp, D3D12_HEAP_FLAG_NONE, &lazy_desc,
-                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
-                        OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&lazy_tex));
+                    HRESULT lazy_hr = AllocateBoundedLazyTexture(
+                        lazy_desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, gpu_va, &lazy_tex);
                     if ((FAILED(lazy_hr) || !lazy_tex) &&
                         (lazy_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0) {
                         lazy_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
                         lazy_desc.Format = orig_san_fmt;
-                        lazy_hr = host_dev_->CreateCommittedResource(
-                            &def_hp, D3D12_HEAP_FLAG_NONE, &lazy_desc,
-                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
-                            OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&lazy_tex));
-                    }
-                    if (FAILED(lazy_hr) || !lazy_tex) {
-                        D3D12_HEAP_PROPERTIES l0_hp{};
-                        l0_hp.Type = D3D12_HEAP_TYPE_CUSTOM;
-                        l0_hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
-                        l0_hp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
-                        l0_hp.CreationNodeMask = 1u;
-                        l0_hp.VisibleNodeMask = 1u;
-                        lazy_hr = host_dev_->CreateCommittedResource(
-                            &l0_hp, D3D12_HEAP_FLAG_NONE, &lazy_desc,
-                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
-                            OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&lazy_tex));
+                        lazy_hr = AllocateBoundedLazyTexture(
+                            lazy_desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, gpu_va, &lazy_tex);
                     }
                     if (SUCCEEDED(lazy_hr) && lazy_tex) {
                         if (tile_mode != XG_TILE_MODE_LINEAR) {
@@ -6665,6 +6792,8 @@ void DeviceX::CreatePlacedShaderResourceViewX(
                             if (uit != unified_textures_.end()) {
                                 uit->second.is_lazy_placed = true;
                                 uit->second.gpu_alias_va = gpu_va;
+                                uit->second.born_present_epoch =
+                                    present_reclaim_epoch_.load(std::memory_order_relaxed);
                                 owned_by_unified = true;
                             }
                         }
@@ -10504,13 +10633,15 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
         if (gpso.NumRenderTargets > 8u) gpso.NumRenderTargets = 8u;
         for (UINT r = 0u; r < gpso.NumRenderTargets; ++r) {
             gpso.RTVFormats[r] = SanitizeRtvFormatForHost(gpso.RTVFormats[r]);
-            if (gpso.RTVFormats[r] == DXGI_FORMAT_UNKNOWN && r == 0u && !ps_dxil.empty()) {
+            if (gpso.RTVFormats[r] == DXGI_FORMAT_UNKNOWN && !ps_dxil.empty()) {
                 gpso.RTVFormats[r] = DXGI_FORMAT_R8G8B8A8_UNORM;
             }
         }
         for (UINT r = gpso.NumRenderTargets; r < 8u; ++r) gpso.RTVFormats[r] = DXGI_FORMAT_UNKNOWN;
         SanitizeGraphicsPsoDescForDesktop(gpso);
 
+        const size_t ms_dxil_sz = ms_dxil.size();
+        const size_t ps_dxil_sz = ps_dxil.size();
         ID3D12PipelineState* lifted_ms_pso = nullptr;
         HRESULT mhr = BuildHostMeshPipelineState(
             host_dev2_, pd->host_rs, ms_dxil, as_dxil, ps_dxil, gpso, &lifted_ms_pso);
@@ -10532,9 +10663,51 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
             safe_gpso.RasterizerState.AntialiasedLineEnable = FALSE;
             safe_gpso.BlendState.AlphaToCoverageEnable = FALSE;
             safe_gpso.BlendState.IndependentBlendEnable = FALSE;
+            for (UINT r = 1u; r < 8u; ++r) {
+                safe_gpso.BlendState.RenderTarget[r] = D3D12_RENDER_TARGET_BLEND_DESC{
+                    FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
+                    D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, 0x0Fu};
+            }
+            if (safe_gpso.NumRenderTargets == 0u && safe_gpso.DSVFormat == DXGI_FORMAT_UNKNOWN && !ps_dxil.empty()) {
+                safe_gpso.NumRenderTargets = 1u;
+                safe_gpso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            }
             mhr = BuildHostMeshPipelineState(
                 host_dev2_, pd->host_rs, ms_dxil, as_dxil, ps_dxil, safe_gpso, &lifted_ms_pso);
             if (SUCCEEDED(mhr)) gpso = safe_gpso;
+        }
+        if (FAILED(mhr) && gpso.NumRenderTargets == 0u && gpso.DSVFormat == DXGI_FORMAT_UNKNOWN &&
+            pd->ps_blob.size() <= 64u) {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC dsv_gpso = gpso;
+            dsv_gpso.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+            const std::vector<uint8_t> empty_ps;
+            mhr = BuildHostMeshPipelineState(
+                host_dev2_, pd->host_rs, ms_dxil, as_dxil, empty_ps, dsv_gpso, &lifted_ms_pso);
+            if (SUCCEEDED(mhr)) {
+                gpso = dsv_gpso;
+                ps_dxil.clear();
+            }
+        }
+        if (FAILED(mhr)) {
+            ID3D12InfoQueue* iq = nullptr;
+            if (SUCCEEDED(host_dev_->QueryInterface(OS_D3D12_IID(ID3D12InfoQueue), reinterpret_cast<void**>(&iq))) && iq) {
+                const UINT64 n = iq->GetNumStoredMessages();
+                const UINT64 start = (n > 8u) ? (n - 8u) : 0u;
+                for (UINT64 i = start; i < n; ++i) {
+                    SIZE_T len = 0u;
+                    iq->GetMessage(i, nullptr, &len);
+                    if (len > 0u) {
+                        std::vector<uint8_t> buf(len);
+                        auto* m = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+                        if (SUCCEEDED(iq->GetMessage(i, m, &len)) && m->pDescription) {
+                            std::fprintf(stderr, "[OpenScarlett][D3D12DBG-MS] %s\n", m->pDescription);
+                        }
+                    }
+                }
+                iq->ClearStoredMessages();
+                iq->Release();
+                std::fflush(stderr);
+            }
         }
         if (SUCCEEDED(mhr) && lifted_ms_pso) {
             pd->lifted_gpso = gpso;
@@ -10551,7 +10724,7 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
                          seq, static_cast<unsigned long long>(::GetTickCount64() - lift_t0_ms),
                          static_cast<void*>(proxy), static_cast<void*>(pd->host_rs),
                          pd->ms_blob.size(), pd->ps_blob.size(), max_ms_params,
-                         pd->lifted_ms_dxil.size(), pd->lifted_ps_dxil.size(),
+                         ms_dxil_sz, ps_dxil_sz,
                          gpso.NumRenderTargets,
                          gpso.NumRenderTargets > 0u ? static_cast<int>(gpso.RTVFormats[0]) : 0,
                          static_cast<int>(gpso.DSVFormat), static_cast<unsigned long>(mhr));
@@ -13535,24 +13708,32 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
         const bool tight_4gb_vram =
             (adapter_info_.dedicated_video_memory_bytes > 0ull &&
              adapter_info_.dedicated_video_memory_bytes <= (4608ull * 1024ull * 1024ull));
+        const bool live_vram_tight = tight_4gb_vram && IsLocalVramNearBudget();
         const uint64_t max_srv_vram_bytes =
-            tight_4gb_vram ? (1024ull * 1024ull * 1024ull) : (1536ull * 1024ull * 1024ull);
+            tight_4gb_vram ? (512ull * 1024ull * 1024ull) : (1536ull * 1024ull * 1024ull);
         const uint64_t max_rt_ds_vram_bytes =
-            tight_4gb_vram ? (768ull * 1024ull * 1024ull) : (1024ull * 1024ull * 1024ull);
+            tight_4gb_vram ? (512ull * 1024ull * 1024ull) : (1024ull * 1024ull * 1024ull);
         const bool non_rt_over_budget =
-            (!is_buf && !is_rt_ds && !is_msaa) &&
-            (committed_non_rt_vram_bytes_.load(std::memory_order_relaxed) >= max_srv_vram_bytes);
+            (!is_rt_ds && !is_msaa) &&
+            (live_vram_tight ||
+             committed_non_rt_vram_bytes_.load(std::memory_order_relaxed) >= max_srv_vram_bytes);
         const bool rt_ds_over_budget =
             (is_rt_ds && !is_msaa) &&
-            (committed_rt_ds_vram_bytes_.load(std::memory_order_relaxed) >= max_rt_ds_vram_bytes);
-        const bool want_alias = rt_ds_over_budget || is_msaa || non_rt_over_budget || (is_buf && clean_desc.Width <= 65536ull);
-        if (want_alias) {
-            const uint64_t pool_bytes = is_buf ? (64ull * 1024ull * 1024ull)
+            (live_vram_tight ||
+             committed_rt_ds_vram_bytes_.load(std::memory_order_relaxed) >= max_rt_ds_vram_bytes);
+        const bool is_large_buf_alias =
+            is_buf && clean_desc.Width > 65536ull && clean_desc.Width <= (128ull * 1024ull * 1024ull) &&
+            non_rt_over_budget;
+        const bool want_alias =
+            rt_ds_over_budget || is_msaa || non_rt_over_budget || (is_buf && clean_desc.Width <= 65536ull);
+        if (want_alias && (!is_buf || clean_desc.Width <= (128ull * 1024ull * 1024ull))) {
+            const uint64_t pool_bytes = is_buf ? (is_large_buf_alias ? (256ull * 1024ull * 1024ull)
+                                                                     : (64ull * 1024ull * 1024ull))
                                                : (is_msaa ? (64ull * 1024ull * 1024ull)
                                                           : (is_ds ? (128ull * 1024ull * 1024ull)
                                                                    : (256ull * 1024ull * 1024ull)));
             const D3D12_RESOURCE_ALLOCATION_INFO ainfo =
-                is_buf ? D3D12_RESOURCE_ALLOCATION_INFO{65536ull, 65536ull}
+                is_buf ? D3D12_RESOURCE_ALLOCATION_INFO{(clean_desc.Width + 65535ull) & ~65535ull, 65536ull}
                        : host_dev_->GetResourceAllocationInfo(0u, 1u, &clean_desc);
             const uint64_t req_align = std::max<uint64_t>(
                 ainfo.Alignment ? ainfo.Alignment : 65536ull, 65536ull);
@@ -13561,7 +13742,8 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
                 if (heap_off + ainfo.SizeInBytes > pool_bytes) {
                     heap_off = 0ull;
                 }
-                const uint64_t map_key = is_buf ? 2ull : (is_msaa ? 1ull : (is_ds ? 5ull : (is_rt_ds ? 0ull : 4ull)));
+                const uint64_t map_key = is_buf ? (is_large_buf_alias ? 7ull : 2ull)
+                                                : (is_msaa ? 1ull : (is_ds ? 5ull : (is_rt_ds ? 0ull : 4ull)));
                 ID3D12Heap* alias_heap = nullptr;
                 {
                     std::lock_guard<std::mutex> alk(placed_alias_mutex_);
@@ -13572,7 +13754,15 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
                     } else {
                         D3D12_HEAP_DESC hd{};
                         hd.SizeInBytes = pool_bytes;
-                        hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+                        if (is_large_buf_alias) {
+                            hd.Properties.Type = D3D12_HEAP_TYPE_CUSTOM;
+                            hd.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+                            hd.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+                            hd.Properties.CreationNodeMask = 1u;
+                            hd.Properties.VisibleNodeMask = 1u;
+                        } else {
+                            hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+                        }
                         hd.Alignment = is_msaa ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
                                                : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
                         hd.Flags = is_buf ? D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS
@@ -13595,6 +13785,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
                         clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
                     if (SUCCEEDED(hr) && host_res) {
                         placed_in_alias_heap = true;
+                        if (is_large_buf_alias) spilled_to_l0 = true;
                     }
                     alias_heap->Release();
                 }
@@ -13602,19 +13793,41 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
         }
     }
 
-    // Fallback to committed default-heap resource if not attached or heap placement incompatible.
+    // Fallback to committed resource if not attached or heap placement incompatible.
     if (FAILED(hr) || !host_res) {
-        hr = host_dev_->CreateCommittedResource(
-            &default_heap_props, D3D12_HEAP_FLAG_NONE, &clean_desc, InitialState,
-            clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
-        if (SUCCEEDED(hr) && host_res && retail_scarlett_abi_ &&
-            clean_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
-            const uint64_t est_vram = EstimateResourceVramBytes(clean_desc);
-            if ((clean_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-                                     D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0) {
-                committed_rt_ds_vram_bytes_.fetch_add(est_vram, std::memory_order_relaxed);
-            } else {
-                committed_non_rt_vram_bytes_.fetch_add(est_vram, std::memory_order_relaxed);
+        const bool spill_committed_to_l0 =
+            retail_scarlett_abi_ &&
+            (clean_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                 D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) == 0 &&
+            clean_desc.SampleDesc.Count <= 1u &&
+            IsLocalVramNearBudget();
+        if (spill_committed_to_l0) {
+            D3D12_HEAP_PROPERTIES l0_pref{};
+            l0_pref.Type = D3D12_HEAP_TYPE_CUSTOM;
+            l0_pref.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+            l0_pref.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+            l0_pref.CreationNodeMask = 1u;
+            l0_pref.VisibleNodeMask = 1u;
+            hr = host_dev_->CreateCommittedResource(
+                &l0_pref, D3D12_HEAP_FLAG_NONE, &clean_desc, InitialState,
+                clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+            if (SUCCEEDED(hr) && host_res) {
+                default_heap_props = l0_pref;
+                spilled_to_l0 = true;
+            }
+        }
+        if (FAILED(hr) || !host_res) {
+            hr = host_dev_->CreateCommittedResource(
+                &default_heap_props, D3D12_HEAP_FLAG_NONE, &clean_desc, InitialState,
+                clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+            if (SUCCEEDED(hr) && host_res && retail_scarlett_abi_) {
+                const uint64_t est_vram = EstimateResourceVramBytes(clean_desc);
+                if ((clean_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                         D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0) {
+                    committed_rt_ds_vram_bytes_.fetch_add(est_vram, std::memory_order_relaxed);
+                } else {
+                    committed_non_rt_vram_bytes_.fetch_add(est_vram, std::memory_order_relaxed);
+                }
             }
         }
     }
@@ -16965,6 +17178,16 @@ bool DeviceX::IsValidRootDescriptorTableParam(
     return true;
 }
 
+void DeviceX::GetAutoSpace2RootParams(void* host_rs, std::vector<uint32_t>& out_params) const {
+    out_params.clear();
+    if (!host_rs) return;
+    std::lock_guard<std::mutex> lk(guest_dh_mutex_);
+    auto it = rs_auto_s2_params_.find(host_rs);
+    if (it != rs_auto_s2_params_.end()) {
+        out_params = it->second;
+    }
+}
+
 D3D12_GPU_DESCRIPTOR_HANDLE DeviceX::MaterializeGuestDescriptorTable(
     D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle,
     ID3D12RootSignature* bound_host_rs,
@@ -17391,13 +17614,9 @@ D3D12_GPU_DESCRIPTOR_HANDLE DeviceX::MaterializeGuestDescriptorTable(
                                         : ((lazy_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
                                                ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
                                                : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-                                D3D12_HEAP_PROPERTIES def_hp{};
-                                def_hp.Type = D3D12_HEAP_TYPE_DEFAULT;
                                 ID3D12Resource* lazy_tex = nullptr;
-                                HRESULT lazy_hr = host_dev_->CreateCommittedResource(
-                                    &def_hp, D3D12_HEAP_FLAG_NONE, &lazy_desc,
-                                    init_st, nullptr,
-                                    OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&lazy_tex));
+                                HRESULT lazy_hr = AllocateBoundedLazyTexture(
+                                    lazy_desc, init_st, ts.gpu_va, &lazy_tex);
                                 if ((FAILED(lazy_hr) || !lazy_tex) &&
                                     (lazy_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) != 0) {
                                     lazy_desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
@@ -17405,22 +17624,8 @@ D3D12_GPU_DESCRIPTOR_HANDLE DeviceX::MaterializeGuestDescriptorTable(
                                         (lazy_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
                                             ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
                                             : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-                                    lazy_hr = host_dev_->CreateCommittedResource(
-                                        &def_hp, D3D12_HEAP_FLAG_NONE, &lazy_desc,
-                                        retry_st, nullptr,
-                                        OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&lazy_tex));
-                                }
-                                if (FAILED(lazy_hr) || !lazy_tex) {
-                                    D3D12_HEAP_PROPERTIES l0_hp{};
-                                    l0_hp.Type = D3D12_HEAP_TYPE_CUSTOM;
-                                    l0_hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
-                                    l0_hp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
-                                    l0_hp.CreationNodeMask = 1u;
-                                    l0_hp.VisibleNodeMask = 1u;
-                                    lazy_hr = host_dev_->CreateCommittedResource(
-                                        &l0_hp, D3D12_HEAP_FLAG_NONE, &lazy_desc,
-                                        D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                        OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&lazy_tex));
+                                    lazy_hr = AllocateBoundedLazyTexture(
+                                        lazy_desc, retry_st, ts.gpu_va, &lazy_tex);
                                 }
                                 if (SUCCEEDED(lazy_hr) && lazy_tex) {
                                     if (ts_tile_mode != XG_TILE_MODE_LINEAR) {
@@ -17450,6 +17655,8 @@ D3D12_GPU_DESCRIPTOR_HANDLE DeviceX::MaterializeGuestDescriptorTable(
                                         if (uit != unified_textures_.end()) {
                                             uit->second.is_lazy_placed = true;
                                             uit->second.gpu_alias_va = ts.gpu_va;
+                                            uit->second.born_present_epoch =
+                                                present_reclaim_epoch_.load(std::memory_order_relaxed);
                                             owned = true;
                                         }
                                     }
@@ -18273,15 +18480,146 @@ void DeviceX::TrackTransientGpuResource(ID3D12Resource* res) {
     transient_gpu_resources_.push_back(TransientGpuResourceEntry{res, cur_frame});
 }
 
+bool DeviceX::IsLocalVramNearBudget() noexcept {
+    if (!host_dev_) return false;
+    const uint32_t n = vram_probe_counter_.fetch_add(1u, std::memory_order_relaxed);
+    if ((n & 31u) != 0u) {
+        return cached_local_vram_tight_.load(std::memory_order_relaxed);
+    }
+    openscarlett::HostAdapterVideoMemoryInfo info{};
+    if (openscarlett::QueryHostAdapterVideoMemoryInfo(host_dev_, info) &&
+        info.queried_dxgi_adapter3 && info.local_budget_bytes > 0ull) {
+        const uint64_t headroom = 512ull * 1024ull * 1024ull;
+        const bool tight = (info.local_current_usage_bytes + headroom >= info.local_budget_bytes);
+        cached_local_vram_tight_.store(tight, std::memory_order_relaxed);
+        return tight;
+    }
+    return cached_local_vram_tight_.load(std::memory_order_relaxed);
+}
+
+HRESULT DeviceX::AllocateBoundedLazyTexture(
+    const D3D12_RESOURCE_DESC& desc,
+    D3D12_RESOURCE_STATES init_state,
+    uint64_t gpu_va,
+    ID3D12Resource** out_tex) {
+    if (!out_tex || !host_dev_) return E_INVALIDARG;
+    *out_tex = nullptr;
+
+    const bool tight_4gb =
+        (adapter_info_.dedicated_video_memory_bytes > 0ull &&
+         adapter_info_.dedicated_video_memory_bytes <= (4608ull * 1024ull * 1024ull));
+    const uint64_t max_lazy_comm = tight_4gb ? (384ull * 1024ull * 1024ull) : (1024ull * 1024ull * 1024ull);
+    const bool use_alias =
+        (lazy_placed_committed_bytes_.load(std::memory_order_relaxed) >= max_lazy_comm) ||
+        IsLocalVramNearBudget();
+
+    if (use_alias && (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                    D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) == 0 &&
+        desc.SampleDesc.Count <= 1u) {
+        constexpr uint64_t kLazyPoolBytes = 256ull * 1024ull * 1024ull;
+        const D3D12_RESOURCE_ALLOCATION_INFO ainfo = host_dev_->GetResourceAllocationInfo(0u, 1u, &desc);
+        const uint64_t req_align = std::max<uint64_t>(ainfo.Alignment ? ainfo.Alignment : 65536ull, 65536ull);
+        if (ainfo.SizeInBytes > 0ull && ainfo.SizeInBytes <= kLazyPoolBytes) {
+            uint64_t heap_off = (gpu_va & (kLazyPoolBytes - 1ull)) & ~(req_align - 1ull);
+            if (heap_off + ainfo.SizeInBytes > kLazyPoolBytes) heap_off = 0ull;
+            ID3D12Heap* lazy_heap = nullptr;
+            {
+                std::lock_guard<std::mutex> alk(placed_alias_mutex_);
+                auto it = placed_alias_heaps_.find(6ull);
+                if (it != placed_alias_heaps_.end() && it->second) {
+                    lazy_heap = it->second;
+                    lazy_heap->AddRef();
+                } else {
+                    D3D12_HEAP_DESC hd{};
+                    hd.SizeInBytes = kLazyPoolBytes;
+                    hd.Properties.Type = D3D12_HEAP_TYPE_CUSTOM;
+                    hd.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+                    hd.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+                    hd.Properties.CreationNodeMask = 1u;
+                    hd.Properties.VisibleNodeMask = 1u;
+                    hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+                    hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+                    ID3D12Heap* new_heap = nullptr;
+                    if (FAILED(host_dev_->CreateHeap(
+                            &hd, OS_D3D12_IID(ID3D12Heap), reinterpret_cast<void**>(&new_heap))) || !new_heap) {
+                        hd.Properties = {};
+                        hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+                        (void)host_dev_->CreateHeap(
+                            &hd, OS_D3D12_IID(ID3D12Heap), reinterpret_cast<void**>(&new_heap));
+                    }
+                    if (new_heap) {
+                        placed_alias_heaps_[6ull] = new_heap;
+                        lazy_heap = new_heap;
+                        lazy_heap->AddRef();
+                    }
+                }
+            }
+            if (lazy_heap) {
+                const HRESULT phr = host_dev_->CreatePlacedResource(
+                    lazy_heap, heap_off, &desc, init_state, nullptr,
+                    OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(out_tex));
+                lazy_heap->Release();
+                if (SUCCEEDED(phr) && *out_tex) {
+                    return phr;
+                }
+            }
+        }
+    }
+
+    if (use_alias) {
+        D3D12_HEAP_PROPERTIES l0_hp{};
+        l0_hp.Type = D3D12_HEAP_TYPE_CUSTOM;
+        l0_hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+        l0_hp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        l0_hp.CreationNodeMask = 1u;
+        l0_hp.VisibleNodeMask = 1u;
+        const HRESULT lhr = host_dev_->CreateCommittedResource(
+            &l0_hp, D3D12_HEAP_FLAG_NONE, &desc, init_state, nullptr,
+            OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(out_tex));
+        if (SUCCEEDED(lhr) && *out_tex) {
+            return lhr;
+        }
+    }
+
+    D3D12_HEAP_PROPERTIES def_hp{};
+    def_hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    HRESULT hr = host_dev_->CreateCommittedResource(
+        &def_hp, D3D12_HEAP_FLAG_NONE, &desc, init_state, nullptr,
+        OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(out_tex));
+    if (SUCCEEDED(hr) && *out_tex) {
+        lazy_placed_committed_bytes_.fetch_add(EstimateResourceVramBytes(desc), std::memory_order_relaxed);
+        return hr;
+    }
+
+    D3D12_HEAP_PROPERTIES l0_hp{};
+    l0_hp.Type = D3D12_HEAP_TYPE_CUSTOM;
+    l0_hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+    l0_hp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+    l0_hp.CreationNodeMask = 1u;
+    l0_hp.VisibleNodeMask = 1u;
+    return host_dev_->CreateCommittedResource(
+        &l0_hp, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+        OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(out_tex));
+}
+
 void DeviceX::ReclaimCompletedGpuResources(ID3D12CommandQueue* host_queue) noexcept {
     if (!host_queue || !host_dev_) return;
     const uint64_t cur_present = present_reclaim_epoch_.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
     const uint64_t cur_frame = next_frame_token_.load(std::memory_order_relaxed);
+    if ((cur_present & 15ull) == 0ull) {
+        vram_probe_counter_.store(0u, std::memory_order_relaxed);
+        (void)IsLocalVramNearBudget();
+    }
 
     std::vector<ID3D12Resource*> evicted_lazy;
     if ((cur_present & 15ull) == 0ull) {
         {
             std::lock_guard<std::mutex> lock(unified_mutex_);
+            size_t lazy_total = 0u;
+            for (const auto& kv : unified_textures_) {
+                if (kv.second.is_lazy_placed && kv.second.resource) ++lazy_total;
+            }
+            const bool over_lazy_cap = (lazy_total > 640u);
             for (auto it = unified_textures_.begin(); it != unified_textures_.end();) {
                 auto& m = it->second;
                 if (!m.is_lazy_placed || !m.resource) {
@@ -18291,24 +18629,30 @@ void DeviceX::ReclaimCompletedGpuResources(ID3D12CommandQueue* host_queue) noexc
                 const uint64_t eff_va =
                     (m.gpu_alias_va != 0ull) ? ResolveGuestCpuAliasVa(m.gpu_alias_va) : m.guest_va;
                 const bool still_readable = IsReadableGuestVaRange(eff_va, 256ull);
-                if (still_readable) {
+                const bool aged_out_under_cap =
+                    over_lazy_cap && (lazy_total > 512u) &&
+                    (m.born_present_epoch > 0ull && cur_present >= m.born_present_epoch + 180ull);
+                if (still_readable && !aged_out_under_cap) {
                     m.unmapped_present_epoch = 0ull;
                     ++it;
                     continue;
                 }
-                if (m.unmapped_present_epoch == 0ull) {
-                    m.unmapped_present_epoch = cur_present;
-                    ++it;
-                    continue;
-                }
-                if (cur_present < m.unmapped_present_epoch + 32ull) {
-                    ++it;
-                    continue;
+                if (!aged_out_under_cap) {
+                    if (m.unmapped_present_epoch == 0ull) {
+                        m.unmapped_present_epoch = cur_present;
+                        ++it;
+                        continue;
+                    }
+                    if (cur_present < m.unmapped_present_epoch + 32ull) {
+                        ++it;
+                        continue;
+                    }
                 }
                 if (m.dirty) {
                     m.dirty = false;
                     dirty_unified_count_.fetch_sub(1u, std::memory_order_acq_rel);
                 }
+                if (lazy_total > 0u) --lazy_total;
                 evicted_lazy.push_back(m.resource);  // transfers unified_textures_ ref
                 it = unified_textures_.erase(it);
                 registered_unified_count_.fetch_sub(1u, std::memory_order_acq_rel);
@@ -18316,12 +18660,15 @@ void DeviceX::ReclaimCompletedGpuResources(ID3D12CommandQueue* host_queue) noexc
         }
         {
             std::lock_guard<std::mutex> lock(transient_res_mutex_);
+            const bool over_unowned_cap = (unowned_lazy_placed_textures_.size() > 512u);
+            size_t unowned_evicted = 0u;
             for (auto it = unowned_lazy_placed_textures_.begin(); it != unowned_lazy_placed_textures_.end();) {
                 ID3D12Resource* res = it->first;
                 const uint64_t eff_va = ResolveGuestCpuAliasVa(it->second);
-                if (!IsReadableGuestVaRange(eff_va, 256ull)) {
+                if (!IsReadableGuestVaRange(eff_va, 256ull) || (over_unowned_cap && unowned_evicted < 128u)) {
                     evicted_lazy.push_back(res);
                     it = unowned_lazy_placed_textures_.erase(it);
+                    ++unowned_evicted;
                 } else {
                     ++it;
                 }

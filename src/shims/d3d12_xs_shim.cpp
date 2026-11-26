@@ -1732,7 +1732,14 @@ public:
     virtual void STDMETHODCALLTYPE Slot98() { RecordClUnimpl(98); }
     virtual void STDMETHODCALLTYPE Slot99() { RecordClUnimpl(99); }
     virtual void STDMETHODCALLTYPE Slot100() { RecordClUnimpl(100); }
-    virtual void STDMETHODCALLTYPE Slot101() { RecordClUnimpl(101); }
+    // Slot 101 (+0x328): Scarlett SetDriverHintX (driver-only scheduling hint; safe no-op on PC)
+    virtual void STDMETHODCALLTYPE Slot101(uint64_t a1 = 0ull, uint64_t a2 = 0ull) {
+        (void)a1;
+        (void)a2;
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailCmdList::SetDriverHintX_Slot101",
+            openscarlett::CallOutcome::Ok, S_OK, 101);
+    }
     virtual void STDMETHODCALLTYPE Slot102() { RecordClUnimpl(102); }
     virtual void STDMETHODCALLTYPE Slot103() { RecordClUnimpl(103); }
     virtual void STDMETHODCALLTYPE Slot104() { RecordClUnimpl(104); }
@@ -4372,6 +4379,71 @@ HRESULT CreateWrappedDeviceInternal(
                             }
                         }
                     }
+                }
+                // Case G (`+0x49F8BA`): streaming dependency readiness poll `mov ecx, [rax+404h]`
+                // (`8B 88 04 04 00 00`) preceded by `mov rax, [rcx+20h]; mov edx, [rcx+9Ch]`
+                // (`48 8B 41 20 8B 91 9C 00 00 00`) before stack allocation (`rip[0x35] == C3 ret`):
+                // when optional owner `[rcx+20h]` is null, return `al = 1` (ready).
+                if (code == EXCEPTION_ACCESS_VIOLATION &&
+                    ep->ExceptionRecord->NumberParameters >= 2u &&
+                    ep->ExceptionRecord->ExceptionInformation[0] == 0u &&
+                    ep->ContextRecord->Rax < 0x10000ull &&
+                    reinterpret_cast<uintptr_t>(rip) > 16u &&
+                    IsReadableRetailRange(reinterpret_cast<uintptr_t>(rip) - 10u, 10u + 0x38u) &&
+                    rip[-10] == 0x48u && rip[-9] == 0x8Bu && rip[-8] == 0x41u && rip[-7] == 0x20u &&
+                    rip[-6] == 0x8Bu && rip[-5] == 0x91u && rip[-4] == 0x9Cu && rip[-3] == 0x00u &&
+                    rip[-2] == 0x00u && rip[-1] == 0x00u &&
+                    rip[0] == 0x8Bu && rip[1] == 0x88u && rip[2] == 0x04u &&
+                    rip[3] == 0x04u && rip[4] == 0x00u && rip[5] == 0x00u &&
+                    rip[0x35] == 0xC3u) {
+                    static std::atomic<uint32_t> s_poll_guard{0u};
+                    const uint32_t gn = s_poll_guard.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                    if (gn <= 16u) {
+                        const HMODULE main_exe = ::GetModuleHandleW(nullptr);
+                        const uintptr_t rva = main_exe
+                            ? (reinterpret_cast<uintptr_t>(rip) - reinterpret_cast<uintptr_t>(main_exe))
+                            : reinterpret_cast<uintptr_t>(rip);
+                        std::fprintf(stderr,
+                                     "[OpenScarlett][VEH-GUARD] Null owner at +0x%llX #%u (rcx=0x%llX hdl=0x%llX) -> ret 1\n",
+                                     static_cast<unsigned long long>(rva), gn,
+                                     static_cast<unsigned long long>(ep->ContextRecord->Rcx),
+                                     static_cast<unsigned long long>(ep->ContextRecord->Rdx));
+                        std::fflush(stderr);
+                    }
+                    ep->ContextRecord->Rax = 1ull;
+                    ep->ContextRecord->Rip = reinterpret_cast<uintptr_t>(rip) + 0x35u;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                // Case H (`+0x19125B8`): streaming ref archetype flags check `movzx edx, word ptr [rdx+0C2h]`
+                // (`0F B7 92 C2 00 00 00`) preceded by `and rdx, -16` (`48 83 E2 F0`) with clean epilogue at
+                // `rip + 0x28` (`31 F6 89 F0 48 83 C4 28 5F 5E C3`): when `[rcx+8]` is null, unwind and return 0.
+                if (code == EXCEPTION_ACCESS_VIOLATION &&
+                    ep->ExceptionRecord->NumberParameters >= 2u &&
+                    ep->ExceptionRecord->ExceptionInformation[0] == 0u &&
+                    ep->ContextRecord->Rdx < 0x10000ull &&
+                    reinterpret_cast<uintptr_t>(rip) > 16u &&
+                    IsReadableRetailRange(reinterpret_cast<uintptr_t>(rip) - 4u, 4u + 0x34u) &&
+                    rip[-4] == 0x48u && rip[-3] == 0x83u && rip[-2] == 0xE2u && rip[-1] == 0xF0u &&
+                    rip[0] == 0x0Fu && rip[1] == 0xB7u && rip[2] == 0x92u &&
+                    rip[3] == 0xC2u && rip[4] == 0x00u && rip[5] == 0x00u && rip[6] == 0x00u &&
+                    rip[0x28] == 0x31u && rip[0x29] == 0xF6u && rip[0x2A] == 0x89u && rip[0x2B] == 0xF0u &&
+                    rip[0x2C] == 0x48u && rip[0x2D] == 0x83u && rip[0x2E] == 0xC4u && rip[0x2F] == 0x28u &&
+                    rip[0x30] == 0x5Fu && rip[0x31] == 0x5Eu && rip[0x32] == 0xC3u) {
+                    static std::atomic<uint32_t> s_ref_guard{0u};
+                    const uint32_t gn = s_ref_guard.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                    if (gn <= 16u) {
+                        const HMODULE main_exe = ::GetModuleHandleW(nullptr);
+                        const uintptr_t rva = main_exe
+                            ? (reinterpret_cast<uintptr_t>(rip) - reinterpret_cast<uintptr_t>(main_exe))
+                            : reinterpret_cast<uintptr_t>(rip);
+                        std::fprintf(stderr,
+                                     "[OpenScarlett][VEH-GUARD] Null ref target at +0x%llX #%u (rcx=0x%llX) -> epilogue ret 0\n",
+                                     static_cast<unsigned long long>(rva), gn,
+                                     static_cast<unsigned long long>(ep->ContextRecord->Rcx));
+                        std::fflush(stderr);
+                    }
+                    ep->ContextRecord->Rip = reinterpret_cast<uintptr_t>(rip) + 0x28u;
+                    return EXCEPTION_CONTINUE_EXECUTION;
                 }
                 // Self-healing recovery for Rockstar RAGE9 lock-free `fwPool::New` pop ABA/double-free
                 // corruption across all 37 inline `fwPool` instantiations (+0x3E42CD4 `fwKnownRefHolder`, etc.):

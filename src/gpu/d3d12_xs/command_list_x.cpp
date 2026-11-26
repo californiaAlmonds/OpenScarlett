@@ -3483,6 +3483,19 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootSignature(
     }
     if (host_rs) {
         host_list_->SetComputeRootSignature(host_rs);
+        if (device_x_ && bound_cbv_srv_uav_heap_ && !last_cmp_rs_is_empty_) {
+            std::vector<uint32_t> auto_s2;
+            device_x_->GetAutoSpace2RootParams(host_rs, auto_s2);
+            if (!auto_s2.empty()) {
+                const D3D12_GPU_DESCRIPTOR_HANDLE h0 =
+                    bound_cbv_srv_uav_heap_->GetGPUDescriptorHandleForHeapStart();
+                if (h0.ptr != 0ull) {
+                    for (uint32_t api : auto_s2) {
+                        host_list_->SetComputeRootDescriptorTable(api, h0);
+                    }
+                }
+            }
+        }
     }
     RecordList("ID3D12GraphicsCommandListX::SetComputeRootSignature", 29, S_OK);
 }
@@ -3510,18 +3523,34 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRootSignature(
     }
     if (host_rs) {
         host_list_->SetGraphicsRootSignature(host_rs);
+        if (device_x_ && bound_cbv_srv_uav_heap_ && !last_gfx_rs_is_empty_) {
+            std::vector<uint32_t> auto_s2;
+            device_x_->GetAutoSpace2RootParams(host_rs, auto_s2);
+            if (!auto_s2.empty()) {
+                const D3D12_GPU_DESCRIPTOR_HANDLE h0 =
+                    bound_cbv_srv_uav_heap_->GetGPUDescriptorHandleForHeapStart();
+                if (h0.ptr != 0ull) {
+                    for (uint32_t api : auto_s2) {
+                        host_list_->SetGraphicsRootDescriptorTable(api, h0);
+                    }
+                }
+            }
+        }
     }
     RecordList("ID3D12GraphicsCommandListX::SetGraphicsRootSignature", 30, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::SetComputeRootDescriptorTable(
     UINT RootParameterIndex, D3D12_GPU_DESCRIPTOR_HANDLE BaseDescriptor) {
+    const D3D12_GPU_DESCRIPTOR_HANDLE orig_gpu = BaseDescriptor;
     bool is_sampler_param = false;
     const bool is_table_param =
         !device_x_ || device_x_->IsValidRootDescriptorTableParam(
                           last_host_compute_rs_, RootParameterIndex, &is_sampler_param);
+    D3D12_GPU_DESCRIPTOR_HANDLE xlat_gpu = BaseDescriptor;
     if (device_x_) {
-        BaseDescriptor = device_x_->TranslateGpuDescriptorHandle(BaseDescriptor);
+        xlat_gpu = device_x_->TranslateGpuDescriptorHandle(BaseDescriptor);
+        BaseDescriptor = xlat_gpu;
         if (is_table_param && !is_sampler_param) {
             BaseDescriptor = device_x_->MaterializeGuestDescriptorTable(
                 BaseDescriptor, last_host_compute_rs_, RootParameterIndex, nullptr, nullptr, /*is_compute=*/true);
@@ -3531,6 +3560,8 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootDescriptorTable(
         device_x_->RecordBridgeTableBind();
     }
     bool valid_for_host = is_table_param && (BaseDescriptor.ptr != 0ull);
+    uint64_t heap_start_clamp = 0ull;
+    uint64_t heap_end_clamp = UINT64_MAX;
     if (device_x_ && device_x_->IsRetailScarlettAbi()) {
         ID3D12DescriptorHeap* req_heap =
             is_sampler_param ? bound_sampler_heap_ : bound_cbv_srv_uav_heap_;
@@ -3538,11 +3569,11 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootDescriptorTable(
             valid_for_host = false;
         } else {
             const D3D12_DESCRIPTOR_HEAP_DESC hd = req_heap->GetDesc();
-            const uint64_t h_start = req_heap->GetGPUDescriptorHandleForHeapStart().ptr;
+            heap_start_clamp = req_heap->GetGPUDescriptorHandleForHeapStart().ptr;
             const uint32_t inc = device_x_->GetDescriptorHandleIncrementSize(hd.Type);
-            const uint64_t h_end = h_start + static_cast<uint64_t>(hd.NumDescriptors) * inc;
-            if (BaseDescriptor.ptr < h_start || BaseDescriptor.ptr >= h_end) {
-                BaseDescriptor.ptr = h_start;
+            heap_end_clamp = heap_start_clamp + static_cast<uint64_t>(hd.NumDescriptors) * inc;
+            if (BaseDescriptor.ptr < heap_start_clamp || BaseDescriptor.ptr >= heap_end_clamp) {
+                BaseDescriptor.ptr = heap_start_clamp;
             }
             valid_for_host = (BaseDescriptor.ptr != 0ull);
         }
@@ -3557,6 +3588,22 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootDescriptorTable(
     if (valid_for_host && !last_cmp_rs_is_empty_) {
         host_list_->SetComputeRootDescriptorTable(RootParameterIndex, BaseDescriptor);
     }
+    if (device_x_ && !is_sampler_param && !last_cmp_rs_is_empty_ && bound_cbv_srv_uav_heap_ &&
+        orig_gpu.ptr != 0ull) {
+        std::vector<uint32_t> auto_s2;
+        device_x_->GetAutoSpace2RootParams(last_host_compute_rs_, auto_s2);
+        for (uint32_t api : auto_s2) {
+            if (api == RootParameterIndex && valid_for_host) continue;
+            D3D12_GPU_DESCRIPTOR_HANDLE ah = device_x_->MaterializeGuestDescriptorTable(
+                xlat_gpu, last_host_compute_rs_, api, nullptr, nullptr, /*is_compute=*/true);
+            if (heap_start_clamp != 0ull && (ah.ptr < heap_start_clamp || ah.ptr >= heap_end_clamp)) {
+                ah.ptr = heap_start_clamp;
+            }
+            if (ah.ptr != 0ull) {
+                host_list_->SetComputeRootDescriptorTable(api, ah);
+            }
+        }
+    }
     RecordList("ID3D12GraphicsCommandListX::SetComputeRootDescriptorTable", 31, S_OK);
 }
 
@@ -3569,8 +3616,10 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRootDescriptorTable(
                           last_host_graphics_rs_, RootParameterIndex, &is_sampler_param);
     uint32_t mat_hits = 0u;
     uint32_t mat_slots = 0u;
+    D3D12_GPU_DESCRIPTOR_HANDLE xlat_gpu = BaseDescriptor;
     if (device_x_) {
-        BaseDescriptor = device_x_->TranslateGpuDescriptorHandle(BaseDescriptor);
+        xlat_gpu = device_x_->TranslateGpuDescriptorHandle(BaseDescriptor);
+        BaseDescriptor = xlat_gpu;
         if (is_table_param && !is_sampler_param) {
             BaseDescriptor = device_x_->MaterializeGuestDescriptorTable(
                 BaseDescriptor, last_host_graphics_rs_, RootParameterIndex, &mat_hits, &mat_slots);
@@ -3580,6 +3629,8 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRootDescriptorTable(
         device_x_->RecordBridgeTableBind();
     }
     bool valid_for_host = is_table_param && (BaseDescriptor.ptr != 0ull);
+    uint64_t heap_start_clamp = 0ull;
+    uint64_t heap_end_clamp = UINT64_MAX;
     if (device_x_ && device_x_->IsRetailScarlettAbi()) {
         ID3D12DescriptorHeap* req_heap =
             is_sampler_param ? bound_sampler_heap_ : bound_cbv_srv_uav_heap_;
@@ -3587,11 +3638,11 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRootDescriptorTable(
             valid_for_host = false;
         } else {
             const D3D12_DESCRIPTOR_HEAP_DESC hd = req_heap->GetDesc();
-            const uint64_t h_start = req_heap->GetGPUDescriptorHandleForHeapStart().ptr;
+            heap_start_clamp = req_heap->GetGPUDescriptorHandleForHeapStart().ptr;
             const uint32_t inc = device_x_->GetDescriptorHandleIncrementSize(hd.Type);
-            const uint64_t h_end = h_start + static_cast<uint64_t>(hd.NumDescriptors) * inc;
-            if (BaseDescriptor.ptr < h_start || BaseDescriptor.ptr >= h_end) {
-                BaseDescriptor.ptr = h_start;
+            heap_end_clamp = heap_start_clamp + static_cast<uint64_t>(hd.NumDescriptors) * inc;
+            if (BaseDescriptor.ptr < heap_start_clamp || BaseDescriptor.ptr >= heap_end_clamp) {
+                BaseDescriptor.ptr = heap_start_clamp;
             }
             valid_for_host = (BaseDescriptor.ptr != 0ull);
         }
@@ -3611,6 +3662,22 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRootDescriptorTable(
     }
     if (valid_for_host && !last_gfx_rs_is_empty_) {
         host_list_->SetGraphicsRootDescriptorTable(RootParameterIndex, BaseDescriptor);
+    }
+    if (device_x_ && !is_sampler_param && !last_gfx_rs_is_empty_ && bound_cbv_srv_uav_heap_ &&
+        orig_gpu.ptr != 0ull && RootParameterIndex == 0u) {
+        std::vector<uint32_t> auto_s2;
+        device_x_->GetAutoSpace2RootParams(last_host_graphics_rs_, auto_s2);
+        for (uint32_t api : auto_s2) {
+            if (api == RootParameterIndex && valid_for_host) continue;
+            D3D12_GPU_DESCRIPTOR_HANDLE ah = device_x_->MaterializeGuestDescriptorTable(
+                xlat_gpu, last_host_graphics_rs_, api, nullptr, nullptr, /*is_compute=*/false);
+            if (heap_start_clamp != 0ull && (ah.ptr < heap_start_clamp || ah.ptr >= heap_end_clamp)) {
+                ah.ptr = heap_start_clamp;
+            }
+            if (ah.ptr != 0ull) {
+                host_list_->SetGraphicsRootDescriptorTable(api, ah);
+            }
+        }
     }
     RecordList("ID3D12GraphicsCommandListX::SetGraphicsRootDescriptorTable", 32, S_OK);
 }

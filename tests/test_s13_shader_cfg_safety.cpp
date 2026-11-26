@@ -20,6 +20,15 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <d3d12.h>
+#include <dxgi1_4.h>
+#endif
+
 namespace openscarlett {
 Status ExecuteGuardedShaderTranslation(
     const std::function<Status()>& work,
@@ -807,7 +816,8 @@ void TestVop3AddLshlAndTopologicalDag() {
     // Optional live-captured 3D shader corpus check when saved_3d_psos_v18 is present locally.
     const std::filesystem::path saved_dir(R"(E:\OpenScarlett\.tmp\saved_3d_psos_v18)");
     if (has_dxc && std::filesystem::exists(saved_dir / "bound_11_ms.bin", ec)) {
-        auto lift_saved = [&](const char* fname, bool is_cs, bool is_ms, uint32_t max_ms_params) {
+        auto lift_saved = [&](const char* fname, bool is_cs, bool is_ms, uint32_t max_ms_params,
+                              std::vector<uint8_t>* out_dxil = nullptr) {
             std::vector<uint8_t> blob;
             FILE* fp = nullptr;
             const std::string p = (saved_dir / fname).string();
@@ -833,10 +843,11 @@ void TestVop3AddLshlAndTopologicalDag() {
             }
             auto& pb = lo.lift_options.stage_contract.psv0_bindings;
             pb.enabled = true;
-            pb.in0_is_srv = true;
-            pb.in0_is_cbv = false;
+            pb.in0_is_srv = is_cs;
+            pb.in0_is_cbv = !is_cs;
             pb.in0_reg = 0u;
             pb.in0_space = 2u;
+            pb.space2_cbv_slot_mask = is_cs ? 0u : 0xFFFFu;
             pb.has_tex0 = true;
             pb.tex0_reg = 0u;
             pb.tex0_space = 2u;
@@ -861,11 +872,160 @@ void TestVop3AddLshlAndTopologicalDag() {
                           lr.lift.pc_dxil.size() < 250000u,
                       "bound_14_cs.bin compiles as loop-free topological DAG (<250 KB DXIL, no 616 KB state-machine bloat)");
             }
+            if (out_dxil) *out_dxil = std::move(lr.lift.pc_dxil);
         };
-        lift_saved("bound_11_ms.bin", false, true, 0u);
-        lift_saved("bound_12_ms.bin", false, true, 4u);
+        std::vector<uint8_t> b11_ms_dxil, b11_ps_dxil, b12_ms_dxil, b12_ps_dxil;
+        lift_saved("bound_11_ms.bin", false, true, 0u, &b11_ms_dxil);
+        lift_saved("bound_11_ps.bin", false, false, 0u, &b11_ps_dxil);
+        lift_saved("bound_12_ms.bin", false, true, 2u, &b12_ms_dxil);
+        lift_saved("bound_12_ps.bin", false, false, 0u, &b12_ps_dxil);
         lift_saved("bound_14_cs.bin", true, false, 0u);
         lift_saved("bound_17_cs.bin", true, false, 0u);
+
+#if defined(_WIN32)
+        // Verify live D3D12 Mesh Shader PSO creation (ID3D12Device2::CreatePipelineState) on hardware GPU!
+        HMODULE d3d12_mod = ::LoadLibraryA("d3d12.dll");
+        if (d3d12_mod && !b11_ms_dxil.empty() && !b12_ms_dxil.empty()) {
+            using PfnCreateDev = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+            using PfnSerVrs = HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
+            using PfnGetDbg = HRESULT(WINAPI*)(REFIID, void**);
+            auto fn_dev = reinterpret_cast<PfnCreateDev>(::GetProcAddress(d3d12_mod, "D3D12CreateDevice"));
+            auto fn_ser = reinterpret_cast<PfnSerVrs>(::GetProcAddress(d3d12_mod, "D3D12SerializeVersionedRootSignature"));
+            auto fn_dbg = reinterpret_cast<PfnGetDbg>(::GetProcAddress(d3d12_mod, "D3D12GetDebugInterface"));
+            char dbg_env[8]{};
+            if (fn_dbg && ::GetEnvironmentVariableA("OPENSCARLETT_ENABLE_D3D12_DEBUG", dbg_env, sizeof(dbg_env)) > 0 &&
+                dbg_env[0] == '1') {
+                ID3D12Debug* dbg = nullptr;
+                if (SUCCEEDED(fn_dbg(IID_PPV_ARGS(&dbg))) && dbg) {
+                    dbg->EnableDebugLayer();
+                    dbg->Release();
+                }
+            }
+            ID3D12Device2* dev2 = nullptr;
+            D3D12_FEATURE_DATA_D3D12_OPTIONS7 opt7{};
+            HMODULE dxgi_mod = ::LoadLibraryA("dxgi.dll");
+            if (dxgi_mod && fn_dev) {
+                using PfnCreateDxgi = HRESULT(WINAPI*)(REFIID, void**);
+                auto fn_dxgi = reinterpret_cast<PfnCreateDxgi>(::GetProcAddress(dxgi_mod, "CreateDXGIFactory1"));
+                IDXGIFactory4* fac = nullptr;
+                if (fn_dxgi && SUCCEEDED(fn_dxgi(IID_PPV_ARGS(&fac))) && fac) {
+                    for (UINT ai = 0u;; ++ai) {
+                        IDXGIAdapter1* ad = nullptr;
+                        if (fac->EnumAdapters1(ai, &ad) == DXGI_ERROR_NOT_FOUND) break;
+                        ID3D12Device2* cand = nullptr;
+                        if (SUCCEEDED(fn_dev(ad, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&cand))) && cand) {
+                            D3D12_FEATURE_DATA_D3D12_OPTIONS7 co7{};
+                            if (SUCCEEDED(cand->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &co7, sizeof(co7))) &&
+                                co7.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED) {
+                                dev2 = cand;
+                                opt7 = co7;
+                                ad->Release();
+                                break;
+                            }
+                            cand->Release();
+                        }
+                        ad->Release();
+                    }
+                    fac->Release();
+                }
+            }
+            if (fn_ser && dev2 && opt7.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED) {
+                {
+                    D3D12_DESCRIPTOR_RANGE1 rngs[5]{};
+                    rngs[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 16u, 0u, 2u, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, 0u};
+                    rngs[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 16u, 0u, 98u, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, 0u};
+                    rngs[2] = {D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 16u, 0u, 2u, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, 16u};
+                    rngs[3] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 16u, 0u, 2u, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, 32u};
+                    rngs[4] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 16u, 0u, 98u, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, 32u};
+                    D3D12_ROOT_PARAMETER1 rp{};
+                    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+                    rp.DescriptorTable = {5u, rngs};
+                    D3D12_STATIC_SAMPLER_DESC samp{};
+                    samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+                    samp.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+                    samp.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+                    samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+                    samp.MaxAnisotropy = 1u;
+                    samp.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+                    samp.MaxLOD = D3D12_FLOAT32_MAX;
+                    samp.ShaderRegister = 0u;
+                    samp.RegisterSpace = 99u;
+                    samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+                    D3D12_VERSIONED_ROOT_SIGNATURE_DESC vrs{};
+                    vrs.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+                    vrs.Desc_1_1 = {1u, &rp, 1u, &samp, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+                    ID3DBlob* rs_blob = nullptr;
+                    ID3DBlob* rs_err = nullptr;
+                    ID3D12RootSignature* rs = nullptr;
+                    if (SUCCEEDED(fn_ser(&vrs, &rs_blob, &rs_err)) && rs_blob) {
+                        (void)dev2->CreateRootSignature(0u, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(), IID_PPV_ARGS(&rs));
+                        rs_blob->Release();
+                    }
+                    if (rs_err) rs_err->Release();
+
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
+                    struct alignas(void*) SubRs { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; ID3D12RootSignature* v; };
+                    struct alignas(void*) SubBc { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_SHADER_BYTECODE v; };
+                    struct alignas(void*) SubRts { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; D3D12_RT_FORMAT_ARRAY v; };
+                    struct alignas(void*) SubSamp { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE t; DXGI_SAMPLE_DESC v; };
+                    struct Stream {
+                        SubRs rs;
+                        SubBc ms;
+                        SubBc ps;
+                        SubRts rts;
+                        SubSamp samp;
+                    };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
+                    auto test_mesh_pso = [&](const char* label, const std::vector<uint8_t>& ms_b,
+                                             const std::vector<uint8_t>& ps_b, UINT num_rts, DXGI_FORMAT rt_fmt) {
+                        Stream stm{};
+                        stm.rs = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, rs};
+                        stm.ms = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, {ms_b.data(), ms_b.size()}};
+                        stm.ps = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {ps_b.data(), ps_b.size()}};
+                        stm.rts.t = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS;
+                        stm.rts.v.NumRenderTargets = num_rts;
+                        for (UINT i = 0u; i < num_rts; ++i) stm.rts.v.RTFormats[i] = rt_fmt;
+                        stm.samp = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, {1u, 0u}};
+                        D3D12_PIPELINE_STATE_STREAM_DESC sd{sizeof(stm), &stm};
+                        ID3D12PipelineState* pso = nullptr;
+                        const HRESULT hr = dev2->CreatePipelineState(&sd, IID_PPV_ARGS(&pso));
+                        if (FAILED(hr)) {
+                            ID3D12InfoQueue* iq = nullptr;
+                            if (SUCCEEDED(dev2->QueryInterface(IID_PPV_ARGS(&iq))) && iq) {
+                                for (UINT64 mi = 0; mi < iq->GetNumStoredMessages(); ++mi) {
+                                    SIZE_T ml = 0;
+                                    iq->GetMessage(mi, nullptr, &ml);
+                                    std::vector<uint8_t> mb(ml);
+                                    auto* msg = reinterpret_cast<D3D12_MESSAGE*>(mb.data());
+                                    if (ml > 0 && SUCCEEDED(iq->GetMessage(mi, msg, &ml)) && msg->pDescription) {
+                                        std::fprintf(stderr, "  [D3D12-PSO-ERR %s] %s\n", label, msg->pDescription);
+                                    }
+                                }
+                                iq->ClearStoredMessages();
+                                iq->Release();
+                            }
+                        }
+                        std::printf("  [LIVE-MESH-PSO] %s -> hr=0x%08lX\n", label, static_cast<unsigned long>(hr));
+                        Check(SUCCEEDED(hr) && pso != nullptr, label);
+                        if (pso) pso->Release();
+                    };
+                    if (rs) {
+                        test_mesh_pso("Live D3D12 Mesh PSO bound_11 (ms+ps, 1xRGBA8)", b11_ms_dxil, b11_ps_dxil, 1u, DXGI_FORMAT_R8G8B8A8_UNORM);
+                        test_mesh_pso("Live D3D12 Mesh PSO bound_12 (ms+ps, 5xSRGB)", b12_ms_dxil, b12_ps_dxil, 5u, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+                        rs->Release();
+                    }
+                }
+                dev2->Release();
+            }
+        }
+#endif
     }
 }
 
