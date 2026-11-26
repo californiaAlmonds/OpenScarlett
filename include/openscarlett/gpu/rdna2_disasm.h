@@ -241,6 +241,74 @@ struct Rdna2MtbufFormatInfo {
 Rdna2MtbufFormatInfo GetRdna2MtbufFormatInfo(Rdna2MtbufFormat fmt) noexcept;
 Rdna2MtbufFormatInfo GetRdna2MtbufFormatInfo(uint8_t raw_fmt) noexcept;
 
+// Hardware-exact GFX10.3 / RDNA2 unified 7-bit buffer format IDs (V# word3[18:12] / MTBUF FORMAT[6:0])
+enum class Rdna2Gfx103Ufmt : uint8_t {
+    Invalid = 0,
+    R8_UNORM = 1,
+    R8_SNORM = 2,
+    R8_USCALED = 3,
+    R8_SSCALED = 4,
+    R8_UINT = 5,
+    R8_SINT = 6,
+    R16_UNORM = 7,
+    R16_SNORM = 8,
+    R16_USCALED = 9,
+    R16_SSCALED = 10,
+    R16_UINT = 11,
+    R16_SINT = 12,
+    R16_FLOAT = 13,
+    R8G8_UNORM = 14,
+    R8G8_SNORM = 15,
+    R8G8_USCALED = 16,
+    R8G8_SSCALED = 17,
+    R8G8_UINT = 18,
+    R8G8_SINT = 19,
+    R32_UINT = 20,
+    R32_SINT = 21,
+    R32_FLOAT = 22,
+    R16G16_UNORM = 23,
+    R16G16_SNORM = 24,
+    R16G16_USCALED = 25,
+    R16G16_SSCALED = 26,
+    R16G16_UINT = 27,
+    R16G16_SINT = 28,
+    R16G16_FLOAT = 29,
+    R10G11B11_FLOAT = 36,
+    R11G11B10_FLOAT = 43,
+    R10G10B10A2_UNORM = 44,
+    R10G10B10A2_SNORM = 45,
+    R10G10B10A2_UINT = 48,
+    R10G10B10A2_SINT = 49,
+    R2G10B10A10_UNORM = 50,
+    R2G10B10A10_SNORM = 51,
+    R2G10B10A10_UINT = 54,
+    R2G10B10A10_SINT = 55,
+    R8G8B8A8_UNORM = 56,
+    R8G8B8A8_SNORM = 57,
+    R8G8B8A8_USCALED = 58,
+    R8G8B8A8_SSCALED = 59,
+    R8G8B8A8_UINT = 60,
+    R8G8B8A8_SINT = 61,
+    R32G32_UINT = 62,
+    R32G32_SINT = 63,
+    R32G32_FLOAT = 64,
+    R16G16B16A16_UNORM = 65,
+    R16G16B16A16_SNORM = 66,
+    R16G16B16A16_USCALED = 67,
+    R16G16B16A16_SSCALED = 68,
+    R16G16B16A16_UINT = 69,
+    R16G16B16A16_SINT = 70,
+    R16G16B16A16_FLOAT = 71,
+    R32G32B32_UINT = 72,
+    R32G32B32_SINT = 73,
+    R32G32B32_FLOAT = 74,
+    R32G32B32A32_UINT = 75,
+    R32G32B32A32_SINT = 76,
+    R32G32B32A32_FLOAT = 77,
+};
+
+Rdna2MtbufFormatInfo GetRdna2Gfx103UfmtInfo(uint8_t ufmt) noexcept;
+
 // Full RDNA2 / GFX10.3 ds_swizzle_b32 offset mode decoding & source-lane evaluation (xbox-emulator #184/#186)
 enum class Rdna2DsSwizzleMode : uint8_t {
     BitMode = 0,      // offset[15]==1: ((lane & and_mask) | or_mask) ^ xor_mask
@@ -737,6 +805,33 @@ enum class Rdna2Opcode : uint16_t {
     V_INTERP_P1_F32,
     V_INTERP_P2_F32,
     V_INTERP_MOV_F32,
+
+    // 3D-World RDNA2 Completeness Extensions (appended after V_INTERP_MOV_F32 to preserve core audit bounds)
+    S_BFM_B64,
+    S_QUADMASK_B32,
+    S_QUADMASK_B64,
+    V_WRITELANE_B32,
+    V_BFM_B32,
+    V_SAD_U8,
+    V_SAD_HI_U8,
+    V_SAD_U16,
+    V_SAD_U32,
+    V_MSAD_U8,
+    IMAGE_ATOMIC_SWAP,
+    IMAGE_ATOMIC_ADD,
+    IMAGE_ATOMIC_SUB,
+    IMAGE_ATOMIC_SMIN,
+    IMAGE_ATOMIC_UMIN,
+    IMAGE_ATOMIC_SMAX,
+    IMAGE_ATOMIC_UMAX,
+    IMAGE_ATOMIC_FMIN,
+    IMAGE_ATOMIC_FMAX,
+    IMAGE_ATOMIC_AND,
+    IMAGE_ATOMIC_OR,
+    IMAGE_ATOMIC_XOR,
+    IMAGE_ATOMIC_INC,
+    IMAGE_ATOMIC_DEC,
+    IMAGE_ATOMIC_FCMPSWAP,
 };
 
 enum class Rdna2OperandKind : uint8_t {
@@ -889,6 +984,10 @@ struct Rdna2Instruction {
     bool has_sdwa = false;
     uint32_t sdwa_word = 0;
 
+    // GFX10 DPP16 (0xFA) row/quad permutation, modifier, & mask metadata
+    bool has_dpp16 = false;
+    uint32_t dpp16_word = 0;
+
     // VOP3 SDST carry-out register for 64-bit integer MAD (v_mad_u64_u32 / v_mad_i64_i32)
     Rdna2Operand sdst{};
 
@@ -914,6 +1013,7 @@ bool IsVop3Int16Instruction(const Rdna2Instruction& inst) noexcept;
 bool IsVop3Float16Instruction(const Rdna2Instruction& inst) noexcept;
 bool IsVcmpxOpcode(Rdna2Opcode op) noexcept;
 bool IsF16CompareOpcode(Rdna2Opcode op) noexcept;
+bool IsMimgAtomicOpcode(Rdna2Opcode op) noexcept;
 std::string FormatRdna2Operand(const Rdna2Operand& op);
 std::string FormatRdna2Instruction(const Rdna2Instruction& inst);
 
@@ -956,6 +1056,10 @@ public:
     void EmitVop1Sdwa(Rdna2Opcode op, uint8_t vdst, uint32_t sdwa_word);
     void EmitVop2Sdwa(Rdna2Opcode op, uint8_t vdst, uint8_t vsrc1, uint32_t sdwa_word);
     void EmitVopcSdwa(Rdna2Opcode op, uint8_t vsrc1, uint32_t sdwa_word);
+    // VOP1 / VOP2 / VOPC with GFX10 DPP16 (0xFA) row/quad permutation & mask word
+    void EmitVop1Dpp16(Rdna2Opcode op, uint8_t vdst, uint32_t dpp16_word);
+    void EmitVop2Dpp16(Rdna2Opcode op, uint8_t vdst, uint8_t vsrc1, uint32_t dpp16_word);
+    void EmitVopcDpp16(Rdna2Opcode op, uint8_t vsrc1, uint32_t dpp16_word);
     // VOP3B (64-bit VOP3 with explicit sdst carry-out, e.g., V_MAD_U64_U32 / V_MAD_I64_I32)
     void EmitVop3b(
         Rdna2Opcode op,
@@ -1010,6 +1114,16 @@ public:
         uint8_t vaddr,
         uint8_t srsrc_sgpr,
         Rdna2MtbufFormat format,
+        uint16_t offset = 0,
+        bool offen = true,
+        bool idxen = false,
+        uint8_t soffset = 128);
+    void EmitMtbufUfmt(
+        Rdna2Opcode op,
+        uint8_t vdata,
+        uint8_t vaddr,
+        uint8_t srsrc_sgpr,
+        uint8_t ufmt7,
         uint16_t offset = 0,
         bool offen = true,
         bool idxen = false,

@@ -25,6 +25,8 @@ constexpr uint32_t kDxgiR32G32B32A32Float = 2u;
 constexpr uint32_t kDxgiR32G32B32A32Uint = 3u;
 constexpr uint32_t kDxgiR32G32B32A32Sint = 4u;
 constexpr uint32_t kDxgiR32G32B32Float = 6u;
+constexpr uint32_t kDxgiR32G32B32Uint = 7u;
+constexpr uint32_t kDxgiR32G32B32Sint = 8u;
 constexpr uint32_t kDxgiR16G16B16A16Float = 10u;
 constexpr uint32_t kDxgiR16G16B16A16Unorm = 11u;
 constexpr uint32_t kDxgiR16G16B16A16Uint = 12u;
@@ -121,6 +123,8 @@ uint32_t DxgiFormatElementBytes(uint32_t dxgi_fmt) noexcept {
         case kDxgiR16G16B16A16Float:
             return 8u;
         case kDxgiR32G32B32Float:
+        case kDxgiR32G32B32Uint:
+        case kDxgiR32G32B32Sint:
             return 12u;
         case kDxgiR32G32B32A32Float:
         case kDxgiR32G32B32A32Uint:
@@ -493,9 +497,129 @@ uint32_t Rdna2BufferFormatToDxgi(uint8_t fmt) noexcept {
         case Rdna2MtbufFormat::R16G16B16A16_FLOAT:  return kDxgiR16G16B16A16Float;
         case Rdna2MtbufFormat::R32G32B32_FLOAT:     return kDxgiR32G32B32Float;
         case Rdna2MtbufFormat::R32G32B32A32_FLOAT:  return kDxgiR32G32B32A32Float;
+        default:                                    break;
+    }
+    // Fallback for non-colliding hardware GFX10.3 unified 7-bit UFMT codes (V# word3[18:12])
+    switch (static_cast<Rdna2Gfx103Ufmt>(fmt & 0x7Fu)) {
+        case Rdna2Gfx103Ufmt::R32_FLOAT:            return kDxgiR32Float;
+        case Rdna2Gfx103Ufmt::R16G16_UNORM:         return kDxgiR16G16Unorm;
+        case Rdna2Gfx103Ufmt::R16G16_SNORM:         return kDxgiR16G16Snorm;
+        case Rdna2Gfx103Ufmt::R16G16_USCALED:
+        case Rdna2Gfx103Ufmt::R16G16_UINT:          return kDxgiR16G16Uint;
+        case Rdna2Gfx103Ufmt::R16G16_SSCALED:       return kDxgiR16G16Sint;
+        case Rdna2Gfx103Ufmt::R10G11B11_FLOAT:
+        case Rdna2Gfx103Ufmt::R11G11B10_FLOAT:      return kDxgiR11G11B10Float;
+        case Rdna2Gfx103Ufmt::R10G10B10A2_UNORM:    return kDxgiR10G10B10A2Unorm;
+        case Rdna2Gfx103Ufmt::R8G8B8A8_UNORM:       return kDxgiR8G8B8A8Unorm;
+        case Rdna2Gfx103Ufmt::R8G8B8A8_SNORM:       return kDxgiR8G8B8A8Snorm;
+        case Rdna2Gfx103Ufmt::R8G8B8A8_USCALED:     return kDxgiR8G8B8A8Uint;
+        case Rdna2Gfx103Ufmt::R8G8B8A8_SSCALED:
+        case Rdna2Gfx103Ufmt::R8G8B8A8_SINT:        return kDxgiR8G8B8A8Sint;
+        case Rdna2Gfx103Ufmt::R32G32_UINT:          return kDxgiR32G32Uint;
+        case Rdna2Gfx103Ufmt::R32G32_SINT:          return kDxgiR32G32Sint;
+        case Rdna2Gfx103Ufmt::R32G32_FLOAT:         return kDxgiR32G32Float;
+        case Rdna2Gfx103Ufmt::R16G16B16A16_UNORM:   return kDxgiR16G16B16A16Unorm;
+        case Rdna2Gfx103Ufmt::R16G16B16A16_SNORM:   return kDxgiR16G16B16A16Snorm;
+        case Rdna2Gfx103Ufmt::R16G16B16A16_USCALED:
+        case Rdna2Gfx103Ufmt::R16G16B16A16_UINT:    return kDxgiR16G16B16A16Uint;
+        case Rdna2Gfx103Ufmt::R16G16B16A16_SSCALED:
+        case Rdna2Gfx103Ufmt::R16G16B16A16_SINT:    return kDxgiR16G16B16A16Sint;
+        case Rdna2Gfx103Ufmt::R16G16B16A16_FLOAT:   return kDxgiR16G16B16A16Float;
+        case Rdna2Gfx103Ufmt::R32G32B32_UINT:       return kDxgiR32G32B32Uint;
+        case Rdna2Gfx103Ufmt::R32G32B32_SINT:       return kDxgiR32G32B32Sint;
+        case Rdna2Gfx103Ufmt::R32G32B32A32_UINT:    return kDxgiR32G32B32A32Uint;
+        case Rdna2Gfx103Ufmt::R32G32B32A32_SINT:    return kDxgiR32G32B32A32Sint;
+        case Rdna2Gfx103Ufmt::R32G32B32A32_FLOAT:   return kDxgiR32G32B32A32Float;
         default:                                    return kDxgiUnknown;
     }
 }
+
+namespace {
+
+uint32_t Rdna2Gfx103UfmtToDxgi(uint8_t ufmt) noexcept {
+    switch (static_cast<Rdna2Gfx103Ufmt>(ufmt & 0x7Fu)) {
+        case Rdna2Gfx103Ufmt::R8_UNORM:            return kDxgiR8Unorm;
+        case Rdna2Gfx103Ufmt::R8_SNORM:            return kDxgiR8Snorm;
+        case Rdna2Gfx103Ufmt::R8_USCALED:
+        case Rdna2Gfx103Ufmt::R8_UINT:             return kDxgiR8Uint;
+        case Rdna2Gfx103Ufmt::R8_SSCALED:
+        case Rdna2Gfx103Ufmt::R8_SINT:             return kDxgiR8Sint;
+        case Rdna2Gfx103Ufmt::R16_UNORM:           return kDxgiR16Unorm;
+        case Rdna2Gfx103Ufmt::R16_SNORM:           return kDxgiR16Snorm;
+        case Rdna2Gfx103Ufmt::R16_USCALED:
+        case Rdna2Gfx103Ufmt::R16_UINT:            return kDxgiR16Uint;
+        case Rdna2Gfx103Ufmt::R16_SSCALED:
+        case Rdna2Gfx103Ufmt::R16_SINT:            return kDxgiR16Sint;
+        case Rdna2Gfx103Ufmt::R16_FLOAT:           return kDxgiR16Float;
+        case Rdna2Gfx103Ufmt::R8G8_UNORM:          return kDxgiR8G8Unorm;
+        case Rdna2Gfx103Ufmt::R8G8_SNORM:          return kDxgiR8G8Snorm;
+        case Rdna2Gfx103Ufmt::R8G8_USCALED:
+        case Rdna2Gfx103Ufmt::R8G8_UINT:           return kDxgiR8G8Uint;
+        case Rdna2Gfx103Ufmt::R8G8_SSCALED:
+        case Rdna2Gfx103Ufmt::R8G8_SINT:           return kDxgiR8G8Sint;
+        case Rdna2Gfx103Ufmt::R32_UINT:            return kDxgiR32Uint;
+        case Rdna2Gfx103Ufmt::R32_SINT:            return kDxgiR32Sint;
+        case Rdna2Gfx103Ufmt::R32_FLOAT:           return kDxgiR32Float;
+        case Rdna2Gfx103Ufmt::R16G16_UNORM:        return kDxgiR16G16Unorm;
+        case Rdna2Gfx103Ufmt::R16G16_SNORM:        return kDxgiR16G16Snorm;
+        case Rdna2Gfx103Ufmt::R16G16_USCALED:
+        case Rdna2Gfx103Ufmt::R16G16_UINT:         return kDxgiR16G16Uint;
+        case Rdna2Gfx103Ufmt::R16G16_SSCALED:
+        case Rdna2Gfx103Ufmt::R16G16_SINT:         return kDxgiR16G16Sint;
+        case Rdna2Gfx103Ufmt::R16G16_FLOAT:        return kDxgiR16G16Float;
+        case Rdna2Gfx103Ufmt::R10G11B11_FLOAT:
+        case Rdna2Gfx103Ufmt::R11G11B10_FLOAT:     return kDxgiR11G11B10Float;
+        case Rdna2Gfx103Ufmt::R10G10B10A2_UNORM:
+        case Rdna2Gfx103Ufmt::R2G10B10A10_UNORM:   return kDxgiR10G10B10A2Unorm;
+        case Rdna2Gfx103Ufmt::R10G10B10A2_UINT:
+        case Rdna2Gfx103Ufmt::R2G10B10A10_UINT:    return kDxgiR10G10B10A2Uint;
+        case Rdna2Gfx103Ufmt::R8G8B8A8_UNORM:      return kDxgiR8G8B8A8Unorm;
+        case Rdna2Gfx103Ufmt::R8G8B8A8_SNORM:      return kDxgiR8G8B8A8Snorm;
+        case Rdna2Gfx103Ufmt::R8G8B8A8_USCALED:
+        case Rdna2Gfx103Ufmt::R8G8B8A8_UINT:       return kDxgiR8G8B8A8Uint;
+        case Rdna2Gfx103Ufmt::R8G8B8A8_SSCALED:
+        case Rdna2Gfx103Ufmt::R8G8B8A8_SINT:       return kDxgiR8G8B8A8Sint;
+        case Rdna2Gfx103Ufmt::R32G32_UINT:         return kDxgiR32G32Uint;
+        case Rdna2Gfx103Ufmt::R32G32_SINT:         return kDxgiR32G32Sint;
+        case Rdna2Gfx103Ufmt::R32G32_FLOAT:        return kDxgiR32G32Float;
+        case Rdna2Gfx103Ufmt::R16G16B16A16_UNORM:  return kDxgiR16G16B16A16Unorm;
+        case Rdna2Gfx103Ufmt::R16G16B16A16_SNORM:  return kDxgiR16G16B16A16Snorm;
+        case Rdna2Gfx103Ufmt::R16G16B16A16_USCALED:
+        case Rdna2Gfx103Ufmt::R16G16B16A16_UINT:   return kDxgiR16G16B16A16Uint;
+        case Rdna2Gfx103Ufmt::R16G16B16A16_SSCALED:
+        case Rdna2Gfx103Ufmt::R16G16B16A16_SINT:   return kDxgiR16G16B16A16Sint;
+        case Rdna2Gfx103Ufmt::R16G16B16A16_FLOAT:  return kDxgiR16G16B16A16Float;
+        case Rdna2Gfx103Ufmt::R32G32B32_UINT:      return kDxgiR32G32B32Uint;
+        case Rdna2Gfx103Ufmt::R32G32B32_SINT:      return kDxgiR32G32B32Sint;
+        case Rdna2Gfx103Ufmt::R32G32B32_FLOAT:     return kDxgiR32G32B32Float;
+        case Rdna2Gfx103Ufmt::R32G32B32A32_UINT:   return kDxgiR32G32B32A32Uint;
+        case Rdna2Gfx103Ufmt::R32G32B32A32_SINT:   return kDxgiR32G32B32A32Sint;
+        case Rdna2Gfx103Ufmt::R32G32B32A32_FLOAT:  return kDxgiR32G32B32A32Float;
+        default:                                   return kDxgiUnknown;
+    }
+}
+
+void ResolveVSharpDxgiFormat(const Rdna2BufferDescriptor& vsharp,
+                             uint32_t& out_dxgi_fmt,
+                             bool& out_raw_byte_address) noexcept {
+    // Hardware GFX10.3 SQ_RSRC_BUF V# descriptors encode word3[31:30] == 2 (type == 2)
+    // and word3[24] == 1 (resource_level == true) with unified 7-bit FORMAT in word3[18:12].
+    if (vsharp.resource_level && vsharp.type == 2u) {
+        out_dxgi_fmt = Rdna2Gfx103UfmtToDxgi(vsharp.format);
+        out_raw_byte_address =
+            (vsharp.format == 0u) ||
+            (vsharp.format == static_cast<uint8_t>(Rdna2Gfx103Ufmt::R32_UINT) &&
+             vsharp.oob_select == Rdna2BufferOobSelect::NumRecordsAddress);
+    } else {
+        out_dxgi_fmt = Rdna2BufferFormatToDxgi(vsharp.format);
+        out_raw_byte_address =
+            (vsharp.format == static_cast<uint8_t>(Rdna2MtbufFormat::Invalid)) ||
+            (vsharp.format == static_cast<uint8_t>(Rdna2MtbufFormat::R32_UINT) &&
+             vsharp.oob_select == Rdna2BufferOobSelect::NumRecordsAddress);
+    }
+}
+
+}  // namespace
 
 uint8_t DxgiToRdna2BufferFormat(uint32_t dxgi_format) noexcept {
     switch (dxgi_format) {
@@ -698,6 +822,8 @@ uint32_t DxgiFormatToVkFormat(uint32_t dxgi_format) noexcept {
         case kDxgiR32G32B32A32Sint:  return 108u;  // VK_FORMAT_R32G32B32A32_SINT
         case kDxgiR32G32B32A32Float: return 109u;  // VK_FORMAT_R32G32B32A32_SFLOAT
         case kDxgiR11G11B10Float:    return 122u;  // VK_FORMAT_B10G11R11_UFLOAT_PACK32
+        case kDxgiR32G32B32Uint:     return 104u;  // VK_FORMAT_R32G32B32_UINT
+        case kDxgiR32G32B32Sint:     return 105u;  // VK_FORMAT_R32G32B32_SINT
         case kDxgiD32Float:          return 126u;  // VK_FORMAT_D32_SFLOAT
         case kDxgiBc1Unorm:          return 133u;  // VK_FORMAT_BC1_RGBA_UNORM_BLOCK
         case kDxgiBc1UnormSrgb:      return 134u;  // VK_FORMAT_BC1_RGBA_SRGB_BLOCK
@@ -1044,11 +1170,9 @@ bool DescriptorSgprBridge::SynthesizeD3D12BufferSrv(
         return true;
     }
 
-    const uint32_t dxgi_fmt = Rdna2BufferFormatToDxgi(vsharp.format);
-    const bool raw_byte_address =
-        (vsharp.format == static_cast<uint8_t>(Rdna2MtbufFormat::Invalid)) ||
-        (vsharp.format == static_cast<uint8_t>(Rdna2MtbufFormat::R32_UINT) &&
-         vsharp.oob_select == Rdna2BufferOobSelect::NumRecordsAddress);
+    uint32_t dxgi_fmt = kDxgiUnknown;
+    bool raw_byte_address = false;
+    ResolveVSharpDxgiFormat(vsharp, dxgi_fmt, raw_byte_address);
 
     if (raw_byte_address) {
         // Raw ByteAddressBuffer V# (num_records is in bytes for raw GFX10 descriptors)
@@ -1093,11 +1217,9 @@ bool DescriptorSgprBridge::SynthesizeD3D12BufferUav(
         return true;
     }
 
-    const uint32_t dxgi_fmt = Rdna2BufferFormatToDxgi(vsharp.format);
-    const bool raw_byte_address =
-        (vsharp.format == static_cast<uint8_t>(Rdna2MtbufFormat::Invalid)) ||
-        (vsharp.format == static_cast<uint8_t>(Rdna2MtbufFormat::R32_UINT) &&
-         vsharp.oob_select == Rdna2BufferOobSelect::NumRecordsAddress);
+    uint32_t dxgi_fmt = kDxgiUnknown;
+    bool raw_byte_address = false;
+    ResolveVSharpDxgiFormat(vsharp, dxgi_fmt, raw_byte_address);
 
     if (raw_byte_address) {
         out_desc.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -1679,15 +1801,15 @@ VulkanBindlessBindingEntry DescriptorSgprBridge::TranslateVSharpToVulkan(
     e.resolved_gpu_va = resolved_gpu_va;
     e.stride_bytes = vsharp.stride;
 
-    const uint32_t dxgi_fmt = Rdna2BufferFormatToDxgi(vsharp.format);
+    uint32_t dxgi_fmt = kDxgiUnknown;
+    bool raw_byte_address = false;
+    ResolveVSharpDxgiFormat(vsharp, dxgi_fmt, raw_byte_address);
     e.vk_format = DxgiFormatToVkFormat(dxgi_fmt);
 
     if (vsharp.stride > 0u) {
         e.vk_descriptor_type = kVkDescriptorTypeStorageBuffer;
         e.byte_range = static_cast<uint64_t>(vsharp.num_records) * static_cast<uint64_t>(vsharp.stride);
-    } else if (vsharp.format == static_cast<uint8_t>(Rdna2MtbufFormat::Invalid) ||
-               (vsharp.format == static_cast<uint8_t>(Rdna2MtbufFormat::R32_UINT) &&
-                vsharp.oob_select == Rdna2BufferOobSelect::NumRecordsAddress)) {
+    } else if (raw_byte_address) {
         e.vk_descriptor_type = kVkDescriptorTypeStorageBuffer;
         e.byte_range = static_cast<uint64_t>(vsharp.num_records);
     } else {

@@ -48,6 +48,7 @@ enum class IrOp : uint16_t {
     ImageLoadMip,       // operands: [x_u32, y_u32, z_or_face_u32, mip_u32], imm_u32 = ch | (dim << 4) | (tex_slot<<8) -> f32
     ImageStore,         // operands: [x_u32, y_u32, r_f32, g_f32, b_f32, a_f32, z_u32(opt)], imm_u32 = dim | (uav_tex_slot<<8) -> void
     ImageAtomicCmpSwap, // operands: [x_u32, y_u32, z_or_face_u32, cmp_u32, src_u32], imm_u32 = dim -> prev_u32
+    ImageAtomic,        // operands: [x_u32, y_u32, z_or_face_u32, data_u32, cmp_u32(opt)], imm_u32 = dim | (raw_op<<8) | (glc<<16) -> prev_u32
     BvhIntersectRay,    // operands: [node_ptr, tmax, ox, oy, oz, dx, dy, dz], imm_u32 = comp (0=t,1=u,2=v,3=hit_id)
 
     // Workgroup shared memory / LDS ops (DS)
@@ -66,7 +67,10 @@ enum class IrOp : uint16_t {
     WaveLaneId,             // [] -> lane_id u32 (0..wave_size-1)
     WaveReadFirstLane,      // [val] -> u32
     WaveReadLaneAt,         // [val, lane_idx_u32] -> u32
+    WaveWriteLane,          // [prev_vdst, val, lane_idx_u32] -> u32 (v_writelane_b32 ignoring EXEC)
     WaveDpp8,               // [val_u32], imm_u32 = dpp8_sel24 | (fi << 24) -> u32 (quad-local 8-lane permutation)
+    WaveDpp16,              // [val_u32, old_vdst_u32], imm_u32 = dpp_ctrl9 | (bound_ctrl<<9) | (bank_mask<<12) | (row_mask<<16) -> u32
+    WaveDpp16Mask,          // [], imm_u32 = dpp_ctrl9 | (bound_ctrl<<9) | (bank_mask<<12) | (row_mask<<16) -> Bool (DPP16 lane write enable)
     WaveBallotLo,           // [pred_bool] -> u32 (lanes 0..31)
     WaveBallotHi,           // [pred_bool] -> u32 (lanes 32..63)
     WaveActiveCountBits64,  // [ballot_lo_u32, ballot_hi_u32] -> u32
@@ -128,6 +132,7 @@ enum class IrOp : uint16_t {
     AlignByte,      // operands: [src0_hi, src1_lo, src2_byte_sel] -> u32 (UB-safe shift < 32)
     FmaMix,         // operands: [a, b, c, old_dst], imm_u32 = mode(0=f32,1=lo16,2=hi16) | (vop3p_flags << 4)
     BufferLoadFormat, // operands: [byte_addr_u32], imm_u32 = uav_slot | (fmt<<4) | (comp<<12) | (d16<<16) -> u32/f32
+    BufferLoadVSharp, // operands: [byte_addr_u32, word3_u32], imm_u32 = uav_slot | (comp<<4) | (d16<<8) | (d16_hi<<9) | (ufmt<<16) | (use_ufmt<<23) -> u32/f32
 
     // 32-bit bitfield ops (V_BFE_U32, V_BFE_I32, V_BFI_B32)
     BfeU32,         // operands: [src0, offset, width] -> u32
