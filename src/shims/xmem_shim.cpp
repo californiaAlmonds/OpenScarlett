@@ -312,7 +312,28 @@ void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemMapPhysicalPages(
     const uint64_t* arg4) {
     // Support BOTH:
     //  - Retail Xbox Series X 3-arg ABI: XMemMapPhysicalPages(va, numPages, pPageArray)
+    //    including pPageArray == nullptr, which unmaps [va, va + numPages * 64 KiB) and returns va!
     //  - Legacy 5-arg ABI: XMemMapPhysicalPages(va, numPages, flAllocationType, flProtect, pPageArray)
+    if (arg2 == 0u) {
+        if (!virtualAddress) {
+#if defined(_WIN32)
+            SetLastError(87u);
+#endif
+            RecordOutcome("XMemMapPhysicalPages", false);
+            return nullptr;
+        }
+        if (numberOfPages == 0u) {
+#if defined(_WIN32)
+            SetLastError(0u);
+#endif
+            RecordOutcome("XMemMapPhysicalPages", true);
+            return virtualAddress;
+        }
+        const int32_t unmapped_ok = ::XMemUnmapPhysicalPages(virtualAddress, numberOfPages);
+        void* unmapped_ret = unmapped_ok ? virtualAddress : nullptr;
+        RecordOutcome("XMemMapPhysicalPages", unmapped_ret != nullptr);
+        return unmapped_ret;
+    }
     bool is_three_arg = false;
 #if defined(_WIN32)
     if (arg2 >= 0x10000ull) {
@@ -602,7 +623,6 @@ void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemVirtualAlloc(
     uint32_t flAllocationType,
     uint32_t dwMemoryType,
     uint32_t flProtect) {
-    (void)dwMemoryType;
     uint32_t effective_prot = flProtect;
     if ((effective_prot & 0xFFu) == 0u) {
         if ((effective_prot & 0x800u) != 0u ||
@@ -612,7 +632,8 @@ void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemVirtualAlloc(
             effective_prot |= PAGE_READWRITE;
         }
     }
-    void* ptr = ::KernelXVirtualAllocFromApp(lpAddress, dwSize, flAllocationType, effective_prot);
+    void* ptr = ::OpenScarlettVirtualAllocWithMemType(
+        lpAddress, dwSize, flAllocationType, dwMemoryType, effective_prot);
     if (!ptr && lpAddress == nullptr && dwSize > 0u && (flAllocationType & MEM_COMMIT) != 0u) {
         // Retry with sanitized allocation type flags if guest passed proprietary high bits.
         constexpr uint32_t kKnownAllocMask =
@@ -620,7 +641,8 @@ void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemVirtualAlloc(
             MEM_WRITE_COMBINE | MEM_GRAPHICS | MEM_LARGE_PAGES | MEM_TITLE | MEM_4MB_PAGES;
         const uint32_t sanitized_alloc = (flAllocationType & kKnownAllocMask) | MEM_RESERVE;
         if (sanitized_alloc != flAllocationType) {
-            ptr = ::KernelXVirtualAllocFromApp(nullptr, dwSize, sanitized_alloc, effective_prot);
+            ptr = ::OpenScarlettVirtualAllocWithMemType(
+                nullptr, dwSize, sanitized_alloc, dwMemoryType, effective_prot);
         }
     }
     if (lpAddress == nullptr && ptr != nullptr) {

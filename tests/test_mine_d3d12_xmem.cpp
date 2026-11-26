@@ -232,6 +232,55 @@ void TestXMemTransferMemory() {
         OS_REQUIRE(st.available_bytes <= st.total_bytes);
     }
 
+    // 9. Retail 3-arg XMemMapPhysicalPages(va, count, nullptr) unmaps cleanly & idempotently
+    {
+        using PfnXMemVirtualAlloc = void*(WINAPI*)(void*, SIZE_T, uint32_t, uint32_t, uint32_t);
+        using PfnXMemAllocPhys = int32_t(WINAPI*)(uint32_t, uint64_t*, uint64_t*);
+        using PfnXMemFreePhys = int32_t(WINAPI*)(uint64_t, const uint64_t*);
+        using PfnXMemMap3 = void*(WINAPI*)(void*, uint64_t, const uint64_t*);
+        using PfnKxVirtFree = int32_t(WINAPI*)(void*, SIZE_T, uint32_t);
+
+        auto valloc_fn = reinterpret_cast<PfnXMemVirtualAlloc>(GetProcAddress(mod, "XMemVirtualAlloc"));
+        auto alloc_phys_fn = reinterpret_cast<PfnXMemAllocPhys>(GetProcAddress(mod, "XMemAllocatePhysicalPages"));
+        auto free_phys_fn = reinterpret_cast<PfnXMemFreePhys>(GetProcAddress(mod, "XMemFreePhysicalPages"));
+        auto map3_fn = reinterpret_cast<PfnXMemMap3>(GetProcAddress(mod, "XMemMapPhysicalPages"));
+        HMODULE kx_mod = GetModuleHandleW(L"kernelx.dll");
+        OS_REQUIRE(kx_mod != nullptr);
+        auto vfree_fn = reinterpret_cast<PfnKxVirtFree>(GetProcAddress(kx_mod, "VirtualFree"));
+        OS_REQUIRE(valloc_fn && alloc_phys_fn && free_phys_fn && map3_fn && vfree_fn);
+
+        void* ph = valloc_fn(nullptr, 128u * 1024u, 0x20402000u, 0x181u, PAGE_NOACCESS);
+        OS_REQUIRE(ph != nullptr);
+        OS_REQUIRE(reinterpret_cast<uintptr_t>(ph) < (1ull << 40));
+
+        uint64_t page_cnt = 2ull;
+        uint64_t pfns[2]{};
+        OS_REQUIRE(alloc_phys_fn(0x20400000u, &page_cnt, pfns) != 0);
+        OS_REQUIRE(page_cnt == 2ull);
+
+        OS_REQUIRE(map3_fn(ph, 2ull, pfns) == ph);
+        static_cast<uint32_t*>(ph)[0] = 0xCAFEBABEu;
+        OS_REQUIRE(static_cast<const uint32_t*>(ph)[0] == 0xCAFEBABEu);
+
+        OS_REQUIRE(map3_fn(nullptr, 2ull, nullptr) == nullptr);
+        OS_REQUIRE(map3_fn(ph, 0ull, nullptr) == ph);
+        OS_REQUIRE(map3_fn(ph, 2ull, nullptr) == ph);
+        OS_REQUIRE(map3_fn(ph, 2ull, nullptr) == ph);  // idempotent cleanup unmap
+
+        OS_REQUIRE(free_phys_fn(2ull, pfns) != 0);
+        OS_REQUIRE(vfree_fn(ph, 0u, MEM_RELEASE) != 0);
+
+        // 10. 0x283 large-page pool block is 2 MiB aligned and strictly below 2^40 (1 TiB)
+        constexpr SIZE_T kTwoMiB = 2u * 1024u * 1024u;
+        void* blk283 = valloc_fn(nullptr, kTwoMiB, 0x20003000u, 0x283u, 0x2004u);
+        OS_REQUIRE(blk283 != nullptr);
+        const uintptr_t addr283 = reinterpret_cast<uintptr_t>(blk283);
+        OS_REQUIRE((addr283 % kTwoMiB) == 0u);
+        OS_REQUIRE(addr283 <= ((1ull << 40) - kTwoMiB));
+        static_cast<uint64_t*>(blk283)[0] = 0x1122334455667788ull;
+        OS_REQUIRE(vfree_fn(blk283, 0u, MEM_RELEASE) != 0);
+    }
+
     OS_REQUIRE(FreeLibrary(mod) != FALSE);
 }
 #endif

@@ -391,6 +391,13 @@ OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL OpenScarlettMapTilePa
 OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL OpenScarlettRetryRemappedPageFault(
     uintptr_t faultVirtualAddress);
 
+OPENSCARLETT_KERNELX_API void* OPENSCARLETT_KERNELX_CALL OpenScarlettVirtualAllocWithMemType(
+    void* baseAddress,
+    size_t size,
+    uint32_t allocationType,
+    uint32_t memoryType,
+    uint32_t protection);
+
 // Note: kernelx.dll also exports unprefixed VirtualAllocFromApp, VirtualProtectFromApp,
 // CreateWaitableTimerExW, and QueryUnbiasedInterruptTime in its PE export directory.
 // The KernelX-prefixed declarations below prevent clashes when <windows.h> is included.

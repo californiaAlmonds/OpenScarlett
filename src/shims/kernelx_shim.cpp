@@ -702,41 +702,78 @@ PfnKxMapViewOfFile3 GetKxMapViewOfFile3() noexcept {
     return s_fn;
 }
 
-// Allocates VirtualAlloc / VirtualAlloc2 memory, trying MEM_WRITE_WATCH first whenever
-// MEM_RESERVE is requested, and falling back cleanly without MEM_WRITE_WATCH if rejected.
+// Allocates VirtualAlloc / VirtualAlloc2 memory, trying < 2^40 (1 TiB) placement first so
+// retail Scarlett titles using 40-bit tagged pointers (bzhi ..., 40) or 40-bit GPU/BVH VAs
+// never truncate high ASLR bits, and trying MEM_WRITE_WATCH whenever MEM_RESERVE is requested.
 void* AllocVirtualWriteWatched(void* base_addr,
                                size_t byte_size,
                                size_t alignment,
                                DWORD win_alloc,
-                               DWORD win_prot) noexcept {
+                               DWORD win_prot,
+                               bool require_below_40bit = false) noexcept {
+    constexpr uintptr_t kScarlettLowLimit40 = 1ull << 40;
     const bool try_write_watch = ((win_alloc & MEM_RESERVE) != 0u) &&
                                  ((win_alloc & MEM_RESET) == 0u);
     void* ptr = nullptr;
     const PfnKxVirtualAlloc2 va2 = GetKxVirtualAlloc2();
-    if (base_addr == nullptr && alignment > kPage64KB && va2 != nullptr) {
-        KxMemAddressRequirements addr_req{nullptr, nullptr, alignment};
-        KxMemExtendedParameter ext{};
-        ext.type_and_reserved = 1ull;
-        ext.value.pointer = &addr_req;
-        if (try_write_watch) {
-            ptr = va2(::GetCurrentProcess(),
-                      nullptr,
-                      byte_size,
-                      win_alloc | MEM_WRITE_WATCH,
-                      win_prot,
-                      &ext,
-                      1u);
+    if (base_addr == nullptr && va2 != nullptr) {
+        if (byte_size <= kScarlettLowLimit40) {
+            KxMemAddressRequirements addr_req{
+                nullptr,
+                reinterpret_cast<void*>(kScarlettLowLimit40 - 1ull),
+                (alignment > kPage64KB) ? alignment : 0u};
+            KxMemExtendedParameter ext{};
+            ext.type_and_reserved = 1ull;
+            ext.value.pointer = &addr_req;
+            if (try_write_watch) {
+                ptr = va2(::GetCurrentProcess(),
+                          nullptr,
+                          byte_size,
+                          win_alloc | MEM_WRITE_WATCH,
+                          win_prot,
+                          &ext,
+                          1u);
+            }
+            if (!ptr) {
+                ptr = va2(::GetCurrentProcess(), nullptr, byte_size, win_alloc, win_prot, &ext, 1u);
+            }
         }
-        if (!ptr) {
-            ptr = va2(::GetCurrentProcess(), nullptr, byte_size, win_alloc, win_prot, &ext, 1u);
+        if (!ptr && !require_below_40bit && alignment > kPage64KB) {
+            KxMemAddressRequirements addr_req{nullptr, nullptr, alignment};
+            KxMemExtendedParameter ext{};
+            ext.type_and_reserved = 1ull;
+            ext.value.pointer = &addr_req;
+            if (try_write_watch) {
+                ptr = va2(::GetCurrentProcess(),
+                          nullptr,
+                          byte_size,
+                          win_alloc | MEM_WRITE_WATCH,
+                          win_prot,
+                          &ext,
+                          1u);
+            }
+            if (!ptr) {
+                ptr = va2(::GetCurrentProcess(), nullptr, byte_size, win_alloc, win_prot, &ext, 1u);
+            }
         }
     }
-    if (!ptr) {
+    if (!ptr && !require_below_40bit) {
         if (try_write_watch) {
             ptr = ::VirtualAlloc(base_addr, byte_size, win_alloc | MEM_WRITE_WATCH, win_prot);
         }
         if (!ptr) {
             ptr = ::VirtualAlloc(base_addr, byte_size, win_alloc, win_prot);
+        }
+    }
+    if (ptr && require_below_40bit) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(ptr);
+        const bool aligned_ok = (alignment == 0u) || ((base % alignment) == 0u);
+        const bool below_ok = (byte_size <= kScarlettLowLimit40) &&
+                              (base <= (kScarlettLowLimit40 - byte_size));
+        if (!aligned_ok || !below_ok) {
+            (void)::VirtualFree(ptr, 0u, MEM_RELEASE);
+            ::SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return nullptr;
         }
     }
     if (ptr && try_write_watch && (win_alloc & MEM_COMMIT) != 0u) {
@@ -749,6 +786,7 @@ void* MapSparseViewAlignedKx(size_t byte_size,
                              size_t alignment,
                              DWORD win_prot,
                              const wchar_t* prefix) noexcept {
+    constexpr uintptr_t kScarlettLowLimit40 = 1ull << 40;
     const size_t map_size = AlignUp(byte_size, kPage64KB);
     HANDLE hmap = CreateSparseFileSectionKx(map_size, prefix);
     if (!hmap) {
@@ -756,13 +794,25 @@ void* MapSparseViewAlignedKx(size_t byte_size,
     }
     void* mapped = nullptr;
     const PfnKxMapViewOfFile3 map3 = GetKxMapViewOfFile3();
-    if (alignment > kPage64KB && map3 != nullptr) {
-        KxMemAddressRequirements addr_req{nullptr, nullptr, alignment};
-        KxMemExtendedParameter ext{};
-        ext.type_and_reserved = 1ull;
-        ext.value.pointer = &addr_req;
+    if (map3 != nullptr) {
         const DWORD map_prot = (win_prot == PAGE_READONLY) ? PAGE_READONLY : PAGE_READWRITE;
-        mapped = map3(hmap, ::GetCurrentProcess(), nullptr, 0ull, map_size, 0u, map_prot, &ext, 1u);
+        if (map_size <= kScarlettLowLimit40) {
+            KxMemAddressRequirements addr_req{
+                nullptr,
+                reinterpret_cast<void*>(kScarlettLowLimit40 - 1ull),
+                (alignment > kPage64KB) ? alignment : 0u};
+            KxMemExtendedParameter ext{};
+            ext.type_and_reserved = 1ull;
+            ext.value.pointer = &addr_req;
+            mapped = map3(hmap, ::GetCurrentProcess(), nullptr, 0ull, map_size, 0u, map_prot, &ext, 1u);
+        }
+        if (!mapped && alignment > kPage64KB) {
+            KxMemAddressRequirements addr_req{nullptr, nullptr, alignment};
+            KxMemExtendedParameter ext{};
+            ext.type_and_reserved = 1ull;
+            ext.value.pointer = &addr_req;
+            mapped = map3(hmap, ::GetCurrentProcess(), nullptr, 0ull, map_size, 0u, map_prot, &ext, 1u);
+        }
     }
     if (!mapped) {
         const DWORD access =
@@ -2016,6 +2066,18 @@ public:
                 ph_base != nullptr) {
                 return 1;
             }
+            for (const auto& [b, rec] : app_allocs_) {
+                if (rec.is_placeholder && key >= b && key < b + rec.size) {
+                    return 1;
+                }
+            }
+#if defined(_WIN32)
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (::VirtualQuery(virtualAddress, &mbi, sizeof(mbi)) != 0u &&
+                mbi.State == MEM_RESERVE && mbi.Type == MEM_PRIVATE) {
+                return 1;
+            }
+#endif
         }
 
         SetHostLastError(87u);
@@ -2625,7 +2687,8 @@ public:
     void* VirtualAllocApp(void* baseAddress,
                           size_t size,
                           uint32_t allocationType,
-                          uint32_t protection) {
+                          uint32_t protection,
+                          uint32_t memoryType = 0u) {
         if (size == 0 || allocationType == 0 || !ValidateProtect(protection)) {
             SetHostLastError(87u);
             return nullptr;
@@ -2643,6 +2706,10 @@ public:
         const bool is_large =
             ((allocationType & MEM_4MB_PAGES) != 0u) ||
             (!is_physical && (allocationType & MEM_LARGE_PAGES) != 0u);
+        const bool require_below_40bit =
+            (baseAddress == nullptr) && !is_physical &&
+            ((allocationType & MEM_LARGE_PAGES) != 0u) &&
+            ((memoryType & 0xFFFu) == 0x283u);
 
         // MEM_RESERVE | (MEM_GRAPHICS or MEM_PHYSICAL or MEM_RESERVE_PLACEHOLDER) creates a real OS
         // virtual placeholder so VirtualFree(MEM_PRESERVE_PLACEHOLDER) splits, MEM_REPLACE_PLACEHOLDER,
@@ -2692,12 +2759,16 @@ public:
             }
         }
 
-        const size_t align = is_large ? kPage4MB : ((is_graphics || is_physical) ? kPage64KB : kPage4KB);
-        if (size > (SIZE_MAX - (align - 1u))) {
+        constexpr size_t kPage2MB = 2ull * 1024ull * 1024ull;
+        const size_t align = require_below_40bit
+                                 ? (((allocationType & MEM_4MB_PAGES) != 0u) ? kPage4MB : kPage2MB)
+                                 : (is_large ? kPage4MB : ((is_graphics || is_physical) ? kPage64KB : kPage4KB));
+        const size_t size_gran = (require_below_40bit && (allocationType & MEM_4MB_PAGES) == 0u) ? kPage64KB : align;
+        if (size > (SIZE_MAX - (size_gran - 1u))) {
             SetHostLastError(8u);
             return nullptr;
         }
-        const size_t aligned_size = AlignUp(size, align);
+        const size_t aligned_size = AlignUp(size, size_gran);
         const uint64_t budget = GetTitleBudgetBytes();
         const bool is_gpu_noaccess_window =
             ((protection & 0xFFu) == PAGE_NOACCESS) || ((protection & 0x800u) != 0u);
@@ -2986,6 +3057,7 @@ public:
         }
         const DWORD win_prot = ToWin32PageProtect(protection);
         const bool prefer_sparse =
+            !require_below_40bit &&
             (baseAddress == nullptr) &&
             ((allocationType & MEM_COMMIT) != 0u) &&
             (is_gpu_noaccess_window
@@ -2993,9 +3065,10 @@ public:
                  : ShouldPreferSparseCommitKx(aligned_size, /*prefer_write_watch_first=*/true));
         void* ptr = nullptr;
         if (!prefer_sparse) {
-            ptr = AllocVirtualWriteWatched(baseAddress, aligned_size, align, win_alloc, win_prot);
+            ptr = AllocVirtualWriteWatched(
+                baseAddress, aligned_size, align, win_alloc, win_prot, require_below_40bit);
         }
-        if (!ptr && baseAddress == nullptr && (allocationType & MEM_COMMIT) != 0u) {
+        if (!ptr && !require_below_40bit && baseAddress == nullptr && (allocationType & MEM_COMMIT) != 0u) {
             // Host pagefile commit pressure fallback: back the allocation with a sparse NTFS file
             // on E:\OpenScarlett\.tmp (never C:\) so untouched pages consume zero commit charge
             // and zero disk blocks instead of returning NULL.
@@ -4607,6 +4680,17 @@ int32_t OPENSCARLETT_KERNELX_CALL OpenScarlettMapTilePageBatch(
 
 int32_t OPENSCARLETT_KERNELX_CALL OpenScarlettRetryRemappedPageFault(uintptr_t faultVirtualAddress) {
     return KernelXState::Instance().RetryRemappedPageFault(faultVirtualAddress);
+}
+
+void* OPENSCARLETT_KERNELX_CALL OpenScarlettVirtualAllocWithMemType(void* baseAddress,
+                                                                    size_t size,
+                                                                    uint32_t allocationType,
+                                                                    uint32_t memoryType,
+                                                                    uint32_t protection) {
+    void* ptr = KernelXState::Instance().VirtualAllocApp(
+        baseAddress, size, allocationType, protection, memoryType);
+    RecordTelemetry("VirtualAllocFromApp", ptr ? CallOutcome::Ok : CallOutcome::Error, ptr ? kHrOk : kHrFail);
+    return ptr;
 }
 
 void* OPENSCARLETT_KERNELX_CALL KernelXVirtualAllocFromApp(void* baseAddress,

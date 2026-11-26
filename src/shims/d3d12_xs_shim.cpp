@@ -4362,6 +4362,143 @@ HRESULT CreateWrappedDeviceInternal(
                         }
                     }
                 }
+                // Self-healing recovery for Rockstar RAGE9 lock-free `fwPool::New` pop ABA/double-free
+                // corruption across all 37 inline `fwPool` instantiations (+0x3E42CD4 `fwKnownRefHolder`, etc.):
+                //   mov rax, [rcx+20h]         (48 8B 41 20)
+                //   mov rdx, rax               (48 89 C2)  <-- rewind target
+                //   cmp edx, -2                (83 FA FE)
+                //   je empty_label             (74 xx  OR  0F 84 xx xx xx xx)
+                //   mov r10d, [rcx+8]          (44 8B 51 08)
+                //   mov r9, [rcx]              (4C 8B 09)
+                //   mov rax, rdx               (48 89 D0)
+                //   and rax, r8                (4C 21 C0)
+                //   imul r10d, edx             (44 0F AF D2)
+                //   mov r9d, [r9+r10]          (47 8B 0C 11) <-- faulting rip
+                // Rebuilds `[rcx+20h]` singly-linked free chain directly from `[rcx+28h]` (`allocated_bitmap`,
+                // where bit 1 = allocated, bit 0 = free) under a process-wide SRWLOCK and rewinds to `mov rdx, rax`.
+                if (code == EXCEPTION_ACCESS_VIOLATION &&
+                    ep->ExceptionRecord->NumberParameters >= 2u &&
+                    ep->ExceptionRecord->ExceptionInformation[0] == 0u &&
+                    reinterpret_cast<uintptr_t>(rip) > 32u &&
+                    IsReadableRetailRange(reinterpret_cast<uintptr_t>(rip) - 29u, 33u) &&
+                    rip[0] == 0x47u && rip[1] == 0x8Bu && rip[2] == 0x0Cu && rip[3] == 0x11u) {
+                    static constexpr uint8_t kFwPoolBody[17] = {
+                        0x44u, 0x8Bu, 0x51u, 0x08u, 0x4Cu, 0x8Bu, 0x09u, 0x48u, 0x89u,
+                        0xD0u, 0x4Cu, 0x21u, 0xC0u, 0x44u, 0x0Fu, 0xAFu, 0xD2u};
+                    if (std::memcmp(rip - 17, kFwPoolBody, sizeof(kFwPoolBody)) == 0) {
+                        uintptr_t rewind_rip = 0u;
+                        if (rip[-25] == 0x48u && rip[-24] == 0x89u && rip[-23] == 0xC2u &&
+                            rip[-22] == 0x83u && rip[-21] == 0xFAu && rip[-20] == 0xFEu &&
+                            rip[-19] == 0x74u) {
+                            rewind_rip = reinterpret_cast<uintptr_t>(rip) - 25u;
+                        } else if (rip[-29] == 0x48u && rip[-28] == 0x89u && rip[-27] == 0xC2u &&
+                                   rip[-26] == 0x83u && rip[-25] == 0xFAu && rip[-24] == 0xFEu &&
+                                   rip[-23] == 0x0Fu && rip[-22] == 0x84u) {
+                            rewind_rip = reinterpret_cast<uintptr_t>(rip) - 29u;
+                        }
+                        const uintptr_t pool_hdr = static_cast<uintptr_t>(ep->ContextRecord->Rcx);
+                        auto is_writable_range = [](uintptr_t addr, size_t sz) noexcept -> bool {
+                            if (addr < 0x10000u || sz == 0u || addr > UINTPTR_MAX - sz) return false;
+                            uintptr_t cur = addr;
+                            const uintptr_t end = addr + sz;
+                            while (cur < end) {
+                                MEMORY_BASIC_INFORMATION mbi{};
+                                if (::VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi)) == 0u ||
+                                    mbi.State != MEM_COMMIT ||
+                                    (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                                                    PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0u ||
+                                    (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) {
+                                    return false;
+                                }
+                                const uintptr_t rend =
+                                    reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+                                if (rend <= cur) return false;
+                                cur = rend;
+                            }
+                            return true;
+                        };
+                        if (rewind_rip != 0u && is_writable_range(pool_hdr, 0x30u)) {
+                            const uintptr_t pool_base = *reinterpret_cast<const uintptr_t*>(pool_hdr + 0x00u);
+                            const uint32_t stride = *reinterpret_cast<const uint32_t*>(pool_hdr + 0x08u);
+                            const uint32_t capacity = *reinterpret_cast<const uint32_t*>(pool_hdr + 0x0Cu);
+                            const uintptr_t bitmap_va = *reinterpret_cast<const uintptr_t*>(pool_hdr + 0x28u);
+                            const size_t bitmap_bytes = (static_cast<size_t>(capacity) + 7u) >> 3u;
+                            if (pool_base >= 0x10000u && stride >= 4u && stride <= 0x100000u &&
+                                capacity >= 1u && capacity <= 0x1000000u &&
+                                IsReadableRetailRange(bitmap_va, bitmap_bytes)) {
+                                static SRWLOCK s_fwpool_lock = SRWLOCK_INIT;
+                                ::AcquireSRWLockExclusive(&s_fwpool_lock);
+                                const uint64_t cur_head =
+                                    *reinterpret_cast<const volatile uint64_t*>(pool_hdr + 0x20u);
+                                const uint32_t cur_idx = static_cast<uint32_t>(cur_head);
+                                uint64_t healed_head = cur_head;
+                                uint32_t free_rebuilt = 0u;
+                                uint32_t alloc_seen = 0u;
+                                const bool already_healed =
+                                    (cur_idx == 0xFFFFFFFEu) ||
+                                    (cur_idx < capacity &&
+                                     IsReadableRetailRange(
+                                         pool_base + static_cast<size_t>(cur_idx) * stride, 4u));
+                                if (!already_healed) {
+                                    const auto* bmap = reinterpret_cast<const uint8_t*>(bitmap_va);
+                                    uint32_t next_free = 0xFFFFFFFEu;
+                                    for (uint32_t rev = capacity; rev > 0u; --rev) {
+                                        const uint32_t idx = rev - 1u;
+                                        const bool is_alloc =
+                                            (bmap[idx >> 3u] & static_cast<uint8_t>(1u << (idx & 7u))) != 0u;
+                                        if (is_alloc) {
+                                            ++alloc_seen;
+                                            continue;
+                                        }
+                                        const uintptr_t slot_va =
+                                            pool_base + static_cast<size_t>(idx) * stride;
+                                        if (!is_writable_range(slot_va, 4u)) {
+                                            continue;
+                                        }
+                                        *reinterpret_cast<uint32_t*>(slot_va) = next_free;
+                                        next_free = idx;
+                                        ++free_rebuilt;
+                                    }
+                                    _InterlockedExchange(
+                                        reinterpret_cast<volatile LONG*>(pool_hdr + 0x10u),
+                                        static_cast<LONG>(alloc_seen));
+                                    const uint64_t base_aba =
+                                        std::max<uint64_t>(cur_head >> 32u, ep->ContextRecord->Rdx >> 32u) + 1ull;
+                                    healed_head = (base_aba << 32u) | static_cast<uint64_t>(next_free);
+                                    _InterlockedExchange64(
+                                        reinterpret_cast<volatile LONG64*>(pool_hdr + 0x20u),
+                                        static_cast<LONG64>(healed_head));
+                                }
+                                ::ReleaseSRWLockExclusive(&s_fwpool_lock);
+                                static std::atomic<uint32_t> s_fwpool_heals{0u};
+                                const uint32_t hn = s_fwpool_heals.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                                if (hn <= 16u) {
+                                    const HMODULE main_exe = ::GetModuleHandleW(nullptr);
+                                    const uintptr_t rva = main_exe
+                                        ? (reinterpret_cast<uintptr_t>(rip) - reinterpret_cast<uintptr_t>(main_exe))
+                                        : reinterpret_cast<uintptr_t>(rip);
+                                    std::fprintf(
+                                        stderr,
+                                        "[OpenScarlett][VEH-GUARD] Healed fwPool free-list at +0x%llX #%u "
+                                        "(pool=0x%llX stride=0x%X cap=%u bad_rdx=0x%llX -> head=0x%llX free=%u alloc=%u)\n",
+                                        static_cast<unsigned long long>(rva),
+                                        hn,
+                                        static_cast<unsigned long long>(pool_hdr),
+                                        stride,
+                                        capacity,
+                                        static_cast<unsigned long long>(ep->ContextRecord->Rdx),
+                                        static_cast<unsigned long long>(healed_head),
+                                        free_rebuilt,
+                                        alloc_seen);
+                                    std::fflush(stderr);
+                                }
+                                ep->ContextRecord->Rax = healed_head;
+                                ep->ContextRecord->Rip = rewind_rip;
+                                return EXCEPTION_CONTINUE_EXECUTION;
+                            }
+                        }
+                    }
+                }
                 // Guard transient null streamed archetype (`[entity+0x20] == NULL`) during async world
                 // entity instantiation (+0x52912B4 `mov rax, [rbx+50h]` and +0x4E8F49A `mov eax, [rcx+rax*4+8]`):
                 // return cleanly via each function's own epilogue rather than faulting worker threads.

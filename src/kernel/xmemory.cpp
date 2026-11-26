@@ -575,12 +575,13 @@ Status UnifiedMemoryManager::ReserveVirtualPlaceholder(size_t size,
         return Status::Error(StatusCode::NotImplemented, "VirtualAlloc2 placeholder API unavailable");
     }
 
+    constexpr uintptr_t kScarlettMaxVa40Bit = (1ull << 40) - 1ull;
     void* base = nullptr;
-    if (gran > 65536u) {
+    {
         OsMemAddressRequirements addr_req{};
         addr_req.lowest_starting_address = nullptr;
-        addr_req.highest_ending_address = nullptr;
-        addr_req.alignment = gran;
+        addr_req.highest_ending_address = reinterpret_cast<void*>(kScarlettMaxVa40Bit);
+        addr_req.alignment = (gran > 65536u) ? gran : 0u;
 
         OsMemExtendedParameter ext{};
         ext.type_and_reserved = 1ull;  // MemExtendedParameterAddressRequirements
@@ -593,14 +594,27 @@ Status UnifiedMemoryManager::ReserveVirtualPlaceholder(size_t size,
                                                PAGE_NOACCESS,
                                                &ext,
                                                1u);
-    } else {
-        base = PlaceholderApi().virtual_alloc2(GetCurrentProcess(),
-                                               nullptr,
-                                               aligned_size,
-                                               MEM_RESERVE | kMemReservePlaceholder,
-                                               PAGE_NOACCESS,
-                                               nullptr,
-                                               0u);
+        if (!base) {
+            // Fallback without 40-bit cap if host <1 TiB VA space is fragmented.
+            if (gran > 65536u) {
+                addr_req.highest_ending_address = nullptr;
+                base = PlaceholderApi().virtual_alloc2(GetCurrentProcess(),
+                                                       nullptr,
+                                                       aligned_size,
+                                                       MEM_RESERVE | kMemReservePlaceholder,
+                                                       PAGE_NOACCESS,
+                                                       &ext,
+                                                       1u);
+            } else {
+                base = PlaceholderApi().virtual_alloc2(GetCurrentProcess(),
+                                                       nullptr,
+                                                       aligned_size,
+                                                       MEM_RESERVE | kMemReservePlaceholder,
+                                                       PAGE_NOACCESS,
+                                                       nullptr,
+                                                       0u);
+            }
+        }
     }
     if (!base) {
         return Status::Error(StatusCode::OutOfMemory, "VirtualAlloc2 placeholder reservation failed");
