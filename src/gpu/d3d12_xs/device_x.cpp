@@ -498,11 +498,24 @@ DXGI_FORMAT ResolveCompatibleSrvFormat(DXGI_FORMAT td_fmt, DXGI_FORMAT req_fmt) 
         case DXGI_FORMAT_R8G8B8A8_UNORM:
         case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
             if (req_fmt == DXGI_FORMAT_R8G8B8A8_UNORM || req_fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
-                (td_fmt == DXGI_FORMAT_R8G8B8A8_UNORM && IsPacked16TargetFormat(req_fmt)) ||
+                (td_fmt == DXGI_FORMAT_R8G8B8A8_UNORM &&
+                 (IsPacked16TargetFormat(req_fmt) ||
+                  req_fmt == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                  req_fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)) ||
                 (td_fmt == DXGI_FORMAT_R8G8B8A8_TYPELESS &&
                  (req_fmt == DXGI_FORMAT_R8G8B8A8_UINT || req_fmt == DXGI_FORMAT_R8G8B8A8_SNORM ||
                   req_fmt == DXGI_FORMAT_R8G8B8A8_SINT))) {
                 return (td_fmt == DXGI_FORMAT_R8G8B8A8_TYPELESS) ? req_fmt : td_fmt;
+            }
+            break;
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+            if (IsPacked16TargetFormat(req_fmt) ||
+                req_fmt == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                req_fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                req_fmt == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                req_fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+                return td_fmt;
             }
             break;
         case DXGI_FORMAT_B8G8R8A8_TYPELESS:
@@ -7023,9 +7036,28 @@ void STDMETHODCALLTYPE DeviceX::CreateShaderResourceView(
                 san_fmt = DXGI_FORMAT_R8_UNORM;
                 remap_a8_to_r8 = true;
             }
-        } else if (IsPacked16TargetFormat(san_fmt) && host_res != nullptr &&
-                   host_res->GetDesc().Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
-            san_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+        } else if (host_res != nullptr &&
+                   host_res->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+            const DXGI_FORMAT rdf = host_res->GetDesc().Format;
+            if ((IsPacked16TargetFormat(pDesc->Format) || IsPacked16TargetFormat(san_fmt)) &&
+                (rdf == DXGI_FORMAT_R8G8B8A8_UNORM || rdf == DXGI_FORMAT_B8G8R8A8_UNORM)) {
+                san_fmt = rdf;
+            } else {
+                san_fmt = ResolveCompatibleSrvFormat(rdf, san_fmt);
+            }
+        }
+        bool promote_srv_1d_to_2d = false;
+        bool use_default_srv_for_dim0 = false;
+        if (retail_scarlett_abi_ && host_res != nullptr) {
+            const D3D12_RESOURCE_DESC hrd = host_res->GetDesc();
+            if (pDesc->ViewDimension == D3D12_SRV_DIMENSION_UNKNOWN &&
+                hrd.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+                use_default_srv_for_dim0 = true;
+            } else if (hrd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                       (pDesc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1D ||
+                        pDesc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1DARRAY)) {
+                promote_srv_1d_to_2d = true;
+            }
         }
         const UINT san_map = remap_a8_to_r8
             ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
@@ -7034,10 +7066,37 @@ void STDMETHODCALLTYPE DeviceX::CreateShaderResourceView(
                   D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,
                   D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0)
             : SanitizeOrTranslateXboxShader4ComponentMapping(pDesc->Shader4ComponentMapping, san_fmt);
-        if (san_fmt != pDesc->Format || san_map != pDesc->Shader4ComponentMapping) {
+        if (use_default_srv_for_dim0) {
+            srv_ptr = nullptr;
+        } else if (san_fmt != pDesc->Format || san_map != pDesc->Shader4ComponentMapping || promote_srv_1d_to_2d) {
             clean_srv = *pDesc;
             clean_srv.Format = san_fmt;
             clean_srv.Shader4ComponentMapping = san_map;
+            if (promote_srv_1d_to_2d) {
+                if (pDesc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1DARRAY) {
+                    const UINT most_mip = pDesc->Texture1DArray.MostDetailedMip;
+                    const UINT mips = pDesc->Texture1DArray.MipLevels;
+                    const UINT fa = pDesc->Texture1DArray.FirstArraySlice;
+                    const UINT asz = pDesc->Texture1DArray.ArraySize;
+                    const FLOAT min_lod = pDesc->Texture1DArray.ResourceMinLODClamp;
+                    clean_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                    clean_srv.Texture2DArray.MostDetailedMip = most_mip;
+                    clean_srv.Texture2DArray.MipLevels = mips;
+                    clean_srv.Texture2DArray.FirstArraySlice = fa;
+                    clean_srv.Texture2DArray.ArraySize = asz;
+                    clean_srv.Texture2DArray.PlaneSlice = 0u;
+                    clean_srv.Texture2DArray.ResourceMinLODClamp = min_lod;
+                } else {
+                    const UINT most_mip = pDesc->Texture1D.MostDetailedMip;
+                    const UINT mips = pDesc->Texture1D.MipLevels;
+                    const FLOAT min_lod = pDesc->Texture1D.ResourceMinLODClamp;
+                    clean_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                    clean_srv.Texture2D.MostDetailedMip = most_mip;
+                    clean_srv.Texture2D.MipLevels = mips;
+                    clean_srv.Texture2D.PlaneSlice = 0u;
+                    clean_srv.Texture2D.ResourceMinLODClamp = min_lod;
+                }
+            }
             srv_ptr = &clean_srv;
         }
     }
@@ -7173,9 +7232,14 @@ void STDMETHODCALLTYPE DeviceX::CreateUnorderedAccessView(
             if (rdf == DXGI_FORMAT_R8_UNORM || rdf == DXGI_FORMAT_R8_TYPELESS) {
                 san_fmt = DXGI_FORMAT_R8_UNORM;
             }
-        } else if (IsPacked16TargetFormat(san_fmt) && host_res != nullptr &&
-                   host_res->GetDesc().Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
-            san_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+        } else if (host_res != nullptr &&
+                   host_res->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+            const DXGI_FORMAT rdf = host_res->GetDesc().Format;
+            if ((IsPacked16TargetFormat(pDesc->Format) || IsPacked16TargetFormat(san_fmt) ||
+                 san_fmt == DXGI_FORMAT_B8G8R8A8_UNORM || san_fmt == DXGI_FORMAT_R8G8B8A8_UNORM) &&
+                (rdf == DXGI_FORMAT_R8G8B8A8_UNORM || rdf == DXGI_FORMAT_B8G8R8A8_UNORM)) {
+                san_fmt = rdf;
+            }
         }
         // Unify 1D UAV views onto TEXTURE2D (Width x 1) when backing resource is TEXTURE2D.
         const bool promote_1d_to_2d =
@@ -7338,9 +7402,17 @@ void STDMETHODCALLTYPE DeviceX::CreateRenderTargetView(
         desc_ptr = &rw_desc;
     } else if (pDesc != nullptr) {
         DXGI_FORMAT san_fmt = SanitizeXboxDxgiFormat(pDesc->Format);
-        if (IsPacked16TargetFormat(san_fmt) && host_res != nullptr &&
-            host_res->GetDesc().Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
-            san_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+        if (host_res != nullptr) {
+            const DXGI_FORMAT rdf = host_res->GetDesc().Format;
+            if ((IsPacked16TargetFormat(pDesc->Format) || IsPacked16TargetFormat(san_fmt) ||
+                 san_fmt == DXGI_FORMAT_B8G8R8A8_UNORM || san_fmt == DXGI_FORMAT_R8G8B8A8_UNORM) &&
+                (rdf == DXGI_FORMAT_R8G8B8A8_UNORM || rdf == DXGI_FORMAT_B8G8R8A8_UNORM)) {
+                san_fmt = rdf;
+            } else if ((san_fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+                        san_fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) &&
+                       rdf == DXGI_FORMAT_R8G8B8A8_UNORM) {
+                san_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+            }
         }
         if (san_fmt != pDesc->Format) {
             rw_desc = *pDesc;

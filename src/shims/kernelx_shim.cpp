@@ -1982,15 +1982,17 @@ public:
         ops.reserve(desired.size());
         std::vector<RemapWindowRange> remap_ranges;
 
-        // Validate all non-UINT64_MAX tokens up front BEFORE unmapping any existing view so an
+        // Validate all non-unmap tokens up front BEFORE unmapping any existing view so an
         // invalid token never partially mutates mappings or leaves an unmapped hole.
+        // Note: Valid PFNs start at 1 (AllocateNextPfnLocked); both 0 and UINT64_MAX are
+        // explicit Scarlett unmap sentinels used by RAGE9 scatter unmap batches (+0xF2C4D1).
         for (const auto& [slot_va, tok] : desired) {
             auto ex_it = mappings_.find(slot_va);
             if (ex_it != mappings_.end() && ex_it->second.size_bytes != kPage64KB) {
                 SetHostLastError(87u);
                 return 0;
             }
-            if (tok == kUnmapSlotToken) {
+            if (tok == 0ull || tok == kUnmapSlotToken) {
                 ops.push_back(ValidatedScatterOp{slot_va, true, 0ull, {}});
                 continue;
             }
