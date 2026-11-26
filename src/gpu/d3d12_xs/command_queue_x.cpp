@@ -1871,34 +1871,170 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
         if (CommandListX* clx = CommandListX::TryFromCommandList(ppCommandLists[i])) {
             if (clx->LastCloseFailed()) {
                 // Still honor CPU fence/marker writes & retirements so CPU wait loops never stall.
+                const size_t wait_before = deferred_waits.size();
                 clx->ExtractDeferredCpuOps(deferred_writes, deferred_waits);
+                for (size_t wi = wait_before; wi < deferred_waits.size(); ++wi) {
+                    deferred_waits[wi].list_index = valid_list_count;
+                }
                 clx->ExtractTransientResources(batch_transients);
                 continue;  // Never pass an unclosed/invalid command list to host D3D12 queue
             }
             clx->ExtractPendingMirrorWritebacks(pending_writeback_vas);
+            const size_t wait_before = deferred_waits.size();
             clx->ExtractDeferredCpuOps(deferred_writes, deferred_waits);
+            for (size_t wi = wait_before; wi < deferred_waits.size(); ++wi) {
+                deferred_waits[wi].list_index = valid_list_count;
+            }
             clx->ExtractDeferredStateTransitions(deferred_state_transitions);
             clx->ExtractTransientResources(batch_transients);
         }
         raw_lists[valid_list_count++] = CommandListX::UnwrapHostList(ppCommandLists[i]);
     }
 
-    // Enforce any CPU/mirrored Wait32BitValueX / Wait64BitValueX recorded on command lists.
-    for (const auto& w : deferred_waits) {
-        if (w.is_64bit) {
-            (void)Wait64BitValueX(w.address, w.value, w.mask, w.op);
-        } else {
-            (void)Wait32BitValueX(
-                w.address, static_cast<uint32_t>(w.value), static_cast<uint32_t>(w.mask), w.op);
+    auto apply_write_slice = [this](const std::vector<DeferredCpuWrite32>& writes,
+                                    size_t from_idx,
+                                    size_t to_idx) {
+        uint64_t cached_lo = 0ull;
+        uint64_t cached_hi = 0ull;
+        const size_t limit = std::min(to_idx, writes.size());
+        for (size_t k = from_idx; k < limit; ++k) {
+            const auto& wr = writes[k];
+            if (wr.is_64bit) {
+                if (IsWritableCpuVaCached(wr.address, sizeof(uint64_t), cached_lo, cached_hi)) {
+                    uint64_t v = wr.value;
+                    if (wr.is_timestamp) {
+                        const int64_t now = QueryQpcNow();
+                        v = (qpc_freq_ > 0)
+                                ? static_cast<uint64_t>((static_cast<double>(now) * 99750000.0) /
+                                                        static_cast<double>(qpc_freq_))
+                                : static_cast<uint64_t>(now);
+                    }
+                    ::InterlockedExchange64(
+                        reinterpret_cast<volatile LONG64*>(static_cast<uintptr_t>(wr.address)),
+                        static_cast<LONG64>(v));
+                }
+            } else if (IsWritableCpuVaCached(wr.address, sizeof(uint32_t), cached_lo, cached_hi)) {
+                ::InterlockedExchange(
+                    reinterpret_cast<volatile LONG*>(static_cast<uintptr_t>(wr.address)),
+                    static_cast<LONG>(static_cast<uint32_t>(wr.value)));
+            }
         }
-    }
+    };
+
+    auto eval_wait_Bounded = [this](const DeferredCpuWait& w) {
+        if (w.address == 0ull || w.op == D3D12XBOX_WAIT_VALUE_OP_ALWAYS) {
+            return;
+        }
+        auto check_ready_once = [&]() -> bool {
+            void* cpu_ptr = nullptr;
+            uint64_t rem_bytes = 0ull;
+            const size_t need_sz = w.is_64bit ? sizeof(uint64_t) : sizeof(uint32_t);
+            if (device_x_ &&
+                device_x_->GetTitleVaMirror().ResolveTitleVaToCpu(w.address, cpu_ptr, rem_bytes) &&
+                cpu_ptr && rem_bytes >= need_sz) {
+                if (w.is_64bit) {
+                    const uint64_t cur = *reinterpret_cast<const volatile uint64_t*>(cpu_ptr);
+                    return EvaluateWaitOp<uint64_t>(cur, w.value, w.mask, w.op);
+                }
+                const uint32_t cur = *reinterpret_cast<const volatile uint32_t*>(cpu_ptr);
+                return EvaluateWaitOp<uint32_t>(
+                    cur, static_cast<uint32_t>(w.value), static_cast<uint32_t>(w.mask), w.op);
+            }
+            if (IsReadableCpuVa(w.address, need_sz)) {
+                if (w.is_64bit) {
+                    const uint64_t cur = *reinterpret_cast<const volatile uint64_t*>(
+                        static_cast<uintptr_t>(w.address));
+                    return EvaluateWaitOp<uint64_t>(cur, w.value, w.mask, w.op);
+                }
+                const uint32_t cur = *reinterpret_cast<const volatile uint32_t*>(
+                    static_cast<uintptr_t>(w.address));
+                return EvaluateWaitOp<uint32_t>(
+                    cur, static_cast<uint32_t>(w.value), static_cast<uint32_t>(w.mask), w.op);
+            }
+            return true;
+        };
+
+        if (check_ready_once()) {
+            return;
+        }
+
+        // Drain any in-flight work on this queue first so prior GPU/async writes retire immediately.
+        if (fence_dispatcher_) {
+            (void)fence_dispatcher_->PumpReadyCallbacks();
+        }
+        {
+            std::lock_guard<std::mutex> lock(present_mutex_);
+            if (SUCCEEDED(EnsurePresentHelperObjectsLocked())) {
+                (void)WaitForInternalFenceLocked();
+            }
+        }
+        if (fence_dispatcher_) {
+            (void)fence_dispatcher_->PumpReadyCallbacks();
+        }
+        if (check_ready_once()) {
+            return;
+        }
+
+        // Bounded spin (up to 25 ms) so concurrent CPU/cross-queue writers settle cleanly
+        // without ever deadlocking the submission thread when a cross-queue signal is submitted later.
+        const int64_t start_qpc = QueryQpcNow();
+        const int64_t max_ticks = (qpc_freq_ > 0) ? std::max<int64_t>(1LL, qpc_freq_ / 40LL) : 0LL;
+        for (;;) {
+            if (fence_dispatcher_) {
+                (void)fence_dispatcher_->PumpReadyCallbacks();
+            }
+            {
+                std::lock_guard<std::mutex> lock(present_mutex_);
+                PumpMirrorReadbackCompletionLocked();
+            }
+            if (check_ready_once()) {
+                return;
+            }
+            if (max_ticks > 0 && (QueryQpcNow() - start_qpc) >= max_ticks) {
+                return;
+            }
+            SwitchToThread();
+        }
+    };
 
     if (const auto hook = submit_hook_.load(std::memory_order_acquire)) {
         hook(host_queue_, valid_list_count, raw_lists, submit_hook_ctx_.load(std::memory_order_acquire));
     }
 
+    // Enforce recorded Wait32BitValueX / Wait64BitValueX in program order, splitting earlier lists
+    // and committing earlier Write32BitValueX / Write64BitValueX writes before evaluating each wait.
+    UINT submitted_list_cursor = 0u;
+    size_t committed_write_cursor = 0u;
+    for (const auto& w : deferred_waits) {
+        if (w.list_index > submitted_list_cursor && w.list_index <= valid_list_count) {
+            const UINT seg_count = w.list_index - submitted_list_cursor;
+            host_queue_->ExecuteCommandLists(seg_count, raw_lists + submitted_list_cursor);
+            submitted_list_cursor = w.list_index;
+        }
+        if (w.prior_write_count > committed_write_cursor) {
+            if (submitted_list_cursor > 0u) {
+                std::lock_guard<std::mutex> lock(present_mutex_);
+                if (SUCCEEDED(EnsurePresentHelperObjectsLocked())) {
+                    (void)WaitForInternalFenceLocked();
+                }
+            }
+            apply_write_slice(deferred_writes, committed_write_cursor, w.prior_write_count);
+            committed_write_cursor = std::min<size_t>(w.prior_write_count, deferred_writes.size());
+        }
+        eval_wait_Bounded(w);
+    }
+
+    if (valid_list_count > submitted_list_cursor) {
+        host_queue_->ExecuteCommandLists(
+            valid_list_count - submitted_list_cursor, raw_lists + submitted_list_cursor);
+    }
+    if (committed_write_cursor > 0u && committed_write_cursor <= deferred_writes.size()) {
+        deferred_writes.erase(
+            deferred_writes.begin(),
+            deferred_writes.begin() + static_cast<std::ptrdiff_t>(committed_write_cursor));
+    }
+
     if (valid_list_count > 0u) {
-        host_queue_->ExecuteCommandLists(valid_list_count, raw_lists);
         if (device_x_ && device_x_->IsRetailScarlettAbi() && device_x_->HostDevice()) {
             const HRESULT post_rem = device_x_->HostDevice()->GetDeviceRemovedReason();
             if (FAILED(post_rem)) {

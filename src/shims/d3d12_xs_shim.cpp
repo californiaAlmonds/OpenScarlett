@@ -559,11 +559,15 @@ bool EnvEnablesD3D12Debug() noexcept {
 inline D3D12_RESOURCE_DESC SanitizeRetailResourceDesc(const D3D12_RESOURCE_DESC& src) noexcept {
     D3D12_RESOURCE_DESC d = src;
     switch (static_cast<uint32_t>(d.Format)) {
-        case 115u:  // DXGI_FORMAT_B4G4R4A4_UNORM (no RT/UAV support on desktop GPUs -> BGRA8)
+        case 85u:   // DXGI_FORMAT_B5G6R5_UNORM
+        case 86u:   // DXGI_FORMAT_B5G5R5A1_UNORM
+        case 115u:  // DXGI_FORMAT_B4G4R4A4_UNORM
+            // Desktop GPUs lack typed UAV / universal RT support on 16-bit packed BGR formats;
+            // substitute R8G8B8A8_UNORM when RT or UAV is requested so ALLOW_UNORDERED_ACCESS is preserved.
             if ((static_cast<uint32_t>(d.Flags) &
                  (static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) |
                   static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) != 0u) {
-                d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             }
             break;
         case 116u:  // DXGI_FORMAT_R10G10B10_7E3_A2_FLOAT
@@ -1242,7 +1246,61 @@ public:
                            : nullptr;
             }();
             if (s_map_batch) {
+                // Drain in-flight GPU draws/copies on this queue before unmapping/remapping tile pages.
+                WaitForQueueIdleBeforeTileRemap();
+
+                struct TileRangeWire {
+                    uint32_t kind;
+                    uint32_t start;
+                    uint32_t count;
+                };
+                struct TileBatchWire {
+                    uint64_t destination;
+                    uint32_t count;
+                    uint32_t reserved;
+                    const TileRangeWire* ranges;
+                };
+                std::vector<std::pair<uint64_t, uint64_t>> touched_va_ranges;
+                if (BatchCount <= 524288u &&
+                    IsReadableRetailRange(
+                        reinterpret_cast<uintptr_t>(pBatches),
+                        static_cast<size_t>(BatchCount) * sizeof(TileBatchWire))) {
+                    const auto* wb = static_cast<const TileBatchWire*>(pBatches);
+                    touched_va_ranges.reserve(BatchCount);
+                    for (UINT bi = 0u; bi < BatchCount; ++bi) {
+                        const TileBatchWire b = wb[bi];
+                        if (b.destination < 0x10000ull || b.count == 0u || b.count > 524288u || !b.ranges) {
+                            continue;
+                        }
+                        if (!IsReadableRetailRange(
+                                reinterpret_cast<uintptr_t>(b.ranges),
+                                static_cast<size_t>(b.count) * sizeof(TileRangeWire))) {
+                            continue;
+                        }
+                        uint64_t span_pages = 0ull;
+                        for (uint32_t ri = 0u; ri < b.count; ++ri) {
+                            span_pages += b.ranges[ri].count;
+                        }
+                        if (span_pages > 0ull) {
+                            touched_va_ranges.emplace_back(b.destination, span_pages * 65536ull);
+                        }
+                    }
+                }
+
                 hr = s_map_batch(BatchCount, pBatches, BaseVa, PageSizeOrFlags, Reserved);
+                if (SUCCEEDED(hr) && !touched_va_ranges.empty() && inner_) {
+                    ID3D12DeviceX* dev_x_iface = nullptr;
+                    if (SUCCEEDED(inner_->GetDevice(
+                            __uuidof(ID3D12DeviceX), reinterpret_cast<void**>(&dev_x_iface))) &&
+                        dev_x_iface) {
+                        auto* dev_x = static_cast<openscarlett::d3d12_xs::DeviceX*>(dev_x_iface);
+                        for (const auto& [dst_va, byte_len] : touched_va_ranges) {
+                            dev_x->InvalidateVirtualRangeOnTileRemap(dst_va, byte_len);
+                        }
+                        dev_x_iface->Release();
+                    }
+                }
+
                 static std::atomic<uint32_t> s_slot31_logs{0u};
                 const uint32_t log_idx = s_slot31_logs.fetch_add(1u, std::memory_order_relaxed);
                 if (log_idx < 4u || FAILED(hr)) {
@@ -1310,11 +1368,54 @@ public:
     virtual HRESULT STDMETHODCALLTYPE Slot39() { return RecordUnimpl(39); }
 
 private:
+    struct QueueTileSyncState {
+        std::mutex mutex;
+        ID3D12Fence* fence = nullptr;
+        HANDLE event = nullptr;
+        uint64_t next_val = 0ull;
+        ~QueueTileSyncState() {
+            if (fence) {
+                fence->Release();
+                fence = nullptr;
+            }
+            if (event) {
+                ::CloseHandle(event);
+                event = nullptr;
+            }
+        }
+    };
+
+    void WaitForQueueIdleBeforeTileRemap() noexcept {
+        if (!inner_) return;
+        std::lock_guard<std::mutex> lk(tile_sync_.mutex);
+        if (!tile_sync_.fence) {
+            ID3D12Device* dev = nullptr;
+            if (SUCCEEDED(inner_->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&dev))) && dev) {
+                (void)dev->CreateFence(
+                    0ull, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                    reinterpret_cast<void**>(&tile_sync_.fence));
+                dev->Release();
+            }
+        }
+        if (!tile_sync_.event) {
+            tile_sync_.event = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        }
+        if (!tile_sync_.fence || !tile_sync_.event) return;
+        const uint64_t target = ++tile_sync_.next_val;
+        if (SUCCEEDED(inner_->Signal(tile_sync_.fence, target)) &&
+            tile_sync_.fence->GetCompletedValue() < target) {
+            if (SUCCEEDED(tile_sync_.fence->SetEventOnCompletion(target, tile_sync_.event))) {
+                (void)::WaitForSingleObject(tile_sync_.event, 2000u);
+            }
+        }
+    }
+
     static inline void* const* s_patched_vtbl_ptr_ = nullptr;
     static inline void* const* s_patched_vtbl_v4_ptr_ = nullptr;
     std::atomic<ULONG> ref_count_{1u};
     ID3D12CommandQueueX* inner_ = nullptr;
     uint32_t retail_version_ = 0u;
+    QueueTileSyncState tile_sync_;
 };
 
 // ===========================================================================
@@ -1542,18 +1643,40 @@ public:
             inner_->Write64BitValueX(Address, Value, Flags);
         }
     }
+    static D3D12XBOX_WAIT_VALUE_OP MapRetailWaitComparisonOp(uint32_t raw_op) noexcept {
+        // Retail Scarlett d3d12_xs.dll passes D3D12_COMPARISON_FUNC (1=NEVER .. 8=ALWAYS);
+        // 0 is D3D12XBOX_WAIT_VALUE_OP_ALWAYS.
+        switch (raw_op) {
+            case 0u:
+            case 8u: return D3D12XBOX_WAIT_VALUE_OP_ALWAYS;         // ALWAYS
+            case 2u: return D3D12XBOX_WAIT_VALUE_OP_LESS;           // D3D12_COMPARISON_FUNC_LESS
+            case 3u: return D3D12XBOX_WAIT_VALUE_OP_EQUAL;          // D3D12_COMPARISON_FUNC_EQUAL
+            case 4u: return D3D12XBOX_WAIT_VALUE_OP_LESS_EQUAL;     // D3D12_COMPARISON_FUNC_LESS_EQUAL
+            case 5u: return D3D12XBOX_WAIT_VALUE_OP_GREATER;        // D3D12_COMPARISON_FUNC_GREATER
+            case 6u: return D3D12XBOX_WAIT_VALUE_OP_NOT_EQUAL;      // D3D12_COMPARISON_FUNC_NOT_EQUAL
+            case 7u: return D3D12XBOX_WAIT_VALUE_OP_GREATER_EQUAL;  // D3D12_COMPARISON_FUNC_GREATER_EQUAL
+            default: return D3D12XBOX_WAIT_VALUE_OP_ALWAYS;
+        }
+    }
     // Slot 73 (+0x248): Wait32BitValueX(Address, Op, Ref, Mask, Flags)
     virtual void STDMETHODCALLTYPE Slot73(
         D3D12_GPU_VIRTUAL_ADDRESS Address, uint32_t Op, uint32_t Ref, uint32_t Mask, uint32_t /*Flags*/) {
         if (inner_ && Address != 0ull) {
-            inner_->Wait32BitValueX(Address, Ref, Mask, static_cast<D3D12XBOX_WAIT_VALUE_OP>(Op));
+            const uint32_t eff_mask = (Mask <= 1u) ? 0xFFFFFFFFu : Mask;
+            inner_->Wait32BitValueX(Address, Ref, eff_mask, MapRetailWaitComparisonOp(Op));
         }
     }
-    // Slot 74 (+0x250): Wait64BitValueX(Address, Op, Ref, Mask, Flags)
+    // Slot 74 (+0x250): Wait64BitValueX(Address, Op, Value, MaskOrFlags[, ExtraFlags])
     virtual void STDMETHODCALLTYPE Slot74(
-        D3D12_GPU_VIRTUAL_ADDRESS Address, uint32_t /*Op*/, uint64_t /*Ref*/, uint64_t /*Mask*/, uint32_t /*Flags*/) {
-        // Non-blocking on CPU wait when wait-op is ALWAYS or title-side sync; log telemetry cleanly.
+        D3D12_GPU_VIRTUAL_ADDRESS Address, uint32_t Op, uint64_t Value, uint64_t MaskOrFlags, uint32_t /*Flags*/) {
         if (inner_ && Address != 0ull) {
+            // Retail Scarlett 4-arg ABI passes Flags (0 or 1) in the 4th slot with full 64-bit comparison;
+            // preserve explicit non-flag bitmasks when provided.
+            const uint64_t eff_mask =
+                ((MaskOrFlags & 0xFFFFFFFFull) <= 1ull && MaskOrFlags != UINT64_MAX)
+                    ? UINT64_MAX
+                    : MaskOrFlags;
+            inner_->Wait64BitValueX(Address, Value, eff_mask, MapRetailWaitComparisonOp(Op));
             openscarlett::CallTelemetry::Global().Record(
                 "d3d12_xs.dll", "ScarlettRetailCmdList::Wait64BitValueX_Slot74",
                 openscarlett::CallOutcome::Ok, S_OK, 74);
@@ -1766,7 +1889,17 @@ public:
             openscarlett::CallOutcome::Ok, S_OK, 146);
     }
     virtual void STDMETHODCALLTYPE Slot147() { RecordClUnimpl(147); }
-    virtual void STDMETHODCALLTYPE Slot148() { RecordClUnimpl(148); }
+    // Slot 148 (+0x4A0): AllocateUploadX(uint64_t SizeInBytes, uint64_t Alignment)
+    // Allocates a 16B+ aligned CPU-writable UPLOAD slice associated with the current recording
+    // (adapted with MIT attribution from R0Y00/Xbox2Windows cmdlist_allocate_upload / list_upload_pages.h).
+    virtual void* STDMETHODCALLTYPE Slot148(uint64_t SizeInBytes, uint64_t Alignment) {
+        void* out_ptr = inner_ ? inner_->AllocateUploadX(SizeInBytes, Alignment) : nullptr;
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailCmdList::AllocateUploadX_Slot148",
+            out_ptr ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+            out_ptr ? S_OK : E_INVALIDARG, 148);
+        return out_ptr;
+    }
     virtual void STDMETHODCALLTYPE Slot149() { RecordClUnimpl(149); }
     virtual void STDMETHODCALLTYPE Slot150() { RecordClUnimpl(150); }
     virtual void STDMETHODCALLTYPE Slot151() { RecordClUnimpl(151); }
@@ -1943,6 +2076,82 @@ public:
         return slice_bytes * static_cast<uint64_t>(slices);
     }
 
+    // GFX10 thin 4 KiB block allocation sizing for small 2D textures requesting Alignment == 0x1000
+    // (adapted with MIT attribution from R0Y00/Xbox2Windows src/startup_stubs/small_texture_4k.h
+    // and AMD addrlib GFX10 ADDR_SW_4KB_S).
+    static bool TryComputeSmallTexture4KAllocInfo(
+        const D3D12_RESOURCE_DESC& raw_desc,
+        D3D12_RESOURCE_ALLOCATION_INFO& out_info) noexcept {
+        if (raw_desc.Alignment != 0x1000ull ||
+            raw_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+            raw_desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN ||
+            std::max<uint32_t>(1u, raw_desc.SampleDesc.Count) != 1u ||
+            raw_desc.DepthOrArraySize != 1u ||
+            raw_desc.Width < 1ull || raw_desc.Width > 16384ull ||
+            raw_desc.Height < 1u || raw_desc.Height > 16384u) {
+            return false;
+        }
+        const uint32_t clean_flags = static_cast<uint32_t>(raw_desc.Flags) & 0x0000FFFFu;
+        if ((clean_flags & (static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) |
+                            static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) != 0u) {
+            return false;
+        }
+        const uint32_t fmt = static_cast<uint32_t>(raw_desc.Format);
+        uint32_t bits = 0u;
+        uint64_t bw = 0ull;
+        uint64_t bh = 0ull;
+        if (fmt >= 1u && fmt <= 4u) {
+            bits = 128u; bw = 16ull; bh = 16ull;
+        } else if (fmt >= 9u && fmt <= 18u) {
+            bits = 64u; bw = 32ull; bh = 16ull;
+        } else if ((fmt >= 23u && fmt <= 43u) || fmt == 67u ||
+                   (fmt >= 87u && fmt <= 93u) || fmt == 116u || fmt == 117u) {
+            bits = 32u; bw = 32ull; bh = 32ull;
+        } else if ((fmt >= 48u && fmt <= 59u) || fmt == 85u || fmt == 86u || fmt == 115u) {
+            bits = 16u; bw = 64ull; bh = 32ull;
+        } else if ((fmt >= 60u && fmt <= 65u) ||
+                   (fmt >= 73u && fmt <= 78u) || (fmt >= 82u && fmt <= 84u) || (fmt >= 94u && fmt <= 99u)) {
+            bits = 8u; bw = 64ull; bh = 64ull;
+        } else if ((fmt >= 70u && fmt <= 72u) || (fmt >= 79u && fmt <= 81u)) {
+            bits = 4u; bw = 128ull; bh = 64ull;
+        } else {
+            return false;
+        }
+
+        uint32_t full_mips = 1u;
+        for (uint64_t extent = std::max<uint64_t>(raw_desc.Width, raw_desc.Height); extent > 1ull; extent >>= 1u) {
+            ++full_mips;
+        }
+        const uint32_t mips = (raw_desc.MipLevels != 0u) ? raw_desc.MipLevels : full_mips;
+        if (mips > full_mips) {
+            return false;
+        }
+        if (mips > 1u &&
+            ((raw_desc.Width & (raw_desc.Width - 1ull)) != 0ull ||
+             (raw_desc.Height & (raw_desc.Height - 1u)) != 0u)) {
+            return false;
+        }
+
+        const uint64_t padded_w = ((raw_desc.Width + bw - 1ull) / bw) * bw;
+        const uint64_t padded_h = ((static_cast<uint64_t>(raw_desc.Height) + bh - 1ull) / bh) * bh;
+        if (padded_w * padded_h * static_cast<uint64_t>(bits) > 0x80007ull) {
+            return false;
+        }
+
+        uint64_t blocks = 0ull;
+        for (uint32_t m = 0u; m < mips; ++m) {
+            const uint64_t w = std::max<uint64_t>(1ull, raw_desc.Width >> m);
+            const uint64_t h = std::max<uint64_t>(1ull, static_cast<uint64_t>(raw_desc.Height) >> m);
+            if (mips > 1u && w <= (bw / 2ull) && h <= bh) {
+                out_info = D3D12_RESOURCE_ALLOCATION_INFO{(blocks + 1ull) * 0x1000ull, 0x1000ull};
+                return true;
+            }
+            blocks += ((w + bw - 1ull) / bw) * ((h + bh - 1ull) / bh);
+        }
+        out_info = D3D12_RESOURCE_ALLOCATION_INFO{blocks * 0x1000ull, 0x1000ull};
+        return true;
+    }
+
     static D3D12_RESOURCE_ALLOCATION_INFO ComputeRetailSingleAllocInfo(
         openscarlett::d3d12_xs::DeviceX* /*inner*/,
         UINT /*visibleMask*/,
@@ -1956,6 +2165,11 @@ public:
             const uint64_t w = std::max<uint64_t>(1ull, raw_desc.Width);
             const uint64_t sz = (w + align - 1ull) & ~(align - 1ull);
             return D3D12_RESOURCE_ALLOCATION_INFO{sz, align};
+        }
+
+        D3D12_RESOURCE_ALLOCATION_INFO small_4k{};
+        if (TryComputeSmallTexture4KAllocInfo(raw_desc, small_4k)) {
+            return small_4k;
         }
 
         const uint32_t fmt = static_cast<uint32_t>(raw_desc.Format);
@@ -2935,8 +3149,212 @@ public:
             openscarlett::CallOutcome::Ok, S_OK, 74);
         return S_OK;
     }
+    static bool IsKnownRetailResourceIid(const GUID& riid) noexcept {
+        return IsEqualIID(riid, __uuidof(IUnknown)) ||
+               IsEqualIID(riid, __uuidof(ID3D12Object)) ||
+               IsEqualIID(riid, __uuidof(ID3D12DeviceChild)) ||
+               IsEqualIID(riid, __uuidof(ID3D12Pageable)) ||
+               IsEqualIID(riid, __uuidof(ID3D12Resource)) ||
+               IsEqualIID(riid, __uuidof(ID3D12Resource1)) ||
+               IsEqualIID(riid, __uuidof(ID3D12Resource2)) ||
+               IsEqualIID(riid, openscarlett::d3d12_xs::IID_IOpenScarlettProxyInspect);
+    }
+
+    static void NotifyTitleCommittedResourceAllocHook(
+        openscarlett::d3d12_xs::DeviceX* inner,
+        const D3D12_RESOURCE_DESC* raw_desc_ptr,
+        void** ppvResource) noexcept {
+        if (!inner || !raw_desc_ptr || !ppvResource || !*ppvResource) return;
+        // On Xbox Series X, D3D12X committed resources notify the title's exported
+        // __XMemAllocationHooks__ = {alloc(size, attrs), free(ptr, attrs)} for allocatorId 0x80
+        // (adapted from MIT R0Y00/Xbox2Windows title_resource_memory).
+        using PfnTitleAllocHook = void*(__stdcall*)(size_t, uint64_t);
+        using PfnTitleFreeHook = void(__stdcall*)(void*, uint64_t);
+        struct TitleHookPair {
+            PfnTitleAllocHook alloc_fn = nullptr;
+            PfnTitleFreeHook free_fn = nullptr;
+        };
+        static const TitleHookPair s_title_hooks = []() -> TitleHookPair {
+            TitleHookPair out{};
+            HMODULE main_mod = ::GetModuleHandleW(nullptr);
+            if (!main_mod) return out;
+            const auto* tbl = reinterpret_cast<const uintptr_t*>(
+                ::GetProcAddress(main_mod, "__XMemAllocationHooks__"));
+            if (tbl && tbl[0] >= 0x10000ull) {
+                out.alloc_fn = reinterpret_cast<PfnTitleAllocHook>(tbl[0]);
+                if (tbl[1] >= 0x10000ull) {
+                    out.free_fn = reinterpret_cast<PfnTitleFreeHook>(tbl[1]);
+                }
+            }
+            return out;
+        }();
+        if (!s_title_hooks.alloc_fn) return;
+        const D3D12_RESOURCE_ALLOCATION_INFO ai =
+            ComputeRetailSingleAllocInfo(inner, 0u, *raw_desc_ptr);
+        if (ai.SizeInBytes == 0u || ai.SizeInBytes == UINT64_MAX) return;
+        uint32_t log2_align = 0u;
+        while ((1ull << (log2_align + 1u)) <= ai.Alignment && log2_align < 31u) {
+            ++log2_align;
+        }
+        const uint64_t page_code = (ai.SizeInBytes >= (4ull << 20)) ? 2ull : 1ull;
+        const uint64_t attrs =
+            (page_code << 14) | (0x80ull << 16) | (static_cast<uint64_t>(log2_align) << 24);
+        void* title_mem = s_title_hooks.alloc_fn(static_cast<size_t>(ai.SizeInBytes), attrs);
+        if (title_mem && s_title_hooks.free_fn) {
+            class TitleHookReleaseGuard final : public IUnknown {
+            public:
+                TitleHookReleaseGuard(PfnTitleFreeHook fn, void* p, uint64_t a) noexcept
+                    : free_fn_(fn), ptr_(p), attrs_(a) {}
+                HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+                    if (!out) return E_POINTER;
+                    *out = nullptr;
+                    if (riid == IID_IUnknown) {
+                        *out = static_cast<IUnknown*>(this);
+                        AddRef();
+                        return S_OK;
+                    }
+                    return E_NOINTERFACE;
+                }
+                ULONG STDMETHODCALLTYPE AddRef() override {
+                    return static_cast<ULONG>(::InterlockedIncrement(&refs_));
+                }
+                ULONG STDMETHODCALLTYPE Release() override {
+                    const ULONG r = static_cast<ULONG>(::InterlockedDecrement(&refs_));
+                    if (r == 0u) delete this;
+                    return r;
+                }
+            private:
+                ~TitleHookReleaseGuard() {
+                    if (free_fn_ && ptr_) free_fn_(ptr_, attrs_);
+                }
+                LONG refs_ = 1;
+                PfnTitleFreeHook free_fn_ = nullptr;
+                void* ptr_ = nullptr;
+                uint64_t attrs_ = 0ull;
+            };
+            static constexpr GUID kTitleHookGuardGuid = {
+                0x91D3A741u, 0x5B2Cu, 0x4E8Au, {0x9Au, 0x62u, 0x31u, 0x7Eu, 0x44u, 0x10u, 0x8Bu, 0xC9u}};
+            ID3D12Object* obj = nullptr;
+            if (SUCCEEDED(static_cast<IUnknown*>(*ppvResource)->QueryInterface(
+                    __uuidof(ID3D12Object), reinterpret_cast<void**>(&obj))) &&
+                obj) {
+                auto* guard = new (std::nothrow)
+                    TitleHookReleaseGuard(s_title_hooks.free_fn, title_mem, attrs);
+                if (guard) {
+                    (void)obj->SetPrivateDataInterface(kTitleHookGuardGuid, guard);
+                    guard->Release();
+                }
+                obj->Release();
+            }
+        }
+    }
+
     virtual HRESULT STDMETHODCALLTYPE Slot75() { return RecordUnimpl(75); }
-    virtual HRESULT STDMETHODCALLTYPE Slot76() { return RecordUnimpl(76); }
+    // Slot 76 (+0x260): CreateCommittedResourceX
+    // Retail Scarlett 7-arg ABI: (self, pHeapProps, HeapFlags, pXboxDesc, InitialState, pClearValue, riid, ppvResource);
+    // also accepts optional 8-arg callers passing optExtPtr before (riid, ppvResource).
+    virtual HRESULT STDMETHODCALLTYPE CreateCommittedResourceX_Slot76(
+        const D3D12_HEAP_PROPERTIES* pHeapProperties,
+        D3D12_HEAP_FLAGS HeapFlags,
+        const D3D12_RESOURCE_DESC* pXboxDesc,
+        D3D12_RESOURCE_STATES InitialResourceState,
+        const D3D12_CLEAR_VALUE* pOptimizedClearValue,
+        const void* arg6_riid_or_ext,
+        void* arg7_ppv_or_riid,
+        void** arg8_ppv_opt) {
+        const GUID* riid_ptr = nullptr;
+        void** ppv_out = nullptr;
+        const bool arg6_is_guid =
+            arg6_riid_or_ext != nullptr &&
+            IsReadableRetailRange(reinterpret_cast<uintptr_t>(arg6_riid_or_ext), sizeof(GUID)) &&
+            IsKnownRetailResourceIid(*static_cast<const GUID*>(arg6_riid_or_ext));
+        const bool arg7_is_guid =
+            !arg6_is_guid &&
+            arg7_ppv_or_riid != nullptr &&
+            IsReadableRetailRange(reinterpret_cast<uintptr_t>(arg7_ppv_or_riid), sizeof(GUID)) &&
+            IsKnownRetailResourceIid(*static_cast<const GUID*>(arg7_ppv_or_riid));
+        if (arg7_is_guid) {
+            riid_ptr = static_cast<const GUID*>(arg7_ppv_or_riid);
+            ppv_out = arg8_ppv_opt;
+        } else if (arg6_riid_or_ext != nullptr &&
+                   IsReadableRetailRange(reinterpret_cast<uintptr_t>(arg6_riid_or_ext), sizeof(GUID))) {
+            riid_ptr = static_cast<const GUID*>(arg6_riid_or_ext);
+            ppv_out = static_cast<void**>(arg7_ppv_or_riid);
+        }
+
+        if (!inner_ || !pHeapProperties || !pXboxDesc || !riid_ptr) {
+            openscarlett::CallTelemetry::Global().Record(
+                "d3d12_xs.dll", "ScarlettRetailDevice::CreateCommittedResourceX_Slot76",
+                openscarlett::CallOutcome::Error, E_POINTER, 76);
+            return E_POINTER;
+        }
+
+        const D3D12_RESOURCE_DESC guest_desc = *pXboxDesc;
+        const D3D12_RESOURCE_DESC clean_desc = SanitizeRetailResourceDesc(guest_desc);
+        D3D12_RESOURCE_STATES state = InitialResourceState;
+        if (static_cast<uint32_t>(state) == 0xFFFFFFFFu) {
+            state = D3D12_RESOURCE_STATE_COMMON;
+        }
+        if (pHeapProperties->Type == D3D12_HEAP_TYPE_READBACK &&
+            (clean_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ||
+             static_cast<uint32_t>(guest_desc.Layout) == D3D12XBOX_TEXTURE_LAYOUT_GFX10_BASE)) {
+            state = D3D12_RESOURCE_STATE_COPY_DEST;
+        }
+
+        const HRESULT hr = inner_->CreateCommittedResourceWithGuestDesc(
+            pHeapProperties, HeapFlags, &clean_desc, &guest_desc,
+            state, pOptimizedClearValue, *riid_ptr, ppv_out);
+        if (SUCCEEDED(hr) && ppv_out && *ppv_out) {
+            static constexpr GUID kSlot76GuestDescGuid = {
+                0x4F534431u, 0x3258u, 0x0076u, {0x47u, 0x44u, 0x45u, 0x53u, 0x43u, 0x00u, 0x00u, 0x01u}};
+            auto* res_obj = static_cast<ID3D12Resource*>(*ppv_out);
+            (void)res_obj->SetPrivateData(kSlot76GuestDescGuid, sizeof(guest_desc), &guest_desc);
+
+            static void* s_slot76_res_vtbl[17]{};
+            static void* const* s_slot76_vtbl_ptr = nullptr;
+            static void* s_orig_get_desc_fn = nullptr;
+            static std::once_flag s_slot76_vtbl_once;
+            auto thunk_slot76_get_desc = +[](void* arg0, void* arg1) -> D3D12_RESOURCE_DESC* {
+                ID3D12Resource* self = nullptr;
+                D3D12_RESOURCE_DESC* out = nullptr;
+                if (arg0 && reinterpret_cast<uintptr_t>(arg0) >= 0x10000u &&
+                    *reinterpret_cast<void* const* const*>(arg0) == s_slot76_vtbl_ptr) {
+                    self = static_cast<ID3D12Resource*>(arg0);
+                    out = static_cast<D3D12_RESOURCE_DESC*>(arg1);
+                } else {
+                    out = static_cast<D3D12_RESOURCE_DESC*>(arg0);
+                    self = static_cast<ID3D12Resource*>(arg1);
+                }
+                if (out && self) {
+                    UINT sz = sizeof(D3D12_RESOURCE_DESC);
+                    if (SUCCEEDED(self->GetPrivateData(kSlot76GuestDescGuid, &sz, out)) &&
+                        sz == sizeof(D3D12_RESOURCE_DESC)) {
+                        return out;
+                    }
+                    if (s_orig_get_desc_fn) {
+                        using PfnOrigGetDesc = D3D12_RESOURCE_DESC* (*)(void*, void*);
+                        return reinterpret_cast<PfnOrigGetDesc>(s_orig_get_desc_fn)(arg0, arg1);
+                    }
+                    *out = D3D12_RESOURCE_DESC{};
+                }
+                return out;
+            };
+            const void* const* cur_vtbl = *reinterpret_cast<const void* const* const*>(res_obj);
+            std::call_once(s_slot76_vtbl_once, [cur_vtbl, thunk_slot76_get_desc]() {
+                std::memcpy(s_slot76_res_vtbl, cur_vtbl, sizeof(s_slot76_res_vtbl));
+                s_orig_get_desc_fn = s_slot76_res_vtbl[10];
+                s_slot76_res_vtbl[10] = reinterpret_cast<void*>(thunk_slot76_get_desc);
+                s_slot76_vtbl_ptr = s_slot76_res_vtbl;
+            });
+            *reinterpret_cast<void* const**>(res_obj) = s_slot76_res_vtbl;
+
+            NotifyTitleCommittedResourceAllocHook(inner_, &guest_desc, ppv_out);
+        }
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailDevice::CreateCommittedResourceX_Slot76",
+            SUCCEEDED(hr) ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr, 76);
+        return hr;
+    }
     virtual HRESULT STDMETHODCALLTYPE Slot77() { return RecordUnimpl(77); }
     // Slot 78 (+0x270): SetFrameIntervalX
     virtual HRESULT STDMETHODCALLTYPE SetFrameIntervalX(
@@ -3336,94 +3754,26 @@ public:
             desc_ptr = &desc0;
         }
         const D3D12_RESOURCE_STATES state = MapBarrierLayoutToResourceState(InitialLayout);
-        const HRESULT hr = inner_->CreateCommittedResource(
-            pHeapProperties, HeapFlags, desc_ptr, state, pOptimizedClearValue, riidResource, ppvResource);
-        if (SUCCEEDED(hr) && desc_ptr) {
-            // On Xbox Series X, D3D12X committed resources notify the title's exported
-            // __XMemAllocationHooks__ = {alloc(size, attrs), free(ptr, attrs)} for allocatorId 0x80
-            // (adapted from MIT R0Y00/Xbox2Windows title_resource_memory). Invoke the title hook
-            // directly without XMemAllocDefault fallback, and release on ID3D12Resource destruction.
-            using PfnTitleAllocHook = void*(__stdcall*)(size_t, uint64_t);
-            using PfnTitleFreeHook = void(__stdcall*)(void*, uint64_t);
-            struct TitleHookPair {
-                PfnTitleAllocHook alloc_fn = nullptr;
-                PfnTitleFreeHook free_fn = nullptr;
-            };
-            static const TitleHookPair s_title_hooks = []() -> TitleHookPair {
-                TitleHookPair out{};
-                HMODULE main_mod = ::GetModuleHandleW(nullptr);
-                if (!main_mod) return out;
-                const auto* tbl = reinterpret_cast<const uintptr_t*>(
-                    ::GetProcAddress(main_mod, "__XMemAllocationHooks__"));
-                if (tbl && tbl[0] >= 0x10000ull) {
-                    out.alloc_fn = reinterpret_cast<PfnTitleAllocHook>(tbl[0]);
-                    if (tbl[1] >= 0x10000ull) {
-                        out.free_fn = reinterpret_cast<PfnTitleFreeHook>(tbl[1]);
-                    }
-                }
-                return out;
-            }();
-            if (s_title_hooks.alloc_fn) {
-                const D3D12_RESOURCE_ALLOCATION_INFO ai =
-                    inner_->GetResourceAllocationInfo(0u, 1u, desc_ptr);
-                if (ai.SizeInBytes > 0u && ai.SizeInBytes != UINT64_MAX) {
-                    uint32_t log2_align = 0u;
-                    while ((1ull << (log2_align + 1u)) <= ai.Alignment && log2_align < 31u) {
-                        ++log2_align;
-                    }
-                    const uint64_t page_code = (ai.SizeInBytes >= (4ull << 20)) ? 2ull : 1ull;
-                    const uint64_t attrs =
-                        (page_code << 14) | (0x80ull << 16) | (static_cast<uint64_t>(log2_align) << 24);
-                    void* title_mem = s_title_hooks.alloc_fn(static_cast<size_t>(ai.SizeInBytes), attrs);
-                    if (title_mem && s_title_hooks.free_fn && ppvResource && *ppvResource) {
-                        class TitleHookReleaseGuard final : public IUnknown {
-                        public:
-                            TitleHookReleaseGuard(PfnTitleFreeHook fn, void* p, uint64_t a) noexcept
-                                : free_fn_(fn), ptr_(p), attrs_(a) {}
-                            HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
-                                if (!out) return E_POINTER;
-                                *out = nullptr;
-                                if (riid == IID_IUnknown) {
-                                    *out = static_cast<IUnknown*>(this);
-                                    AddRef();
-                                    return S_OK;
-                                }
-                                return E_NOINTERFACE;
-                            }
-                            ULONG STDMETHODCALLTYPE AddRef() override {
-                                return static_cast<ULONG>(::InterlockedIncrement(&refs_));
-                            }
-                            ULONG STDMETHODCALLTYPE Release() override {
-                                const ULONG r = static_cast<ULONG>(::InterlockedDecrement(&refs_));
-                                if (r == 0u) delete this;
-                                return r;
-                            }
-                        private:
-                            ~TitleHookReleaseGuard() {
-                                if (free_fn_ && ptr_) free_fn_(ptr_, attrs_);
-                            }
-                            LONG refs_ = 1;
-                            PfnTitleFreeHook free_fn_ = nullptr;
-                            void* ptr_ = nullptr;
-                            uint64_t attrs_ = 0ull;
-                        };
-                        static constexpr GUID kTitleHookGuardGuid = {
-                            0x91D3A741u, 0x5B2Cu, 0x4E8Au, {0x9Au, 0x62u, 0x31u, 0x7Eu, 0x44u, 0x10u, 0x8Bu, 0xC9u}};
-                        ID3D12Object* obj = nullptr;
-                        if (SUCCEEDED(static_cast<IUnknown*>(*ppvResource)->QueryInterface(
-                                __uuidof(ID3D12Object), reinterpret_cast<void**>(&obj))) &&
-                            obj) {
-                            auto* guard = new (std::nothrow)
-                                TitleHookReleaseGuard(s_title_hooks.free_fn, title_mem, attrs);
-                            if (guard) {
-                                (void)obj->SetPrivateDataInterface(kTitleHookGuardGuid, guard);
-                                guard->Release();
-                            }
-                            obj->Release();
-                        }
-                    }
-                }
-            }
+        D3D12_RESOURCE_DESC guest_desc0{};
+        const D3D12_RESOURCE_DESC* guest_desc_ptr = nullptr;
+        if (pDesc) {
+            guest_desc0.Dimension = pDesc->Dimension;
+            guest_desc0.Alignment = pDesc->Alignment;
+            guest_desc0.Width = pDesc->Width;
+            guest_desc0.Height = pDesc->Height;
+            guest_desc0.DepthOrArraySize = pDesc->DepthOrArraySize;
+            guest_desc0.MipLevels = pDesc->MipLevels;
+            guest_desc0.Format = pDesc->Format;
+            guest_desc0.SampleDesc = pDesc->SampleDesc;
+            guest_desc0.Layout = pDesc->Layout;
+            guest_desc0.Flags = pDesc->Flags;
+            guest_desc_ptr = &guest_desc0;
+        }
+        const HRESULT hr = inner_->CreateCommittedResourceWithGuestDesc(
+            pHeapProperties, HeapFlags, desc_ptr, guest_desc_ptr,
+            state, pOptimizedClearValue, riidResource, ppvResource);
+        if (SUCCEEDED(hr) && guest_desc_ptr) {
+            NotifyTitleCommittedResourceAllocHook(inner_, guest_desc_ptr, ppvResource);
         }
         static const bool trace_cr3 = []() {
             char v[16]{};
@@ -3681,7 +4031,11 @@ HRESULT CreateWrappedDeviceInternal(
         }
 #endif
     }
-    if (retail_scarlett_vtable) {
+    {
+        static std::atomic<bool> s_retail_veh_enabled{false};
+        if (retail_scarlett_vtable) {
+            s_retail_veh_enabled.store(true, std::memory_order_release);
+        }
         static std::once_flag s_crash_veh_once;
         std::call_once(s_crash_veh_once, []() {
             ::AddVectoredExceptionHandler(1u, [](EXCEPTION_POINTERS* ep) -> LONG {
@@ -3689,6 +4043,33 @@ HRESULT CreateWrappedDeviceInternal(
                     return EXCEPTION_CONTINUE_SEARCH;
                 }
                 const DWORD code = ep->ExceptionRecord->ExceptionCode;
+                // First-chance 64 KiB physical view-swap retry (adapted with MIT attribution from
+                // R0Y00/Xbox2Windows xmem_mapped_pages.cpp): if a concurrent streaming/hash-table
+                // worker thread faults on a page mid-remap (UnmapViewOfFile2 -> MapViewOfFile3),
+                // spin/synchronize until kernelx finishes the remap, verify MEM_COMMIT, and retry.
+                if (code == EXCEPTION_ACCESS_VIOLATION &&
+                    ep->ExceptionRecord->NumberParameters >= 2u &&
+                    ep->ExceptionRecord->ExceptionInformation[0] <= 1u) {
+                    using PfnRetryRemap = int32_t(__stdcall*)(uintptr_t);
+                    static std::atomic<PfnRetryRemap> s_retry_fn{nullptr};
+                    PfnRetryRemap retry_fn = s_retry_fn.load(std::memory_order_acquire);
+                    if (!retry_fn) {
+                        if (HMODULE hkx = ::GetModuleHandleW(L"kernelx.dll")) {
+                            retry_fn = reinterpret_cast<PfnRetryRemap>(
+                                ::GetProcAddress(hkx, "OpenScarlettRetryRemappedPageFault"));
+                            if (retry_fn) {
+                                s_retry_fn.store(retry_fn, std::memory_order_release);
+                            }
+                        }
+                    }
+                    if (retry_fn &&
+                        retry_fn(static_cast<uintptr_t>(ep->ExceptionRecord->ExceptionInformation[1])) != 0) {
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                }
+                if (!s_retail_veh_enabled.load(std::memory_order_acquire)) {
+                    return EXCEPTION_CONTINUE_SEARCH;
+                }
                 const auto* rip = reinterpret_cast<const uint8_t*>(ep->ContextRecord->Rip);
                 if (code == 0x0000087Du) {
                     static std::atomic<uint32_t> s_87d_cnt{0u};
