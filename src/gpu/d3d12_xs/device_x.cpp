@@ -2873,6 +2873,8 @@ DeviceX::DeviceX(
             supports_r9g9b9e5_uav_ =
                 ((fmt_sup.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0) &&
                 ((fmt_sup.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0);
+            supports_r9g9b9e5_rtv_ =
+                ((fmt_sup.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) != 0);
         }
         adapter_info_.supports_r9g9b9e5_uav = supports_r9g9b9e5_uav_;
 
@@ -3433,9 +3435,36 @@ void DeviceX::SetForceR9G9B9E5UavFallback(bool force) noexcept {
 }
 
 bool DeviceX::ShouldRewriteR9G9B9E5Uav(const D3D12_RESOURCE_DESC& desc) const noexcept {
-    return IsR9G9B9E5UavFallbackActive() &&
-           desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP &&
-           (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+    if (desc.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
+        return false;
+    }
+    const bool force_fb = g_force_r9g9b9e5_uav_fallback.load(std::memory_order_acquire);
+    if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0 &&
+        (!supports_r9g9b9e5_uav_ || force_fb)) {
+        return true;
+    }
+    if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0 &&
+        (!supports_r9g9b9e5_rtv_ || force_fb)) {
+        return true;
+    }
+    return false;
+}
+
+DXGI_FORMAT DeviceX::SanitizeRtvFormatForHost(DXGI_FORMAT fmt) const noexcept {
+    DXGI_FORMAT san = SanitizeXboxDxgiFormat(fmt);
+    if (san == DXGI_FORMAT_R9G9B9E5_SHAREDEXP &&
+        (!supports_r9g9b9e5_rtv_ || g_force_r9g9b9e5_uav_fallback.load(std::memory_order_acquire))) {
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    }
+    if (IsPacked16TargetFormat(san) && host_dev_ != nullptr) {
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{};
+        fs.Format = san;
+        if (FAILED(host_dev_->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) ||
+            (fs.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) == 0) {
+            return DXGI_FORMAT_R8G8B8A8_UNORM;
+        }
+    }
+    return san;
 }
 
 void DeviceX::TrackFallbackResource(IUnknown* obj, bool is_fallback) {
@@ -8930,7 +8959,7 @@ HRESULT DeviceX::CreateDerivedGraphicsPipelineStateX(
                         uint32_t rfmt = 0u;
                         std::memcpy(&rfmt, ent + 0x18u + r * 4u, 4u);
                         derived.RTVFormats[r] = (r < num_rts)
-                                                    ? SanitizeXboxDxgiFormat(static_cast<DXGI_FORMAT>(rfmt))
+                                                    ? SanitizeRtvFormatForHost(static_cast<DXGI_FORMAT>(rfmt))
                                                     : DXGI_FORMAT_UNKNOWN;
                     }
                 }
@@ -8946,7 +8975,7 @@ HRESULT DeviceX::CreateDerivedGraphicsPipelineStateX(
                     for (UINT r = 0u; r < num_rts; ++r) {
                         uint32_t rfmt = 0u;
                         std::memcpy(&rfmt, ent + 0x18u + r * 4u, 4u);
-                        const DXGI_FORMAT cand = SanitizeXboxDxgiFormat(static_cast<DXGI_FORMAT>(rfmt));
+                        const DXGI_FORMAT cand = SanitizeRtvFormatForHost(static_cast<DXGI_FORMAT>(rfmt));
                         if (cand != DXGI_FORMAT_UNKNOWN) {
                             derived.RTVFormats[r] = cand;
                         } else if (derived.RTVFormats[r] == DXGI_FORMAT_UNKNOWN) {
@@ -10051,7 +10080,7 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
         }
         if (gpso.NumRenderTargets > 8u) gpso.NumRenderTargets = 8u;
         for (UINT r = 0u; r < gpso.NumRenderTargets; ++r) {
-            gpso.RTVFormats[r] = SanitizeXboxDxgiFormat(gpso.RTVFormats[r]);
+            gpso.RTVFormats[r] = SanitizeRtvFormatForHost(gpso.RTVFormats[r]);
             if (gpso.RTVFormats[r] == DXGI_FORMAT_UNKNOWN && r == 0u && !ps_dxil.empty()) {
                 gpso.RTVFormats[r] = DXGI_FORMAT_R8G8B8A8_UNORM;
             }
@@ -10185,7 +10214,7 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
         gpso.NumRenderTargets = 8u;
     }
     for (UINT r = 0u; r < gpso.NumRenderTargets; ++r) {
-        gpso.RTVFormats[r] = SanitizeXboxDxgiFormat(gpso.RTVFormats[r]);
+        gpso.RTVFormats[r] = SanitizeRtvFormatForHost(gpso.RTVFormats[r]);
         if (gpso.RTVFormats[r] == DXGI_FORMAT_UNKNOWN && r == 0u && !ps_dxil.empty()) {
             gpso.RTVFormats[r] = DXGI_FORMAT_R8G8B8A8_UNORM;
         }

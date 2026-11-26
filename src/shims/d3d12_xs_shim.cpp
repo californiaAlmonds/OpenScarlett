@@ -3875,6 +3875,112 @@ HRESULT CreateWrappedDeviceInternal(
                         }
                     }
                 }
+                // Guard intrusive circular-bucket cursor advance (`48 8B 01 | 48 8B 50 18 | 48 89 11 | C3`,
+                // i.e. `mov rax, [rcx]; mov rdx, [rax+0x18]; mov [rcx], rdx; ret` at +0x5298EE3 / +0x188013)
+                // when an unlocked worker unregister (+0xBE42A0/+0xBE49F9) or non-atomic [rcx+8] count race
+                // empties `[rcx]` after the caller snapshotted `[rcx+8]` at loop entry: reconcile `[rcx+8] = 0`
+                // and unwind cleanly to the caller's own `add rsp, 20h/28h; pop ...; ret` epilogue.
+                if (code == EXCEPTION_ACCESS_VIOLATION &&
+                    ep->ExceptionRecord->NumberParameters >= 2u &&
+                    ep->ExceptionRecord->ExceptionInformation[0] == 0u &&
+                    ep->ExceptionRecord->ExceptionInformation[1] == 0x18ull &&
+                    ep->ContextRecord->Rax == 0ull &&
+                    reinterpret_cast<uintptr_t>(rip) > 16u &&
+                    IsReadableRetailRange(reinterpret_cast<uintptr_t>(rip) - 3u, 11u)) {
+                    static constexpr uint8_t kRingPopFn[11] = {
+                        0x48u, 0x8Bu, 0x01u, 0x48u, 0x8Bu, 0x50u, 0x18u, 0x48u, 0x89u, 0x11u, 0xC3u};
+                    if (std::memcmp(rip - 3, kRingPopFn, sizeof(kRingPopFn)) == 0) {
+                        HMODULE hit_mod = nullptr;
+                        const HMODULE main_exe = ::GetModuleHandleW(nullptr);
+                        const uintptr_t rsp = static_cast<uintptr_t>(ep->ContextRecord->Rsp);
+                        if (main_exe &&
+                            ::GetModuleHandleExA(
+                                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                reinterpret_cast<LPCSTR>(rip), &hit_mod) &&
+                            hit_mod == main_exe &&
+                            IsReadableRetailRange(rsp, sizeof(uint64_t))) {
+                            uint64_t ret_ip = 0ull;
+                            std::memcpy(&ret_ip, reinterpret_cast<const void*>(rsp), sizeof(ret_ip));
+                            HMODULE ret_mod = nullptr;
+                            if (ret_ip > 96ull &&
+                                ::GetModuleHandleExA(
+                                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                    reinterpret_cast<LPCSTR>(static_cast<uintptr_t>(ret_ip)),
+                                    &ret_mod) &&
+                                ret_mod == main_exe &&
+                                IsReadableRetailRange(static_cast<uintptr_t>(ret_ip) - 85u, 85u)) {
+                                const uintptr_t call_ip = static_cast<uintptr_t>(ret_ip) - 5u;
+                                const auto* call_ptr = reinterpret_cast<const uint8_t*>(call_ip);
+                                if (call_ptr[0] == 0xE8u) {
+                                    uintptr_t epilogue_ip = 0u;
+                                    for (size_t back = 5u; back <= 80u; ++back) {
+                                        const uint8_t op = *(call_ptr - back);
+                                        if (op == 0x7Eu) {
+                                            const int8_t rel8 = static_cast<int8_t>(*(call_ptr - back + 1u));
+                                            const uintptr_t cand = static_cast<uintptr_t>(
+                                                static_cast<intptr_t>(call_ip - back + 2u) + rel8);
+                                            if (IsReadableRetailRange(cand, 4u)) {
+                                                const auto* ep_bytes = reinterpret_cast<const uint8_t*>(cand);
+                                                if (ep_bytes[0] == 0x48u && ep_bytes[1] == 0x83u &&
+                                                    ep_bytes[2] == 0xC4u &&
+                                                    (ep_bytes[3] == 0x20u || ep_bytes[3] == 0x28u)) {
+                                                    epilogue_ip = cand;
+                                                    break;
+                                                }
+                                            }
+                                        } else if (op == 0x7Fu) {
+                                            const uintptr_t cand = call_ip - back + 2u;
+                                            if (IsReadableRetailRange(cand, 4u)) {
+                                                const auto* ep_bytes = reinterpret_cast<const uint8_t*>(cand);
+                                                if (ep_bytes[0] == 0x48u && ep_bytes[1] == 0x83u &&
+                                                    ep_bytes[2] == 0xC4u &&
+                                                    (ep_bytes[3] == 0x20u || ep_bytes[3] == 0x28u)) {
+                                                    epilogue_ip = cand;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (epilogue_ip != 0u) {
+                                        const uintptr_t bucket_va = static_cast<uintptr_t>(ep->ContextRecord->Rcx);
+                                        MEMORY_BASIC_INFORMATION bmbi{};
+                                        if (bucket_va >= 0x10000u &&
+                                            ::VirtualQuery(reinterpret_cast<LPCVOID>(bucket_va), &bmbi, sizeof(bmbi)) != 0u &&
+                                            bmbi.State == MEM_COMMIT &&
+                                            (bmbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                                                             PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0u &&
+                                            (bmbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0u &&
+                                            bucket_va + 12u <=
+                                                reinterpret_cast<uintptr_t>(bmbi.BaseAddress) + bmbi.RegionSize) {
+                                            if (*reinterpret_cast<const uint64_t*>(bucket_va) == 0ull) {
+                                                _InterlockedExchange(
+                                                    reinterpret_cast<volatile LONG*>(bucket_va + 8u), 0L);
+                                            }
+                                        }
+                                        static std::atomic<uint32_t> s_ring_guard{0u};
+                                        const uint32_t rn = s_ring_guard.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                                        if (rn <= 16u) {
+                                            const uintptr_t base = reinterpret_cast<uintptr_t>(main_exe);
+                                            std::fprintf(
+                                                stderr,
+                                                "[OpenScarlett][VEH-GUARD] Empty ring bucket at +0x%llX <- +0x%llX #%u (bucket=0x%llX) -> epilogue +0x%llX\n",
+                                                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(rip) - base),
+                                                static_cast<unsigned long long>(call_ip - base),
+                                                rn,
+                                                static_cast<unsigned long long>(bucket_va),
+                                                static_cast<unsigned long long>(epilogue_ip - base));
+                                            std::fflush(stderr);
+                                        }
+                                        ep->ContextRecord->Rsp = rsp + sizeof(uint64_t);
+                                        ep->ContextRecord->Rip = epilogue_ip;
+                                        return EXCEPTION_CONTINUE_EXECUTION;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 return EXCEPTION_CONTINUE_SEARCH;
             });
             ::SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {

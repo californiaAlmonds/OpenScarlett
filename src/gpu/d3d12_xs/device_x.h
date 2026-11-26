@@ -1185,6 +1185,8 @@ private:
     D3D12AdapterInfo adapter_info_{};
     HWND default_hwnd_ = nullptr;
     bool supports_r9g9b9e5_uav_ = false;
+    bool supports_r9g9b9e5_rtv_ = false;
+    DXGI_FORMAT SanitizeRtvFormatForHost(DXGI_FORMAT fmt) const noexcept;
     bool supports_depth_bounds_test_ = false;
     bool supports_view_instancing_ = false;
     bool supports_programmable_sample_positions_ = false;
