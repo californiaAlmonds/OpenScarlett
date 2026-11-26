@@ -4653,6 +4653,33 @@ HRESULT CreateWrappedDeviceInternal(
                             ep->ContextRecord->Rip = reinterpret_cast<uintptr_t>(rip) + 0x33u;
                             return EXCEPTION_CONTINUE_EXECUTION;
                         }
+                        // Case E (+0x156D2AF, +0x17ABCA1, +0x30A55B7 polymorphic extension `Clone` triplets
+                        // under critical section `+0x80122E8`): when a streamed extension sub-object has an
+                        // unplaced/stripped null vtable (`*(uint64_t*)def == 0`, so `rax == 0` on
+                        // `call qword ptr [rax+10h]` `FF 50 10`), advance +3 bytes to `mov [rsi], rax`
+                        // (`48 89 06`) so `*out_inst = nullptr` and critical section `+0x80122E8` is released.
+                        if (av_addr == 0x10ull &&
+                            ep->ContextRecord->Rax == 0ull &&
+                            IsReadableRetailRange(reinterpret_cast<uintptr_t>(rip), 17u) &&
+                            rip[0] == 0xFFu && rip[1] == 0x50u && rip[2] == 0x10u &&
+                            rip[3] == 0x48u && rip[4] == 0x89u && rip[5] == 0x06u &&
+                            rip[6] == 0x48u && rip[7] == 0x8Du && rip[8] == 0x0Du &&
+                            rip[13] == 0x48u && rip[14] == 0x83u && rip[15] == 0xC4u) {
+                            static std::atomic<uint32_t> s_null_ext_vtbl{0u};
+                            const uint32_t en = s_null_ext_vtbl.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                            if (en <= 8u) {
+                                std::fprintf(
+                                    stderr,
+                                    "[OpenScarlett][VEH-GUARD] Unplaced extension vtable at +0x%llX #%u (def=0x%llX) -> skip\n",
+                                    static_cast<unsigned long long>(
+                                        reinterpret_cast<uintptr_t>(rip) - reinterpret_cast<uintptr_t>(main_exe)),
+                                    en,
+                                    static_cast<unsigned long long>(ep->ContextRecord->Rcx));
+                                std::fflush(stderr);
+                            }
+                            ep->ContextRecord->Rip = reinterpret_cast<uintptr_t>(rip) + 3u;
+                            return EXCEPTION_CONTINUE_EXECUTION;
+                        }
                     }
                 }
                 return EXCEPTION_CONTINUE_SEARCH;

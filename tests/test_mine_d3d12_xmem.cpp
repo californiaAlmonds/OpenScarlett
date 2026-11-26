@@ -337,6 +337,24 @@ __declspec(allocate(".text")) alignas(16) const uint8_t kRetailShaderVarStub[128
     0xCCu, 0x31u, 0xC0u, 0x48u, 0x83u, 0xC4u, 0x40u, 0x5Fu
 };
 
+// Replica of `+0x17ABC50..+0x17ABCB9` (`phExtension::Clone` triplet Case E):
+//   0x00: 56                    push rsi
+//   0x01: 48 83 EC 20           sub rsp, 20h
+//   0x05: 48 89 D6              mov rsi, rdx  (out_inst)
+//   0x08: 48 8B 01              mov rax, [rcx] (0 when unplaced!)
+//   0x0B: FF 50 10              call qword ptr [rax+10h]  <-- Case E fault
+//   0x0E: 48 89 06              mov [rsi], rax            <-- Case E recovery target (rip + 3)
+//   0x11: 48 8D 0D 00 00 00 00  lea rcx, [rip+0]
+//   0x18: 48 83 C4 20           add rsp, 20h
+//   0x1C: 5E                    pop rsi
+//   0x1D: C3                    ret
+__declspec(allocate(".text")) alignas(16) const uint8_t kRetailExtCloneStub[32] = {
+    0x56u, 0x48u, 0x83u, 0xECu, 0x20u, 0x48u, 0x89u, 0xD6u,
+    0x48u, 0x8Bu, 0x01u, 0xFFu, 0x50u, 0x10u, 0x48u, 0x89u,
+    0x06u, 0x48u, 0x8Du, 0x0Du, 0x00u, 0x00u, 0x00u, 0x00u,
+    0x48u, 0x83u, 0xC4u, 0x20u, 0x5Eu, 0xC3u, 0xCCu, 0xCCu
+};
+
 void TestRetailShaderVarNullBindingGuard() {
     std::printf("[3/3] Retail Scarlett +0x94E725 / +0x5429D33 unbound shader texture var VEH guard...\n");
 
@@ -388,6 +406,14 @@ void TestRetailShaderVarNullBindingGuard() {
         // 3) Empty non-null table (`count == 0`) also misses and recovers via Case C cleanly
         const uint64_t empty_table[2] = {0ull, 0ull};
         OS_REQUIRE(resolve_fn(empty_table, &fake_tex, 0x84C69350u) == 0xCAFEBABE12345678ull);
+
+        // 4) Unplaced extension def (`*(uint64_t*)def == 0`) recovers via Case E (+0x17ABCA1) and writes `*out = 0`
+        using PfnExtCloneStub = void(__fastcall*)(const uint64_t* def, uint64_t* out_inst);
+        auto ext_clone_fn = reinterpret_cast<PfnExtCloneStub>(&kRetailExtCloneStub[0]);
+        const uint64_t unplaced_def[2] = {0ull, 0x12345678ull};
+        uint64_t cloned_inst = 0xDEADBEEFCAFEBABEull;
+        ext_clone_fn(unplaced_def, &cloned_inst);
+        OS_REQUIRE(cloned_inst == 0ull);
 
         dev->Release();
     }
