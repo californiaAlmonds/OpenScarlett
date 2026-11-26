@@ -13,7 +13,7 @@ import struct
 from dataclasses import dataclass
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-DISCORD_URL = "https://discord.gg/sShMY2fjR"
+DISCORD_URL = "https://discord.gg/Q4U4RefGPK"
 
 
 @dataclass

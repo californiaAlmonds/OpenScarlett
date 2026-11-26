@@ -12,7 +12,7 @@ OpenScarlett tracks every capability by verification tier: **Live-Verified**, **
 | **Untouched Microsoft `Xbox-GDK-Samples`** | 🟢 **Live Pass** | **4 untouched MIT samples** compiled for `_GAMING_XBOX_SCARLETT` (`SimpleTriangle`, `SimpleLighting`, `SimpleTexture`, `SimpleInstancing`) + **`SimpleDirectStorageCombo`** (`0x6824D2954256492C` byte-identical, 769 live calls) |
 | **Custom Dual-API 3D GDK Workloads** | 🟢 **Live Pass** | Shadowed/skinned BC1+BC3 **`gdk_3d_scene`**, **`SimplePBR`** (4× MSAA), **`MeshletCull`** (`as_6_5`+`ms_6_5`+`ps_6_5`), **`DXRTriangle`**, **`HDRCubeMap`** (666.7 nits ST.2084), **`VulkanMeshShowcase`** (`VK_EXT_mesh_shader`, `0.0000` MAE vs D3D12) |
 | **Commercial Shipping GDK Thunks & Launchers** | 🟢 **Live Pass** | Shipping `XGamingRuntimeThunks.dll` (*Alexandria IV DEMO*: 292/292 parity, 24 COM `QueryApiImpl` interfaces, `0 E_NOINTERFACE`); multi-process child-hook propagation (*Pizza House Simulator*, 3-gen *House Flipper 2*) |
-| **Commercial Retail Xbox Series X\|S Games** | 🟣 **Not Playable Yet** | **0 retail AAA games playable so far.** Active bring-up target — join [Discord](https://discord.gg/sShMY2fjR) to share First-Boot Probe telemetry on unpacked GDK builds! |
+| **Commercial Retail Xbox Series X\|S Games** | 🟣 **Not Playable Yet** | **0 retail AAA games playable so far.** Active bring-up target — join [Discord](https://discord.gg/Q4U4RefGPK) to share First-Boot Probe telemetry on unpacked GDK builds! |
 
 ---
 

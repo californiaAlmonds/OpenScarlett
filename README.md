@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/californiaAlmonds/OpenScarlett/releases/latest"><img height="20" src="https://img.shields.io/github/v/release/californiaAlmonds/OpenScarlett?label=download&color=e11d48" alt="Download Latest Release" /></a>
-  <a href="https://discord.gg/sShMY2fjR"><img height="20" src="https://img.shields.io/badge/discord-join%20community-5865F2" alt="Join Discord" /></a>
+  <a href="https://discord.gg/Q4U4RefGPK"><img height="20" src="https://img.shields.io/badge/discord-join%20community-5865F2" alt="Join Discord" /></a>
   <a href="https://github.com/californiaAlmonds/OpenScarlett/actions/workflows/ci.yml"><img height="20" src="https://img.shields.io/github/actions/workflow/status/californiaAlmonds/OpenScarlett/ci.yml?label=windows%20ci" alt="Windows CI" /></a>
   <a href="https://californiaalmonds.github.io/OpenScarlett/"><img height="20" src="https://img.shields.io/badge/dashboard-interactive-1f6feb" alt="Interactive Dashboard" /></a>
   <a href="https://github.com/californiaAlmonds/OpenScarlett/wiki"><img height="20" src="https://img.shields.io/badge/wiki-documentation-e11d48" alt="OpenScarlett Wiki" /></a>
@@ -74,7 +74,7 @@ No coding or SDK required to test your GPU or launch unpacked GDK binaries:
 
 1. **[Download the latest `OpenScarlett-*-win64.zip`](https://github.com/californiaAlmonds/OpenScarlett/releases/latest)** and extract anywhere *(includes `OpenScarlettLauncher.exe` and open-source `dxc.exe`)*.
 2. **Run `OpenScarlettLauncher.exe`** → open **60s Hardware Self-Test** → click **Run 60s Hardware Test** *(automatically strips usernames and local paths)*.
-3. Share your sanitized hardware report or `--telemetry report.json` in **[Discord](https://discord.gg/sShMY2fjR)** or GitHub Issues — no game files ever need to be shared.
+3. Share your sanitized hardware report or `--telemetry report.json` in **[Discord](https://discord.gg/Q4U4RefGPK)** or GitHub Issues — no game files ever need to be shared.
 
 ---
 

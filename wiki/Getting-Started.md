@@ -39,7 +39,7 @@ Double-click **`OpenScarlettLauncher.exe`** to open the zero-dependency native W
    - Pick an unpacked Xbox GDK package directory (containing `MicrosoftGame.Config`), a `.mgc` config file, or a standalone `.exe`.
    - Choose the GPU backend (**DirectX 12** default or **Vulkan 1.4**).
    - Toggle **First-Boot Probe Mode** (`--probe-unknown-imports`) when testing a brand-new binary for the first time — automatically synthesizes `E_NOTIMPL` trampolines for missing imports and attaches the Win32 VEH 50-call API ring buffer crash logger.
-   - Click **Copy Sanitized Telemetry** to copy a privacy-stripped summary (usernames and local paths removed) to share on [Discord](https://discord.gg/sShMY2fjR) or GitHub Issues.
+   - Click **Copy Sanitized Telemetry** to copy a privacy-stripped summary (usernames and local paths removed) to share on [Discord](https://discord.gg/Q4U4RefGPK) or GitHub Issues.
 3. **60s Hardware Self-Test Tab**
    - Click **Run 60s Hardware Test** to validate your GPU and Windows build across the bundled tests.
    - Click **Open Pre-Filled GitHub Hardware Report** to submit a sanitized hardware compatibility report in one click.

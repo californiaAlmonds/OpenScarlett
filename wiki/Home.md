@@ -50,4 +50,4 @@ Because the Xbox Series X|S runs an **AMD Zen 2 x86-64 CPU** with a Windows-deri
 - **GitHub Repository:** [californiaAlmonds/OpenScarlett](https://github.com/californiaAlmonds/OpenScarlett)
 - **Interactive Coverage Dashboard:** [californiaalmonds.github.io/OpenScarlett](https://californiaalmonds.github.io/OpenScarlett/)
 - **Latest Portable Win64 Release:** [GitHub Releases](https://github.com/californiaAlmonds/OpenScarlett/releases/latest)
-- **Community Discord:** [Join Discord](https://discord.gg/sShMY2fjR)
+- **Community Discord:** [Join Discord](https://discord.gg/Q4U4RefGPK)

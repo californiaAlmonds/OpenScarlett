@@ -25,4 +25,4 @@
 ---
 - [Interactive Dashboard](https://californiaalmonds.github.io/OpenScarlett/)
 - [Latest Release](https://github.com/californiaAlmonds/OpenScarlett/releases/latest)
-- [Discord Community](https://discord.gg/sShMY2fjR)
+- [Discord Community](https://discord.gg/Q4U4RefGPK)

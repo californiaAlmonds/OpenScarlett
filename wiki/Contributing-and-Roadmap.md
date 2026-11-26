@@ -9,7 +9,7 @@ OpenScarlett welcomes both **community hardware testers** (no coding required!) 
 ### Option A: 60-Second GPU Hardware Report (No Coding!)
 1. Download the latest portable `OpenScarlett-*-win64.zip` from [GitHub Releases](https://github.com/californiaAlmonds/OpenScarlett/releases/latest).
 2. Run **`OpenScarlettLauncher.exe`** → **60s Hardware Self-Test** (or `run_hardware_test.ps1`).
-3. Click **Open Pre-Filled GitHub Hardware Report** or share your sanitized summary in [Discord](https://discord.gg/sShMY2fjR).
+3. Click **Open Pre-Filled GitHub Hardware Report** or share your sanitized summary in [Discord](https://discord.gg/Q4U4RefGPK).
    *(Failing tests on new GPUs like RTX 40, RX 6000, Intel Arc, or handheld APUs are just as valuable as passing ones!)*
 
 ### Option B: Test Unpacked GDK Builds with First-Boot Probe
