@@ -1756,7 +1756,7 @@ inline constexpr uint32_t kSpvBuiltInLocalInvocationId = 27u;
 inline constexpr uint32_t kSpvBuiltInGlobalInvocationId = 28u;
 inline constexpr uint32_t kSpvBuiltInLocalInvocationIndex = 29u;
 inline constexpr uint32_t kSpvBuiltInVertexIndex = 42u;
-inline constexpr uint32_t kSpvBuiltInPrimitiveTriangleIndicesEXT = 5294u;
+inline constexpr uint32_t kSpvBuiltInPrimitiveTriangleIndicesEXT = 5296u;
 
 inline constexpr uint32_t kSpvStorageUniformConstant = 0u;
 inline constexpr uint32_t kSpvStorageInput = 1u;

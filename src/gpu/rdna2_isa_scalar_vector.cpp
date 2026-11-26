@@ -5408,6 +5408,46 @@ public:
         return r;
     }
 
+    uint32_t EmitMixFma(uint32_t a, uint32_t b, uint32_t c) {
+        const uint32_t native = Glsl3(t_f32_, 50u /*Fma*/, a, b, c);
+        const uint32_t a_bits = Bitcast(t_u32_, a);
+        const uint32_t b_bits = Bitcast(t_u32_, b);
+        const uint32_t c_bits = Bitcast(t_u32_, c);
+        const auto exponent = [&](uint32_t bits) {
+            return BinU32(199u /*And*/, BinU32(194u /*Shr*/, bits, ConstU32(23)), ConstU32(255));
+        };
+        const auto significand = [&](uint32_t bits) {
+            return BinU32(197u /*Or*/, BinU32(199u, bits, ConstU32(0x7fffff)), ConstU32(0x800000));
+        };
+        const auto normal = [&](uint32_t exp) {
+            return BinBool(176u /*ULessThan*/, BinU32(130u /*ISub*/, exp, ConstU32(1)), ConstU32(254));
+        };
+        const uint32_t ea = exponent(a_bits), eb = exponent(b_bits), ec = exponent(c_bits);
+        const uint32_t product = BinF32(133u /*FMul*/, a, b);
+        const uint32_t neg_c_bits = BinU32(198u /*Xor*/, c_bits, ConstU32(0x80000000u));
+        uint32_t cancelled = BinBool(170u /*IEqual*/, Bitcast(t_u32_, product), neg_c_bits);
+        cancelled = BinBool(167u /*LogicalAnd*/, cancelled, normal(ea));
+        cancelled = BinBool(167u, cancelled, normal(eb));
+        cancelled = BinBool(167u, cancelled, normal(ec));
+        cancelled = BinBool(167u, cancelled, BinBool(180u /*FOrdEqual*/, native, ConstF32(0.0f)));
+
+        // GLSL Fma may round the product first. If c cancels that rounded product,
+        // the exact residual fits in 24 signed magnitude bits. Subtract the aligned
+        // significands modulo 2^32 to recover it, even for a 48-bit product.
+        const uint32_t sum_exp = BinU32(128u /*IAdd*/, ea, eb);
+        const uint32_t shift = BinU32(130u, BinU32(128u, ec, ConstU32(150)), sum_exp);
+        const uint32_t aligned_c = BinU32(196u /*Shl*/, significand(c_bits), BinU32(199u, shift, ConstU32(31)));
+        const uint32_t delta = BinU32(130u, BinU32(132u /*IMul*/, significand(a_bits), significand(b_bits)), aligned_c);
+        const uint32_t delta_f = AllocId();
+        Emit(sec_fn_, 111u /*ConvertSToF*/, {t_f32_, delta_f, Bitcast(t_i32_, delta)});
+        const uint32_t scale = Bitcast(t_i32_, BinU32(130u, sum_exp, ConstU32(300)));
+        const uint32_t residual = Glsl2(t_f32_, 53u /*Ldexp*/, delta_f, scale);
+        const uint32_t product_sign = BinU32(199u, neg_c_bits, ConstU32(0x80000000u));
+        const uint32_t signed_residual = BinU32(198u, Bitcast(t_u32_, residual), product_sign);
+        cancelled = BinBool(167u, cancelled, BinBool(171u /*INotEqual*/, delta, ConstU32(0)));
+        return SelF32(cancelled, Bitcast(t_f32_, signed_residual), native);
+    }
+
     uint32_t UnpackF16Lo(uint32_t u) {
         const uint32_t v2 = AllocId();
         Emit(sec_fn_, 12u, {t_v2f32_, v2, ext_glsl_, 62u /*UnpackHalf2x16*/, u});
@@ -7188,7 +7228,7 @@ public:
                             if ((inst.vop3p_neg_hi >> bit) & 1u) { uint32_t nf = AllocId(); Emit(sec_fn_, 127u, {t_f32_, nf, f}); f = nf; }
                             return f;
                         };
-                        const uint32_t mf = Glsl3(t_f32_, 50u /*Fma*/, mix_spv(a, 0u), mix_spv(b, 1u), mix_spv(c, 2u));
+                        const uint32_t mf = EmitMixFma(mix_spv(a, 0u), mix_spv(b, 1u), mix_spv(c, 2u));
                         if (raw == 0x20u) {
                             r = Bitcast(t_u32_, mf);
                         } else if (raw == 0x21u) {

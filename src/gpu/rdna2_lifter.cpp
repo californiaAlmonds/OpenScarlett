@@ -318,7 +318,7 @@ constexpr uint32_t kSpvBuiltInLocalInvocationId = 27u;
 constexpr uint32_t kSpvBuiltInGlobalInvocationId = 28u;
 constexpr uint32_t kSpvBuiltInLocalInvocationIndex = 29u;
 constexpr uint32_t kSpvBuiltInVertexIndex = 42u;
-constexpr uint32_t kSpvBuiltInPrimitiveTriangleIndicesEXT = 5294u;
+constexpr uint32_t kSpvBuiltInPrimitiveTriangleIndicesEXT = 5296u;
 constexpr uint32_t kSpvBuiltInCullPrimitiveEXT = 5299u;
 
 // SPIR-V Capabilities & Mesh/Task Shader EXT constants

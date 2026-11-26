@@ -300,7 +300,7 @@ std::vector<uint32_t> BuildSimpleMeshSpirv14() {
 
     b.Op(71, {t_pv, 2});
     b.Op(72, {t_pv, 0, 11, 0});
-    b.Op(71, {v_idx, 11, 5294});
+    b.Op(71, {v_idx, 11, 5296});  // BuiltIn PrimitiveTriangleIndicesEXT
 
     b.Op(19, {t_void});
     b.Op(33, {t_fn, t_void});

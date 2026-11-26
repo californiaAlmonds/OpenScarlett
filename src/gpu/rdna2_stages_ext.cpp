@@ -3090,7 +3090,7 @@ Status LowerRdna2StageWithBarycentricAndCullDistance(
         EmitSpv(types, SpvOpVariable, {ty_ptr_out_prims, var_prims, 3u});
         EmitSpv(decs, SpvOpDecorate, {var_lid, 11u, 29u});      // BuiltIn LocalInvocationIndex
         EmitSpv(decs, SpvOpDecorate, {var_col, 30u, 0u});       // Location 0
-        EmitSpv(decs, SpvOpDecorate, {var_prims, 11u, 5294u});  // BuiltIn PrimitiveTriangleIndicesEXT
+        EmitSpv(decs, SpvOpDecorate, {var_prims, 11u, 5296u});  // BuiltIn PrimitiveTriangleIndicesEXT
         iface = {var_lid, var_out, var_col, var_prims};
 
         uint32_t var_b2 = 0u, var_b3 = 0u;

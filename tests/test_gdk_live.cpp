@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -50,22 +51,16 @@ float4 main(Interpolants In) : SV_TARGET0 { return In.color; }
 
 constexpr const char* kFallbackMeshMs = R"HLSL(
 struct VertexOut { float4 Color : COLOR0; float4 Position : SV_Position; };
-static const float4 s_Pos[3] = {
-    float4(-0.5f, -0.5f, 0.5f, 1.0f),
-    float4( 0.0f,  0.5f, 0.5f, 1.0f),
-    float4( 0.5f, -0.5f, 0.5f, 1.0f)
-};
-static const float4 s_Col[3] = {
-    float4(1.0f, 0.0f, 0.0f, 1.0f),
-    float4(0.0f, 1.0f, 0.0f, 1.0f),
-    float4(0.0f, 0.0f, 1.0f, 1.0f)
-};
 [RootSignature("")]
 [NumThreads(32, 1, 1)]
 [OutputTopology("triangle")]
 void main(uint gtid : SV_GroupThreadID, out indices uint3 tris[1], out vertices VertexOut verts[3]) {
     SetMeshOutputCounts(3, 1);
-    if (gtid < 3) { verts[gtid].Position = s_Pos[gtid]; verts[gtid].Color = s_Col[gtid]; }
+    if (gtid < 3) {
+        // This fixture needs only the lane index to generate its RGB triangle.
+        verts[gtid].Position = float4(0.5f * float(gtid) - 0.5f, gtid == 1 ? 0.5f : -0.5f, 0.5f, 1.0f);
+        verts[gtid].Color = float4(gtid == 0, gtid == 1, gtid == 2, 1.0f);
+    }
     if (gtid < 1) { tris[0] = uint3(0, 1, 2); }
 }
 )HLSL";
@@ -812,6 +807,25 @@ int main() {
         OS_REQUIRE(fs::exists(cb_t / "combo_summary.txt"));
 
         const auto metrics = ParseKeyValueFile(cb_t / "combo_summary.txt");
+        // The inherited retail profile must reach the guest, independently of
+        // the guest's cross-check between its kernel and GDK identities.
+        char selected[128]{};
+        DWORD length = GetEnvironmentVariableA("OPENSCARLETT_CONSOLE_TYPE", selected, sizeof(selected));
+        if (length == 0) {
+            length = GetEnvironmentVariableA("OPENSCARLETT_CONSOLE_PROFILE", selected, sizeof(selected));
+        }
+        std::string profile = length && length < sizeof(selected) ? std::string(selected, length) : "anaconda";
+        std::transform(profile.begin(), profile.end(), profile.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const std::set<std::string> series_s = {"series-s", "series_s", "seriess", "lockhart", "3", "s", "8gb", "8gib"};
+        const std::set<std::string> series_x = {"series-x", "series_x", "seriesx", "anaconda", "4", "x", "13.5gb", "16gb"};
+        if (series_s.count(profile) || series_x.count(profile)) {
+            const bool lockhart = series_s.count(profile) != 0;
+            OS_REQUIRE(metrics.at("console_type") == (lockhart ? "3" : "4"));
+            OS_REQUIRE(metrics.at("device_type") == (lockhart ? "6" : "7"));
+            OS_REQUIRE(std::stoull(metrics.at("title_budget_bytes")) ==
+                       (lockhart ? 8ull * 1024 * 1024 * 1024 : 27ull * 512 * 1024 * 1024));
+        }
         const auto tel_sum = ParseTelemetryJson(cb_tel);
         OS_REQUIRE(tel_sum.total_not_impl == 0);
 

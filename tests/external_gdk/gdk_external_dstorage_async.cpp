@@ -874,13 +874,19 @@ int main() {
         "gamesave_combo=ok\n"
         "dstorage_combo=ok\n"
         "gameinput=ok\n"
-        "pix3=ok\n",
+        "pix3=ok\n"
+        "runtime_uninitialize=pending\n",
         title_id);
     if (n <= 0 || !WriteWholeFileW(L"T:\\dstorage_async_metrics.txt", metrics, static_cast<size_t>(n))) {
         return Fail("Write T:\\dstorage_async_metrics.txt");
     }
 
     XGameRuntimeUninitialize();
+    constexpr char kShutdownMarker[] = "runtime_uninitialize=returned\n";
+    if (!WriteWholeFileW(L"T:\\dstorage_async_shutdown.txt", kShutdownMarker, sizeof(kShutdownMarker) - 1)) {
+        return Fail("Write T:\\dstorage_async_shutdown.txt");
+    }
     std::printf("[gdk_external_dstorage_async] PASS (TitleId=0x%08X)\n", title_id);
+    std::fflush(stdout);
     return 0;
 }

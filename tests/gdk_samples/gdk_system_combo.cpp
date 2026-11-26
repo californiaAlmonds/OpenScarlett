@@ -199,8 +199,10 @@ int main() {
         return Fail("GetProcAddress on kernelx.dll");
     }
 
-    if (p_get_console() != 4u /* CONSOLE_TYPE_XBOX_SCARLETT_ANACONDA */) {
-        return Fail("kernelx GetConsoleType != Scarlett Anaconda");
+    constexpr uint32_t kLockhart = 3u, kAnaconda = 4u;
+    const uint32_t console_type = p_get_console();
+    if (console_type != kLockhart && console_type != kAnaconda) {
+        return Fail("kernelx GetConsoleType returned an unsupported retail profile", console_type);
     }
     if (p_get_procs() != 14u) {
         return Fail("kernelx XGetProcessorCount != 14");
@@ -208,7 +210,9 @@ int main() {
 
     KernelXTitleMemoryStatus tms{};
     tms.dwLength = static_cast<uint32_t>(sizeof(KernelXTitleMemoryStatus));
-    if (p_tms(&tms) != 1 || tms.ullTotalMem != (27ull * 512ull * 1024ull * 1024ull)) {
+    const uint64_t expected_title_bytes = console_type == kLockhart
+        ? 8ull * 1024ull * 1024ull * 1024ull : 27ull * 512ull * 1024ull * 1024ull;
+    if (p_tms(&tms) != 1 || tms.ullTotalMem != expected_title_bytes) {
         return Fail("kernelx TitleMemoryStatus");
     }
 
@@ -246,8 +250,11 @@ int main() {
     if (XGameRuntimeInitialize() != XGR_S_OK) {
         return Fail("XGameRuntimeInitialize");
     }
-    if (XSystemGetDeviceType() != XSystemDeviceType_XboxScarlettAnaconda) {
-        return Fail("XSystemGetDeviceType != Anaconda");
+    const auto device_type = XSystemGetDeviceType();
+    const auto expected_device = console_type == kLockhart
+        ? XSystemDeviceType_XboxScarlettLockhart : XSystemDeviceType_XboxScarlettAnaconda;
+    if (device_type != expected_device) {
+        return Fail("XSystemGetDeviceType disagrees with kernelx GetConsoleType", device_type);
     }
 
     // XTaskQueue callback execution
@@ -796,10 +803,15 @@ int main() {
         summary, sizeof(summary),
         "sample=SystemCombo\n"
         "adapter=%s\n"
+        "console_type=%u\n"
+        "device_type=%u\n"
+        "title_budget_bytes=%llu\n"
         "dlls_exercised=10\n"
         "xuid=%llu\n"
         "total_ms=%.3f\n",
         gpu_info.AdapterName,
+        console_type, static_cast<unsigned>(device_type),
+        static_cast<unsigned long long>(tms.ullTotalMem),
         static_cast<unsigned long long>(xuid),
         total_ms);
     if (summary_len <= 0 ||

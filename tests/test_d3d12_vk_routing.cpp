@@ -428,7 +428,7 @@ std::vector<uint32_t> BuildSimpleMeshSpirv() {
     b.Op(71, {t_pv, 2});
     b.Op(72, {t_pv, 0, 11, 0});          // BuiltIn Position
     b.Op(71, {v_col, 30, 0});            // Location 0
-    b.Op(71, {v_idx, 11, 5294});         // BuiltIn PrimitiveTriangleIndicesEXT
+    b.Op(71, {v_idx, 11, 5296});         // BuiltIn PrimitiveTriangleIndicesEXT
 
     b.Op(19, {t_void});
     b.Op(33, {t_fn, t_void});

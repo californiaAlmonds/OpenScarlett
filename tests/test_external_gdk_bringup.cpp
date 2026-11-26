@@ -399,6 +399,7 @@ int main() {
     const fs::path scratch_root = ResolveScratchDir(L"openscarlett_wave2_external_gdk");
     std::error_code ec;
     fs::remove_all(scratch_root, ec);
+    OS_REQUIRE(!ec);
     fs::create_directories(scratch_root, ec);
     OS_REQUIRE(fs::exists(scratch_root));
 
@@ -524,7 +525,9 @@ int main() {
         OS_REQUIRE(after.fnv1a_hash == before.fnv1a_hash);
         OS_REQUIRE(after.entries == before.entries);
         AssertNoDllsInDir(pkg_dir);
-        OS_REQUIRE(fs::exists(vfs_t / "dstorage_async_metrics.txt"));
+        OS_REQUIRE(ReadFileBytes(vfs_t / "dstorage_async_metrics.txt").find("runtime_uninitialize=pending\n")
+                   != std::string::npos);
+        OS_REQUIRE(ReadFileBytes(vfs_t / "dstorage_async_shutdown.txt") == "runtime_uninitialize=returned\n");
 
         const TelemetrySummary tel = ParseTelemetryJson(tel_path);
         AssertZeroBlockers(tel, "gdk_external_dstorage_async");

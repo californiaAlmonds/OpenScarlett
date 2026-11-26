@@ -681,11 +681,25 @@ void TestLockhartBudgetWriteWatchAndSparseFallback() {
         OS_REQUIRE(ws32.avail <= kLockhartBytes);
     }
 
-    // 2. Verify "auto" profile selection based on host physical RAM (<= 18 GiB -> Lockhart).
+    ::SetEnvironmentVariableA("OPENSCARLETT_CONSOLE_PROFILE", "series-x");
+    OS_REQUIRE(GetConsoleType() == CONSOLE_TYPE_XBOX_SCARLETT_ANACONDA);
+    MEMORYSTATUSEX series_x_ms{};
+    series_x_ms.dwLength = sizeof(series_x_ms);
+    OS_REQUIRE(p_gms(&series_x_ms) != FALSE);
+    OS_REQUIRE(series_x_ms.ullTotalPhys == 27ull * 512ull * 1024ull * 1024ull);
+
+    // 2. Verify "auto" against the host, even when the executable's normal
+    // GlobalMemoryStatusEx import resolves to the guest-budget export in kernelx.dll.
     ::SetEnvironmentVariableA("OPENSCARLETT_CONSOLE_PROFILE", "auto");
+    HMODULE kernel32 = ::GetModuleHandleW(L"kernel32.dll");
+    OS_REQUIRE(kernel32 != nullptr);
+    auto host_memory_status = reinterpret_cast<PfnGlobalMemoryStatusEx>(
+        ::GetProcAddress(kernel32, "GlobalMemoryStatusEx"));
+    OS_REQUIRE(host_memory_status != nullptr);
     MEMORYSTATUSEX real_host_ms{};
     real_host_ms.dwLength = sizeof(real_host_ms);
-    OS_REQUIRE(::GlobalMemoryStatusEx(&real_host_ms) != FALSE);
+    OS_REQUIRE(host_memory_status(&real_host_ms) != FALSE);
+    OS_REQUIRE(real_host_ms.ullTotalPhys > 0ull);
     const uint32_t expected_auto =
         (real_host_ms.ullTotalPhys <= (18ull * 1024ull * 1024ull * 1024ull))
             ? CONSOLE_TYPE_XBOX_SCARLETT_LOCKHART

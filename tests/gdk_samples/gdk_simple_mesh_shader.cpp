@@ -156,7 +156,11 @@ double QpcMs(LARGE_INTEGER t0, LARGE_INTEGER t1, LARGE_INTEGER freq) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool use_warp = argc == 2 && std::strcmp(argv[1], "--warp") == 0;
+    if (argc > 1 && !use_warp) {
+        return Fail("Usage: gdk_simple_mesh_shader [--warp]");
+    }
     // 1. GDK Game Runtime initialization & Scarlett check
     if (XGameRuntimeInitialize() != XGR_S_OK) {
         return Fail("XGameRuntimeInitialize");
@@ -178,8 +182,8 @@ int main() {
         return Fail("Read G:\\SimpleTrianglePS.cso", ::GetLastError());
     }
 
-    // 3. Create Hardware D3D12X device (GTX 1650 Ti with MeshTier=10)
-    OpenScarlettD3D12SetPreferWarp(0);
+    // 3. Select the requested D3D12 device before checking mesh support.
+    OpenScarlettD3D12SetPreferWarp(use_warp ? 1 : 0);
     D3D12XBOX_CREATE_DEVICE_PARAMETERS dev_params{};
     dev_params.Version = 1;
 
@@ -192,8 +196,11 @@ int main() {
 
     D3D12XBOX_GPU_HARDWARE_INFO gpu_info{};
     hr = device->GetGpuHardwareInfoX(&gpu_info);
-    if (FAILED(hr) || gpu_info.IsWarp != 0u) {
-        return Fail("Expected hardware GPU adapter for Mesh Shaders", hr);
+    if (FAILED(hr)) {
+        return Fail("GetGpuHardwareInfoX", hr);
+    }
+    if ((gpu_info.IsWarp != 0u) != use_warp) {
+        return Fail("Adapter WARP mode mismatch", gpu_info.IsWarp);
     }
 
     // Exact Microsoft SimpleMeshShader.cpp feature support checks (SM 6.5 + MeshShaderTier >= 10)
@@ -514,8 +521,9 @@ int main() {
     }
 
     std::printf(
-        "[gdk_simple_mesh_shader] PASS | Adapter=%s (MeshTier=%u) | %ux%u | NonBG=%u | Colors=%zu | FNV1a=0x%016llX | %.2f ms\n",
+        "[gdk_simple_mesh_shader] PASS | Adapter=%s (%s, MeshTier=%u) | %ux%u | NonBG=%u | Colors=%zu | FNV1a=0x%016llX | %.2f ms\n",
         gpu_info.AdapterName,
+        use_warp ? "WARP" : "HW",
         static_cast<unsigned>(opt7.MeshShaderTier),
         out_w,
         out_h,
