@@ -827,8 +827,18 @@ void TestOfflineGdkSubsystemsParity() {
         auto** vtbl = *reinterpret_cast<void***>(disp_obj);
         using PfnGetHdr = XDisplayHdrModeResult(OPENSCARLETT_GDK_CALL*)(void*, XDisplayHdrModeInfo*);
         XDisplayHdrModeInfo info{};
-        (void)reinterpret_cast<PfnGetHdr>(vtbl[3])(disp_obj, &info);
-        OS_REQUIRE(info.maxToneMapLuminance > 0.0f);
+        const XDisplayHdrModeResult hdr_res = reinterpret_cast<PfnGetHdr>(vtbl[3])(disp_obj, &info);
+        if (hdr_res == XDisplayHdrModeResult_Enabled) {
+            OS_REQUIRE(info.maxToneMapLuminance > 0.0f);
+        } else {
+            OS_REQUIRE(hdr_res == XDisplayHdrModeResult_Disabled);
+            OS_REQUIRE(info.maxToneMapLuminance == 0.0f);
+        }
+        ::SetEnvironmentVariableA("OPENSCARLETT_FORCE_HDR", "1");
+        XDisplayHdrModeInfo forced_hdr{};
+        OS_REQUIRE(reinterpret_cast<PfnGetHdr>(vtbl[3])(disp_obj, &forced_hdr) == XDisplayHdrModeResult_Enabled);
+        OS_REQUIRE(forced_hdr.maxToneMapLuminance > 0.0f);
+        ::SetEnvironmentVariableA("OPENSCARLETT_FORCE_HDR", nullptr);
 
         XDisplayTimeoutDeferralHandle def = nullptr;
         OS_REQUIRE(XDisplayAcquireTimeoutDeferral(&def) == XGR_S_OK && def != nullptr);

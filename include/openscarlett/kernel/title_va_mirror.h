@@ -135,6 +135,10 @@ public:
     // Unregisters a region by base or interior Title-VA and releases owned resources.
     Status UnregisterRegion(uint64_t title_va);
 
+    // Unregisters all regions overlapping [range_start, range_start + byte_size) and cancels
+    // any pending GPU->CPU readbacks targeting them so recycled virtual pages are never clobbered.
+    uint64_t InvalidateOverlappingRange(uint64_t range_start, uint64_t byte_size);
+
     // Unregisters all regions and releases all owned CPU/GPU resources.
     void Clear();
 

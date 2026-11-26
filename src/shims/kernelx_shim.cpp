@@ -187,6 +187,33 @@ void AppendCoalescedRemapRange(std::vector<RemapWindowRange>& ranges,
     }
 }
 
+void NotifyActiveD3D12VirtualRemapRanges(const std::vector<RemapWindowRange>& ranges) noexcept {
+    if (ranges.empty()) {
+        return;
+    }
+#if defined(_WIN32)
+    using PfnInvalidateActiveRange = void(__stdcall*)(uint64_t, uint64_t);
+    static std::atomic<PfnInvalidateActiveRange> s_fn{nullptr};
+    PfnInvalidateActiveRange fn = s_fn.load(std::memory_order_acquire);
+    if (!fn) {
+        if (HMODULE hd3d = ::GetModuleHandleW(L"d3d12_xs.dll")) {
+            fn = reinterpret_cast<PfnInvalidateActiveRange>(
+                ::GetProcAddress(hd3d, "OpenScarlettD3D12InvalidateActiveVirtualRange"));
+            if (fn) {
+                s_fn.store(fn, std::memory_order_release);
+            }
+        }
+    }
+    if (fn) {
+        for (const auto& r : ranges) {
+            if (r.base != 0u && r.size != 0u) {
+                fn(static_cast<uint64_t>(r.base), static_cast<uint64_t>(r.size));
+            }
+        }
+    }
+#endif
+}
+
 constexpr const char* kModuleName = "kernelx.dll";
 
 // Xbox Series X (Anaconda): 16 GiB GDDR6 total -> 13.5 GiB title + 2.5 GiB tooling/OS.
@@ -802,6 +829,7 @@ struct PageFrameRecord {
     size_t page_size_bytes = kPage64KB;
     uint32_t alloc_flags = 0;
     uint32_t map_refcount = 0;
+    std::vector<uintptr_t> gpu_tile_vas;
 };
 
 struct ActiveTitleMapping {
@@ -812,6 +840,7 @@ struct ActiveTitleMapping {
     uint32_t alloc_flags = 0;
     uint32_t win32_protect = PAGE_READWRITE;
     bool owns_placeholder = false;
+    bool is_gpu_tile_view = false;
     std::vector<uint64_t> pfns;
     std::vector<void*> alias_ptrs;
 };
@@ -1498,6 +1527,7 @@ public:
         }
 
         std::vector<uint64_t> pools_to_free;
+        std::vector<RemapWindowRange> retired_tile_ranges;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (numberOfPages > pfn_table_.size()) {
@@ -1520,6 +1550,41 @@ public:
                 seen.emplace(pfn, it->second.physical_id);
             }
 
+            // Unmap any lingering GPU-only Slot31 tile views referencing these CPU-unmapped PFNs
+            // so physical section handles release cleanly without leaking PFNs or host commit.
+            std::vector<uintptr_t> stale_tile_vas;
+            for (uint64_t i = 0; i < numberOfPages; ++i) {
+                auto it = pfn_table_.find(pPageArray[i]);
+                if (it != pfn_table_.end() && !it->second.gpu_tile_vas.empty()) {
+                    stale_tile_vas.insert(
+                        stale_tile_vas.end(),
+                        it->second.gpu_tile_vas.begin(),
+                        it->second.gpu_tile_vas.end());
+                    it->second.gpu_tile_vas.clear();
+                }
+            }
+            if (!stale_tile_vas.empty()) {
+                std::sort(stale_tile_vas.begin(), stale_tile_vas.end());
+                stale_tile_vas.erase(
+                    std::unique(stale_tile_vas.begin(), stale_tile_vas.end()),
+                    stale_tile_vas.end());
+                for (uintptr_t tva : stale_tile_vas) {
+                    AppendCoalescedRemapRange(retired_tile_ranges, tva, kPage64KB);
+                }
+                auto tile_ranges_copy = retired_tile_ranges;
+                ScopedRemapWindow tile_unmap_guard(std::move(tile_ranges_copy));
+                for (uintptr_t tva : stale_tile_vas) {
+                    auto mit = mappings_.find(tva);
+                    if (mit != mappings_.end() && mit->second.is_gpu_tile_view &&
+                        !mit->second.owns_placeholder) {
+                        for (void* ap : mit->second.alias_ptrs) {
+                            (void)memory_.UnmapPhysicalAlias(ap);
+                        }
+                        mappings_.erase(mit);
+                    }
+                }
+            }
+
             for (uint64_t i = 0; i < numberOfPages; ++i) {
                 const uint64_t pfn = pPageArray[i];
                 auto it = pfn_table_.find(pfn);
@@ -1540,6 +1605,10 @@ public:
             }
         }
 
+        if (!retired_tile_ranges.empty()) {
+            NotifyActiveD3D12VirtualRemapRanges(retired_tile_ranges);
+        }
+
         for (uint64_t phys_id : pools_to_free) {
             Status st = memory_.FreePhysicalPages(phys_id);
             if (!st.ok()) {
@@ -1548,6 +1617,21 @@ public:
             }
         }
         return 1;
+    }
+
+    void detach_mapping_from_pfn_locked(const ActiveTitleMapping& m, uintptr_t slot_va) {
+        for (uint64_t pfn : m.pfns) {
+            auto pit = pfn_table_.find(pfn);
+            if (pit == pfn_table_.end()) {
+                continue;
+            }
+            if (m.is_gpu_tile_view) {
+                auto& gvas = pit->second.gpu_tile_vas;
+                gvas.erase(std::remove(gvas.begin(), gvas.end(), slot_va), gvas.end());
+            } else if (pit->second.map_refcount > 0) {
+                --pit->second.map_refcount;
+            }
+        }
     }
 
     void* MapPhysicalPages(void* virtualAddress,
@@ -1564,7 +1648,7 @@ public:
             return nullptr;
         }
 
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         std::vector<PageFrameRecord> frames;
         frames.reserve(static_cast<size_t>(numberOfPages));
         size_t page_bytes = 0;
@@ -1685,12 +1769,7 @@ public:
                     for (void* ap : ex_it->second.alias_ptrs) {
                         (void)memory_.UnmapPhysicalAlias(ap);
                     }
-                    for (uint64_t pfn : ex_it->second.pfns) {
-                        auto pit = pfn_table_.find(pfn);
-                        if (pit != pfn_table_.end() && pit->second.map_refcount > 0) {
-                            --pit->second.map_refcount;
-                        }
-                    }
+                    detach_mapping_from_pfn_locked(ex_it->second, slot_va);
                     mappings_.erase(ex_it);
                 }
             };
@@ -1736,6 +1815,7 @@ public:
                     AppendCoalescedRemapRange(remap_ranges, slot_va, page_bytes);
                 }
             }
+            std::vector<RemapWindowRange> notify_ranges = remap_ranges;
             ScopedRemapWindow remap_guard(std::move(remap_ranges));
 
             base_va = virtualAddress;
@@ -1775,6 +1855,8 @@ public:
                 mappings_[slot_va] = std::move(page_map);
                 newly_mapped_slots.push_back(slot_va);
             }
+            lock.unlock();
+            NotifyActiveD3D12VirtualRemapRanges(notify_ranges);
             return base_va;
         } else if (UnifiedMemoryManager::SupportsOsPlaceholders()) {
             // Reserve a properly aligned OS virtual placeholder (64 KiB or 4 MiB granule)
@@ -1869,11 +1951,13 @@ public:
             return 0;
         }
 
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<RemapWindowRange> notify_ranges;
+        std::unique_lock<std::mutex> lock(mutex_);
         const uintptr_t key = reinterpret_cast<uintptr_t>(virtualAddress);
         auto it = mappings_.find(key);
         if (it != mappings_.end() &&
             (numberOfPages == 0u || numberOfPages == it->second.pfns.size())) {
+            const size_t unmapped_bytes = it->second.size_bytes;
             for (void* alias_ptr : it->second.alias_ptrs) {
                 Status st = memory_.UnmapPhysicalAlias(alias_ptr);
                 if (!st.ok()) {
@@ -1884,13 +1968,11 @@ public:
             if (it->second.owns_placeholder) {
                 (void)memory_.ReleaseVirtualPlaceholder(virtualAddress);
             }
-            for (uint64_t pfn : it->second.pfns) {
-                auto pit = pfn_table_.find(pfn);
-                if (pit != pfn_table_.end() && pit->second.map_refcount > 0) {
-                    --pit->second.map_refcount;
-                }
-            }
+            detach_mapping_from_pfn_locked(it->second, key);
             mappings_.erase(it);
+            AppendCoalescedRemapRange(notify_ranges, key, unmapped_bytes);
+            lock.unlock();
+            NotifyActiveD3D12VirtualRemapRanges(notify_ranges);
             return 1;
         }
 
@@ -1917,16 +1999,14 @@ public:
                 for (void* alias_ptr : sit->second.alias_ptrs) {
                     (void)memory_.UnmapPhysicalAlias(alias_ptr);
                 }
-                for (uint64_t pfn : sit->second.pfns) {
-                    auto pit = pfn_table_.find(pfn);
-                    if (pit != pfn_table_.end() && pit->second.map_refcount > 0) {
-                        --pit->second.map_refcount;
-                    }
-                }
+                detach_mapping_from_pfn_locked(sit->second, slot_va);
                 mappings_.erase(sit);
+                AppendCoalescedRemapRange(notify_ranges, slot_va, page_bytes);
                 unmapped_any = true;
             }
             if (unmapped_any) {
+                lock.unlock();
+                NotifyActiveD3D12VirtualRemapRanges(notify_ranges);
                 return 1;
             }
             void* ph_base = nullptr;
@@ -1970,7 +2050,8 @@ public:
             desired[va] = tok;
         }
 
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<RemapWindowRange> notify_ranges;
+        std::unique_lock<std::mutex> lock(mutex_);
 
         struct ValidatedScatterOp {
             uintptr_t slot_va = 0u;
@@ -1993,6 +2074,9 @@ public:
                 return 0;
             }
             if (tok == 0ull || tok == kUnmapSlotToken) {
+                if (ex_it != mappings_.end()) {
+                    AppendCoalescedRemapRange(notify_ranges, slot_va, kPage64KB);
+                }
                 ops.push_back(ValidatedScatterOp{slot_va, true, 0ull, {}});
                 continue;
             }
@@ -2002,12 +2086,14 @@ public:
                 return 0;
             }
             if (ex_it != mappings_.end() &&
+                !ex_it->second.is_gpu_tile_view &&
                 ex_it->second.pfns.size() == 1u &&
                 ex_it->second.pfns[0] == tok) {
                 continue;  // Already mapped to the exact requested PFN.
             }
             if (ex_it != mappings_.end()) {
                 AppendCoalescedRemapRange(remap_ranges, slot_va, kPage64KB);
+                AppendCoalescedRemapRange(notify_ranges, slot_va, kPage64KB);
             }
             ops.push_back(ValidatedScatterOp{slot_va, false, tok, pit->second});
         }
@@ -2026,12 +2112,7 @@ public:
             for (void* ap : ex_it->second.alias_ptrs) {
                 (void)memory_.UnmapPhysicalAlias(ap);
             }
-            for (uint64_t pfn : ex_it->second.pfns) {
-                auto pit = pfn_table_.find(pfn);
-                if (pit != pfn_table_.end() && pit->second.map_refcount > 0) {
-                    --pit->second.map_refcount;
-                }
-            }
+            detach_mapping_from_pfn_locked(ex_it->second, slot_va);
             mappings_.erase(ex_it);
             return true;
         };
@@ -2119,6 +2200,8 @@ public:
                 return 0;
             }
         }
+        lock.unlock();
+        NotifyActiveD3D12VirtualRemapRanges(notify_ranges);
         SetHostLastError(0u);
         return 1;
     }
@@ -2269,12 +2352,7 @@ public:
                     for (void* ap : ex_it->second.alias_ptrs) {
                         (void)memory_.UnmapPhysicalAlias(ap);
                     }
-                    for (uint64_t pfn : ex_it->second.pfns) {
-                        auto pit = pfn_table_.find(pfn);
-                        if (pit != pfn_table_.end() && pit->second.map_refcount > 0) {
-                            --pit->second.map_refcount;
-                        }
-                    }
+                    detach_mapping_from_pfn_locked(ex_it->second, slot_va);
                     mappings_.erase(ex_it);
                 }
                 continue;
@@ -2295,12 +2373,7 @@ public:
                 for (void* ap : ex_it->second.alias_ptrs) {
                     (void)memory_.UnmapPhysicalAlias(ap);
                 }
-                for (uint64_t old_pfn : ex_it->second.pfns) {
-                    auto opit = pfn_table_.find(old_pfn);
-                    if (opit != pfn_table_.end() && opit->second.map_refcount > 0) {
-                        --opit->second.map_refcount;
-                    }
-                }
+                detach_mapping_from_pfn_locked(ex_it->second, slot_va);
                 mappings_.erase(ex_it);
             }
             void* slot = reinterpret_cast<void*>(slot_va);
@@ -2340,9 +2413,13 @@ public:
                 page_map.alloc_flags = MEM_GRAPHICS | frame.alloc_flags;
                 page_map.win32_protect = PAGE_READWRITE;
                 page_map.owns_placeholder = false;
+                page_map.is_gpu_tile_view = true;
                 page_map.pfns.push_back(want_pfn);
                 page_map.alias_ptrs.push_back(out_alias.host_ptr);
-                ++pfn_table_[want_pfn].map_refcount;
+                auto& gvas = pfn_table_[want_pfn].gpu_tile_vas;
+                if (std::find(gvas.begin(), gvas.end(), slot_va) == gvas.end()) {
+                    gvas.push_back(slot_va);
+                }
                 mappings_[slot_va] = std::move(page_map);
             }
         }

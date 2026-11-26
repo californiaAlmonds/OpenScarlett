@@ -14893,6 +14893,22 @@ void DeviceX::InvalidateVirtualRangeOnTileRemap(
 
     (void)NotifyVirtualRemap(guest_va_base, byte_size, 0ull, nullptr);
 
+    // Cancel pending GPU->CPU mirror readbacks and unregister mirrored regions overlapping the
+    // remapped/unmapped virtual pages so recycled CPU pools are never overwritten by stale GPU copies.
+    if (title_va_mirror_.InvalidateOverlappingRange(guest_va_base, byte_size) > 0ull) {
+        std::lock_guard<std::mutex> lock(mirrored_res_mutex_);
+        for (auto it = mirrored_res_to_va_.begin(); it != mirrored_res_to_va_.end();) {
+            openscarlett::TitleVaRegionInfo rinfo{};
+            if (!title_va_mirror_.LookupRegion(it->second, rinfo)) {
+                it = mirrored_res_to_va_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        mirrored_va_count_.store(
+            static_cast<uint32_t>(mirrored_res_to_va_.size()), std::memory_order_release);
+    }
+
     // Evict cached placed textures whose virtual span overlaps the remapped/unmapped tile range.
     {
         std::lock_guard<std::mutex> lock(placed_tex_va_mutex_);

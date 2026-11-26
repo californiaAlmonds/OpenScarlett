@@ -4362,6 +4362,55 @@ HRESULT CreateWrappedDeviceInternal(
                         }
                     }
                 }
+                // Guard transient null streamed archetype (`[entity+0x20] == NULL`) during async world
+                // entity instantiation (+0x52912B4 `mov rax, [rbx+50h]` and +0x4E8F49A `mov eax, [rcx+rax*4+8]`):
+                // return cleanly via each function's own epilogue rather than faulting worker threads.
+                if (code == EXCEPTION_ACCESS_VIOLATION &&
+                    ep->ExceptionRecord->NumberParameters >= 2u &&
+                    ep->ExceptionRecord->ExceptionInformation[0] == 0u) {
+                    const uint64_t av_addr = ep->ExceptionRecord->ExceptionInformation[1];
+                    HMODULE hit_mod = nullptr;
+                    const HMODULE main_exe = ::GetModuleHandleW(nullptr);
+                    if (main_exe &&
+                        ::GetModuleHandleExA(
+                            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(rip), &hit_mod) &&
+                        hit_mod == main_exe) {
+                        // Case A (+0x52912B4): `48 8B 43 50` (`mov rax, [rbx+50h]`) with rbx==0, rcx==0x10D,
+                        // and epilogue at rip+0x1A0 (`48 83 C4 28 5B 5D 5F 5E`).
+                        if (av_addr == 0x50ull &&
+                            ep->ContextRecord->Rbx == 0ull &&
+                            ep->ContextRecord->Rcx == 0x10Dull &&
+                            IsReadableRetailRange(reinterpret_cast<uintptr_t>(rip), 0x1A8u) &&
+                            rip[0] == 0x48u && rip[1] == 0x8Bu && rip[2] == 0x43u && rip[3] == 0x50u &&
+                            rip[0x1A0] == 0x48u && rip[0x1A1] == 0x83u &&
+                            rip[0x1A2] == 0xC4u && rip[0x1A3] == 0x28u &&
+                            rip[0x1A4] == 0x5Bu && rip[0x1A5] == 0x5Du) {
+                            static std::atomic<uint32_t> s_null_arch_a{0u};
+                            const uint32_t an = s_null_arch_a.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                            if (an <= 8u) {
+                                std::fprintf(stderr,
+                                             "[OpenScarlett][VEH-GUARD] Null entity archetype at +0x%llX #%u (entity=0x%llX) -> epilogue\n",
+                                             static_cast<unsigned long long>(
+                                                 reinterpret_cast<uintptr_t>(rip) - reinterpret_cast<uintptr_t>(main_exe)),
+                                             an,
+                                             static_cast<unsigned long long>(ep->ContextRecord->Rsi));
+                                std::fflush(stderr);
+                            }
+                            ep->ContextRecord->Rip = reinterpret_cast<uintptr_t>(rip) + 0x1A0u;
+                            return EXCEPTION_CONTINUE_EXECUTION;
+                        }
+                        // Case B (+0x4E8F49A): `8B 44 81 08` (`mov eax, [rcx+rax*4+8]`) with rcx < 0x10000
+                        // and leaf `xor eax, eax; ret` (`31 C0 C3`) at rip + 11.
+                        if (ep->ContextRecord->Rcx < 0x10000ull &&
+                            IsReadableRetailRange(reinterpret_cast<uintptr_t>(rip), 14u) &&
+                            rip[0] == 0x8Bu && rip[1] == 0x44u && rip[2] == 0x81u && rip[3] == 0x08u &&
+                            rip[11] == 0x31u && rip[12] == 0xC0u && rip[13] == 0xC3u) {
+                            ep->ContextRecord->Rip = reinterpret_cast<uintptr_t>(rip) + 11u;
+                            return EXCEPTION_CONTINUE_EXECUTION;
+                        }
+                    }
+                }
                 return EXCEPTION_CONTINUE_SEARCH;
             });
             ::SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
@@ -4986,6 +5035,18 @@ OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12NotifyVirtualRemap(
     hr = um->NotifyVirtualRemap(guest_va_base, byte_size, new_backing_va, out_flagged_count);
     um->Release();
     return hr;
+}
+
+OPENSCARLETT_D3D12_API void WINAPI OpenScarlettD3D12InvalidateActiveVirtualRange(
+    uint64_t guest_va_base,
+    uint64_t byte_size) {
+    if (guest_va_base == 0ull || byte_size == 0ull) {
+        return;
+    }
+    if (auto* active = AcquireActiveDevice()) {
+        active->InvalidateVirtualRangeOnTileRemap(guest_va_base, byte_size);
+        active->Release();
+    }
 }
 
 OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12FlushDirtyUnifiedTextures(

@@ -415,6 +415,46 @@ Status TitleVAMirror::UnregisterRegion(uint64_t title_va) {
     return Status::Ok();
 }
 
+uint64_t TitleVAMirror::InvalidateOverlappingRange(uint64_t range_start, uint64_t byte_size) {
+    if (range_start == 0ull || byte_size == 0ull) {
+        return 0ull;
+    }
+    const uint64_t range_end =
+        (range_start > UINT64_MAX - byte_size) ? UINT64_MAX : (range_start + byte_size);
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (regions_.empty()) {
+        return 0ull;
+    }
+
+    std::vector<uint64_t> removed_vas;
+    for (auto it = regions_.begin(); it != regions_.end();) {
+        const uint64_t reg_start = it->title_va;
+        const uint64_t reg_end =
+            (reg_start > UINT64_MAX - it->size_bytes) ? UINT64_MAX : (reg_start + it->size_bytes);
+        if (reg_start < range_end && range_start < reg_end) {
+            removed_vas.push_back(reg_start);
+            ReleaseEntryResources(*it);
+            it = regions_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    if (!removed_vas.empty() && !pending_readbacks_.empty()) {
+        pending_readbacks_.erase(
+            std::remove_if(pending_readbacks_.begin(),
+                           pending_readbacks_.end(),
+                           [&removed_vas](const PendingReadback& rb) noexcept {
+                               return std::find(removed_vas.begin(),
+                                                removed_vas.end(),
+                                                rb.title_va) != removed_vas.end();
+                           }),
+            pending_readbacks_.end());
+    }
+    return static_cast<uint64_t>(removed_vas.size());
+}
+
 void TitleVAMirror::Clear() {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     pending_readbacks_.clear();
@@ -892,6 +932,36 @@ Status TitleVAMirror::CompleteReadbacksOnFence(uint64_t completed_fence_value,
         }
 
         auto* cpu_bytes = static_cast<uint8_t*>(entry.cpu_backing_ptr);
+        bool cpu_range_writable = true;
+        {
+            uintptr_t cur = reinterpret_cast<uintptr_t>(cpu_bytes + rb.offset);
+            size_t rem = static_cast<size_t>(rb.size_bytes);
+            while (rem > 0u) {
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (::VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi)) == 0u ||
+                    mbi.State != MEM_COMMIT ||
+                    (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0u ||
+                    (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                                    PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0u) {
+                    cpu_range_writable = false;
+                    break;
+                }
+                const uintptr_t seg_end =
+                    reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+                if (seg_end <= cur) {
+                    cpu_range_writable = false;
+                    break;
+                }
+                const size_t step = std::min(rem, static_cast<size_t>(seg_end - cur));
+                cur += step;
+                rem -= step;
+            }
+        }
+        if (!cpu_range_writable) {
+            const D3D12_RANGE empty_write{0, 0};
+            entry.readback_staging->Unmap(0u, &empty_write);
+            continue;
+        }
         std::memcpy(cpu_bytes + rb.offset,
                     readback_ptr + rb.offset,
                     static_cast<size_t>(rb.size_bytes));

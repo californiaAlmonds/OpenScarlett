@@ -28,6 +28,7 @@ EXPORTS
     OpenScarlettD3D12RegisterUnifiedTexture
     OpenScarlettD3D12UnregisterUnifiedTexture
     OpenScarlettD3D12NotifyVirtualRemap
+    OpenScarlettD3D12InvalidateActiveVirtualRange
     OpenScarlettD3D12FlushDirtyUnifiedTextures
     OpenScarlettD3D12GetUnifiedTextureStats
     OpenScarlettD3D12GetTelemetryDetail
