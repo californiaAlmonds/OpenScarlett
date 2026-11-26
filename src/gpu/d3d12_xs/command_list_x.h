@@ -199,6 +199,8 @@ struct DeferredCpuWait {
     uint64_t mask = 0ull;
     D3D12XBOX_WAIT_VALUE_OP op = D3D12XBOX_WAIT_VALUE_OP_ALWAYS;
     bool is_64bit = false;
+    uint32_t prior_write_count = 0u;
+    uint32_t list_index = 0u;
 };
 
 // {4F534431-3258-4241-5200-000000000032}
@@ -496,6 +498,7 @@ public:
         uint32_t Flags,
         D3D12_GPU_VIRTUAL_ADDRESS BaseAddress,
         SIZE_T SizeInBytes) override;
+    void* AllocateUploadX(uint64_t size_bytes, uint64_t alignment);
 
     // Inspection helper for tests/runtime diagnostics.
     void GetDepthBiasXState(
@@ -711,6 +714,16 @@ private:
     UINT guest_stencil_ref_ = 0u;
     ID3D12Resource* ei_sync_dummy_buf_ = nullptr;
     std::atomic<bool> last_close_failed_{false};
+    std::atomic<bool> is_closed_{false};
+    struct UploadArenaPage {
+        ID3D12Resource* buffer = nullptr;
+        uint8_t* cpu_ptr = nullptr;
+        UINT64 capacity = 0ull;
+        UINT64 cursor = 0ull;
+    };
+    std::mutex upload_arena_mutex_;
+    std::vector<UploadArenaPage> upload_arena_pages_;
+    void RetireUploadArenaPages(bool immediate_release) noexcept;
     mutable std::mutex diag_ops_mutex_;
     std::vector<std::string> diag_ops_;
 

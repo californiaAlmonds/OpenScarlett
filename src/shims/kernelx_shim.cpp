@@ -98,6 +98,95 @@ using openscarlett::Status;
 using openscarlett::UnifiedMemoryAlias;
 using openscarlett::UnifiedMemoryManager;
 
+// Tracks active 64 KiB physical view-swap windows around UnmapPhysicalAlias -> MapPhysicalAlias
+// (UnmapViewOfFile2 -> MapViewOfFile3) so concurrent worker threads hitting a mid-remap page
+// fault can spin/synchronize in a first-chance VEH and retry cleanly once MEM_COMMIT is restored.
+// Adapted with MIT attribution from R0Y00/Xbox2Windows (src/xmem_mapped_pages.cpp:433-495).
+struct RemapWindowRange {
+    uintptr_t base = 0u;
+    size_t size = 0u;
+};
+
+struct RemapWindowTracker {
+#if defined(_WIN32)
+    SRWLOCK lock = SRWLOCK_INIT;
+#else
+    mutable std::mutex lock;
+#endif
+    std::vector<RemapWindowRange> ranges;
+    std::atomic<uint64_t> generation{0ull};  // Odd while a view-swap window is active, even when finished.
+};
+
+RemapWindowTracker& GetRemapWindowTracker() noexcept {
+    static RemapWindowTracker tracker;
+    return tracker;
+}
+
+thread_local bool g_in_remap_window_thread = false;
+
+class ScopedRemapWindow {
+public:
+    explicit ScopedRemapWindow(std::vector<RemapWindowRange>&& new_ranges) noexcept {
+        if (new_ranges.empty()) {
+            return;
+        }
+        active_ = true;
+        g_in_remap_window_thread = true;
+        auto& t = GetRemapWindowTracker();
+#if defined(_WIN32)
+        ::AcquireSRWLockExclusive(&t.lock);
+        t.ranges = std::move(new_ranges);
+        const uint64_t prev = t.generation.load(std::memory_order_relaxed);
+        t.generation.store((prev & ~1ull) + 1ull, std::memory_order_release);
+        ::ReleaseSRWLockExclusive(&t.lock);
+#else
+        std::lock_guard<std::mutex> lk(t.lock);
+        t.ranges = std::move(new_ranges);
+        const uint64_t prev = t.generation.load(std::memory_order_relaxed);
+        t.generation.store((prev & ~1ull) + 1ull, std::memory_order_release);
+#endif
+    }
+
+    ~ScopedRemapWindow() noexcept {
+        if (!active_) {
+            return;
+        }
+        auto& t = GetRemapWindowTracker();
+#if defined(_WIN32)
+        ::AcquireSRWLockExclusive(&t.lock);
+        const uint64_t cur = t.generation.load(std::memory_order_relaxed);
+        t.generation.store(cur + 1ull, std::memory_order_release);
+        ::ReleaseSRWLockExclusive(&t.lock);
+#else
+        {
+            std::lock_guard<std::mutex> lk(t.lock);
+            const uint64_t cur = t.generation.load(std::memory_order_relaxed);
+            t.generation.store(cur + 1ull, std::memory_order_release);
+        }
+#endif
+        g_in_remap_window_thread = false;
+    }
+
+    ScopedRemapWindow(const ScopedRemapWindow&) = delete;
+    ScopedRemapWindow& operator=(const ScopedRemapWindow&) = delete;
+
+private:
+    bool active_ = false;
+};
+
+void AppendCoalescedRemapRange(std::vector<RemapWindowRange>& ranges,
+                               uintptr_t base,
+                               size_t size) {
+    if (size == 0u) {
+        return;
+    }
+    if (!ranges.empty() && ranges.back().base + ranges.back().size == base) {
+        ranges.back().size += size;
+    } else {
+        ranges.push_back(RemapWindowRange{base, size});
+    }
+}
+
 constexpr const char* kModuleName = "kernelx.dll";
 
 // Xbox Series X (Anaconda): 16 GiB GDDR6 total -> 13.5 GiB title + 2.5 GiB tooling/OS.
@@ -1640,6 +1729,15 @@ public:
             // Map placeholder targets at individual page granularity (64 KiB / 4 MiB) so subsequent
             // XMemMapPhysicalPagesScatter or partial XMemUnmapPhysicalPages calls can atomically
             // remap or unmap any subset of pages without disturbing adjacent mapped pages.
+            std::vector<RemapWindowRange> remap_ranges;
+            for (uint64_t i = 0; i < numberOfPages; ++i) {
+                const uintptr_t slot_va = req + static_cast<size_t>(i) * page_bytes;
+                if (mappings_.find(slot_va) != mappings_.end()) {
+                    AppendCoalescedRemapRange(remap_ranges, slot_va, page_bytes);
+                }
+            }
+            ScopedRemapWindow remap_guard(std::move(remap_ranges));
+
             base_va = virtualAddress;
             std::vector<uintptr_t> newly_mapped_slots;
             newly_mapped_slots.reserve(static_cast<size_t>(numberOfPages));
@@ -1856,8 +1954,11 @@ public:
             return 0;
         }
 
+        constexpr uint64_t kUnmapSlotToken = UINT64_MAX;
+
         // Deduplicate by 64 KiB page address (last write in batch wins, matching Scarlett &
         // MIT-licensed R0Y00/Xbox2Windows local_apply_locked semantics).
+        // UINT64_MAX (or tokens == nullptr) explicitly unmaps the slot to a MEM_RESERVE placeholder.
         std::map<uintptr_t, uint64_t> desired;
         for (uint64_t i = 0u; i < count; ++i) {
             const uintptr_t va = reinterpret_cast<uintptr_t>(addresses[i]);
@@ -1865,22 +1966,60 @@ public:
                 SetHostLastError(87u);
                 return 0;
             }
-            const uint64_t tok =
-                (tokens != nullptr)
-                    ? ((tokens[i] == ~0ull || tokens[i] == 0xFFFFFFFFull) ? 0ull : tokens[i])
-                    : 0ull;
+            const uint64_t tok = (tokens != nullptr) ? tokens[i] : kUnmapSlotToken;
             desired[va] = tok;
         }
 
         std::lock_guard<std::mutex> lock(mutex_);
 
-        auto unmap_slot_locked = [&](uintptr_t slot_va) -> bool {
+        struct ValidatedScatterOp {
+            uintptr_t slot_va = 0u;
+            bool is_unmap = false;
+            uint64_t pfn = 0ull;
+            PageFrameRecord frame{};
+        };
+        std::vector<ValidatedScatterOp> ops;
+        ops.reserve(desired.size());
+        std::vector<RemapWindowRange> remap_ranges;
+
+        // Validate all non-UINT64_MAX tokens up front BEFORE unmapping any existing view so an
+        // invalid token never partially mutates mappings or leaves an unmapped hole.
+        for (const auto& [slot_va, tok] : desired) {
             auto ex_it = mappings_.find(slot_va);
-            if (ex_it == mappings_.end() || ex_it->second.owns_placeholder) {
+            if (ex_it != mappings_.end() && ex_it->second.size_bytes != kPage64KB) {
+                SetHostLastError(87u);
+                return 0;
+            }
+            if (tok == kUnmapSlotToken) {
+                ops.push_back(ValidatedScatterOp{slot_va, true, 0ull, {}});
+                continue;
+            }
+            auto pit = pfn_table_.find(tok);
+            if (pit == pfn_table_.end() || pit->second.page_size_bytes != kPage64KB) {
+                SetHostLastError(87u);
+                return 0;
+            }
+            if (ex_it != mappings_.end() &&
+                ex_it->second.pfns.size() == 1u &&
+                ex_it->second.pfns[0] == tok) {
+                continue;  // Already mapped to the exact requested PFN.
+            }
+            if (ex_it != mappings_.end()) {
+                AppendCoalescedRemapRange(remap_ranges, slot_va, kPage64KB);
+            }
+            ops.push_back(ValidatedScatterOp{slot_va, false, tok, pit->second});
+        }
+
+        auto unmap_slot_locked = [&](uintptr_t slot_va, bool* out_prev_owns_ph = nullptr) -> bool {
+            if (out_prev_owns_ph) {
+                *out_prev_owns_ph = false;
+            }
+            auto ex_it = mappings_.find(slot_va);
+            if (ex_it == mappings_.end() || ex_it->second.size_bytes != kPage64KB) {
                 return false;
             }
-            if (ex_it->second.size_bytes != kPage64KB) {
-                return false;
+            if (out_prev_owns_ph) {
+                *out_prev_owns_ph = ex_it->second.owns_placeholder;
             }
             for (void* ap : ex_it->second.alias_ptrs) {
                 (void)memory_.UnmapPhysicalAlias(ap);
@@ -1897,7 +2036,8 @@ public:
 
         auto map_slot_locked = [&](uintptr_t slot_va,
                                    const PageFrameRecord& frame,
-                                   uint64_t pfn) -> bool {
+                                   uint64_t pfn,
+                                   bool owns_placeholder) -> bool {
             void* slot = reinterpret_cast<void*>(slot_va);
             const MemoryProtection prot = MemoryProtection::ReadWrite;
             const uint32_t mem_flags = ToUnifiedFlags(MEM_GRAPHICS | frame.alloc_flags, PAGE_READWRITE);
@@ -1936,7 +2076,7 @@ public:
             page_map.primary_physical_id = frame.physical_id;
             page_map.alloc_flags = MEM_GRAPHICS | frame.alloc_flags;
             page_map.win32_protect = PAGE_READWRITE;
-            page_map.owns_placeholder = false;
+            page_map.owns_placeholder = owns_placeholder;
             page_map.pfns.push_back(pfn);
             page_map.alias_ptrs.push_back(out_alias.host_ptr);
             ++pfn_table_[pfn].map_refcount;
@@ -1944,56 +2084,37 @@ public:
             return true;
         };
 
-        for (const auto& [slot_va, tok] : desired) {
-            if (tok == 0ull) {
-                (void)unmap_slot_locked(slot_va);
+        ScopedRemapWindow remap_guard(std::move(remap_ranges));
+
+        for (const auto& op : ops) {
+            if (op.is_unmap) {
+                (void)unmap_slot_locked(op.slot_va);
+#if defined(_WIN32)
+                (void)memory_.PromoteReservedRangeToPlaceholder(
+                    reinterpret_cast<void*>(op.slot_va), kPage64KB);
+#endif
                 continue;
             }
-            auto ex_it = mappings_.find(slot_va);
-            if (ex_it != mappings_.end() &&
-                ex_it->second.size_bytes == kPage64KB &&
-                ex_it->second.pfns.size() == 1u &&
-                ex_it->second.pfns[0] == tok) {
-                continue;  // Already mapped to the exact requested PFN!
+            bool has_prev = false;
+            uint64_t prev_pfn = 0ull;
+            PageFrameRecord prev_frame{};
+            bool prev_owns_ph = false;
+            auto ex_it = mappings_.find(op.slot_va);
+            if (ex_it != mappings_.end() && !ex_it->second.pfns.empty()) {
+                prev_pfn = ex_it->second.pfns[0];
+                auto old_pit = pfn_table_.find(prev_pfn);
+                if (old_pit != pfn_table_.end()) {
+                    has_prev = true;
+                    prev_frame = old_pit->second;
+                }
             }
-            auto pit = pfn_table_.find(tok);
-            if (pit == pfn_table_.end() || pit->second.page_size_bytes != kPage64KB) {
-                if (count == 1u) {
-                    SetHostLastError(87u);
-                    return 0;
+            (void)unmap_slot_locked(op.slot_va, &prev_owns_ph);
+            if (!map_slot_locked(op.slot_va, op.frame, op.pfn, prev_owns_ph)) {
+                if (has_prev) {
+                    (void)map_slot_locked(op.slot_va, prev_frame, prev_pfn, prev_owns_ph);
                 }
-                static std::atomic<uint32_t> s_scatter_warn{0u};
-                const uint32_t wn = s_scatter_warn.fetch_add(1u, std::memory_order_relaxed) + 1u;
-                if (wn <= 16u) {
-                    std::fprintf(
-                        stderr,
-                        "[OpenScarlett][kernelx] MapPhysicalPagesScatter skipped unowned tok=0x%llX at va=%p (batch=%llu)\n",
-                        static_cast<unsigned long long>(tok),
-                        reinterpret_cast<void*>(slot_va),
-                        static_cast<unsigned long long>(count));
-                    std::fflush(stderr);
-                }
-                (void)unmap_slot_locked(slot_va);
-                continue;
-            }
-            const PageFrameRecord frame = pit->second;
-            (void)unmap_slot_locked(slot_va);
-            if (!map_slot_locked(slot_va, frame, tok)) {
-                if (count == 1u) {
-                    SetHostLastError(487u);
-                    return 0;
-                }
-                static std::atomic<uint32_t> s_scatter_map_err{0u};
-                const uint32_t mn = s_scatter_map_err.fetch_add(1u, std::memory_order_relaxed) + 1u;
-                if (mn <= 16u) {
-                    std::fprintf(
-                        stderr,
-                        "[OpenScarlett][kernelx] MapPhysicalPagesScatter alias FAIL tok=0x%llX at va=%p (batch=%llu)\n",
-                        static_cast<unsigned long long>(tok),
-                        reinterpret_cast<void*>(slot_va),
-                        static_cast<unsigned long long>(count));
-                    std::fflush(stderr);
-                }
+                SetHostLastError(487u);
+                return 0;
             }
         }
         SetHostLastError(0u);
@@ -2121,6 +2242,20 @@ public:
             }
         }
 
+        std::vector<RemapWindowRange> tile_remap_ranges;
+        for (const auto& [slot_va, want_pfn] : edits) {
+            if (want_pfn == kKeepTileSentinel || want_pfn == 0ull) {
+                continue;
+            }
+            auto ex_it = mappings_.find(slot_va);
+            if (ex_it != mappings_.end() &&
+                ex_it->second.size_bytes == kPage64KB &&
+                !(ex_it->second.pfns.size() == 1u && ex_it->second.pfns[0] == want_pfn)) {
+                AppendCoalescedRemapRange(tile_remap_ranges, slot_va, kPage64KB);
+            }
+        }
+        ScopedRemapWindow tile_remap_guard(std::move(tile_remap_ranges));
+
         for (const auto& [slot_va, want_pfn] : edits) {
             if (want_pfn == kKeepTileSentinel) {
                 continue;
@@ -2210,6 +2345,88 @@ public:
             }
         }
         return kHrBatchOk;
+    }
+
+    int32_t RetryRemappedPageFault(uintptr_t faultVirtualAddress) const {
+        if (g_in_remap_window_thread || faultVirtualAddress < 0x10000u) {
+            return 0;
+        }
+        const uintptr_t page = faultVirtualAddress & ~(uintptr_t{kPage64KB} - 1u);
+        auto& tracker = GetRemapWindowTracker();
+        bool inside = false;
+        uint64_t seen = 0ull;
+#if defined(_WIN32)
+        ::AcquireSRWLockShared(&tracker.lock);
+        for (const auto& r : tracker.ranges) {
+            if (faultVirtualAddress >= r.base && (faultVirtualAddress - r.base) < r.size) {
+                inside = true;
+                break;
+            }
+        }
+        seen = tracker.generation.load(std::memory_order_acquire);
+        ::ReleaseSRWLockShared(&tracker.lock);
+#else
+        {
+            std::lock_guard<std::mutex> lk(tracker.lock);
+            for (const auto& r : tracker.ranges) {
+                if (faultVirtualAddress >= r.base && (faultVirtualAddress - r.base) < r.size) {
+                    inside = true;
+                    break;
+                }
+            }
+            seen = tracker.generation.load(std::memory_order_acquire);
+        }
+#endif
+        if (!inside || seen == 0ull) {
+            return 0;
+        }
+
+        const uint64_t break_id = (seen & 1ull) ? seen : (seen - 1ull);
+        thread_local uintptr_t tl_retried_page = 0u;
+        thread_local uint64_t tl_retried_break = 0ull;
+        if (tl_retried_page == page && tl_retried_break == break_id) {
+            return 0;
+        }
+
+        for (uint32_t spin = 0u;
+             tracker.generation.load(std::memory_order_acquire) == break_id && spin < 4096u;
+             ++spin) {
+#if defined(_WIN32)
+            if (spin < 64u) {
+                YieldProcessor();
+            } else {
+                ::SwitchToThread();
+            }
+#endif
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        bool mapped_in_state = false;
+        auto direct_it = mappings_.find(page);
+        if (direct_it != mappings_.end() && direct_it->second.size_bytes >= kPage64KB) {
+            mapped_in_state = true;
+        } else {
+            for (const auto& [base, m] : mappings_) {
+                if (page >= base && page < base + m.size_bytes) {
+                    mapped_in_state = true;
+                    break;
+                }
+            }
+        }
+        if (!mapped_in_state) {
+            return 0;
+        }
+#if defined(_WIN32)
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (::VirtualQuery(reinterpret_cast<LPCVOID>(page), &mbi, sizeof(mbi)) == 0u ||
+            mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0u) {
+            return 0;
+        }
+#endif
+        tl_retried_page = page;
+        tl_retried_break = break_id;
+        return 1;
     }
 
     int32_t QueryPhysicalPages(const void* virtualAddress,
@@ -4307,6 +4524,10 @@ int32_t OPENSCARLETT_KERNELX_CALL OpenScarlettMapTilePageBatch(
     uint32_t flags) {
     return KernelXState::Instance().MapTilePageBatch(
         batchCount, batches, poolBaseVa, poolPages, flags);
+}
+
+int32_t OPENSCARLETT_KERNELX_CALL OpenScarlettRetryRemappedPageFault(uintptr_t faultVirtualAddress) {
+    return KernelXState::Instance().RetryRemappedPageFault(faultVirtualAddress);
 }
 
 void* OPENSCARLETT_KERNELX_CALL KernelXVirtualAllocFromApp(void* baseAddress,

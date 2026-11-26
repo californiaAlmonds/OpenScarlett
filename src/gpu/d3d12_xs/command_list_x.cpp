@@ -382,6 +382,7 @@ CommandListX::~CommandListX() {
     ReleaseAlignedStagingRing();
     ReleaseTiledTransientResources();
     ReleaseAllAlignTransientResources();
+    RetireUploadArenaPages(/*immediate_release=*/false);
     if (ei_sync_dummy_buf_) {
         ei_sync_dummy_buf_->Release();
         ei_sync_dummy_buf_ = nullptr;
@@ -633,6 +634,7 @@ HRESULT STDMETHODCALLTYPE CommandListX::Close() {
         }
     }
     const HRESULT hr = host_list_->Close();
+    is_closed_.store(true, std::memory_order_release);
     if (device_x_) {
         device_x_->CheckCpuDeviceRemoved(
             "CommandListX::Close", static_cast<uint64_t>(hr), static_cast<uint64_t>(list_type_));
@@ -722,6 +724,8 @@ void CommandListX::ExtractTransientResources(std::vector<ID3D12Resource*>& out) 
 HRESULT STDMETHODCALLTYPE CommandListX::Reset(
     ID3D12CommandAllocator* pAllocator, ID3D12PipelineState* pInitialState) {
     last_close_failed_.store(false, std::memory_order_release);
+    is_closed_.store(false, std::memory_order_release);
+    RetireUploadArenaPages(/*immediate_release=*/false);
     last_pso_is_standin_ = false;
     last_gfx_rs_is_empty_ = false;
     last_cmp_rs_is_empty_ = false;
@@ -5564,7 +5568,13 @@ void STDMETHODCALLTYPE CommandListX::Wait32BitValueX(
     if (Address != 0ull) {
         std::lock_guard<std::mutex> lock(aaa_rec_mutex_);
         deferred_cpu_waits_.push_back(DeferredCpuWait{
-            Address, static_cast<uint64_t>(Value), static_cast<uint64_t>(Mask), Operation, false});
+            Address,
+            static_cast<uint64_t>(Value),
+            static_cast<uint64_t>(Mask),
+            Operation,
+            false,
+            static_cast<uint32_t>(deferred_cpu_writes_.size()),
+            0u});
     }
     if (host_list_) {
         const D3D12_COMMAND_LIST_TYPE list_type = host_list_->GetType();
@@ -5586,7 +5596,14 @@ void STDMETHODCALLTYPE CommandListX::Wait64BitValueX(
     D3D12XBOX_WAIT_VALUE_OP Operation) {
     if (Address != 0ull) {
         std::lock_guard<std::mutex> lock(aaa_rec_mutex_);
-        deferred_cpu_waits_.push_back(DeferredCpuWait{Address, Value, Mask, Operation, true});
+        deferred_cpu_waits_.push_back(DeferredCpuWait{
+            Address,
+            Value,
+            Mask,
+            Operation,
+            true,
+            static_cast<uint32_t>(deferred_cpu_writes_.size()),
+            0u});
     }
     if (host_list_) {
         const D3D12_COMMAND_LIST_TYPE list_type = host_list_->GetType();
@@ -5755,6 +5772,138 @@ void STDMETHODCALLTYPE CommandListX::FlushGpuCacheRange(
     RecordList("ID3D12GraphicsCommandListX::FlushGpuCacheRange", 88, S_OK);
 }
 
+void CommandListX::RetireUploadArenaPages(bool immediate_release) noexcept {
+    std::vector<UploadArenaPage> retired;
+    {
+        std::lock_guard<std::mutex> lock(upload_arena_mutex_);
+        if (upload_arena_pages_.empty()) {
+            return;
+        }
+        retired.swap(upload_arena_pages_);
+    }
+    for (auto& page : retired) {
+        if (!page.buffer) continue;
+        if (page.cpu_ptr) {
+            D3D12_RANGE written{0u, static_cast<SIZE_T>(page.cursor)};
+            page.buffer->Unmap(0u, &written);
+            page.cpu_ptr = nullptr;
+        }
+        if (!immediate_release && device_x_) {
+            device_x_->DeferHostResourceRelease(page.buffer);
+            page.buffer->Release();
+        } else {
+            if (device_x_) {
+                device_x_->NotifyResourceDestroyed(page.buffer);
+            }
+            page.buffer->Release();
+        }
+        page.buffer = nullptr;
+    }
+}
+
+void* CommandListX::AllocateUploadX(uint64_t size_bytes, uint64_t alignment) {
+    if (!device_x_ || !device_x_->HostDevice() ||
+        is_closed_.load(std::memory_order_acquire) ||
+        size_bytes == 0ull || size_bytes > (256ull * 1024ull * 1024ull)) {
+        return nullptr;
+    }
+    if (alignment == 0ull) {
+        alignment = 16ull;
+    }
+    if ((alignment & (alignment - 1ull)) != 0ull || alignment > 65536ull) {
+        return nullptr;
+    }
+    const uint64_t eff_align = std::max<uint64_t>(alignment, 16ull);
+
+    std::lock_guard<std::mutex> lock(upload_arena_mutex_);
+    if (!upload_arena_pages_.empty()) {
+        auto& cur = upload_arena_pages_.back();
+        if (cur.cpu_ptr && cur.buffer) {
+            const uint64_t base_addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cur.cpu_ptr));
+            const uint64_t cand_addr =
+                (base_addr + cur.cursor + eff_align - 1ull) & ~(eff_align - 1ull);
+            const uint64_t new_off = cand_addr - base_addr;
+            if (new_off <= cur.capacity && size_bytes <= cur.capacity - new_off) {
+                cur.cursor = new_off + size_bytes;
+                return reinterpret_cast<void*>(static_cast<uintptr_t>(cand_addr));
+            }
+        }
+    }
+
+    constexpr uint64_t kMinUploadPageBytes = 65536ull;
+    const uint64_t raw_need = size_bytes + eff_align;
+    const uint64_t page_cap = std::max<uint64_t>(
+        kMinUploadPageBytes, (raw_need + 65535ull) & ~65535ull);
+
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    hp.CreationNodeMask = 1u;
+    hp.VisibleNodeMask = 1u;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Alignment = 0ull;
+    desc.Width = page_cap;
+    desc.Height = 1u;
+    desc.DepthOrArraySize = 1u;
+    desc.MipLevels = 1u;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1u;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    ID3D12Resource* new_buf = nullptr;
+    if (FAILED(device_x_->HostDevice()->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&new_buf))) ||
+        !new_buf) {
+        return nullptr;
+    }
+
+    void* mapped = nullptr;
+    D3D12_RANGE zero_read{0u, 0u};
+    if (FAILED(new_buf->Map(0u, &zero_read, &mapped)) || !mapped) {
+        new_buf->Release();
+        return nullptr;
+    }
+
+    device_x_->RegisterGuestMappedBufferVa(
+        new_buf, desc, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mapped)));
+
+    const uint64_t base_addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mapped));
+    const uint64_t cand_addr = (base_addr + eff_align - 1ull) & ~(eff_align - 1ull);
+    const uint64_t new_off = cand_addr - base_addr;
+    if (new_off > page_cap || size_bytes > page_cap - new_off) {
+        D3D12_RANGE no_write{0u, 0u};
+        new_buf->Unmap(0u, &no_write);
+        device_x_->NotifyResourceDestroyed(new_buf);
+        new_buf->Release();
+        return nullptr;
+    }
+
+    UploadArenaPage page{};
+    page.buffer = new_buf;
+    page.cpu_ptr = static_cast<uint8_t*>(mapped);
+    page.capacity = page_cap;
+    page.cursor = new_off + size_bytes;
+    upload_arena_pages_.push_back(page);
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(cand_addr));
+}
+
+void CommandListX::ExtractDeferredCpuOps(
+    std::vector<DeferredCpuWrite32>& out_writes,
+    std::vector<DeferredCpuWait>& out_waits) const {
+    std::lock_guard<std::mutex> lock(aaa_rec_mutex_);
+    const uint32_t base_write_idx = static_cast<uint32_t>(out_writes.size());
+    out_writes.insert(out_writes.end(), deferred_cpu_writes_.begin(), deferred_cpu_writes_.end());
+    out_waits.reserve(out_waits.size() + deferred_cpu_waits_.size());
+    for (DeferredCpuWait w : deferred_cpu_waits_) {
+        w.prior_write_count += base_write_idx;
+        out_waits.push_back(w);
+    }
+}
+
 void CommandListX::GetDepthBiasXState(
     float* out_depth_bias,
     float* out_depth_bias_clamp,
@@ -5808,14 +5957,6 @@ void CommandListX::ExtractPendingMirrorWritebacks(std::vector<uint64_t>& out_tit
             out_title_vas.push_back(va);
         }
     }
-}
-
-void CommandListX::ExtractDeferredCpuOps(
-    std::vector<DeferredCpuWrite32>& out_writes,
-    std::vector<DeferredCpuWait>& out_waits) const {
-    std::lock_guard<std::mutex> lock(aaa_rec_mutex_);
-    out_writes.insert(out_writes.end(), deferred_cpu_writes_.begin(), deferred_cpu_writes_.end());
-    out_waits.insert(out_waits.end(), deferred_cpu_waits_.begin(), deferred_cpu_waits_.end());
 }
 
 void CommandListX::ExtractDeferredStateTransitions(

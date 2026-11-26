@@ -521,6 +521,24 @@ public:
     void RegisterUmaShadowMapping(
         ID3D12Resource* resource, void* cpu_ptr, const D3D12_RESOURCE_DESC& desc);
     void MarkUmaShadowDirty(ID3D12Resource* resource) noexcept;
+    HRESULT CreateCommittedResourceWithGuestDesc(
+        const D3D12_HEAP_PROPERTIES* pHeapProperties,
+        D3D12_HEAP_FLAGS HeapFlags,
+        const D3D12_RESOURCE_DESC* pHostDesc,
+        const D3D12_RESOURCE_DESC* pGuestDesc,
+        D3D12_RESOURCE_STATES InitialResourceState,
+        const D3D12_CLEAR_VALUE* pOptimizedClearValue,
+        REFIID riidResource,
+        void** ppvResource);
+    void RegisterGuestMappedBufferVa(
+        ID3D12Resource* host_res,
+        const D3D12_RESOURCE_DESC& desc,
+        uint64_t guest_va) {
+        TrackBufferVaResource(host_res, desc, guest_va);
+    }
+    void InvalidateVirtualRangeOnTileRemap(
+        uint64_t guest_va_base,
+        uint64_t byte_size) noexcept;
 
     // IUnknown (slots 0..2)
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;

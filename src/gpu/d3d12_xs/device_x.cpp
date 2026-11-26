@@ -1870,7 +1870,14 @@ bool FormatForbidsDesktopUav(DXGI_FORMAT fmt) noexcept {
 
 D3D12_RESOURCE_DESC SanitizeXboxResourceDesc(const D3D12_RESOURCE_DESC& desc) noexcept {
     D3D12_RESOURCE_DESC out = desc;
-    out.Format = SanitizeXboxDxgiFormat(out.Format);
+    if (IsPacked16TargetFormat(desc.Format) &&
+        (static_cast<uint32_t>(desc.Flags) &
+         (static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) |
+          static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))) != 0u) {
+        out.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    } else {
+        out.Format = SanitizeXboxDxgiFormat(out.Format);
+    }
     if (out.SampleDesc.Count == 0u) {
         out.SampleDesc.Count = 1u;
         out.SampleDesc.Quality = 0u;
@@ -1887,7 +1894,14 @@ D3D12_RESOURCE_DESC SanitizeXboxResourceDesc(const D3D12_RESOURCE_DESC& desc) no
 
 D3D12_RESOURCE_DESC1 SanitizeXboxResourceDesc1(const D3D12_RESOURCE_DESC1& desc) noexcept {
     D3D12_RESOURCE_DESC1 out = desc;
-    out.Format = SanitizeXboxDxgiFormat(out.Format);
+    if (IsPacked16TargetFormat(desc.Format) &&
+        (static_cast<uint32_t>(desc.Flags) &
+         (static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) |
+          static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))) != 0u) {
+        out.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    } else {
+        out.Format = SanitizeXboxDxgiFormat(out.Format);
+    }
     if (out.SampleDesc.Count == 0u) {
         out.SampleDesc.Count = 1u;
         out.SampleDesc.Quality = 0u;
@@ -6294,14 +6308,125 @@ void DeviceX::CreatePlacedShaderResourceViewX(
     const D3D12_RESOURCE_DESC* pResourceDesc,
     const void* pViewDesc,
     D3D12_CPU_DESCRIPTOR_HANDLE destDescriptor) {
-    if (!host_dev_ || !pResourceDesc || !pViewDesc || destDescriptor.ptr == 0u) return;
-    uint64_t gpu_va = 0ull;
-    std::memcpy(&gpu_va, static_cast<const uint8_t*>(pViewDesc) + 0x28u, sizeof(gpu_va));
+    if (!host_dev_ || !pViewDesc || destDescriptor.ptr == 0u) return;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     std::memcpy(&srv, pViewDesc, sizeof(srv));
     if (srv.Shader4ComponentMapping == 0u) {
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     }
+    uint64_t gpu_va = 0ull;
+    if (IsReadableGuestVaRange(reinterpret_cast<uintptr_t>(pViewDesc) + 0x28u, sizeof(gpu_va))) {
+        std::memcpy(&gpu_va, static_cast<const uint8_t*>(pViewDesc) + 0x28u, sizeof(gpu_va));
+    }
+
+    // Slot 70 Raytracing Acceleration Structure SRVs pass pResourceDesc == nullptr and specify
+    // the BVH virtual address via srv.RaytracingAccelerationStructure.Location (or +0x28).
+    // On non-RT GPUs (e.g. GTX 1650 Ti, raytracing_tier == 0), resolve Location into a valid
+    // R32_TYPELESS raw-buffer SRV (or null raw-buffer SRV) so rdna2_rayquery_bridge shaders
+    // never sample an uninitialized descriptor slot.
+    if (srv.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE) {
+        const uint64_t rtas_va =
+            (srv.RaytracingAccelerationStructure.Location != 0ull)
+                ? srv.RaytracingAccelerationStructure.Location
+                : gpu_va;
+        const bool use_shadow =
+            retail_scarlett_abi_ || has_guest_backed_desc_heaps_.load(std::memory_order_acquire);
+        uint64_t guest_wb = 0ull;
+        D3D12_CPU_DESCRIPTOR_HANDLE eff_dest = destDescriptor;
+        if (use_shadow) {
+            RedirectGuestDescDestIfNeeded(eff_dest, guest_wb);
+        }
+
+        uint64_t host_buf_off = 0ull;
+        ID3D12Resource* placed_host_buf =
+            (rtas_va != 0ull) ? ResolveBufferResourceByGpuVa(rtas_va, &host_buf_off) : nullptr;
+
+        if (adapter_info_.raytracing_tier >= 10u && placed_host_buf != nullptr) {
+            const D3D12_GPU_VIRTUAL_ADDRESS host_rtas_va =
+                placed_host_buf->GetGPUVirtualAddress() + host_buf_off;
+            if (host_rtas_va != 0ull &&
+                (host_rtas_va % D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT) == 0ull) {
+                D3D12_SHADER_RESOURCE_VIEW_DESC native_rtas = srv;
+                native_rtas.RaytracingAccelerationStructure.Location = host_rtas_va;
+                host_dev_->CreateShaderResourceView(nullptr, &native_rtas, eff_dest);
+                CheckCpuDeviceRemoved("CreatePlacedShaderResourceViewX[RTAS]", rtas_va, 0u);
+                if (use_shadow) {
+                    SnapshotCreatedDescriptorToShadow(eff_dest, guest_wb, /*prefer_static_partition=*/false, nullptr);
+                }
+                TrackPagedDescriptorWrite(destDescriptor);
+                return;
+            }
+        }
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC raw_srv{};
+        raw_srv.Format = DXGI_FORMAT_R32_TYPELESS;
+        raw_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        raw_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        raw_srv.Buffer.FirstElement = 0ull;
+        raw_srv.Buffer.NumElements = 1u;
+        raw_srv.Buffer.StructureByteStride = 0u;
+        raw_srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+
+        ID3D12Resource* srv_res = nullptr;
+        const uint64_t eff_cpu_va = (rtas_va != 0ull) ? ResolveGuestCpuAliasVa(rtas_va) : 0ull;
+        const uint64_t cpu_span =
+            (eff_cpu_va != 0ull) ? (MaxReadableGuestSpan(eff_cpu_va, 65536ull) & ~3ull) : 0ull;
+        if (placed_host_buf != nullptr) {
+            const uint64_t hb_width = placed_host_buf->GetDesc().Width;
+            const uint64_t aligned_off = host_buf_off & ~3ull;
+            if (aligned_off + 4ull <= hb_width) {
+                raw_srv.Buffer.FirstElement = aligned_off / 4ull;
+                raw_srv.Buffer.NumElements =
+                    static_cast<UINT>(std::min<uint64_t>((hb_width - aligned_off) / 4ull, 0x0FFFFFFFull));
+                srv_res = placed_host_buf;
+            }
+        } else if (cpu_span >= 4ull) {
+            const D3D12_GPU_VIRTUAL_ADDRESS ring_gpu = UploadTransientGuestBufferForDesktop(
+                eff_cpu_va, cpu_span, 256ull, /*allow_same_frame_cache=*/false);
+            if (ring_gpu != 0ull && transient_ring_ && ring_gpu >= transient_ring_gpu_) {
+                const uint64_t ring_off = (ring_gpu - transient_ring_gpu_) & ~3ull;
+                raw_srv.Buffer.FirstElement = ring_off / 4ull;
+                raw_srv.Buffer.NumElements = static_cast<UINT>(cpu_span / 4ull);
+                srv_res = transient_ring_;
+            }
+        }
+
+        host_dev_->CreateShaderResourceView(srv_res, &raw_srv, eff_dest);
+        CheckCpuDeviceRemoved("CreatePlacedShaderResourceViewX[RTASFallback]", rtas_va, raw_srv.Buffer.NumElements);
+        uint64_t rtas_sh_ptr = 0ull;
+        if (use_shadow) {
+            SnapshotCreatedDescriptorToShadow(eff_dest, guest_wb, /*prefer_static_partition=*/false, &rtas_sh_ptr);
+        }
+        if (retail_scarlett_abi_ && (placed_host_buf != nullptr || cpu_span >= 4ull)) {
+            ShadowBufSrvSource bsrc{};
+            bsrc.host_res = placed_host_buf;
+            bsrc.guest_cpu_va = (cpu_span >= 4ull) ? eff_cpu_va : 0ull;
+            bsrc.host_byte_off = host_buf_off & ~3ull;
+            bsrc.byte_size = std::max<uint64_t>(4ull, cpu_span);
+            bsrc.stride = 4u;
+            bsrc.format = DXGI_FORMAT_R32_TYPELESS;
+            bsrc.flags = D3D12_BUFFER_SRV_FLAG_RAW;
+            std::lock_guard<std::mutex> lk(guest_dh_mutex_);
+            if (rtas_sh_ptr != 0ull) {
+                shadow_buf_srv_sources_[rtas_sh_ptr] = bsrc;
+            }
+            if (eff_dest.ptr == destDescriptor.ptr) {
+                staging_buf_srv_sources_[destDescriptor.ptr] = bsrc;
+            }
+        }
+        TrackPagedDescriptorWrite(destDescriptor);
+        if (CommandListX::IsDiagTraceEnabled()) {
+            char db[128];
+            std::snprintf(db, sizeof(db), "PLACED_RTAS_SRV(va=0x%llX res=%p elems=%u)",
+                          static_cast<unsigned long long>(rtas_va),
+                          static_cast<void*>(srv_res),
+                          raw_srv.Buffer.NumElements);
+            RecordDiagDescriptor(destDescriptor.ptr, db);
+        }
+        return;
+    }
+
+    if (!pResourceDesc) return;
 
     if (pResourceDesc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
         srv.ViewDimension == D3D12_SRV_DIMENSION_BUFFER && gpu_va != 0ull) {
@@ -7710,6 +7835,19 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
     const D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS HeapFlags,
     const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialResourceState,
     const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riidResource, void** ppvResource) {
+    return CreateCommittedResourceWithGuestDesc(
+        pHeapProperties, HeapFlags, pDesc, pDesc,
+        InitialResourceState, pOptimizedClearValue, riidResource, ppvResource);
+}
+
+HRESULT DeviceX::CreateCommittedResourceWithGuestDesc(
+    const D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS HeapFlags,
+    const D3D12_RESOURCE_DESC* pDesc, const D3D12_RESOURCE_DESC* pGuestDesc,
+    D3D12_RESOURCE_STATES InitialResourceState,
+    const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riidResource, void** ppvResource) {
+    if (static_cast<uint32_t>(InitialResourceState) == 0xFFFFFFFFu) {
+        InitialResourceState = D3D12_RESOURCE_STATE_COMMON;
+    }
     D3D12_RESOURCE_DESC clean_desc{};
     const D3D12_RESOURCE_DESC* desc_ptr = pDesc;
     D3D12_CLEAR_VALUE clean_clear{};
@@ -7841,6 +7979,18 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
             clean_heap_ptr, clean_heap_flags, desc_ptr, D3D12_RESOURCE_STATE_COMMON,
             clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
     }
+    if (FAILED(hr) && retail_scarlett_abi_ && clear_ptr != nullptr && clean_heap_ptr) {
+        // Fallback: retry without optimized clear value if console clear format/flags differ on desktop.
+        hr = host_dev_->CreateCommittedResource(
+            clean_heap_ptr, clean_heap_flags, desc_ptr, InitialResourceState,
+            nullptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+        if (FAILED(hr) && InitialResourceState != D3D12_RESOURCE_STATE_COMMON &&
+            clean_heap_ptr->Type == D3D12_HEAP_TYPE_DEFAULT) {
+            hr = host_dev_->CreateCommittedResource(
+                clean_heap_ptr, clean_heap_flags, desc_ptr, D3D12_RESOURCE_STATE_COMMON,
+                nullptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+        }
+    }
     if (FAILED(hr) || !host_res) {
         RecordDev("ID3D12DeviceX::CreateCommittedResource", 27, hr);
         return hr;
@@ -7860,10 +8010,12 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
     if (desc_ptr) {
         TrackBufferVaResource(host_res, *desc_ptr, 0ull);
     }
+    const D3D12_RESOURCE_DESC* orig_guest_desc = pGuestDesc ? pGuestDesc : pDesc;
     XG_TILE_MODE placed_tile_mode = XG_TILE_MODE_LINEAR;
-    if (pDesc) {
+    if (orig_guest_desc) {
         placed_tile_mode =
-            retail_scarlett_abi_ ? ResolveRetailXboxTileMode(*pDesc) : ExtractXboxGfx10TileMode(pDesc->Layout);
+            retail_scarlett_abi_ ? ResolveRetailXboxTileMode(*orig_guest_desc)
+                                 : ExtractXboxGfx10TileMode(orig_guest_desc->Layout);
         if (placed_tile_mode != XG_TILE_MODE_LINEAR) {
             SetTrackedResourceTileMode(host_res, placed_tile_mode);
         }
@@ -7878,7 +8030,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
         SetRetailResourceState(host_res, InitialResourceState);
     }
     auto* proxy = new (std::nothrow) ResourceXProxy(
-        this, host_res, desc_ptr, pHeapProperties, clean_heap_flags, 0ull);
+        this, host_res, pGuestDesc ? pGuestDesc : desc_ptr, pHeapProperties, clean_heap_flags, 0ull);
     host_res->Release();
     if (!proxy) {
         RecordDev("ID3D12DeviceX::CreateCommittedResource", 27, E_OUTOFMEMORY);
@@ -9123,10 +9275,157 @@ bool ExtractRetailFssmPoolIsa(
     xs2.stage = stage;
     xs2.sgpr_count = 104u;
     xs2.vgpr_count = 128u;
-    xs2.wave_size = 64u;
-    xs2.threadgroup_x = std::clamp(tg_x, 1u, 1024u);
-    xs2.threadgroup_y = std::clamp(tg_y, 1u, 1024u);
-    xs2.threadgroup_z = std::clamp(tg_z, 1u, 1024u);
+    uint32_t detected_wave_size = 64u;
+    uint32_t eff_tg_x = tg_x;
+    uint32_t eff_tg_y = tg_y;
+    uint32_t eff_tg_z = tg_z;
+
+    if (stage == openscarlett::ShaderStage::Mesh) {
+        // Check if an unstripped FSSM header precedes the pool ISA entry (FETCH_HEADER_BASE = 0x2F8).
+        bool found_fssm = false;
+        if (gpu_va >= 0x10300ull &&
+            IsReadableGuestVaRange(gpu_va - 0x2F8ull, 0x160u)) {
+            uint8_t fssm_hdr[0x160]{};
+            if (SafeMemcpyPoolIsa(
+                    fssm_hdr,
+                    reinterpret_cast<const void*>(static_cast<uintptr_t>(gpu_va - 0x2F8ull)),
+                    sizeof(fssm_hdr))) {
+                uint32_t fssm_magic = 0u;
+                uint32_t fssm_ver = 0u;
+                std::memcpy(&fssm_magic, fssm_hdr, 4u);
+                std::memcpy(&fssm_ver, fssm_hdr + 0x04u, 4u);
+                if (fssm_magic == 0x4D535346u && fssm_ver >= 5u && fssm_ver <= 12u) {
+                    uint32_t flags_d4 = 0u;
+                    std::memcpy(&flags_d4, fssm_hdr + 0xD4u, 4u);
+                    detected_wave_size = (((flags_d4 >> 5u) & 1u) != 0u) ? 32u : 64u;
+                    const size_t tg_off = 0x134u + ((fssm_ver >= 9u) ? 4u : 0u);
+                    uint32_t nx = 0u, ny = 0u, nz = 0u;
+                    std::memcpy(&nx, fssm_hdr + tg_off + 0u, 4u);
+                    std::memcpy(&ny, fssm_hdr + tg_off + 4u, 4u);
+                    std::memcpy(&nz, fssm_hdr + tg_off + 8u, 4u);
+                    if (nx >= 1u && nx <= 1024u && ny >= 1u && ny <= 1024u &&
+                        nz >= 1u && nz <= 1024u &&
+                        static_cast<uint64_t>(nx) * ny * nz <= 1024ull) {
+                        eff_tg_x = nx;
+                        eff_tg_y = ny;
+                        eff_tg_z = nz;
+                        found_fssm = true;
+                    }
+                }
+            }
+        }
+
+        // Decode stripped Mesh57 RDNA2 ISA subgroup launch shift (v5 = (prim_cnt << shift) | vert_cnt)
+        // and Wave32/Wave64 EXEC mask width (adapted from R0Y00/Xbox2Windows gfx2hlsl.py MESH_EXCHANGE
+        // & TuxBox mesh.rs so 256-lane Mesh57 shaders trigger mesh_wave32_split_ on SM 6.5 GPUs).
+        bool saw_exec32 = false;
+        bool saw_exec64 = false;
+        uint32_t isa_shift_threads = 0u;
+        int32_t v5_scalar_sgpr = -1;
+        for (size_t wi = 0u; wi < code_words.size(); ++wi) {
+            const uint32_t w = code_words[wi];
+            const uint32_t top6 = w >> 26u;
+            // 64-bit encodings: VOP3/P (0x34, 0x35), DS (0x36), FLAT (0x37), MUBUF (0x38),
+            // MTBUF (0x39), MIMG (0x3C), SMEM (0x3D), EXP (0x3E).
+            if (top6 == 0x34u || top6 == 0x35u || top6 == 0x36u || top6 == 0x37u ||
+                top6 == 0x38u || top6 == 0x39u || top6 == 0x3Cu || top6 == 0x3Du || top6 == 0x3Eu) {
+                if (top6 == 0x35u && wi + 1u < code_words.size()) {
+                    const uint32_t w1 = code_words[wi + 1u];
+                    const uint32_t vop3_op = (w >> 16u) & 0x3FFu;
+                    const uint32_t src0 = w1 & 0x1FFu;
+                    const uint32_t src1 = (w1 >> 9u) & 0x1FFu;
+                    if (vop3_op == 0x116u && src1 == 0x105u && src0 >= 0x85u && src0 <= 0x8Au) {
+                        isa_shift_threads = std::max(isa_shift_threads, 1u << (src0 - 0x80u));
+                    }
+                }
+                ++wi;
+                continue;
+            }
+            if ((w & 0xFF800000u) == 0xBE800000u) {  // SOP1
+                const uint32_t sdst = (w >> 16u) & 0x7Fu;
+                const uint32_t op = (w >> 8u) & 0xFFu;
+                const uint32_t ssrc = w & 0xFFu;
+                if ((sdst == 126u && op == 0x03u) || (op >= 0x3Cu && op <= 0x47u)) {
+                    saw_exec32 = true;
+                } else if ((sdst == 126u && op == 0x04u) ||
+                           (op >= 0x24u && op <= 0x2Bu) ||
+                           (op >= 0x37u && op <= 0x3Au)) {
+                    saw_exec64 = true;
+                }
+                if (ssrc == 0xFFu) ++wi;
+                continue;
+            }
+            if ((w >> 30u) == 2u) {  // SOP2
+                const uint32_t sop2 = (w >> 23u) & 0x7Fu;
+                const uint32_t ssrc1 = (w >> 8u) & 0xFFu;
+                const uint32_t ssrc0 = w & 0xFFu;
+                if (sop2 == 0x20u && v5_scalar_sgpr >= 0 &&
+                    ssrc0 == static_cast<uint32_t>(v5_scalar_sgpr) &&
+                    ssrc1 >= 0x85u && ssrc1 <= 0x8Au) {
+                    isa_shift_threads = std::max(isa_shift_threads, 1u << (ssrc1 - 0x80u));
+                }
+                if (ssrc0 == 0xFFu || ssrc1 == 0xFFu) ++wi;
+                continue;
+            }
+            if ((w & 0xFF800000u) == 0xBF000000u) {  // SOPC
+                if ((w & 0xFFu) == 0xFFu || ((w >> 8u) & 0xFFu) == 0xFFu) ++wi;
+                continue;
+            }
+            if ((w >> 28u) == 0xBu && (w >> 23u) < 0x17Du) {  // SOPK
+                if (((w >> 23u) & 0x1Fu) == 0x14u) ++wi;
+                continue;
+            }
+            if ((w >> 25u) == 0x3Fu) {  // VOP1
+                const uint32_t vop1 = (w >> 9u) & 0xFFu;
+                const uint32_t src0 = w & 0x1FFu;
+                if (vop1 == 0x02u && src0 == 0x105u) {  // v_readfirstlane_b32 sdst, v5
+                    v5_scalar_sgpr = static_cast<int32_t>((w >> 17u) & 0x7Fu);
+                }
+                if (src0 == 0xFFu || src0 == 0xF9u || src0 == 0xFAu || src0 == 0xE9u || src0 == 0xEAu) ++wi;
+                continue;
+            }
+            if ((w >> 25u) == 0x3Eu) {  // VOPC
+                const uint32_t src0 = w & 0x1FFu;
+                if (src0 == 0xFFu || src0 == 0xF9u || src0 == 0xFAu || src0 == 0xE9u || src0 == 0xEAu) ++wi;
+                continue;
+            }
+            if ((w >> 31u) == 0u) {  // VOP2
+                const uint32_t vop2 = (w >> 25u) & 0x3Fu;
+                const uint32_t vsrc1 = (w >> 9u) & 0xFFu;
+                const uint32_t src0 = w & 0x1FFu;
+                if (vop2 == 0x16u && vsrc1 == 5u && src0 >= 0x85u && src0 <= 0x8Au) {
+                    // v_lshrrev_b32_e32 vDst, <shift>, v5 -> group size = 1 << shift (128 or 256)
+                    isa_shift_threads = std::max(isa_shift_threads, 1u << (src0 - 0x80u));
+                }
+                if (vop2 == 0x21u || vop2 == 0x22u || vop2 == 0x2Cu || vop2 == 0x2Du ||
+                    vop2 == 0x37u || vop2 == 0x38u || src0 == 0xFFu || src0 == 0xF9u ||
+                    src0 == 0xFAu || src0 == 0xE9u || src0 == 0xEAu) {
+                    ++wi;
+                }
+            }
+        }
+        if (!found_fssm) {
+            if (isa_shift_threads >= 32u && isa_shift_threads <= 1024u &&
+                eff_tg_x * eff_tg_y * eff_tg_z <= 128u && isa_shift_threads > eff_tg_x) {
+                eff_tg_x = isa_shift_threads;
+                eff_tg_y = 1u;
+                eff_tg_z = 1u;
+            } else if (isa_shift_threads >= 32u && isa_shift_threads <= 1024u && eff_tg_x == 128u &&
+                       eff_tg_y == 1u && eff_tg_z == 1u) {
+                eff_tg_x = isa_shift_threads;
+            }
+            if (saw_exec32 && !saw_exec64) {
+                detected_wave_size = 32u;
+            } else if (eff_tg_x * eff_tg_y * eff_tg_z > 128u && !saw_exec64) {
+                detected_wave_size = 32u;
+            }
+        }
+    }
+
+    xs2.wave_size = detected_wave_size;
+    xs2.threadgroup_x = std::clamp(eff_tg_x, 1u, 1024u);
+    xs2.threadgroup_y = std::clamp(eff_tg_y, 1u, 1024u);
+    xs2.threadgroup_z = std::clamp(eff_tg_z, 1u, 1024u);
     xs2.code_words = std::move(code_words);
     out_xs2_blob = openscarlett::BuildXs2Container(xs2);
     return !out_xs2_blob.empty();
@@ -9505,10 +9804,50 @@ HRESULT DeviceX::DeserializeGraphicsPipelineStateX(
         std::vector<uint8_t> vs_xs2;
         std::vector<uint8_t> ms_xs2;
         std::vector<uint8_t> ps_xs2;
+        uint32_t ms_tg_x = 128u, ms_tg_y = 1u, ms_tg_z = 1u;
+        if (has_s57_ms) {
+            // Extract Mesh57 threadgroup X/Y/Z from FSSM / PSV0 stage metadata (q[15], q[16]) or State Block A
+            // before falling back to ExtractRetailFssmPoolIsa's RDNA2 NGG launch-shift ISA decoder.
+            if (q[15] >= 0x10000ull && q[16] >= 52ull && q[16] <= 0x4000ull) {
+                uint8_t mms[512]{};
+                const size_t mn = static_cast<size_t>(std::min<uint64_t>(q[16], sizeof(mms)));
+                if (SafeMemcpyPoolIsa(mms, reinterpret_cast<const void*>(static_cast<uintptr_t>(q[15])), mn)) {
+                    uint32_t m0 = 0u, m1 = 0u;
+                    std::memcpy(&m0, mms + 0u, 4u);
+                    std::memcpy(&m1, mms + 4u, 4u);
+                    if (m0 == 0x4D535346u && m1 >= 5u && m1 <= 12u) {  // "FSSM"
+                        const size_t tg_off = 0x134u + ((m1 >= 9u) ? 4u : 0u);
+                        if (tg_off + 12u <= mn) {
+                            uint32_t nx = 0u, ny = 0u, nz = 0u;
+                            std::memcpy(&nx, mms + tg_off + 0u, 4u);
+                            std::memcpy(&ny, mms + tg_off + 4u, 4u);
+                            std::memcpy(&nz, mms + tg_off + 8u, 4u);
+                            if (nx >= 1u && nx <= 1024u && ny >= 1u && ny <= 1024u && nz >= 1u && nz <= 1024u &&
+                                static_cast<uint64_t>(nx) * ny * nz <= 1024ull) {
+                                ms_tg_x = nx;
+                                ms_tg_y = ny;
+                                ms_tg_z = nz;
+                            }
+                        }
+                    } else if (m0 >= 48u && 4u + m0 <= mn && mms[4u + 24u] == 13u) {  // PSV0 Mesh runtime info
+                        uint32_t nx = 0u, ny = 0u, nz = 0u;
+                        std::memcpy(&nx, mms + 4u + 36u, 4u);
+                        std::memcpy(&ny, mms + 4u + 40u, 4u);
+                        std::memcpy(&nz, mms + 4u + 44u, 4u);
+                        if (nx >= 1u && nx <= 1024u && ny >= 1u && ny <= 1024u && nz >= 1u && nz <= 1024u &&
+                            static_cast<uint64_t>(nx) * ny * nz <= 1024ull) {
+                            ms_tg_x = nx;
+                            ms_tg_y = ny;
+                            ms_tg_z = nz;
+                        }
+                    }
+                }
+            }
+        }
         const bool vs_ok = !has_s57_vs || ExtractRetailFssmPoolIsa(
             q[9], q[10], openscarlett::ShaderStage::Vertex, 1u, 1u, 1u, vs_xs2);
         const bool ms_ok = !has_s57_ms || ExtractRetailFssmPoolIsa(
-            q[13], q[14], openscarlett::ShaderStage::Mesh, 128u, 1u, 1u, ms_xs2);
+            q[13], q[14], openscarlett::ShaderStage::Mesh, ms_tg_x, ms_tg_y, ms_tg_z, ms_xs2);
         const bool has_ps = (q[5] >= 0x10000ull && q[6] >= 40ull);
         const bool ps_ok = !has_ps || ExtractRetailFssmPoolIsa(
             q[5], q[6], openscarlett::ShaderStage::Pixel, 1u, 1u, 1u, ps_xs2);
@@ -14443,7 +14782,10 @@ HRESULT STDMETHODCALLTYPE DeviceX::NotifyVirtualRemap(
             }
             m.cpu_readable = IsReadableGuestVaRange(m.guest_va, m.byte_size);
             ++m.page_generation;
-            if (!m.dirty && m.cpu_readable) {
+            if (!m.cpu_readable && m.dirty) {
+                m.dirty = false;
+                dirty_unified_count_.fetch_sub(1u, std::memory_order_acq_rel);
+            } else if (!m.dirty && m.cpu_readable) {
                 m.dirty = true;
                 dirty_unified_count_.fetch_add(1u, std::memory_order_acq_rel);
             }
@@ -14454,6 +14796,85 @@ HRESULT STDMETHODCALLTYPE DeviceX::NotifyVirtualRemap(
     if (out_flagged_count) *out_flagged_count = flagged;
     RecordDev("ID3D12DeviceX::NotifyVirtualRemap", -1, S_OK);
     return S_OK;
+}
+
+void DeviceX::InvalidateVirtualRangeOnTileRemap(
+    uint64_t guest_va_base,
+    uint64_t byte_size) noexcept {
+    if (guest_va_base == 0ull || byte_size == 0ull) {
+        return;
+    }
+    const uint64_t range_end =
+        (guest_va_base > UINT64_MAX - byte_size) ? UINT64_MAX : (guest_va_base + byte_size);
+
+    (void)NotifyVirtualRemap(guest_va_base, byte_size, 0ull, nullptr);
+
+    // Evict cached placed textures whose virtual span overlaps the remapped/unmapped tile range.
+    {
+        std::lock_guard<std::mutex> lock(placed_tex_va_mutex_);
+        for (auto it = placed_tex_by_va_.begin(); it != placed_tex_by_va_.end();) {
+            const uint64_t t_va = it->first;
+            auto& vec = it->second;
+            vec.erase(
+                std::remove_if(vec.begin(), vec.end(), [&](ID3D12Resource* cand) {
+                    if (!cand) return true;
+                    const uint64_t est = std::max<uint64_t>(
+                        EstimateResourceVramBytes(cand->GetDesc()), 65536ull);
+                    const uint64_t t_end =
+                        (t_va > UINT64_MAX - est) ? UINT64_MAX : (t_va + est);
+                    if (t_va < range_end && guest_va_base < t_end) {
+                        auto rit = placed_tex_res_to_va_.find(cand);
+                        if (rit != placed_tex_res_to_va_.end() && rit->second == t_va) {
+                            placed_tex_res_to_va_.erase(rit);
+                        }
+                        return true;
+                    }
+                    return false;
+                }),
+                vec.end());
+            if (vec.empty()) {
+                it = placed_tex_by_va_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Invalidate guest-VA buffer bindings and same-frame transient upload cache slices overlapping the range.
+    {
+        std::unique_lock<std::shared_mutex> lock(buffer_va_mutex_);
+        bool any_buf_changed = false;
+        for (auto& [res, entry] : buffer_va_map_) {
+            if (entry.guest_va == 0ull) continue;
+            // Keep CommandListX::AllocateUploadX UPLOAD pages intact (guest_va == host mapped_cpu_ptr).
+            if (entry.owns_persistent_map && entry.mapped_cpu_ptr != nullptr &&
+                entry.guest_va == reinterpret_cast<uint64_t>(entry.mapped_cpu_ptr)) {
+                continue;
+            }
+            const uint64_t b_end =
+                (entry.guest_va > UINT64_MAX - entry.size_bytes)
+                    ? UINT64_MAX
+                    : (entry.guest_va + entry.size_bytes);
+            if (entry.guest_va < range_end && guest_va_base < b_end) {
+                entry.guest_va = 0ull;
+                any_buf_changed = true;
+            }
+        }
+        if (any_buf_changed) {
+            buffer_va_gen_.fetch_add(1ull, std::memory_order_release);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(transient_ring_mutex_);
+        for (auto& s : transient_ring_cache_) {
+            if (s.frame_token == 0ull || s.byte_len == 0ull) continue;
+            const uint64_t s_end =
+                (s.raw_start > UINT64_MAX - s.byte_len) ? UINT64_MAX : (s.raw_start + s.byte_len);
+            if (s.raw_start < range_end && guest_va_base < s_end) {
+                s.frame_token = 0ull;
+            }
+        }
+    }
 }
 
 HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
@@ -17482,12 +17903,28 @@ D3D12_GPU_VIRTUAL_ADDRESS DeviceX::ResolveOrUploadRootCbvGpuVa(
     D3D12_GPU_VIRTUAL_ADDRESS guest_va) {
     if (guest_va == 0ull) return 0ull;
     if (!retail_scarlett_abi_) {
+        uint64_t off = 0ull;
+        if (ID3D12Resource* res = ResolveBufferResourceByGpuVa(guest_va, &off)) {
+            return AlignRootCbvGpuVaForDesktop(res->GetGPUVirtualAddress() + off, guest_va);
+        }
         return AlignRootCbvGpuVaForDesktop(TranslateGuestGpuVa(guest_va), guest_va);
     }
     uint64_t off = 0ull;
     ID3D12Resource* res = ResolveBufferResourceByGpuVa(guest_va, &off);
-    if (res && IsGpuWrittenBufferRange(res, off, 256ull)) {
-        return AlignRootCbvGpuVaForDesktop(res->GetGPUVirtualAddress() + off, guest_va);
+    if (res) {
+        bool is_direct_upload = false;
+        {
+            std::shared_lock<std::shared_mutex> lk(buffer_va_mutex_);
+            auto mit = buffer_va_map_.find(res);
+            if (mit != buffer_va_map_.end() && mit->second.owns_persistent_map &&
+                mit->second.mapped_cpu_ptr != nullptr &&
+                mit->second.guest_va == reinterpret_cast<uint64_t>(mit->second.mapped_cpu_ptr)) {
+                is_direct_upload = true;
+            }
+        }
+        if (is_direct_upload || IsGpuWrittenBufferRange(res, off, 256ull)) {
+            return AlignRootCbvGpuVaForDesktop(res->GetGPUVirtualAddress() + off, guest_va);
+        }
     }
     const uint64_t cpu_va = ResolveGuestCpuAliasVa(guest_va);
     const uint64_t span = MaxReadableGuestSpan(cpu_va, 4096ull);
@@ -17506,12 +17943,28 @@ D3D12_GPU_VIRTUAL_ADDRESS DeviceX::ResolveOrUploadRootSrvGpuVa(
     D3D12_GPU_VIRTUAL_ADDRESS guest_va) {
     if (guest_va == 0ull) return 0ull;
     if (!retail_scarlett_abi_) {
+        uint64_t off = 0ull;
+        if (ID3D12Resource* res = ResolveBufferResourceByGpuVa(guest_va, &off)) {
+            return (res->GetGPUVirtualAddress() + off) & ~3ull;
+        }
         return TranslateGuestGpuVa(guest_va);
     }
     uint64_t off = 0ull;
     ID3D12Resource* res = ResolveBufferResourceByGpuVa(guest_va, &off);
-    if (res && IsGpuWrittenBufferRange(res, off, 256ull)) {
-        return (res->GetGPUVirtualAddress() + off) & ~3ull;
+    if (res) {
+        bool is_direct_upload = false;
+        {
+            std::shared_lock<std::shared_mutex> lk(buffer_va_mutex_);
+            auto mit = buffer_va_map_.find(res);
+            if (mit != buffer_va_map_.end() && mit->second.owns_persistent_map &&
+                mit->second.mapped_cpu_ptr != nullptr &&
+                mit->second.guest_va == reinterpret_cast<uint64_t>(mit->second.mapped_cpu_ptr)) {
+                is_direct_upload = true;
+            }
+        }
+        if (is_direct_upload || IsGpuWrittenBufferRange(res, off, 256ull)) {
+            return (res->GetGPUVirtualAddress() + off) & ~3ull;
+        }
     }
     const uint64_t cpu_va = ResolveGuestCpuAliasVa(guest_va);
     const uint64_t span = MaxReadableGuestSpan(cpu_va, 262144ull) & ~3ull;
