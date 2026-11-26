@@ -350,7 +350,22 @@ void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemMapPhysicalPages(
         return false;
 #endif
     }();
-    if (trace_xmem_map) {
+    if (!ptr) {
+        static std::atomic<uint32_t> s_map_fail{0u};
+        if (s_map_fail.fetch_add(1u, std::memory_order_relaxed) < 16u) {
+#if defined(_WIN32)
+            const DWORD err = ::GetLastError();
+#else
+            const unsigned long err = 0ul;
+#endif
+            std::fprintf(stderr,
+                "[OpenScarlett][xmem] XMemMapPhysicalPages FAIL va=%p count=%llu 3arg=%d arg2=0x%llX err=%lu\n",
+                virtualAddress, static_cast<unsigned long long>(numberOfPages),
+                is_three_arg ? 1 : 0, static_cast<unsigned long long>(arg2),
+                static_cast<unsigned long>(err));
+            std::fflush(stderr);
+        }
+    } else if (trace_xmem_map) {
         std::fprintf(stderr,
             "[OpenScarlett][xmem] XMemMapPhysicalPages va=%p count=%llu 3arg=%d arg2=0x%llX -> %p\n",
             virtualAddress, static_cast<unsigned long long>(numberOfPages),
@@ -365,6 +380,15 @@ int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemUnmapPhysicalPages(
     void* virtualAddress,
     uint64_t numberOfPages) {
     const int32_t ok = ::XMemUnmapPhysicalPages(virtualAddress, numberOfPages);
+    if (!ok) {
+        static std::atomic<uint32_t> s_unmap_fail{0u};
+        if (s_unmap_fail.fetch_add(1u, std::memory_order_relaxed) < 16u) {
+            std::fprintf(stderr,
+                "[OpenScarlett][xmem] XMemUnmapPhysicalPages FAIL va=%p count=%llu\n",
+                virtualAddress, static_cast<unsigned long long>(numberOfPages));
+            std::fflush(stderr);
+        }
+    }
     RecordOutcome("XMemUnmapPhysicalPages", ok != 0);
     return ok;
 }
@@ -385,7 +409,16 @@ int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemAllocatePhysicalPages(
         return false;
 #endif
     }();
-    if (trace_xmem_alloc) {
+    if (!ok) {
+        static std::atomic<uint32_t> s_alloc_fail{0u};
+        if (s_alloc_fail.fetch_add(1u, std::memory_order_relaxed) < 16u) {
+            std::fprintf(stderr,
+                "[OpenScarlett][xmem] XMemAllocatePhysicalPages FAIL flags=0x%X req=%llu got=%llu\n",
+                flAllocationType, static_cast<unsigned long long>(req),
+                static_cast<unsigned long long>(pNumberOfPages ? *pNumberOfPages : 0ull));
+            std::fflush(stderr);
+        }
+    } else if (trace_xmem_alloc) {
         std::fprintf(stderr,
             "[OpenScarlett][xmem] XMemAllocatePhysicalPages flags=0x%X req=%llu got=%llu pfn0=0x%llX -> %d\n",
             flAllocationType, static_cast<unsigned long long>(req),

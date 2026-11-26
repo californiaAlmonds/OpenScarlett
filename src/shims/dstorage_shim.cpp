@@ -894,6 +894,104 @@ public:
 
     const std::wstring& FilePath() const noexcept { return file_path_; }
 
+    struct Rds5ChunkEntry {
+        uint64_t comp_off = 0ull;
+        uint32_t comp_sz = 0u;
+        uint32_t uncomp_sz = 0u;
+        uint8_t flags = 0u;
+    };
+
+    bool ResolveRds5Request(
+        uint64_t req_off,
+        uint32_t req_src_sz,
+        size_t dst_sz,
+        bool use_zlib,
+        uint64_t bcpack_mode,
+        uint64_t& out_true_off,
+        size_t& out_full_uncomp_sz,
+        size_t& out_slice_off) {
+        EnsureRds5IndexLoaded();
+        if (!rds5_valid_ || rds5_chunks_.empty() || req_src_sz == 0u || dst_sz == 0u) {
+            return false;
+        }
+        const uint8_t want_flags =
+            use_zlib ? 8u : static_cast<uint8_t>(bcpack_mode & 0x7u);
+
+        auto cmp_off = [](const Rds5ChunkEntry& e, uint64_t off) {
+            return e.comp_off < off;
+        };
+
+        // 1. Exact comp_off match (normal unshifted request or prefix sub-chunk).
+        auto it = std::lower_bound(
+            rds5_chunks_.begin(), rds5_chunks_.end(), req_off, cmp_off);
+        if (it != rds5_chunks_.end() &&
+            it->comp_off == req_off &&
+            it->comp_sz == req_src_sz &&
+            it->flags == want_flags &&
+            it->uncomp_sz >= dst_sz) {
+            out_true_off = req_off;
+            out_full_uncomp_sz = it->uncomp_sz;
+            out_slice_off = 0u;
+            return true;
+        }
+
+        // 2. Cached constant-shift fast path (e.g. lighting.ttpf +0xE0000).
+        const uint64_t cached_shift = last_rds5_shift_.load(std::memory_order_relaxed);
+        if (cached_shift > 0ull && req_off >= cached_shift) {
+            const uint64_t cand_off = req_off - cached_shift;
+            auto sit = std::lower_bound(
+                rds5_chunks_.begin(), rds5_chunks_.end(), cand_off, cmp_off);
+            if (sit != rds5_chunks_.end() &&
+                sit->comp_off == cand_off &&
+                sit->comp_sz == req_src_sz &&
+                sit->flags == want_flags &&
+                sit->uncomp_sz == dst_sz) {
+                out_true_off = cand_off;
+                out_full_uncomp_sz = dst_sz;
+                out_slice_off = 0u;
+                return true;
+            }
+        }
+
+        // 3. Backward scan within 16 MiB for sub-chunk slice or shifted whole chunk.
+        constexpr uint64_t kMaxRds5ShiftWindow = 16ull * 1024ull * 1024ull;
+        auto cur = std::upper_bound(
+            rds5_chunks_.begin(),
+            rds5_chunks_.end(),
+            req_off,
+            [](uint64_t off, const Rds5ChunkEntry& e) { return off < e.comp_off; });
+
+        const Rds5ChunkEntry* whole_match = nullptr;
+        while (cur != rds5_chunks_.begin()) {
+            --cur;
+            if (cur->comp_off >= req_off) continue;
+            const uint64_t shift = req_off - cur->comp_off;
+            if (shift > kMaxRds5ShiftWindow) {
+                break;
+            }
+            if (cur->comp_sz != req_src_sz || cur->flags != want_flags) {
+                continue;
+            }
+            if (cur->uncomp_sz > dst_sz && shift + dst_sz <= cur->uncomp_sz) {
+                out_true_off = cur->comp_off;
+                out_full_uncomp_sz = cur->uncomp_sz;
+                out_slice_off = static_cast<size_t>(shift);
+                return true;
+            }
+            if (!whole_match && cur->uncomp_sz == dst_sz) {
+                whole_match = &(*cur);
+            }
+        }
+        if (whole_match) {
+            last_rds5_shift_.store(req_off - whole_match->comp_off, std::memory_order_relaxed);
+            out_true_off = whole_match->comp_off;
+            out_full_uncomp_sz = dst_sz;
+            out_slice_off = 0u;
+            return true;
+        }
+        return false;
+    }
+
     int32_t OPENSCARLETT_DSTORAGE_CALL QueryInterface(
         const DStorageGuid* riid, void** ppvObject) override {
         if (!ppvObject) return RecordHr("IDStorageFileX::QueryInterface", OS_DSTORAGE_E_POINTER, 0);
@@ -1108,6 +1206,67 @@ private:
 #endif
     }
 
+    void EnsureRds5IndexLoaded() {
+        if (rds5_checked_.load(std::memory_order_acquire)) {
+            return;
+        }
+        std::lock_guard<std::mutex> lk(rds5_mutex_);
+        if (rds5_checked_.load(std::memory_order_relaxed)) {
+            return;
+        }
+        DSTORAGE_FILE_INFO finfo{};
+        std::vector<uint8_t> hdr;
+        if (GetFileInformation(&finfo) >= 0 && finfo.FileSize >= 32u &&
+            ReadAt(0u, 16u, hdr) >= 0 && hdr.size() == 16u &&
+            std::memcmp(hdr.data(), "RDS5", 4u) == 0) {
+            uint32_t cnt = 0u;
+            uint64_t q1 = 0ull;
+            std::memcpy(&cnt, hdr.data() + 4u, sizeof(cnt));
+            std::memcpy(&q1, hdr.data() + 8u, sizeof(q1));
+            const uint64_t tbl_bytes = static_cast<uint64_t>(cnt) * 8ull;
+            if (cnt >= 2u && cnt <= 262144u && 16ull + tbl_bytes <= finfo.FileSize) {
+                std::vector<uint8_t> tbl;
+                if (ReadAt(16u, static_cast<uint32_t>(tbl_bytes), tbl) >= 0 &&
+                    tbl.size() == static_cast<size_t>(tbl_bytes)) {
+                    uint64_t qlast = 0ull;
+                    std::memcpy(&qlast, tbl.data() + static_cast<size_t>(cnt - 1u) * 8u, sizeof(qlast));
+                    const uint64_t last_comp = (qlast & 0x00FFFFFFull) << 8u;
+                    const uint64_t last_uncomp = ((qlast >> 30u) & 0x3FFFFFull) << 12u;
+                    const uint64_t hdr_uncomp = q1 & 0xFFFFFFFFFFull;
+                    if (last_comp == finfo.FileSize && last_uncomp == hdr_uncomp) {
+                        rds5_chunks_.resize(cnt - 1u);
+                        bool valid_tbl = true;
+                        for (uint32_t i = 0u; i + 1u < cnt; ++i) {
+                            uint64_t q = 0ull;
+                            uint64_t qn = 0ull;
+                            std::memcpy(&q, tbl.data() + static_cast<size_t>(i) * 8u, sizeof(q));
+                            std::memcpy(&qn, tbl.data() + static_cast<size_t>(i + 1u) * 8u, sizeof(qn));
+                            const uint64_t c0 = (q & 0x00FFFFFFull) << 8u;
+                            const uint64_t c1 = (qn & 0x00FFFFFFull) << 8u;
+                            const uint64_t pad = (q >> 52u) & 0xFFFull;
+                            const uint64_t u0 = ((q >> 30u) & 0x3FFFFFull) << 12u;
+                            const uint64_t u1 = ((qn >> 30u) & 0x3FFFFFull) << 12u;
+                            if (c1 < c0 + pad || u1 < u0) {
+                                valid_tbl = false;
+                                break;
+                            }
+                            rds5_chunks_[i].comp_off = c0;
+                            rds5_chunks_[i].comp_sz = static_cast<uint32_t>((c1 - c0) - pad);
+                            rds5_chunks_[i].uncomp_sz = static_cast<uint32_t>(u1 - u0);
+                            rds5_chunks_[i].flags = static_cast<uint8_t>((q >> 26u) & 0xFu);
+                        }
+                        if (valid_tbl) {
+                            rds5_valid_ = true;
+                        } else {
+                            rds5_chunks_.clear();
+                        }
+                    }
+                }
+            }
+        }
+        rds5_checked_.store(true, std::memory_order_release);
+    }
+
     std::atomic<uint32_t> ref_count_{1};
     std::atomic<bool> closing_{false};
     mutable std::shared_mutex handle_rw_mutex_;
@@ -1119,6 +1278,11 @@ private:
     bool iocp_attached_ = false;
     bool skip_iocp_on_sync_ = false;
     std::wstring file_path_;
+    std::mutex rds5_mutex_;
+    std::atomic<bool> rds5_checked_{false};
+    bool rds5_valid_ = false;
+    std::vector<Rds5ChunkEntry> rds5_chunks_;
+    mutable std::atomic<uint64_t> last_rds5_shift_{0ull};
 };
 
 // ===========================================================================
@@ -2376,6 +2540,9 @@ private:
         // 2. Acquire source bytes (IOCP file read, virtual memory, or physical page array).
         const uint8_t* src_ptr = nullptr;
         size_t src_size = 0u;
+        bool has_rds5_remap = false;
+        size_t rds5_full_uncomp_sz = 0u;
+        size_t rds5_slice_off = 0u;
         if (src_phys) {
             if (req.Options.SourceType != DSTORAGE_REQUEST_SOURCE_MEMORY ||
                 !req.Source.Memory.Source || req.Source.Memory.Size == 0u) {
@@ -2393,7 +2560,47 @@ private:
             src_ptr = buf_a.data();
             src_size = buf_a.size();
         } else {
-            if (dest_phys && req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE &&
+            if (req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE &&
+                req.Source.File.Source != nullptr && req.Source.File.Size > 0u) {
+                auto* file_impl = static_cast<DStorageFileImpl*>(req.Source.File.Source);
+                uint64_t rds5_true_off = 0ull;
+                if (file_impl->ResolveRds5Request(
+                        req.Source.File.Offset,
+                        req.Source.File.Size,
+                        dst_size,
+                        use_zlib,
+                        bcpack_mode,
+                        rds5_true_off,
+                        rds5_full_uncomp_sz,
+                        rds5_slice_off)) {
+                    if (rds5_true_off != req.Source.File.Offset) {
+                        static std::atomic<uint32_t> s_rds5_log{0u};
+                        const uint32_t rn = s_rds5_log.fetch_add(1u, std::memory_order_relaxed);
+                        if (rn < 8u) {
+                            std::fprintf(
+                                stderr,
+                                "[OpenScarlett][dstorage] RDS5-REMAP #%u reqOff=0x%llX -> trueOff=0x%llX srcSz=0x%X dstSz=0x%zX fullSz=0x%zX slice=0x%zX z=%d bc=%llu\n",
+                                rn,
+                                static_cast<unsigned long long>(req.Source.File.Offset),
+                                static_cast<unsigned long long>(rds5_true_off),
+                                req.Source.File.Size,
+                                dst_size,
+                                rds5_full_uncomp_sz,
+                                rds5_slice_off,
+                                use_zlib ? 1 : 0,
+                                static_cast<unsigned long long>(bcpack_mode));
+                            std::fflush(stderr);
+                        }
+                    }
+                    const int32_t rds_hr = file_impl->ReadAt(
+                        rds5_true_off, req.Source.File.Size, buf_a, cancel_flag);
+                    if (rds_hr < 0) return rds_hr;
+                    src_ptr = buf_a.data();
+                    src_size = buf_a.size();
+                    has_rds5_remap = true;
+                }
+            }
+            if (!has_rds5_remap && dest_phys && req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE &&
                 req.Source.File.Source != nullptr) {
                 auto* file_impl = static_cast<DStorageFileImpl*>(req.Source.File.Source);
                 DSTORAGE_FILE_INFO finfo{};
@@ -2443,24 +2650,28 @@ private:
                     return (zhr < 0) ? zhr : OS_DSTORAGE_S_OK;
                 }
             }
-            const int32_t shr = AcquireSourceBytes(
-                req, staging_limit, buf_a, src_ptr, src_size, cancel_flag, false);
-            if (shr < 0) return shr;
+            if (!has_rds5_remap) {
+                const int32_t shr = AcquireSourceBytes(
+                    req, staging_limit, buf_a, src_ptr, src_size, cancel_flag, false);
+                if (shr < 0) return shr;
+            }
         }
         if (is_canceled()) return OS_DSTORAGE_E_CANCELLED;
 
         // 3. Stage 1 Decompression: RFC 1950/1951 Zlib if Options.ZlibDecompress is set.
         const uint8_t* cur_ptr = src_ptr;
         size_t cur_size = src_size;
+        const size_t stage_dst_size =
+            (has_rds5_remap && rds5_full_uncomp_sz > dst_size) ? rds5_full_uncomp_sz : dst_size;
 
         if (use_zlib) {
             const size_t zlib_max =
                 (bcpack_mode != 0u && item.xbox_intermediate_size > 0u)
                     ? static_cast<size_t>(item.xbox_intermediate_size)
-                    : std::max(dst_size, static_cast<size_t>(item.xbox_intermediate_size));
+                    : std::max(stage_dst_size, static_cast<size_t>(item.xbox_intermediate_size));
             if (zlib_max == 0u) return OS_DSTORAGE_E_INVALIDARG;
             if (zlib_max > staging_limit) return OS_DSTORAGE_E_STAGING_BUFFER_TOO_SMALL;
-            ReserveZlibOutputHint(buf_b, cur_size, (bcpack_mode == 0u) ? dst_size : zlib_max);
+            ReserveZlibOutputHint(buf_b, cur_size, (bcpack_mode == 0u) ? stage_dst_size : zlib_max);
             const bool allow_prefix =
                 (bcpack_mode == 0u && req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE);
             bool z_ok = zlib_rfc1950::DecompressXboxStream(
@@ -2469,17 +2680,17 @@ private:
                 // Retail RPF8/9 packfile readers occasionally request a sub-chunk prefix
                 // (e.g. DestinationSize = 16 KiB from a 64 KiB Zlib-compressed RPF chunk).
                 const size_t chunk_cap =
-                    std::min<size_t>(staging_limit, std::max<size_t>(dst_size * 16u, 262144u));
+                    std::min<size_t>(staging_limit, std::max<size_t>(stage_dst_size * 16u, 262144u));
                 if (chunk_cap > zlib_max) {
                     z_ok = zlib_rfc1950::DecompressXboxStream(
                         cur_ptr, cur_size, chunk_cap, buf_b, true);
-                    if (z_ok && buf_b.size() > dst_size) {
-                        buf_b.resize(dst_size);
+                    if (z_ok && buf_b.size() > stage_dst_size) {
+                        buf_b.resize(stage_dst_size);
                     }
                 }
                 // Retail RDS5 (.ttpf) packfile readers sub-slice multi-page Zlib chunks (e.g. 512 KiB
                 // chunk read in 128 KiB pages) where EnqueueChunksForRead added sub_offset to File.Offset.
-                if (!z_ok && req.Source.File.Source != nullptr) {
+                if (!z_ok && !has_rds5_remap && req.Source.File.Source != nullptr) {
                     z_ok = TryResolveShiftedZlibSubChunk(
                         static_cast<DStorageFileImpl*>(req.Source.File.Source),
                         req.Source.File.Offset,
@@ -2491,36 +2702,31 @@ private:
                 }
             }
             if (!z_ok) {
-                static const bool trace_zfail = []() {
-#if defined(_WIN32)
-                    char buf[16]{};
-                    return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_DSTORAGE", buf, sizeof(buf)) > 0 && buf[0] != '0';
-#else
-                    return false;
-#endif
-                }();
-                if (trace_zfail) {
-                    static std::atomic<uint32_t> s_zf{0u};
-                    if (s_zf.fetch_add(1u, std::memory_order_relaxed) < 16u) {
-                        char hex[64]{};
-                        int hp = 0;
-                        const size_t hn = std::min<size_t>(cur_size, 16u);
-                        for (size_t hi = 0u; hi < hn && hp + 4 < static_cast<int>(sizeof(hex)); ++hi) {
-                            hp += std::snprintf(hex + hp, sizeof(hex) - static_cast<size_t>(hp), "%02X ", cur_ptr[hi]);
-                        }
-                        std::fprintf(stderr,
-                                     "[OpenScarlett][dstorage] ZLIB-FAIL srcSz=0x%zX dstSz=0x%zX bc=%u hdr=[%s]\n",
-                                     cur_size, dst_size, static_cast<unsigned>(bcpack_mode), hex);
-                        std::fflush(stderr);
+                static std::atomic<uint32_t> s_zf{0u};
+                const uint32_t zfn = s_zf.fetch_add(1u, std::memory_order_relaxed);
+                if (zfn < 8u) {
+                    char hex[64]{};
+                    int hp = 0;
+                    const size_t hn = std::min<size_t>(cur_size, 16u);
+                    for (size_t hi = 0u; hi < hn && hp + 4 < static_cast<int>(sizeof(hex)); ++hi) {
+                        hp += std::snprintf(hex + hp, sizeof(hex) - static_cast<size_t>(hp), "%02X ", cur_ptr[hi]);
                     }
+                    std::fprintf(stderr,
+                                 "[OpenScarlett][dstorage] ZLIB-FAIL #%u off=0x%llX srcSz=0x%zX dstSz=0x%zX bc=%u hdr=[%s]\n",
+                                 zfn,
+                                 req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE
+                                     ? static_cast<unsigned long long>(req.Source.File.Offset)
+                                     : 0ull,
+                                 cur_size, dst_size, static_cast<unsigned>(bcpack_mode), hex);
+                    std::fflush(stderr);
                 }
                 return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
             }
-            if (bcpack_mode == 0u && buf_b.size() > dst_size &&
+            if (bcpack_mode == 0u && buf_b.size() > stage_dst_size &&
                 req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE) {
-                buf_b.resize(dst_size);
+                buf_b.resize(stage_dst_size);
             }
-            if (bcpack_mode == 0u && buf_b.size() != dst_size) {
+            if (bcpack_mode == 0u && buf_b.size() != stage_dst_size) {
                 static const bool trace_ds_z = []() {
 #if defined(_WIN32)
                     char buf[16]{};
@@ -2532,7 +2738,7 @@ private:
                 if (trace_ds_z) {
                     std::fprintf(stderr,
                                  "[OpenScarlett][dstorage] ZLIB-SIZE-MISMATCH stage=%zu dst=%zu src=%zu off=0x%llX\n",
-                                 buf_b.size(), dst_size, cur_size,
+                                 buf_b.size(), stage_dst_size, cur_size,
                                  req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE
                                      ? static_cast<unsigned long long>(req.Source.File.Offset)
                                      : 0ull);
@@ -2552,33 +2758,33 @@ private:
 
         // 4. Stage 2 Decompression: Hardware BCPack BC1-BC7 if Options.BcpackMode != NONE.
         if (bcpack_mode != 0u) {
-            if (dst_size > staging_limit) {
+            if (stage_dst_size > staging_limit) {
                 return OS_DSTORAGE_E_STAGING_BUFFER_TOO_SMALL;
             }
             const auto fmt = static_cast<openscarlett::BcFormat>(bcpack_mode);
             const uint32_t blk_bytes = openscarlett::BcFormatBlockBytes(fmt);
-            if (blk_bytes == 0u || (dst_size % blk_bytes) != 0u) {
+            if (blk_bytes == 0u || (stage_dst_size % blk_bytes) != 0u) {
                 return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
             }
             std::vector<uint8_t>& bcpack_out =
                 (!buf_a.empty() && cur_ptr == buf_a.data()) ? buf_b : buf_a;
-            bcpack_out.resize(dst_size);
+            bcpack_out.resize(stage_dst_size);
             size_t written = 0u;
             auto st = openscarlett::BcPackHwDecodeBitstream(
                 fmt, cur_ptr, cur_size, bcpack_out.data(), bcpack_out.size(), &written);
-            if (!st.ok() && dst_size < 65536u) {
+            if (!st.ok() && stage_dst_size < 65536u) {
                 static constexpr size_t kCandidateChunkBytes[] = {
                     4096u, 8192u, 12288u, 16384u, 32768u, 65536u};
                 std::vector<uint8_t> full_chunk;
                 for (size_t cand_bytes : kCandidateChunkBytes) {
-                    if (dst_size >= cand_bytes) continue;
+                    if (stage_dst_size >= cand_bytes) continue;
                     full_chunk.resize(cand_bytes);
                     size_t cand_written = 0u;
                     if (openscarlett::BcPackHwDecodeBitstream(
                             fmt, cur_ptr, cur_size, full_chunk.data(), full_chunk.size(), &cand_written).ok() &&
                         cand_written == cand_bytes) {
-                        std::memcpy(bcpack_out.data(), full_chunk.data(), dst_size);
-                        written = dst_size;
+                        std::memcpy(bcpack_out.data(), full_chunk.data(), stage_dst_size);
+                        written = stage_dst_size;
                         st = openscarlett::Status::Ok();
                         break;
                     }
@@ -2589,39 +2795,31 @@ private:
                 openscarlett::BcPackHeader hdr{};
                 if (openscarlett::BcPackParseHeader(cur_ptr, cur_size, hdr).ok() &&
                     hdr.format == fmt &&
-                    hdr.original_size == dst_size &&
+                    hdr.original_size == stage_dst_size &&
                     openscarlett::BcPackDecompressInto(
                         cur_ptr, cur_size, bcpack_out.data(), bcpack_out.size(), &written).ok()) {
                     st = openscarlett::Status::Ok();
                 }
             }
-            if (!st.ok() || written != dst_size) {
-                static const bool trace_ds_bcp = []() {
-#if defined(_WIN32)
-                    char buf[16]{};
-                    return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_DSTORAGE", buf, sizeof(buf)) > 0 && buf[0] != '0';
-#else
-                    return false;
-#endif
-                }();
-                if (trace_ds_bcp) {
-                    static std::atomic<uint32_t> s_bcp_log_cnt{0u};
-                    if (s_bcp_log_cnt.fetch_add(1u, std::memory_order_relaxed) < 16u) {
-                        char hex[96]{};
-                        size_t hp = 0u;
-                        for (size_t k = 0u; k < std::min<size_t>(cur_size, 24u) && hp + 4u < sizeof(hex); ++k) {
-                            hp += static_cast<size_t>(std::snprintf(hex + hp, sizeof(hex) - hp, "%02X ", cur_ptr[k]));
-                        }
-                        std::fprintf(stderr,
-                                     "[OpenScarlett][dstorage] BCPACK-FAIL mode=%llu src=%zu dst=%zu int=%u off=0x%llX hdr=[%s]\n",
-                                     static_cast<unsigned long long>(bcpack_mode),
-                                     cur_size, dst_size, item.xbox_intermediate_size,
-                                     req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE
-                                         ? static_cast<unsigned long long>(req.Source.File.Offset)
-                                         : 0ull,
-                                     hex);
-                        std::fflush(stderr);
+            if (!st.ok() || written != stage_dst_size) {
+                static std::atomic<uint32_t> s_bcp_log_cnt{0u};
+                const uint32_t bcn = s_bcp_log_cnt.fetch_add(1u, std::memory_order_relaxed);
+                if (bcn < 8u) {
+                    char hex[96]{};
+                    size_t hp = 0u;
+                    for (size_t k = 0u; k < std::min<size_t>(cur_size, 24u) && hp + 4u < sizeof(hex); ++k) {
+                        hp += static_cast<size_t>(std::snprintf(hex + hp, sizeof(hex) - hp, "%02X ", cur_ptr[k]));
                     }
+                    std::fprintf(stderr,
+                                 "[OpenScarlett][dstorage] BCPACK-FAIL #%u mode=%llu src=%zu dst=%zu int=%u off=0x%llX hdr=[%s]\n",
+                                 bcn,
+                                 static_cast<unsigned long long>(bcpack_mode),
+                                 cur_size, stage_dst_size, item.xbox_intermediate_size,
+                                 req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE
+                                     ? static_cast<unsigned long long>(req.Source.File.Offset)
+                                     : 0ull,
+                                 hex);
+                    std::fflush(stderr);
                 }
                 return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
             }
@@ -2634,6 +2832,17 @@ private:
             RecordOk("DirectStorage::XboxBcpackDecompress");
         }
         if (is_canceled()) return OS_DSTORAGE_E_CANCELLED;
+
+        if (has_rds5_remap && rds5_full_uncomp_sz > dst_size && cur_size >= rds5_slice_off + dst_size) {
+            std::vector<uint8_t>& active_vec =
+                (!buf_a.empty() && cur_ptr == buf_a.data()) ? buf_a : buf_b;
+            if (rds5_slice_off > 0u) {
+                std::memmove(active_vec.data(), active_vec.data() + rds5_slice_off, dst_size);
+            }
+            active_vec.resize(dst_size);
+            cur_ptr = active_vec.data();
+            cur_size = dst_size;
+        }
 
         if (cur_size != dst_size) {
             return (use_zlib || bcpack_mode != 0u)

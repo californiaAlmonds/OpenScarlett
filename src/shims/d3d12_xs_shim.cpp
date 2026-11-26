@@ -3673,6 +3673,42 @@ HRESULT CreateWrappedDeviceInternal(
                         }
                     }
                 }
+                // Guard hash-table linear scan (`cmp qword ptr [rcx+r10*8], r8` = `4E 39 04 D1` at
+                // RVA +0x28CD253) if a partially-mapped dictionary hits an unmapped tail page:
+                // return 0xFFFF ("not found") cleanly via `+0x28CD265` (`C3 ret`).
+                if (code == EXCEPTION_ACCESS_VIOLATION &&
+                    IsReadableRetailRange(reinterpret_cast<uintptr_t>(rip), 8u) &&
+                    rip[0] == 0x4Eu && rip[1] == 0x39u && rip[2] == 0x04u && rip[3] == 0xD1u) {
+                    HMODULE hit_mod = nullptr;
+                    const HMODULE main_exe = ::GetModuleHandleW(nullptr);
+                    if (main_exe &&
+                        ::GetModuleHandleExA(
+                            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(rip), &hit_mod) &&
+                        hit_mod == main_exe) {
+                        const uintptr_t base = reinterpret_cast<uintptr_t>(main_exe);
+                        const uintptr_t rva = reinterpret_cast<uintptr_t>(rip) - base;
+                        if (rva == 0x28CD253u &&
+                            IsReadableRetailRange(base + 0x28CD265u, 1u)) {
+                            static std::atomic<uint32_t> s_hash_guard{0u};
+                            const uint32_t hn = s_hash_guard.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                            if (hn <= 8u) {
+                                std::fprintf(
+                                    stderr,
+                                    "[OpenScarlett][VEH-GUARD] LookupByHash +0x28CD253 #%u rcx=0x%llX rdx=0x%llX r9=0x%llX r8=0x%llX -> 0xFFFF\n",
+                                    hn,
+                                    static_cast<unsigned long long>(ep->ContextRecord->Rcx),
+                                    static_cast<unsigned long long>(ep->ContextRecord->Rdx),
+                                    static_cast<unsigned long long>(ep->ContextRecord->R9),
+                                    static_cast<unsigned long long>(ep->ContextRecord->R8));
+                                std::fflush(stderr);
+                            }
+                            ep->ContextRecord->Rax = (ep->ContextRecord->Rax & ~0xFFFFull) | 0xFFFFull;
+                            ep->ContextRecord->Rip = base + 0x28CD265u;
+                            return EXCEPTION_CONTINUE_EXECUTION;
+                        }
+                    }
+                }
                 return EXCEPTION_CONTINUE_SEARCH;
             });
             ::SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
