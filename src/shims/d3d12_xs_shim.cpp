@@ -4680,6 +4680,38 @@ HRESULT CreateWrappedDeviceInternal(
                             ep->ContextRecord->Rip = reinterpret_cast<uintptr_t>(rip) + 3u;
                             return EXCEPTION_CONTINUE_EXECUTION;
                         }
+                        // Case F (+0x50E5525 lockless weak-handle check on an evicted 64 KB paged `fwPool`
+                        // chunk `[+0x99AB7B0]`): when `+0x0B18CE0` evicts an empty 64 KB page (`rcx`,
+                        // `MEM_RESERVE`), worker threads probing `cmp byte ptr [rcx+0F72h], 0` (`80 B9 72 0F
+                        // 00 00 00 75 37`) fault at `rcx + 0xF72`. Advance +0x40 bytes to `+0x50E5565`
+                        // (`xor eax, eax; jmp epilogue`) to report inactive/destroyed cleanly.
+                        if (ep->ContextRecord->Rcx >= 0x10000ull &&
+                            av_addr == ep->ContextRecord->Rcx + 0xF72ull &&
+                            reinterpret_cast<uintptr_t>(rip) > 5u &&
+                            IsReadableRetailRange(reinterpret_cast<uintptr_t>(rip) - 5u, 0x4Cu) &&
+                            rip[-5] == 0x56u && rip[-4] == 0x48u && rip[-3] == 0x83u &&
+                            rip[-2] == 0xECu && rip[-1] == 0x20u &&
+                            rip[0] == 0x80u && rip[1] == 0xB9u && rip[2] == 0x72u &&
+                            rip[3] == 0x0Fu && rip[4] == 0x00u && rip[5] == 0x00u &&
+                            rip[6] == 0x00u && rip[7] == 0x75u && rip[8] == 0x37u &&
+                            rip[0x3E] == 0x5Eu && rip[0x3F] == 0xC3u &&
+                            rip[0x40] == 0x31u && rip[0x41] == 0xC0u &&
+                            rip[0x42] == 0xEBu && rip[0x43] == 0xF6u) {
+                            static std::atomic<uint32_t> s_evicted_fwpool_probe{0u};
+                            const uint32_t fn = s_evicted_fwpool_probe.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                            if (fn <= 8u) {
+                                std::fprintf(
+                                    stderr,
+                                    "[OpenScarlett][VEH-GUARD] Evicted paged fwPool weak-handle probe at +0x%llX #%u (slot=0x%llX) -> inactive\n",
+                                    static_cast<unsigned long long>(
+                                        reinterpret_cast<uintptr_t>(rip) - reinterpret_cast<uintptr_t>(main_exe)),
+                                    fn,
+                                    static_cast<unsigned long long>(ep->ContextRecord->Rcx));
+                                std::fflush(stderr);
+                            }
+                            ep->ContextRecord->Rip = reinterpret_cast<uintptr_t>(rip) + 0x40u;
+                            return EXCEPTION_CONTINUE_EXECUTION;
+                        }
                     }
                 }
                 return EXCEPTION_CONTINUE_SEARCH;

@@ -7584,6 +7584,85 @@ void SafeDescPoolPush(uint64_t desc_va) noexcept {
     ::ReleaseSRWLockExclusive(&st.lock);
 }
 
+void __fastcall SafeFlushDeferredUnmaps() noexcept {
+    if (g_safe_desc_exe_base == 0u) {
+        return;
+    }
+    auto* count_ptr = reinterpret_cast<volatile uint32_t*>(g_safe_desc_exe_base + 0x71BFEF8u);
+    const uint32_t raw_count = *count_ptr;
+    if (raw_count == 0u) {
+        return;
+    }
+    const uint32_t clamped_count = std::min<uint32_t>(raw_count, 512u);
+    auto* unmap_arr = reinterpret_cast<void* const*>(g_safe_desc_exe_base + 0x71BFF00u);
+    const uint64_t* map_begin = *reinterpret_cast<const uint64_t* const*>(g_safe_desc_exe_base + 0x71B63F0u);
+    const uint64_t* map_end   = *reinterpret_cast<const uint64_t* const*>(g_safe_desc_exe_base + 0x71B63F8u);
+    const bool valid_map_range =
+        (map_begin != nullptr) && (map_end >= map_begin) &&
+        (static_cast<size_t>(map_end - map_begin) <= (1ull << 20));
+
+    void* filtered[512]{};
+    uint32_t filtered_count = 0u;
+    uint32_t skipped_live = 0u;
+    for (uint32_t i = 0u; i < clamped_count; ++i) {
+        void* const va_ptr = unmap_arr[i];
+        const uint64_t page_va = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(va_ptr)) & ~0xFFFFull;
+        if (page_va < 0x10000ull) {
+            continue;
+        }
+        if (valid_map_range && map_begin < map_end) {
+            const uint64_t* it = std::lower_bound(map_begin, map_end, page_va);
+            if (it != map_end && ((*it) & ~0xFFFFull) == page_va) {
+                ++skipped_live;
+                continue;
+            }
+        }
+        bool dup = false;
+        for (uint32_t j = 0u; j < filtered_count; ++j) {
+            if (filtered[j] == reinterpret_cast<void*>(static_cast<uintptr_t>(page_va))) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            filtered[filtered_count++] = reinterpret_cast<void*>(static_cast<uintptr_t>(page_va));
+        }
+    }
+    *count_ptr = 0u;
+
+    if (skipped_live > 0u) {
+        static std::atomic<uint32_t> s_skip_logs{0u};
+        const uint32_t ln = s_skip_logs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (ln <= 16u) {
+            std::fprintf(
+                stderr,
+                "[OpenScarlett][loader] Suppressed %u stale deferred physical page unmap(s) on live re-mapped fwPool pages\n",
+                skipped_live);
+            std::fflush(stderr);
+        }
+    }
+
+    if (filtered_count > 0u) {
+        using PfnScatter = int32_t(__stdcall*)(void* const*, uint64_t, const uint64_t*);
+        static std::atomic<PfnScatter> s_scatter{nullptr};
+        PfnScatter fn = s_scatter.load(std::memory_order_acquire);
+        if (!fn) {
+            HMODULE hx = g_real_GetModuleHandleW ? g_real_GetModuleHandleW(L"xmem.dll")
+                                                 : ::GetModuleHandleW(L"xmem.dll");
+            if (hx) {
+                PfnGetProcAddress gpa = g_real_GetProcAddress ? g_real_GetProcAddress : &::GetProcAddress;
+                fn = reinterpret_cast<PfnScatter>(gpa(hx, "XMemMapPhysicalPagesScatter"));
+                if (fn) {
+                    s_scatter.store(fn, std::memory_order_release);
+                }
+            }
+        }
+        if (fn) {
+            (void)fn(filtered, static_cast<uint64_t>(filtered_count), nullptr);
+        }
+    }
+}
+
 void InstallRetailSafeDescPools(HMODULE main_exe) noexcept {
     if (!main_exe) {
         return;
@@ -7631,6 +7710,25 @@ void InstallRetailSafeDescPools(HMODULE main_exe) noexcept {
         std::fprintf(
             stderr,
             "[OpenScarlett][loader] Installed out-of-band FIFO D3D12 descriptor pools (CBV_SRV_UAV/RTV/DSV)\n");
+        std::fflush(stderr);
+    }
+
+    // Guard `+0x0B18DC0` (`FlushDeferredPhysicalUnmaps`) against unmapping 64 KB `fwPool` pages that
+    // were re-mapped into `[+0x71B63F0..+0x71B63F8)` between `+0x2216A60` and `+0x2216B60`.
+    static constexpr uint8_t kExpectedFlushUnmap[24] = {
+        0x48u, 0x83u, 0xECu, 0x28u,                                // sub rsp, 28h
+        0x8Bu, 0x15u, 0x2Eu, 0x71u, 0x6Au, 0x06u,                  // mov edx, [+0x71BFEF8]
+        0x48u, 0x85u, 0xD2u,                                       // test rdx, rdx
+        0x75u, 0x05u,                                              // jne +5
+        0x48u, 0x83u, 0xC4u, 0x28u,                                // add rsp, 28h
+        0xC3u,                                                     // ret
+        0x48u, 0x8Du, 0x0Du, 0x25u                                 // lea rcx, [+0x71BFF00]
+    };
+    if (verify_site(0x0B18DC0u, kExpectedFlushUnmap) &&
+        write_jmp14(0x0B18DC0u, reinterpret_cast<const void*>(&SafeFlushDeferredUnmaps))) {
+        std::fprintf(
+            stderr,
+            "[OpenScarlett][loader] Installed deferred physical page unmap live-page filter (+0x0B18DC0)\n");
         std::fflush(stderr);
     }
 }

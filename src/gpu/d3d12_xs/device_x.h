@@ -218,6 +218,9 @@ struct UnifiedTextureMapping {
     bool has_uploaded_nonzero = false;
     bool mirrored_by_title_va = false;
     bool has_pending_hash = false;
+    bool is_lazy_placed = false;
+    uint64_t gpu_alias_va = 0ull;
+    uint64_t unmapped_present_epoch = 0ull;
     uint64_t last_uploaded_hash = 0ull;
     uint64_t pending_hash = 0ull;
 };
@@ -1253,8 +1256,22 @@ private:
     ID3D12PipelineState* fb_decode_pso_ = nullptr;
     ID3D12PipelineState* fb_encode_pso_ = nullptr;
 
+    struct TransientGpuResourceEntry {
+        ID3D12Resource* res = nullptr;
+        uint64_t born_frame_token = 0ull;
+    };
+    struct FenceRetiredGpuResource {
+        ID3D12Resource* res = nullptr;
+        uint64_t fence_val = 0ull;
+    };
+    void MarkLazyPlacedTexture(ID3D12Resource* host_res, uint64_t gpu_va, bool owned_by_unified);
+    void ReclaimCompletedGpuResources(ID3D12CommandQueue* host_queue) noexcept;
+
     std::mutex transient_res_mutex_;
-    std::vector<ID3D12Resource*> transient_gpu_resources_;
+    std::vector<TransientGpuResourceEntry> transient_gpu_resources_;
+    std::vector<FenceRetiredGpuResource> fence_retired_resources_;
+    std::unordered_map<ID3D12Resource*, uint64_t> unowned_lazy_placed_textures_;
+    std::atomic<uint64_t> present_reclaim_epoch_{1ull};
 
     // Sprint 12 live wiring counters
     std::atomic<uint64_t> sf_decode_intercepts_{0ull};

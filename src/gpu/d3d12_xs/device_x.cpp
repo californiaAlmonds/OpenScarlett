@@ -6661,16 +6661,16 @@ void DeviceX::CreatePlacedShaderResourceViewX(
                         bool owned_by_unified = false;
                         {
                             std::lock_guard<std::mutex> ulk(unified_mutex_);
-                            owned_by_unified = (unified_textures_.find(lazy_tex) != unified_textures_.end());
+                            auto uit = unified_textures_.find(lazy_tex);
+                            if (uit != unified_textures_.end()) {
+                                uit->second.is_lazy_placed = true;
+                                uit->second.gpu_alias_va = gpu_va;
+                                owned_by_unified = true;
+                            }
                         }
-                        if (owned_by_unified) {
-                            tex_res = lazy_tex;
-                            lazy_tex->Release();  // unified_textures_ holds the lifetime ref
-                        } else {
-                            TrackTransientGpuResource(lazy_tex);
-                            tex_res = lazy_tex;
-                            lazy_tex->Release();
-                        }
+                        MarkLazyPlacedTexture(lazy_tex, gpu_va, owned_by_unified);
+                        tex_res = lazy_tex;
+                        lazy_tex->Release();
                     }
                 }
             }
@@ -14853,18 +14853,32 @@ HRESULT STDMETHODCALLTYPE DeviceX::NotifyVirtualRemap(
     {
         std::lock_guard<std::mutex> lock(unified_mutex_);
         ++total_remap_notifications_;
+        const uint64_t cur_present = present_reclaim_epoch_.load(std::memory_order_relaxed);
         for (auto& [res, m] : unified_textures_) {
             const uint64_t m_end =
                 (m.guest_va > UINT64_MAX - m.byte_size) ? UINT64_MAX : (m.guest_va + m.byte_size);
-            const bool overlaps = (m.guest_va < range_end) && (guest_va_base < m_end);
-            if (!overlaps) continue;
+            const uint64_t g_end =
+                (m.gpu_alias_va > 0ull)
+                    ? ((m.gpu_alias_va > UINT64_MAX - m.byte_size) ? UINT64_MAX : (m.gpu_alias_va + m.byte_size))
+                    : 0ull;
+            const bool overlaps_cpu = (m.guest_va < range_end) && (guest_va_base < m_end);
+            const bool overlaps_gpu = (m.gpu_alias_va > 0ull) && (m.gpu_alias_va < range_end) && (guest_va_base < g_end);
+            if (!overlaps_cpu && !overlaps_gpu) continue;
 
-            if (new_backing_va != 0ull) {
+            if (new_backing_va != 0ull && overlaps_cpu) {
                 const uint64_t rel_offset =
                     (m.guest_va >= guest_va_base) ? (m.guest_va - guest_va_base) : 0ull;
                 m.guest_va = new_backing_va + rel_offset;
+            } else if (m.gpu_alias_va != 0ull) {
+                m.guest_va = ResolveGuestCpuAliasVa(m.gpu_alias_va);
             }
-            m.cpu_readable = IsReadableGuestVaRange(m.guest_va, m.byte_size);
+            const uint64_t probe_bytes = m.is_lazy_placed ? std::min<uint64_t>(m.byte_size, 256ull) : m.byte_size;
+            m.cpu_readable = IsReadableGuestVaRange(m.guest_va, std::max<uint64_t>(probe_bytes, 1ull));
+            if (m.cpu_readable) {
+                m.unmapped_present_epoch = 0ull;
+            } else if (m.is_lazy_placed && m.unmapped_present_epoch == 0ull) {
+                m.unmapped_present_epoch = (cur_present > 0ull) ? cur_present : 1ull;
+            }
             ++m.page_generation;
             if (!m.cpu_readable && m.dirty) {
                 m.dirty = false;
@@ -15003,6 +15017,8 @@ HRESULT DeviceX::FlushDirtyUnifiedTexturesInternal(
         RecordDev("ID3D12DeviceX::FlushDirtyUnifiedTextures", -1, E_INVALIDARG);
         return E_INVALIDARG;
     }
+
+    ReclaimCompletedGpuResources(host_queue);
 
     struct PendingUpload {
         UnifiedTextureMapping mapping;
@@ -17430,11 +17446,14 @@ D3D12_GPU_DESCRIPTOR_HANDLE DeviceX::MaterializeGuestDescriptorTable(
                                     bool owned = false;
                                     {
                                         std::lock_guard<std::mutex> ulk(unified_mutex_);
-                                        owned = (unified_textures_.find(lazy_tex) != unified_textures_.end());
+                                        auto uit = unified_textures_.find(lazy_tex);
+                                        if (uit != unified_textures_.end()) {
+                                            uit->second.is_lazy_placed = true;
+                                            uit->second.gpu_alias_va = ts.gpu_va;
+                                            owned = true;
+                                        }
                                     }
-                                    if (!owned) {
-                                        TrackTransientGpuResource(lazy_tex);
-                                    }
+                                    MarkLazyPlacedTexture(lazy_tex, ts.gpu_va, owned);
                                     tex_res = lazy_tex;
                                     lazy_tex->Release();
                                 }
@@ -18240,10 +18259,172 @@ bool DeviceX::EnsureXgGpuUntilerReady() {
     return st.ok() && xg_untiler_->IsD3D12Ready();
 }
 
+void DeviceX::MarkLazyPlacedTexture(ID3D12Resource* host_res, uint64_t gpu_va, bool owned_by_unified) {
+    if (!host_res || owned_by_unified) return;
+    host_res->AddRef();
+    std::lock_guard<std::mutex> lock(transient_res_mutex_);
+    unowned_lazy_placed_textures_[host_res] = gpu_va;
+}
+
 void DeviceX::TrackTransientGpuResource(ID3D12Resource* res) {
     if (!res) return;
+    const uint64_t cur_frame = next_frame_token_.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(transient_res_mutex_);
-    transient_gpu_resources_.push_back(res);
+    transient_gpu_resources_.push_back(TransientGpuResourceEntry{res, cur_frame});
+}
+
+void DeviceX::ReclaimCompletedGpuResources(ID3D12CommandQueue* host_queue) noexcept {
+    if (!host_queue || !host_dev_) return;
+    const uint64_t cur_present = present_reclaim_epoch_.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+    const uint64_t cur_frame = next_frame_token_.load(std::memory_order_relaxed);
+
+    std::vector<ID3D12Resource*> evicted_lazy;
+    if ((cur_present & 15ull) == 0ull) {
+        {
+            std::lock_guard<std::mutex> lock(unified_mutex_);
+            for (auto it = unified_textures_.begin(); it != unified_textures_.end();) {
+                auto& m = it->second;
+                if (!m.is_lazy_placed || !m.resource) {
+                    ++it;
+                    continue;
+                }
+                const uint64_t eff_va =
+                    (m.gpu_alias_va != 0ull) ? ResolveGuestCpuAliasVa(m.gpu_alias_va) : m.guest_va;
+                const bool still_readable = IsReadableGuestVaRange(eff_va, 256ull);
+                if (still_readable) {
+                    m.unmapped_present_epoch = 0ull;
+                    ++it;
+                    continue;
+                }
+                if (m.unmapped_present_epoch == 0ull) {
+                    m.unmapped_present_epoch = cur_present;
+                    ++it;
+                    continue;
+                }
+                if (cur_present < m.unmapped_present_epoch + 32ull) {
+                    ++it;
+                    continue;
+                }
+                if (m.dirty) {
+                    m.dirty = false;
+                    dirty_unified_count_.fetch_sub(1u, std::memory_order_acq_rel);
+                }
+                evicted_lazy.push_back(m.resource);  // transfers unified_textures_ ref
+                it = unified_textures_.erase(it);
+                registered_unified_count_.fetch_sub(1u, std::memory_order_acq_rel);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(transient_res_mutex_);
+            for (auto it = unowned_lazy_placed_textures_.begin(); it != unowned_lazy_placed_textures_.end();) {
+                ID3D12Resource* res = it->first;
+                const uint64_t eff_va = ResolveGuestCpuAliasVa(it->second);
+                if (!IsReadableGuestVaRange(eff_va, 256ull)) {
+                    evicted_lazy.push_back(res);
+                    it = unowned_lazy_placed_textures_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+
+    if (!evicted_lazy.empty()) {
+        std::lock_guard<std::mutex> lock(placed_tex_va_mutex_);
+        for (ID3D12Resource* res : evicted_lazy) {
+            auto tit = placed_tex_res_to_va_.find(res);
+            if (tit != placed_tex_res_to_va_.end()) {
+                const uint64_t gva = tit->second;
+                placed_tex_res_to_va_.erase(tit);
+                auto vit = placed_tex_by_va_.find(gva);
+                if (vit != placed_tex_by_va_.end()) {
+                    auto& vec = vit->second;
+                    vec.erase(std::remove(vec.begin(), vec.end(), res), vec.end());
+                    if (vec.empty()) {
+                        placed_tex_by_va_.erase(vit);
+                    }
+                }
+            }
+        }
+    }
+
+    std::vector<ID3D12Resource*> ready_for_fence = std::move(evicted_lazy);
+    bool has_fence_retired = false;
+    {
+        std::lock_guard<std::mutex> lock(transient_res_mutex_);
+        auto it = std::remove_if(
+            transient_gpu_resources_.begin(),
+            transient_gpu_resources_.end(),
+            [&](const TransientGpuResourceEntry& e) {
+                if (!e.res) return true;
+                if (cur_frame >= e.born_frame_token + 16ull || (cur_present & 63ull) == 0ull) {
+                    ready_for_fence.push_back(e.res);
+                    return true;
+                }
+                return false;
+            });
+        transient_gpu_resources_.erase(it, transient_gpu_resources_.end());
+        has_fence_retired = !fence_retired_resources_.empty();
+    }
+
+    if (ready_for_fence.empty() && !has_fence_retired) {
+        return;
+    }
+
+    uint64_t completed_fence = 0ull;
+    uint64_t signaled_fence = 0ull;
+    bool fence_ok = false;
+    {
+        std::lock_guard<std::mutex> ulock(unified_upload_mutex_);
+        if (SUCCEEDED(EnsureUnifiedUploadObjectsLocked()) && unified_fence_) {
+            completed_fence = unified_fence_->GetCompletedValue();
+            if (!ready_for_fence.empty()) {
+                const uint64_t target = ++unified_fence_val_;
+                if (SUCCEEDED(host_queue->Signal(unified_fence_, target))) {
+                    signaled_fence = target;
+                    fence_ok = true;
+                }
+            } else {
+                fence_ok = true;
+            }
+        }
+    }
+
+    std::vector<ID3D12Resource*> to_release;
+    {
+        std::lock_guard<std::mutex> lock(transient_res_mutex_);
+        if (!ready_for_fence.empty()) {
+            if (fence_ok && signaled_fence > 0ull) {
+                for (ID3D12Resource* r : ready_for_fence) {
+                    fence_retired_resources_.push_back(FenceRetiredGpuResource{r, signaled_fence});
+                }
+            } else {
+                for (ID3D12Resource* r : ready_for_fence) {
+                    transient_gpu_resources_.push_back(TransientGpuResourceEntry{r, cur_frame});
+                }
+            }
+        }
+        if (fence_ok && completed_fence > 0ull && completed_fence != UINT64_MAX) {
+            auto fit = std::remove_if(
+                fence_retired_resources_.begin(),
+                fence_retired_resources_.end(),
+                [&](const FenceRetiredGpuResource& f) {
+                    if (!f.res) return true;
+                    if (completed_fence >= f.fence_val) {
+                        to_release.push_back(f.res);
+                        return true;
+                    }
+                    return false;
+                });
+            fence_retired_resources_.erase(fit, fence_retired_resources_.end());
+        }
+    }
+
+    for (ID3D12Resource* r : to_release) {
+        if (r) {
+            r->Release();
+        }
+    }
 }
 
 void DeviceX::ReleaseAaaRuntimeObjects() {
@@ -18263,10 +18444,19 @@ void DeviceX::ReleaseAaaRuntimeObjects() {
     }
     {
         std::lock_guard<std::mutex> lock(transient_res_mutex_);
-        for (ID3D12Resource* r : transient_gpu_resources_) {
-            if (r) r->Release();
+        for (const auto& e : transient_gpu_resources_) {
+            if (e.res) e.res->Release();
         }
         transient_gpu_resources_.clear();
+        for (const auto& f : fence_retired_resources_) {
+            if (f.res) f.res->Release();
+        }
+        fence_retired_resources_.clear();
+        for (const auto& [r, va] : unowned_lazy_placed_textures_) {
+            (void)va;
+            if (r) r->Release();
+        }
+        unowned_lazy_placed_textures_.clear();
     }
     {
         std::lock_guard<std::mutex> lock(mirrored_res_mutex_);

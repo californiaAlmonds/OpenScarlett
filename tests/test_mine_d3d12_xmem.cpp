@@ -252,7 +252,7 @@ void TestXMemTransferMemory() {
 
         void* ph = valloc_fn(nullptr, 128u * 1024u, 0x20402000u, 0x181u, PAGE_NOACCESS);
         OS_REQUIRE(ph != nullptr);
-        OS_REQUIRE(reinterpret_cast<uintptr_t>(ph) < (1ull << 40));
+        OS_REQUIRE(reinterpret_cast<uintptr_t>(ph) < (1ull << 34));  // <=2 GiB placeholder prefers <16 GiB (sdsm 34-bit VA)
 
         uint64_t page_cnt = 2ull;
         uint64_t pfns[2]{};
@@ -280,6 +280,24 @@ void TestXMemTransferMemory() {
         OS_REQUIRE(addr283 <= ((1ull << 40) - kTwoMiB));
         static_cast<uint64_t*>(blk283)[0] = 0x1122334455667788ull;
         OS_REQUIRE(vfree_fn(blk283, 0u, MEM_RELEASE) != 0);
+
+        // 11. >=64 MiB 0x283 large-page pool block uses <2^40 NTFS sparse backing when
+        //     OPENSCARLETT_FORCE_SPARSE_COMMIT="large" and supports sub-range MEM_DECOMMIT.
+        constexpr SIZE_T kSixtyFourMiB = 64u * 1024u * 1024u;
+        SetEnvironmentVariableA("OPENSCARLETT_FORCE_SPARSE_COMMIT", "large");
+        void* sparse283 = valloc_fn(nullptr, kSixtyFourMiB, 0x20003000u, 0x283u, 0x2004u);
+        SetEnvironmentVariableA("OPENSCARLETT_FORCE_SPARSE_COMMIT", nullptr);
+        OS_REQUIRE(sparse283 != nullptr);
+        const uintptr_t saddr = reinterpret_cast<uintptr_t>(sparse283);
+        OS_REQUIRE((saddr % kTwoMiB) == 0u);
+        OS_REQUIRE(saddr <= ((1ull << 40) - kSixtyFourMiB));
+        MEMORY_BASIC_INFORMATION smbi{};
+        OS_REQUIRE(VirtualQuery(sparse283, &smbi, sizeof(smbi)) != 0u);
+        OS_REQUIRE(smbi.Type == MEM_MAPPED);
+        static_cast<uint64_t*>(sparse283)[0] = 0xFEEDFACECAFEBEEFull;
+        OS_REQUIRE(static_cast<const uint64_t*>(sparse283)[0] == 0xFEEDFACECAFEBEEFull);
+        OS_REQUIRE(vfree_fn(static_cast<uint8_t*>(sparse283) + 65536u, 65536u, MEM_DECOMMIT) != 0);
+        OS_REQUIRE(vfree_fn(sparse283, 0u, MEM_RELEASE) != 0);
     }
 
     OS_REQUIRE(FreeLibrary(mod) != FALSE);
@@ -355,6 +373,35 @@ __declspec(allocate(".text")) alignas(16) const uint8_t kRetailExtCloneStub[32] 
     0x48u, 0x83u, 0xC4u, 0x20u, 0x5Eu, 0xC3u, 0xCCu, 0xCCu
 };
 
+// Replica of `+0x50E5520..+0x50E5568` (Case F evicted paged `fwPool` weak-handle probe):
+//   0x00: 56                       push rsi
+//   0x01: 48 83 EC 20              sub rsp, 20h
+//   0x05: 80 B9 72 0F 00 00 00     cmp byte ptr [rcx+0F72h], 0   <-- Case F fault (rip)
+//   0x0C: 75 37                    jne +0x45 (rip + 0x40)
+//   0x0E: B0 01                    mov al, 1
+//   0x10: EB 2D                    jmp +0x3F (epilogue)
+//   0x12..0x3E: 90...              padding matching real function layout
+//   0x3F: 48 83 C4 20              add rsp, 20h                  (rip + 0x3A)
+//   0x43: 5E                       pop rsi                       (rip + 0x3E)
+//   0x44: C3                       ret                           (rip + 0x3F)
+//   0x45: 31 C0                    xor eax, eax                  (rip + 0x40) <-- Case F recovery
+//   0x47: EB F6                    jmp -10 -> 0x3F               (rip + 0x42)
+__declspec(allocate(".text")) alignas(16) const uint8_t kRetailEvictedFwPoolProbeStub[80] = {
+    0x56u, 0x48u, 0x83u, 0xECu, 0x20u,
+    0x80u, 0xB9u, 0x72u, 0x0Fu, 0x00u, 0x00u, 0x00u,
+    0x75u, 0x37u,
+    0xB0u, 0x01u, 0xEBu, 0x2Du,
+    0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u,
+    0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u,
+    0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u,
+    0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u,
+    0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u, 0x90u,
+    0x90u, 0x90u, 0x90u, 0x90u, 0x90u,
+    0x48u, 0x83u, 0xC4u, 0x20u, 0x5Eu, 0xC3u,
+    0x31u, 0xC0u, 0xEBu, 0xF6u,
+    0xCCu, 0xCCu, 0xCCu, 0xCCu, 0xCCu, 0xCCu, 0xCCu
+};
+
 void TestRetailShaderVarNullBindingGuard() {
     std::printf("[3/3] Retail Scarlett +0x94E725 / +0x5429D33 unbound shader texture var VEH guard...\n");
 
@@ -414,6 +461,18 @@ void TestRetailShaderVarNullBindingGuard() {
         uint64_t cloned_inst = 0xDEADBEEFCAFEBABEull;
         ext_clone_fn(unplaced_def, &cloned_inst);
         OS_REQUIRE(cloned_inst == 0ull);
+
+        // 5) Evicted paged `fwPool` weak-handle probe (+0x50E5525 Case F) returns 0 on MEM_RESERVE page
+        using PfnFwPoolProbe = uint8_t(__fastcall*)(const void* slot_base);
+        auto fw_probe_fn = reinterpret_cast<PfnFwPoolProbe>(&kRetailEvictedFwPoolProbeStub[0]);
+        alignas(64) uint8_t valid_slot[0x1000]{};
+        OS_REQUIRE(fw_probe_fn(valid_slot) == 1u);
+        valid_slot[0xF72] = 1u;
+        OS_REQUIRE(fw_probe_fn(valid_slot) == 0u);
+        void* evicted_page = VirtualAlloc(nullptr, 65536u, MEM_RESERVE, PAGE_NOACCESS);
+        OS_REQUIRE(evicted_page != nullptr);
+        OS_REQUIRE(fw_probe_fn(evicted_page) == 0u);
+        OS_REQUIRE(VirtualFree(evicted_page, 0u, MEM_RELEASE) != FALSE);
 
         dev->Release();
     }

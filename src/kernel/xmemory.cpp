@@ -575,25 +575,39 @@ Status UnifiedMemoryManager::ReserveVirtualPlaceholder(size_t size,
         return Status::Error(StatusCode::NotImplemented, "VirtualAlloc2 placeholder API unavailable");
     }
 
-    constexpr uintptr_t kScarlettMaxVa40Bit = (1ull << 40) - 1ull;
+    constexpr uintptr_t kScarlettMaxVa34Bit = (1ull << 34) - 1ull;  // 16 GiB (34-bit VA for sdsm 22-bit 4KB PFN tables)
+    constexpr uintptr_t kScarlettMaxVa40Bit = (1ull << 40) - 1ull;  // 1 TiB (40-bit Scarlett GPU/CPU VA limit)
+    constexpr size_t kPrefer34BitMaxBytes = static_cast<size_t>(2ull * 1024ull * 1024ull * 1024ull);
     void* base = nullptr;
     {
         OsMemAddressRequirements addr_req{};
         addr_req.lowest_starting_address = nullptr;
-        addr_req.highest_ending_address = reinterpret_cast<void*>(kScarlettMaxVa40Bit);
         addr_req.alignment = (gran > 65536u) ? gran : 0u;
 
         OsMemExtendedParameter ext{};
         ext.type_and_reserved = 1ull;  // MemExtendedParameterAddressRequirements
         ext.value.pointer = &addr_req;
 
-        base = PlaceholderApi().virtual_alloc2(GetCurrentProcess(),
-                                               nullptr,
-                                               aligned_size,
-                                               MEM_RESERVE | kMemReservePlaceholder,
-                                               PAGE_NOACCESS,
-                                               &ext,
-                                               1u);
+        if (aligned_size <= kPrefer34BitMaxBytes) {
+            addr_req.highest_ending_address = reinterpret_cast<void*>(kScarlettMaxVa34Bit);
+            base = PlaceholderApi().virtual_alloc2(GetCurrentProcess(),
+                                                   nullptr,
+                                                   aligned_size,
+                                                   MEM_RESERVE | kMemReservePlaceholder,
+                                                   PAGE_NOACCESS,
+                                                   &ext,
+                                                   1u);
+        }
+        if (!base) {
+            addr_req.highest_ending_address = reinterpret_cast<void*>(kScarlettMaxVa40Bit);
+            base = PlaceholderApi().virtual_alloc2(GetCurrentProcess(),
+                                                   nullptr,
+                                                   aligned_size,
+                                                   MEM_RESERVE | kMemReservePlaceholder,
+                                                   PAGE_NOACCESS,
+                                                   &ext,
+                                                   1u);
+        }
         if (!base) {
             // Fallback without 40-bit cap if host <1 TiB VA space is fragmented.
             if (gran > 65536u) {
