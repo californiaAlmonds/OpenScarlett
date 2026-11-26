@@ -10002,6 +10002,26 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
         if (!host_dev2_ || adapter_info_.mesh_shader_tier == 0u) {
             return;
         }
+        {
+            char dump_dir[260]{};
+            if (seq < 96u && ::GetEnvironmentVariableA("OPENSCARLETT_DUMP_BOUND_PSO", dump_dir, sizeof(dump_dir)) > 0) {
+                ::CreateDirectoryA(dump_dir, nullptr);
+                char pbuf[320]{};
+                std::snprintf(pbuf, sizeof(pbuf), "%s\\bound_%02u_ms.bin", dump_dir, seq);
+                FILE* f = nullptr;
+                if (!pd->ms_blob.empty() && ::fopen_s(&f, pbuf, "wb") == 0 && f) {
+                    std::fwrite(pd->ms_blob.data(), 1u, pd->ms_blob.size(), f);
+                    std::fclose(f);
+                }
+                if (!pd->ps_blob.empty()) {
+                    std::snprintf(pbuf, sizeof(pbuf), "%s\\bound_%02u_ps.bin", dump_dir, seq);
+                    if (::fopen_s(&f, pbuf, "wb") == 0 && f) {
+                        std::fwrite(pd->ps_blob.data(), 1u, pd->ps_blob.size(), f);
+                        std::fclose(f);
+                    }
+                }
+            }
+        }
         std::vector<uint8_t> ps_dxil, as_dxil, ms_dxil;
         std::string ps_err, as_err, ms_err;
         uint32_t ps_param_in_count = 0u;

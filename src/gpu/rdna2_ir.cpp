@@ -291,16 +291,24 @@ uint8_t EncodeF16CmpPred(Rdna2Opcode op) noexcept {
         case Rdna2Opcode::V_CMPX_LG_F16:  return 5u;   // LG (ordered !=)
         case Rdna2Opcode::V_CMP_GE_F16:
         case Rdna2Opcode::V_CMPX_GE_F16:  return 6u;   // GE
-        case Rdna2Opcode::V_CMP_U_F16:    return 8u;   // Unordered (either NaN)
-        case Rdna2Opcode::V_CMP_NGE_F16:  return 9u;   // !(a >= b) == (a < b || unordered)
-        case Rdna2Opcode::V_CMP_NLG_F16:  return 10u;  // (a == b || unordered)
-        case Rdna2Opcode::V_CMP_NGT_F16:  return 11u;  // (a <= b || unordered)
-        case Rdna2Opcode::V_CMP_NLE_F16:  return 12u;  // (a > b || unordered)
+        case Rdna2Opcode::V_CMP_O_F16:
+        case Rdna2Opcode::V_CMPX_O_F16:   return 7u;   // Ordered (neither NaN)
+        case Rdna2Opcode::V_CMP_U_F16:
+        case Rdna2Opcode::V_CMPX_U_F16:   return 8u;   // Unordered (either NaN)
+        case Rdna2Opcode::V_CMP_NGE_F16:
+        case Rdna2Opcode::V_CMPX_NGE_F16: return 9u;   // !(a >= b) == (a < b || unordered)
+        case Rdna2Opcode::V_CMP_NLG_F16:
+        case Rdna2Opcode::V_CMPX_NLG_F16: return 10u;  // (a == b || unordered)
+        case Rdna2Opcode::V_CMP_NGT_F16:
+        case Rdna2Opcode::V_CMPX_NGT_F16: return 11u;  // (a <= b || unordered)
+        case Rdna2Opcode::V_CMP_NLE_F16:
+        case Rdna2Opcode::V_CMPX_NLE_F16: return 12u;  // (a > b || unordered)
         case Rdna2Opcode::V_CMP_NEQ_F16:
         case Rdna2Opcode::V_CMPX_NEQ_F16: return 13u;  // (a != b || unordered)
         case Rdna2Opcode::V_CMP_NLT_F16:
         case Rdna2Opcode::V_CMPX_NLT_F16: return 14u;  // (a >= b || unordered)
-        case Rdna2Opcode::V_CMP_TRU_F16:  return 15u;  // Always true
+        case Rdna2Opcode::V_CMP_TRU_F16:
+        case Rdna2Opcode::V_CMPX_TRU_F16: return 15u;  // Always true
         default:                          return 0u;
     }
 }
@@ -4201,12 +4209,17 @@ Status BuildRdna2Ir(
                 case Rdna2Opcode::V_CMPX_EQ_U32:
                 case Rdna2Opcode::V_CMPX_GT_U32:
                 case Rdna2Opcode::V_CMPX_GE_U32:
+                case Rdna2Opcode::V_CMP_CLASS_F32:
+                case Rdna2Opcode::V_CMPX_CLASS_F32:
+                case Rdna2Opcode::V_CMP_CLASS_F16:
+                case Rdna2Opcode::V_CMPX_CLASS_F16:
                 case Rdna2Opcode::V_CMP_LT_F16:
                 case Rdna2Opcode::V_CMP_EQ_F16:
                 case Rdna2Opcode::V_CMP_LE_F16:
                 case Rdna2Opcode::V_CMP_GT_F16:
                 case Rdna2Opcode::V_CMP_LG_F16:
                 case Rdna2Opcode::V_CMP_GE_F16:
+                case Rdna2Opcode::V_CMP_O_F16:
                 case Rdna2Opcode::V_CMP_U_F16:
                 case Rdna2Opcode::V_CMP_NGE_F16:
                 case Rdna2Opcode::V_CMP_NLG_F16:
@@ -4221,8 +4234,15 @@ Status BuildRdna2Ir(
                 case Rdna2Opcode::V_CMPX_GT_F16:
                 case Rdna2Opcode::V_CMPX_LG_F16:
                 case Rdna2Opcode::V_CMPX_GE_F16:
+                case Rdna2Opcode::V_CMPX_O_F16:
+                case Rdna2Opcode::V_CMPX_U_F16:
+                case Rdna2Opcode::V_CMPX_NGE_F16:
+                case Rdna2Opcode::V_CMPX_NLG_F16:
+                case Rdna2Opcode::V_CMPX_NGT_F16:
+                case Rdna2Opcode::V_CMPX_NLE_F16:
                 case Rdna2Opcode::V_CMPX_NEQ_F16:
                 case Rdna2Opcode::V_CMPX_NLT_F16:
+                case Rdna2Opcode::V_CMPX_TRU_F16:
                 case Rdna2Opcode::V_CMP_LT_I64:
                 case Rdna2Opcode::V_CMP_EQ_I64:
                 case Rdna2Opcode::V_CMP_LE_I64:
@@ -4318,6 +4338,62 @@ Status BuildRdna2Ir(
                             default:
                                 break;
                         }
+                    } else if (inst.opcode == Rdna2Opcode::V_CMP_CLASS_F32 ||
+                               inst.opcode == Rdna2Opcode::V_CMPX_CLASS_F32 ||
+                               inst.opcode == Rdna2Opcode::V_CMP_CLASS_F16 ||
+                               inst.opcode == Rdna2Opcode::V_CMPX_CLASS_F16) {
+                        // Bit-exact IEEE-754 10-bit class mask evaluation (adapted from MIT R0Y00/Xbox2Windows):
+                        // bit 0: sNaN, 1: qNaN, 2: -inf, 3: -norm, 4: -denorm, 5: -0, 6: +0, 7: +denorm, 8: +norm, 9: +inf.
+                        const bool is_f16 = (inst.opcode == Rdna2Opcode::V_CMP_CLASS_F16 ||
+                                             inst.opcode == Rdna2Opcode::V_CMPX_CLASS_F16);
+                        auto ku32 = [&](uint32_t v) { return emit_in_bb(IrOp::ConstU32, IrType::U32, {}, v, 0.0f); };
+                        IrValueId bits = kInvalidIrValue;
+                        if (is_f16) {
+                            Rdna2Operand raw0 = inst.src[0];
+                            raw0.abs = false;
+                            raw0.neg = false;
+                            bits = eval_operand(raw0, false);
+                            if ((inst.vop3_op_sel & 1u) != 0u) {
+                                bits = emit_in_bb(IrOp::Shr, IrType::U32, {bits, ku32(16u)});
+                            }
+                            bits = emit_in_bb(IrOp::BitAnd, IrType::U32, {bits, ku32(0xFFFFu)});
+                            if (inst.src[0].abs) bits = emit_in_bb(IrOp::BitAnd, IrType::U32, {bits, ku32(0x7FFFu)});
+                            if (inst.src[0].neg) bits = emit_in_bb(IrOp::BitXor, IrType::U32, {bits, ku32(0x8000u)});
+                        } else if (inst.has_sdwa || inst.src[0].kind == Rdna2OperandKind::InlineFloat) {
+                            bits = eval_src0(inst, true);
+                        } else {
+                            Rdna2Operand raw0 = inst.src[0];
+                            raw0.abs = false;
+                            raw0.neg = false;
+                            bits = eval_operand(raw0, false);
+                            if (inst.src[0].abs) bits = emit_in_bb(IrOp::BitAnd, IrType::U32, {bits, ku32(0x7FFFFFFFu)});
+                            if (inst.src[0].neg) bits = emit_in_bb(IrOp::BitXor, IrType::U32, {bits, ku32(0x80000000u)});
+                        }
+                        const IrValueId mask_v = eval_src1(inst, false);
+                        const uint32_t sign_bit = is_f16 ? 0x8000u : 0x80000000u;
+                        const uint32_t mag_mask = is_f16 ? 0x7FFFu : 0x7FFFFFFFu;
+                        const uint32_t inf_exp  = is_f16 ? 0x7C00u : 0x7F800000u;
+                        const uint32_t min_norm = is_f16 ? 0x0400u : 0x00800000u;
+                        const uint32_t qnan_bit = is_f16 ? 0x0200u : 0x00400000u;
+                        const IrValueId mag = emit_in_bb(IrOp::BitAnd, IrType::U32, {bits, ku32(mag_mask)});
+                        const IrValueId neg = emit_in_bb(IrOp::CmpGeU, IrType::Bool, {bits, ku32(sign_bit)});
+                        const IrValueId qbit = emit_in_bb(IrOp::BitAnd, IrType::U32, {bits, ku32(qnan_bit)});
+                        const IrValueId is_qnan = emit_in_bb(IrOp::CmpNe, IrType::Bool, {qbit, ku32(0u)});
+                        const IrValueId c_zero   = emit_in_bb(IrOp::Select, IrType::U32, {neg, ku32(0x20u), ku32(0x40u)});
+                        const IrValueId c_denorm = emit_in_bb(IrOp::Select, IrType::U32, {neg, ku32(0x10u), ku32(0x80u)});
+                        const IrValueId c_norm   = emit_in_bb(IrOp::Select, IrType::U32, {neg, ku32(0x08u), ku32(0x100u)});
+                        const IrValueId c_inf    = emit_in_bb(IrOp::Select, IrType::U32, {neg, ku32(0x04u), ku32(0x200u)});
+                        const IrValueId c_nan    = emit_in_bb(IrOp::Select, IrType::U32, {is_qnan, ku32(0x02u), ku32(0x01u)});
+                        const IrValueId s0 = emit_in_bb(IrOp::Select, IrType::U32,
+                                                        {emit_in_bb(IrOp::CmpNe, IrType::Bool, {mag, ku32(0u)}), c_denorm, c_zero});
+                        const IrValueId s1 = emit_in_bb(IrOp::Select, IrType::U32,
+                                                        {emit_in_bb(IrOp::CmpGeU, IrType::Bool, {mag, ku32(min_norm)}), c_norm, s0});
+                        const IrValueId s2 = emit_in_bb(IrOp::Select, IrType::U32,
+                                                        {emit_in_bb(IrOp::CmpEqU, IrType::Bool, {mag, ku32(inf_exp)}), c_inf, s1});
+                        const IrValueId cls = emit_in_bb(IrOp::Select, IrType::U32,
+                                                         {emit_in_bb(IrOp::CmpGtU, IrType::Bool, {mag, ku32(inf_exp)}), c_nan, s2});
+                        const IrValueId hit = emit_in_bb(IrOp::BitAnd, IrType::U32, {cls, mask_v});
+                        cmp_val = emit_in_bb(IrOp::CmpNe, IrType::Bool, {hit, ku32(0u)});
                     } else if (IsF16CompareOpcode(inst.opcode)) {
                         const uint32_t pred = EncodeF16CmpPred(inst.opcode);
                         uint32_t neg_m = (inst.src[0].neg ? 1u : 0u) | (inst.src[1].neg ? 2u : 0u);

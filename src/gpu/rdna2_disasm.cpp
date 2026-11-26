@@ -603,6 +603,8 @@ Rdna2Opcode DecodeVopcOpcode(uint16_t raw) {
         case 0x85: return Rdna2Opcode::V_CMP_EQ_I32;   // GFX10.3 v_cmp_lg_i32 (ne)
         case 0x86: return Rdna2Opcode::V_CMP_GE_I32;
         case 0x87: return Rdna2Opcode::V_CMP_TRU_F32;  // GFX10.3 v_cmp_tru_i32
+        case 0x88: return Rdna2Opcode::V_CMP_CLASS_F32;
+        case 0x8F: return Rdna2Opcode::V_CMP_CLASS_F16;
         case 0x90: return Rdna2Opcode::V_CMPX_F_F32;   // GFX10.3 v_cmpx_f_i32
         case 0x91: return Rdna2Opcode::V_CMPX_LT_I32;
         case 0x92: return Rdna2Opcode::V_CMPX_EQ_I32;
@@ -611,6 +613,8 @@ Rdna2Opcode DecodeVopcOpcode(uint16_t raw) {
         case 0x95: return Rdna2Opcode::V_CMPX_EQ_I32;  // GFX10.3 v_cmpx_lg_i32 (ne)
         case 0x96: return Rdna2Opcode::V_CMPX_GE_I32;
         case 0x97: return Rdna2Opcode::V_CMPX_TRU_F32; // GFX10.3 v_cmpx_tru_i32
+        case 0x98: return Rdna2Opcode::V_CMPX_CLASS_F32;
+        case 0x9F: return Rdna2Opcode::V_CMPX_CLASS_F16;
         // 64-bit signed integer compares
         case 0xA1: return Rdna2Opcode::V_CMP_LT_I64;
         case 0xA2: return Rdna2Opcode::V_CMP_EQ_I64;
@@ -627,12 +631,14 @@ Rdna2Opcode DecodeVopcOpcode(uint16_t raw) {
         case 0xC6: return Rdna2Opcode::V_CMP_GE_U32;
         case 0xC7: return Rdna2Opcode::V_CMP_TRU_F32;  // GFX10.3 v_cmp_tru_u32
         // GFX10 split F16 compare range (lower half 0xC8..0xCF; upper half 0xD8..0xDF)
+        case 0xC8: return Rdna2Opcode::V_CMP_F_F32;    // GFX10.3 v_cmp_f_f16 (always false)
         case 0xC9: return Rdna2Opcode::V_CMP_LT_F16;
         case 0xCA: return Rdna2Opcode::V_CMP_EQ_F16;
         case 0xCB: return Rdna2Opcode::V_CMP_LE_F16;
         case 0xCC: return Rdna2Opcode::V_CMP_GT_F16;
         case 0xCD: return Rdna2Opcode::V_CMP_LG_F16;
         case 0xCE: return Rdna2Opcode::V_CMP_GE_F16;
+        case 0xCF: return Rdna2Opcode::V_CMP_O_F16;
         case 0xD0: return Rdna2Opcode::V_CMPX_F_F32;   // GFX10.3 v_cmpx_f_u32
         case 0xD1: return Rdna2Opcode::V_CMPX_LT_U32;
         case 0xD2: return Rdna2Opcode::V_CMPX_EQ_U32;
@@ -657,14 +663,22 @@ Rdna2Opcode DecodeVopcOpcode(uint16_t raw) {
         case 0xE5: return Rdna2Opcode::V_CMP_LG_U64;
         case 0xE6: return Rdna2Opcode::V_CMP_GE_U64;
         // GFX10 split F16 V_CMPX range (lower half 0xE8..0xEF; upper half 0xF8..0xFF)
+        case 0xE8: return Rdna2Opcode::V_CMPX_F_F32;   // GFX10.3 v_cmpx_f_f16 (always false)
         case 0xE9: return Rdna2Opcode::V_CMPX_LT_F16;
         case 0xEA: return Rdna2Opcode::V_CMPX_EQ_F16;
         case 0xEB: return Rdna2Opcode::V_CMPX_LE_F16;
         case 0xEC: return Rdna2Opcode::V_CMPX_GT_F16;
         case 0xED: return Rdna2Opcode::V_CMPX_LG_F16;
         case 0xEE: return Rdna2Opcode::V_CMPX_GE_F16;
+        case 0xEF: return Rdna2Opcode::V_CMPX_O_F16;
+        case 0xF8: return Rdna2Opcode::V_CMPX_U_F16;
+        case 0xF9: return Rdna2Opcode::V_CMPX_NGE_F16;
+        case 0xFA: return Rdna2Opcode::V_CMPX_NLG_F16;
+        case 0xFB: return Rdna2Opcode::V_CMPX_NGT_F16;
+        case 0xFC: return Rdna2Opcode::V_CMPX_NLE_F16;
         case 0xFD: return Rdna2Opcode::V_CMPX_NEQ_F16;
         case 0xFE: return Rdna2Opcode::V_CMPX_NLT_F16;
+        case 0xFF: return Rdna2Opcode::V_CMPX_TRU_F16;
         default:   return Rdna2Opcode::Unknown;
     }
 }
@@ -707,10 +721,14 @@ uint16_t EncodeVopcOpcode(Rdna2Opcode op) {
         case Rdna2Opcode::V_CMP_EQ_I32:   return 0x82;
         case Rdna2Opcode::V_CMP_GT_I32:   return 0x84;
         case Rdna2Opcode::V_CMP_GE_I32:   return 0x86;
+        case Rdna2Opcode::V_CMP_CLASS_F32: return 0x88;
+        case Rdna2Opcode::V_CMP_CLASS_F16: return 0x8F;
         case Rdna2Opcode::V_CMPX_LT_I32:  return 0x91;
         case Rdna2Opcode::V_CMPX_EQ_I32:  return 0x92;
         case Rdna2Opcode::V_CMPX_GT_I32:  return 0x94;
         case Rdna2Opcode::V_CMPX_GE_I32:  return 0x96;
+        case Rdna2Opcode::V_CMPX_CLASS_F32: return 0x98;
+        case Rdna2Opcode::V_CMPX_CLASS_F16: return 0x9F;
         case Rdna2Opcode::V_CMP_LT_U32:   return 0xC1;
         case Rdna2Opcode::V_CMP_EQ_U32:   return 0xC2;
         case Rdna2Opcode::V_CMP_GT_U32:   return 0xC4;
@@ -721,6 +739,7 @@ uint16_t EncodeVopcOpcode(Rdna2Opcode op) {
         case Rdna2Opcode::V_CMP_GT_F16:   return 0xCC;
         case Rdna2Opcode::V_CMP_LG_F16:   return 0xCD;
         case Rdna2Opcode::V_CMP_GE_F16:   return 0xCE;
+        case Rdna2Opcode::V_CMP_O_F16:    return 0xCF;
         case Rdna2Opcode::V_CMPX_LT_U32:  return 0xD1;
         case Rdna2Opcode::V_CMPX_EQ_U32:  return 0xD2;
         case Rdna2Opcode::V_CMPX_GT_U32:  return 0xD4;
@@ -739,8 +758,15 @@ uint16_t EncodeVopcOpcode(Rdna2Opcode op) {
         case Rdna2Opcode::V_CMPX_GT_F16:  return 0xEC;
         case Rdna2Opcode::V_CMPX_LG_F16:  return 0xED;
         case Rdna2Opcode::V_CMPX_GE_F16:  return 0xEE;
+        case Rdna2Opcode::V_CMPX_O_F16:   return 0xEF;
+        case Rdna2Opcode::V_CMPX_U_F16:   return 0xF8;
+        case Rdna2Opcode::V_CMPX_NGE_F16: return 0xF9;
+        case Rdna2Opcode::V_CMPX_NLG_F16: return 0xFA;
+        case Rdna2Opcode::V_CMPX_NGT_F16: return 0xFB;
+        case Rdna2Opcode::V_CMPX_NLE_F16: return 0xFC;
         case Rdna2Opcode::V_CMPX_NEQ_F16: return 0xFD;
         case Rdna2Opcode::V_CMPX_NLT_F16: return 0xFE;
+        case Rdna2Opcode::V_CMPX_TRU_F16: return 0xFF;
         case Rdna2Opcode::V_CMP_LT_I64:   return 0xA1;
         case Rdna2Opcode::V_CMP_EQ_I64:   return 0xA2;
         case Rdna2Opcode::V_CMP_LE_I64:   return 0xA3;
@@ -2725,12 +2751,17 @@ const char* Rdna2OpcodeName(Rdna2Opcode op) noexcept {
         case Rdna2Opcode::V_CMPX_EQ_U32:      return "v_cmpx_eq_u32";
         case Rdna2Opcode::V_CMPX_GT_U32:      return "v_cmpx_gt_u32";
         case Rdna2Opcode::V_CMPX_GE_U32:      return "v_cmpx_ge_u32";
+        case Rdna2Opcode::V_CMP_CLASS_F32:    return "v_cmp_class_f32";
+        case Rdna2Opcode::V_CMPX_CLASS_F32:   return "v_cmpx_class_f32";
+        case Rdna2Opcode::V_CMP_CLASS_F16:    return "v_cmp_class_f16";
+        case Rdna2Opcode::V_CMPX_CLASS_F16:   return "v_cmpx_class_f16";
         case Rdna2Opcode::V_CMP_LT_F16:       return "v_cmp_lt_f16";
         case Rdna2Opcode::V_CMP_EQ_F16:       return "v_cmp_eq_f16";
         case Rdna2Opcode::V_CMP_LE_F16:       return "v_cmp_le_f16";
         case Rdna2Opcode::V_CMP_GT_F16:       return "v_cmp_gt_f16";
         case Rdna2Opcode::V_CMP_LG_F16:       return "v_cmp_lg_f16";
         case Rdna2Opcode::V_CMP_GE_F16:       return "v_cmp_ge_f16";
+        case Rdna2Opcode::V_CMP_O_F16:        return "v_cmp_o_f16";
         case Rdna2Opcode::V_CMP_U_F16:        return "v_cmp_u_f16";
         case Rdna2Opcode::V_CMP_NGE_F16:      return "v_cmp_nge_f16";
         case Rdna2Opcode::V_CMP_NLG_F16:      return "v_cmp_nlg_f16";
@@ -2745,8 +2776,15 @@ const char* Rdna2OpcodeName(Rdna2Opcode op) noexcept {
         case Rdna2Opcode::V_CMPX_GT_F16:      return "v_cmpx_gt_f16";
         case Rdna2Opcode::V_CMPX_LG_F16:      return "v_cmpx_lg_f16";
         case Rdna2Opcode::V_CMPX_GE_F16:      return "v_cmpx_ge_f16";
+        case Rdna2Opcode::V_CMPX_O_F16:       return "v_cmpx_o_f16";
+        case Rdna2Opcode::V_CMPX_U_F16:       return "v_cmpx_u_f16";
+        case Rdna2Opcode::V_CMPX_NGE_F16:     return "v_cmpx_nge_f16";
+        case Rdna2Opcode::V_CMPX_NLG_F16:     return "v_cmpx_nlg_f16";
+        case Rdna2Opcode::V_CMPX_NGT_F16:     return "v_cmpx_ngt_f16";
+        case Rdna2Opcode::V_CMPX_NLE_F16:     return "v_cmpx_nle_f16";
         case Rdna2Opcode::V_CMPX_NEQ_F16:     return "v_cmpx_neq_f16";
         case Rdna2Opcode::V_CMPX_NLT_F16:     return "v_cmpx_nlt_f16";
+        case Rdna2Opcode::V_CMPX_TRU_F16:     return "v_cmpx_tru_f16";
         case Rdna2Opcode::V_CMP_LT_I64:       return "v_cmp_lt_i64";
         case Rdna2Opcode::V_CMP_EQ_I64:       return "v_cmp_eq_i64";
         case Rdna2Opcode::V_CMP_LE_I64:       return "v_cmp_le_i64";
@@ -2932,14 +2970,23 @@ bool IsVcmpxOpcode(Rdna2Opcode op) noexcept {
         case Rdna2Opcode::V_CMPX_EQ_U32:
         case Rdna2Opcode::V_CMPX_GT_U32:
         case Rdna2Opcode::V_CMPX_GE_U32:
+        case Rdna2Opcode::V_CMPX_CLASS_F32:
+        case Rdna2Opcode::V_CMPX_CLASS_F16:
         case Rdna2Opcode::V_CMPX_LT_F16:
         case Rdna2Opcode::V_CMPX_EQ_F16:
         case Rdna2Opcode::V_CMPX_LE_F16:
         case Rdna2Opcode::V_CMPX_GT_F16:
         case Rdna2Opcode::V_CMPX_LG_F16:
         case Rdna2Opcode::V_CMPX_GE_F16:
+        case Rdna2Opcode::V_CMPX_O_F16:
+        case Rdna2Opcode::V_CMPX_U_F16:
+        case Rdna2Opcode::V_CMPX_NGE_F16:
+        case Rdna2Opcode::V_CMPX_NLG_F16:
+        case Rdna2Opcode::V_CMPX_NGT_F16:
+        case Rdna2Opcode::V_CMPX_NLE_F16:
         case Rdna2Opcode::V_CMPX_NEQ_F16:
         case Rdna2Opcode::V_CMPX_NLT_F16:
+        case Rdna2Opcode::V_CMPX_TRU_F16:
             return true;
         default:
             return false;
@@ -2954,6 +3001,7 @@ bool IsF16CompareOpcode(Rdna2Opcode op) noexcept {
         case Rdna2Opcode::V_CMP_GT_F16:
         case Rdna2Opcode::V_CMP_LG_F16:
         case Rdna2Opcode::V_CMP_GE_F16:
+        case Rdna2Opcode::V_CMP_O_F16:
         case Rdna2Opcode::V_CMP_U_F16:
         case Rdna2Opcode::V_CMP_NGE_F16:
         case Rdna2Opcode::V_CMP_NLG_F16:
@@ -2968,8 +3016,15 @@ bool IsF16CompareOpcode(Rdna2Opcode op) noexcept {
         case Rdna2Opcode::V_CMPX_GT_F16:
         case Rdna2Opcode::V_CMPX_LG_F16:
         case Rdna2Opcode::V_CMPX_GE_F16:
+        case Rdna2Opcode::V_CMPX_O_F16:
+        case Rdna2Opcode::V_CMPX_U_F16:
+        case Rdna2Opcode::V_CMPX_NGE_F16:
+        case Rdna2Opcode::V_CMPX_NLG_F16:
+        case Rdna2Opcode::V_CMPX_NGT_F16:
+        case Rdna2Opcode::V_CMPX_NLE_F16:
         case Rdna2Opcode::V_CMPX_NEQ_F16:
         case Rdna2Opcode::V_CMPX_NLT_F16:
+        case Rdna2Opcode::V_CMPX_TRU_F16:
             return true;
         default:
             return false;

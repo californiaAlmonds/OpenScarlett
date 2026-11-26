@@ -1477,7 +1477,13 @@ public:
             inner_->ExecuteIndirect(cs, mc, ab, aoff, cb, coff);
         }
     }
-    virtual void STDMETHODCALLTYPE Slot62() { RecordClUnimpl(62); }
+    // Slot 62 (+0x1F0): GetCommandBufferGpuVirtualAddressX / status query on retail Scarlett ID3D12GraphicsCommandList
+    virtual uint64_t STDMETHODCALLTYPE Slot62() {
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailCmdList::GetStatusX_Slot62",
+            openscarlett::CallOutcome::Ok, S_OK, 62);
+        return 0ull;
+    }
     virtual void STDMETHODCALLTYPE Slot63() { RecordClUnimpl(63); }
     virtual void STDMETHODCALLTYPE Slot64() { RecordClUnimpl(64); }
     virtual void STDMETHODCALLTYPE Slot65() { RecordClUnimpl(65); }
@@ -1641,9 +1647,38 @@ public:
                 openscarlett::CallOutcome::Ok, S_OK, 126);
         }
     }
-    virtual void STDMETHODCALLTYPE Slot127() { RecordClUnimpl(127); }
+    virtual void STDMETHODCALLTYPE Slot127(ID3D12Resource* r) {
+        if (inner_) inner_->RSSetShadingRateImage(r);
+    }
     virtual void STDMETHODCALLTYPE Slot128() { RecordClUnimpl(128); }
-    virtual void STDMETHODCALLTYPE Slot129() { RecordClUnimpl(129); }
+    // Slot 129 (+0x408): DispatchMesh(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ) on retail GRDK 2504+
+    virtual void STDMETHODCALLTYPE Slot129(
+        UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ) {
+        static std::atomic<uint32_t> s_dm129_logs{0u};
+        const uint32_t n = s_dm129_logs.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 6u) {
+            const void* ret = _ReturnAddress();
+            const uintptr_t base = reinterpret_cast<uintptr_t>(::GetModuleHandleW(nullptr));
+            const uintptr_t rva = (ret && reinterpret_cast<uintptr_t>(ret) > base)
+                                      ? (reinterpret_cast<uintptr_t>(ret) - base)
+                                      : reinterpret_cast<uintptr_t>(ret);
+            std::fprintf(stderr,
+                         "[OpenScarlett][d3d12_xs] DispatchMesh_Slot129 #%u ret=+0x%llX (%u, %u, %u)\n",
+                         n, static_cast<unsigned long long>(rva),
+                         ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+            std::fflush(stderr);
+        }
+        if (inner_ &&
+            ThreadGroupCountX > 0u && ThreadGroupCountX <= 65535u &&
+            ThreadGroupCountY > 0u && ThreadGroupCountY <= 65535u &&
+            ThreadGroupCountZ > 0u && ThreadGroupCountZ <= 65535u) {
+            inner_->DispatchMesh(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+        } else {
+            openscarlett::CallTelemetry::Global().Record(
+                "d3d12_xs.dll", "ScarlettRetailCmdList::DispatchMesh_Slot129",
+                openscarlett::CallOutcome::Ok, S_OK, 129);
+        }
+    }
     virtual void STDMETHODCALLTYPE Slot130() { RecordClUnimpl(130); }
     // Slot 131 (+0x418): Xbox ID3D12GraphicsCommandList6::BuildRaytracingAccelerationStructuresX
     virtual void STDMETHODCALLTYPE BuildRaytracingAccelerationStructuresX(
@@ -3568,31 +3603,42 @@ HRESULT CreateWrappedDeviceInternal(
                     }
                     return EXCEPTION_CONTINUE_SEARCH;
                 }
-                // Retail console hang-watchdog pattern: mov dword ptr [0], 0; int 3
-                // (C7 04 25 00 00 00 00 00 00 00 00 CC). Console titles set a strict ~30s QPC
-                // budget calibrated for Xbox NVMe + precompiled shaders; on PC cold storage /
-                // on-demand shader lifting, log and step cleanly to the watchdog recovery path.
+                // Retail console hang-watchdog patterns:
+                // 1) mov dword ptr [0], 0; int 3 (C7 04 25 00 00 00 00 00 00 00 00 CC, 12 bytes)
+                // 2) mov dword ptr [0], 0x4D8BD421 (C7 04 25 00 00 00 00 21 D4 8B 4D, 11 bytes)
+                // Console titles set a strict ~30s QPC budget calibrated for Xbox NVMe + precompiled shaders;
+                // on PC cold storage / on-demand DXC shader lifting, log and step cleanly to recovery.
                 if (code == EXCEPTION_ACCESS_VIOLATION &&
                     ep->ExceptionRecord->NumberParameters >= 2u &&
                     ep->ExceptionRecord->ExceptionInformation[0] == 1u &&
                     ep->ExceptionRecord->ExceptionInformation[1] == 0u &&
                     IsReadableRetailRange(reinterpret_cast<uintptr_t>(rip), 12u)) {
-                    static constexpr uint8_t kWatchdogTrap[12] = {
-                        0xC7u, 0x04u, 0x25u, 0x00u, 0x00u, 0x00u, 0x00u,
-                        0x00u, 0x00u, 0x00u, 0x00u, 0xCCu};
-                    if (std::memcmp(rip, kWatchdogTrap, sizeof(kWatchdogTrap)) == 0) {
+                    static constexpr uint8_t kWatchdogPrefix[7] = {
+                        0xC7u, 0x04u, 0x25u, 0x00u, 0x00u, 0x00u, 0x00u};
+                    static constexpr uint8_t kWatchdogZero[5] = {0x00u, 0x00u, 0x00u, 0x00u, 0xCCu};
+                    static constexpr uint8_t kWatchdogMagic[4] = {0x21u, 0xD4u, 0x8Bu, 0x4Du};
+                    size_t skip_len = 0u;
+                    if (std::memcmp(rip, kWatchdogPrefix, sizeof(kWatchdogPrefix)) == 0) {
+                        if (std::memcmp(rip + 7, kWatchdogZero, sizeof(kWatchdogZero)) == 0) {
+                            skip_len = 12u;
+                        } else if (std::memcmp(rip + 7, kWatchdogMagic, sizeof(kWatchdogMagic)) == 0) {
+                            skip_len = 11u;
+                        }
+                    }
+                    if (skip_len > 0u) {
                         static std::atomic<uint32_t> s_wd_hits{0u};
                         const uint32_t n = s_wd_hits.fetch_add(1u, std::memory_order_relaxed) + 1u;
-                        if (n <= 8u) {
+                        if (n <= 12u) {
                             std::fprintf(
                                 stderr,
-                                "[OpenScarlett][WATCHDOG] Suppressed console hang-watchdog trap #%u at rip=0x%llX (tid=%lu)\n",
+                                "[OpenScarlett][WATCHDOG] Suppressed console hang-watchdog trap #%u at rip=0x%llX (+%zuB, tid=%lu)\n",
                                 n,
                                 static_cast<unsigned long long>(ep->ContextRecord->Rip),
+                                skip_len,
                                 ::GetCurrentThreadId());
                             std::fflush(stderr);
                         }
-                        ep->ContextRecord->Rip += 12ull;
+                        ep->ContextRecord->Rip += skip_len;
                         return EXCEPTION_CONTINUE_EXECUTION;
                     }
                 }
