@@ -541,13 +541,20 @@ int main(int argc, char** argv) {
     }
 
     // 2. XDisplay: HDR mode probe + display timeout deferral acquisition
-    XDisplayHdrModeInfo hdr_info{};
+    XDisplayHdrModeInfo hdr_info{0.05f, 300.0f, 250.0f};
     const XDisplayHdrModeResult hdr_result =
         XDisplayTryEnableHdrMode(XDisplayHdrModePreference_PreferHdr, &hdr_info);
-    if ((hdr_result != XDisplayHdrModeResult_Enabled &&
-         hdr_result != XDisplayHdrModeResult_Disabled) ||
-        !(hdr_info.maxToneMapLuminance >= hdr_info.maxFullFrameToneMapLuminance &&
-          hdr_info.maxFullFrameToneMapLuminance > hdr_info.minToneMapLuminance)) {
+    const bool hdr_valid =
+        (hdr_result == XDisplayHdrModeResult_Enabled)
+            ? (hdr_info.maxToneMapLuminance > 0.0f &&
+               hdr_info.maxToneMapLuminance >= hdr_info.maxFullFrameToneMapLuminance &&
+               hdr_info.maxFullFrameToneMapLuminance >= hdr_info.minToneMapLuminance &&
+               hdr_info.minToneMapLuminance >= 0.0f)
+            : (hdr_result == XDisplayHdrModeResult_Disabled &&
+               hdr_info.minToneMapLuminance == 0.0f &&
+               hdr_info.maxToneMapLuminance == 0.0f &&
+               hdr_info.maxFullFrameToneMapLuminance == 0.0f);
+    if (!hdr_valid) {
         PIXEndEventOnCpu();
         XGameRuntimeUninitialize();
         return Fail("XDisplayTryEnableHdrMode invalid result/luminance", static_cast<int64_t>(hdr_result));

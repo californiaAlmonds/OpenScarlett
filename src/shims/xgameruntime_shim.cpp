@@ -6904,8 +6904,11 @@ bool ProbeHostDxgiHdrDisplay(XDisplayHdrModeInfo& out_info) {
                         (desc1.MinLuminance > 0.0f) ? desc1.MinLuminance : 0.005f;
                     out_info.maxToneMapLuminance =
                         (desc1.MaxLuminance > 0.0f) ? desc1.MaxLuminance : 1000.0f;
-                    out_info.maxFullFrameToneMapLuminance =
-                        (desc1.MaxFullFrameLuminance > 0.0f) ? desc1.MaxFullFrameLuminance : 400.0f;
+                    out_info.maxFullFrameToneMapLuminance = std::min(
+                        out_info.maxToneMapLuminance,
+                        (desc1.MaxFullFrameLuminance > 0.0f) ? desc1.MaxFullFrameLuminance : 400.0f);
+                    out_info.minToneMapLuminance = std::min(
+                        out_info.minToneMapLuminance, out_info.maxFullFrameToneMapLuminance);
                 }
                 out6->Release();
             }
