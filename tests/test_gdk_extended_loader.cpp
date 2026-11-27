@@ -74,13 +74,15 @@ uint32_t ReadLe32(const uint8_t* p) {
 void TestXDisplayHdrAndDeferral() {
     OS_REQUIRE(XGameRuntimeInitialize() == XGR_S_OK);
 
-    // Force SDR path deterministically
+    // Force SDR path deterministically (GDK zeroes luminance metadata when HDR is disabled)
     SetEnvVarLocal("OPENSCARLETT_FORCE_HDR", "0");
-    XDisplayHdrModeInfo sdr_info{};
+    XDisplayHdrModeInfo sdr_info{0.05f, 300.0f, 250.0f};
     const XDisplayHdrModeResult sdr_res =
         XDisplayTryEnableHdrMode(XDisplayHdrModePreference_PreferHdr, &sdr_info);
     OS_REQUIRE(sdr_res == XDisplayHdrModeResult_Disabled);
-    OS_REQUIRE(sdr_info.minToneMapLuminance > 0.0f && sdr_info.maxToneMapLuminance <= 400.0f);
+    OS_REQUIRE(sdr_info.minToneMapLuminance == 0.0f &&
+               sdr_info.maxToneMapLuminance == 0.0f &&
+               sdr_info.maxFullFrameToneMapLuminance == 0.0f);
 
     // Force HDR10 path deterministically
     SetEnvVarLocal("OPENSCARLETT_FORCE_HDR", "1");

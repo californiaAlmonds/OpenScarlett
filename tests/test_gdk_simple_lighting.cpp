@@ -622,7 +622,14 @@ void VerifySimpleLightingRun(const std::string& mode,
 
     // XDisplay checks
     OS_REQUIRE(m.at("xdisplay_deferral_ok") == "1");
-    OS_REQUIRE(std::stod(m.at("xdisplay_max_nits")) >= 200.0);
+    const uint32_t hdr_result = static_cast<uint32_t>(std::stoul(m.at("xdisplay_hdr_result")));
+    const double max_nits = std::stod(m.at("xdisplay_max_nits"));
+    if (hdr_result == 1u) {  // XDisplayHdrModeResult_Enabled
+        OS_REQUIRE(max_nits > 0.0);
+    } else {
+        OS_REQUIRE(hdr_result == 2u);  // XDisplayHdrModeResult_Disabled
+        OS_REQUIRE(max_nits == 0.0);
+    }
 
     // XAudio2FX + X3DAudio checks (left -> center -> right panning, distance attenuation, Doppler shift)
     OS_REQUIRE(std::fabs(std::stod(m.at("xaudio2fx_reverb_wetdry")) - 42.5) < 0.1);

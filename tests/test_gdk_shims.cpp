@@ -269,9 +269,17 @@ void TestXGameRuntime() {
     OS_REQUIRE(XPackageEnumerateChunkAvailability(pkg, 0, nullptr, &ready_chunks, &EnumChunkCb) == XGR_S_OK);
     OS_REQUIRE(ready_chunks >= 1);
 
-    XDisplayHdrModeInfo hdr_info{};
-    (void)XDisplayTryEnableHdrMode(0, &hdr_info);
-    OS_REQUIRE(hdr_info.maxToneMapLuminance > 0.0f);
+    XDisplayHdrModeInfo hdr_info{0.05f, 300.0f, 250.0f};
+    const XDisplayHdrModeResult hdr_res = XDisplayTryEnableHdrMode(0, &hdr_info);
+    if (hdr_res == XDisplayHdrModeResult_Enabled) {
+        OS_REQUIRE(hdr_info.maxToneMapLuminance > 0.0f);
+        OS_REQUIRE(hdr_info.maxToneMapLuminance >= hdr_info.maxFullFrameToneMapLuminance);
+    } else {
+        OS_REQUIRE(hdr_res == XDisplayHdrModeResult_Disabled);
+        OS_REQUIRE(hdr_info.minToneMapLuminance == 0.0f &&
+                   hdr_info.maxToneMapLuminance == 0.0f &&
+                   hdr_info.maxFullFrameToneMapLuminance == 0.0f);
+    }
     XDisplayTimeoutDeferralHandle deferral = nullptr;
     OS_REQUIRE(XDisplayTryAcquireTimeoutDeferral(&deferral) == XGR_S_OK && deferral != nullptr);
     XDisplayCloseTimeoutDeferralHandle(deferral);

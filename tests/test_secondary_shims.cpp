@@ -295,9 +295,17 @@ void TestXGameRuntimeQueryApi() {
 
     // 1h. Display vtable
     const auto* disp_vt = QueryVtableRequired<IXgrDisplayApiVtable>(XGR_API_GUID_DISPLAY);
-    XDisplayHdrModeInfo hdr_info{};
-    (void)disp_vt->XDisplayTryEnableHdrMode(1u, &hdr_info);
-    OS_REQUIRE(hdr_info.maxToneMapLuminance > 0.0f);
+    XDisplayHdrModeInfo hdr_info{0.05f, 300.0f, 250.0f};
+    const XDisplayHdrModeResult hdr_res = disp_vt->XDisplayTryEnableHdrMode(1u, &hdr_info);
+    if (hdr_res == XDisplayHdrModeResult_Enabled) {
+        OS_REQUIRE(hdr_info.maxToneMapLuminance > 0.0f);
+        OS_REQUIRE(hdr_info.maxToneMapLuminance >= hdr_info.maxFullFrameToneMapLuminance);
+    } else {
+        OS_REQUIRE(hdr_res == XDisplayHdrModeResult_Disabled);
+        OS_REQUIRE(hdr_info.minToneMapLuminance == 0.0f &&
+                   hdr_info.maxToneMapLuminance == 0.0f &&
+                   hdr_info.maxFullFrameToneMapLuminance == 0.0f);
+    }
     XDisplayTimeoutDeferralHandle deferral = nullptr;
     OS_REQUIRE(disp_vt->XDisplayTryAcquireTimeoutDeferral(&deferral) == XGR_S_OK && deferral != nullptr);
     disp_vt->XDisplayCloseTimeoutDeferralHandle(deferral);
